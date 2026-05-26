@@ -4,6 +4,11 @@ __pycache__/
 
 # Local virtualenv and runtime artifacts
 spike-graphiti/.venv/
+spike-graphiti/kuzu_db
 .env
 *.log
+
+# Runtime data, imported memories, graph backups, snapshots, and watermarks.
+# These can contain personal notes, crawl tokens, and large database files.
+data/
 

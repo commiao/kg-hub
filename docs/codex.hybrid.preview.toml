@@ -1,0 +1,99 @@
+# Codex Hybrid Migration Preview — 2026-05-21
+# ==============================================
+#
+# Purpose: stdio MCPs go Codex native; SSE/legacy MCPs stay on muxcp_fallback.
+# 落地阶段：kg-hub DESIGN.md 决策 17 / Phase 2
+#
+# 状态：🟢 EPHEMERAL VALIDATED 2026-05-21
+#       三路全通过 (kg native + seq native + muxcp_fallback Aliyun SSE)
+#
+# 验证依据：
+#   Phase 1: /Users/mac/workspace_codex/muxcp-codex-native-validation-2026-05-21.md
+#   Phase 2: /Users/mac/workspace_codex/muxcp-codex-hybrid-validation-2026-05-21.md
+#
+# ✅ Ready for install to ~/.codex/config.toml (user decision pending).
+#
+# Validation command (executed 2026-05-21, three paths passed):
+#
+#   codex exec --ephemeral --ignore-user-config \
+#     -c 'default_tools_approval_mode="approve"' \
+#     -c 'mcp_servers.kg.command="/Users/mac/.config/muxcp/bin/run-kg-hub.sh"' \
+#     -c 'mcp_servers.seq.command="npx"' \
+#     -c 'mcp_servers.seq.args=["-y","@modelcontextprotocol/server-sequential-thinking"]' \
+#     -c 'mcp_servers.pw.command="npx"' \
+#     -c 'mcp_servers.pw.args=["-y","@playwright/mcp"]' \
+#     -c 'mcp_servers.muxcp_fallback.command="/Users/mac/.local/bin/muxcp"' \
+#     -c 'mcp_servers.muxcp_fallback.args=["-config","/Users/mac/.config/muxcp/aliyun-only.yaml"]'
+#
+# Install procedure (when ready):
+#   1. Create /Users/mac/.config/muxcp/aliyun-only.yaml (content shown below)
+#   2. Append the four [mcp_servers.*] blocks below to ~/.codex/config.toml
+#   3. Or use claude/codex CLI install commands if available
+#   4. Run Benchmark prompt set in real session to confirm production behavior
+#   5. Observe 1 week stable runtime → upgrade Locked condition #2
+
+# ============================================================
+# Native stdio MCPs (clean tool names: server: <name>, tool: <name>)
+# ============================================================
+
+[mcp_servers.kg]
+command = "/Users/mac/.config/muxcp/bin/run-kg-hub.sh"
+# Validated 2026-05-21: kg.kg_stats returned {entities:2734, edges:6407, episodes:1328}
+
+[mcp_servers.seq]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+# Validated 2026-05-21: seq.sequentialthinking returned valid thought result
+
+[mcp_servers.pw]
+command = "npx"
+args = ["-y", "@playwright/mcp"]
+# Untested in Phase 1 ephemeral, but stdio transport same as kg/seq — expected to work
+
+# ============================================================
+# muxcp fallback (协议适配兜底层 for classical SSE / legacy MCPs)
+# ============================================================
+# Codex native `url=` 走 streamable_http；Aliyun MCP 只懂经典 SSE。
+# Protocol mismatch confirmed 2026-05-21 (Aliyun returns "Method Not Allowed").
+# muxcp 在内部做协议适配——这是它长期保留的核心价值，不是即将淘汰的层。
+
+[mcp_servers.muxcp_fallback]
+command = "/Users/mac/.local/bin/muxcp"
+args = ["-config", "/Users/mac/.config/muxcp/aliyun-only.yaml"]
+
+# Required prerequisite: create /Users/mac/.config/muxcp/aliyun-only.yaml
+# with the following content (this is the "精简版 muxcp_fallback"):
+#
+# ```yaml
+# # Slim muxcp config — only SSE/legacy servers that need protocol adaptation
+# transport: stdio
+# servers:
+#   - name: aliyun_observability
+#     transport: sse
+#     url: "http://192.168.10.113:18081/sse"
+# ```
+#
+# Result: Codex sees `muxcp_fallback__aliyun_observability__*` for SLS/ARMS/CMS tools.
+# Still long-named (this is the price of fallback), but limited to aliyun only.
+# Future: when SSE bridge or streamable_http endpoint exists (Phase 3),
+#         this entry can be replaced with direct [mcp_servers.obs].
+
+# ============================================================
+# Deliberately NOT migrated this phase
+# ============================================================
+#
+# mcp_search:  Skipped to avoid path proliferation.
+#   Current paths: (1) plugin_claude-mem_mcp-search  (2) muxcp__mcp_search
+#   Adding Codex native here = 3rd path; wait for consolidation strategy.
+#
+# Other potential native candidates:  none identified — current source.yaml
+#   has only 5 MCPs total; 3 are stdio-native above, 1 is aliyun (fallback),
+#   1 is mcp_search (deferred).
+
+# ============================================================
+# Phase 2 → Phase 3 trigger
+# ============================================================
+# When this preview is installed and runs stable for 1 week:
+#   → satisfies "Upgrade to Locked" condition #2 (DESIGN.md §决策17)
+#   → unblocks Phase 3 SSE bridge evaluation
+#   → which in turn unblocks Phase 4 generator implementation

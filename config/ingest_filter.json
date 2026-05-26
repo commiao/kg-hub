@@ -1,0 +1,54 @@
+{
+  "_doc": "kg-hub ingest filter — gates obs entering kg-hub from claude-mem.db. Edits hot-reload on next ingester run (no service restart needed). Default shadow_mode=true: log decisions but DO NOT block any obs. Flip to false only after reviewing data/.ingest_decisions.jsonl for a few days.",
+  "version": 1,
+  "shadow_mode": false,
+
+  "global": {
+    "type_whitelist": [
+      "decision", "bugfix", "feature", "refactor",
+      "discovery", "change",
+      "security_alert", "security_note"
+    ],
+    "min_narrative_chars": 80,
+    "min_facts_or_files": 1,
+    "substantive_narrative_chars": 300,
+    "reject_models": ["fallback", "template", "none"]
+  },
+
+  "scoring": {
+    "type_weight": {
+      "decision":        100,
+      "bugfix":           90,
+      "security_alert":  100,
+      "security_note":    70,
+      "feature":          80,
+      "refactor":         60,
+      "discovery":        20,
+      "change":           15,
+      "note":              5
+    },
+    "narrative_chars_cap":     800,
+    "narrative_chars_divisor":  20,
+    "facts_cap":                10,
+    "facts_weight":              3,
+    "concepts_cap":              8,
+    "concepts_weight":           2,
+    "files_modified_weight":     1,
+    "relevance_cap":            20,
+    "relevance_weight":          5
+  },
+
+  "platforms": {
+    "cursor":  { "score_threshold": 80, "daily_quota_per_project": 50 },
+    "claude":  { "score_threshold": 60, "daily_quota_per_project": 200 },
+    "codex":   { "score_threshold": 60, "daily_quota_per_project": 200 },
+    "_default": { "score_threshold": 60, "daily_quota_per_project": 200 }
+  },
+
+  "type_overrides": {
+    "decision":       { "bypass_threshold": true, "bypass_quota": true },
+    "bugfix":         { "bypass_threshold": true, "bypass_quota": true },
+    "security_alert": { "bypass_threshold": true, "bypass_quota": true },
+    "security_note":  { "bypass_threshold": true, "bypass_quota": false }
+  }
+}
