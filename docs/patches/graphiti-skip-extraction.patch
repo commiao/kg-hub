@@ -1,0 +1,93 @@
+--- spike-graphiti/.venv/lib/python3.13/site-packages/graphiti_core/graphiti.py.orig	2026-05-28 16:39:34
++++ spike-graphiti/.venv/lib/python3.13/site-packages/graphiti_core/graphiti.py	2026-05-28 16:40:15
+@@ -948,6 +948,7 @@
+         custom_extraction_instructions: str | None = None,
+         saga: str | SagaNode | None = None,
+         saga_previous_episode_uuid: str | None = None,
++        skip_extraction: bool = False,
+     ) -> AddEpisodeResults:
+         """
+         Process an episode and update the graph.
+@@ -955,6 +956,17 @@
+         This method extracts information from the episode, creates nodes and edges,
+         and updates the graph database accordingly.
+ 
++        skip_extraction : bool, optional
++            If True, bypass all LLM-driven entity/edge extraction. The episode
++            body is stored verbatim as an Episodic node and remains queryable
++            via fulltext episode search, but no entities, attributes, or
++            relations are extracted from it. Use this path for canonical /
++            pre-curated content (design docs, ADRs, RFCs, large markdown
++            references) where LLM extraction would be impractically slow
++            (e.g., 5-10 hours for a 49KB document on a rate-limited endpoint)
++            and where the content is better consumed as a whole. Defaults to
++            False.
++
+         Parameters
+         ----------
+         name : str
+@@ -1036,6 +1048,64 @@
+ 
+         with self.tracer.start_span('add_episode') as span:
+             try:
++                # ============================================================
++                # SHORTCUT: skip_extraction bypasses LLM extraction entirely.
++                # The episode body is stored verbatim as an Episodic node and
++                # remains queryable via fulltext episode search, but no
++                # entities/attributes/edges are extracted. This path is
++                # ~1000x faster than the full pipeline (sub-second vs
++                # tens of minutes per episode) and is the right choice for
++                # pre-curated canonical content where LLM re-parsing adds
++                # no value or is impractically slow.
++                # ============================================================
++                if skip_extraction:
++                    episode = (
++                        await EpisodicNode.get_by_uuid(self.driver, uuid)
++                        if uuid is not None
++                        else EpisodicNode(
++                            name=name,
++                            group_id=group_id,
++                            labels=[],
++                            source=source,
++                            content=episode_body,
++                            source_description=source_description,
++                            created_at=now,
++                            valid_at=reference_time,
++                        )
++                    )
++                    episodic_edges, episode = await self._process_episode_data(
++                        episode,
++                        nodes=[],
++                        entity_edges=[],
++                        now=now,
++                        group_id=group_id,
++                        saga=saga,
++                        saga_previous_episode_uuid=saga_previous_episode_uuid,
++                        node_episode_index_map={},
++                    )
++                    end = time()
++                    span.add_attributes(
++                        {
++                            'episode.uuid': episode.uuid,
++                            'episode.source': source.value,
++                            'episode.reference_time': reference_time.isoformat(),
++                            'group_id': group_id,
++                            'skip_extraction': True,
++                            'duration_ms': (end - start) * 1000,
++                        }
++                    )
++                    logger.info(
++                        f'Completed add_episode (skip_extraction) in {(end - start) * 1000} ms'
++                    )
++                    return AddEpisodeResults(
++                        episode=episode,
++                        episodic_edges=episodic_edges,
++                        nodes=[],
++                        edges=[],
++                        communities=[],
++                        community_edges=[],
++                    )
++
+                 # Retrieve previous episodes for context
+                 previous_episodes = (
+                     await self.retrieve_episodes(
