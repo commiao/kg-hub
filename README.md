@@ -5,6 +5,19 @@
 > **状态**：📝 规划阶段（未开工）
 > **父项目**：claude-mem（`/Users/mac/workspace_claudeCode/claude-mem`）
 
+> ⚠️ **依赖一个 graphiti-core 本地 patch**：本仓库的 `tools/ingest_canonical_docs.py`
+> 使用 `add_episode(skip_extraction=True)`，这是 graphiti-core 上游尚未提供的参数。
+> 详见 [`docs/BUG-add-episode-throughput.md`](docs/BUG-add-episode-throughput.md)
+> （问题根因 + 4 个 fix 提案）和 [`docs/patches/graphiti-skip-extraction.patch`](docs/patches/graphiti-skip-extraction.patch)
+> （93 行 unified diff）。新机器 / CI 环境上需要在 venv 安装完成后执行：
+>
+> ```bash
+> patch -p1 -d spike-graphiti/.venv/lib/python3.13/site-packages \
+>       < docs/patches/graphiti-skip-extraction.patch
+> ```
+>
+> 等上游 PR 合并后移除本依赖。
+
 ## 一句话
 
 把分散在多设备 / 多 IDE / 多 project 上的 claude-mem 本地 observations，**汇聚成一个中央知识图谱**，让所有 AI 工具通过 MCP 做跨设备跨项目的 RAG。
