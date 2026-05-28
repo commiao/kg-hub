@@ -48,6 +48,7 @@ def update_index() -> None:
         "",
         f"- [quality-baseline-{date_tag}.md](quality-baseline-{date_tag}.md)",
         f"- [decisions-7d-{date_tag}.md](decisions-7d-{date_tag}.md)",
+        f"- [kg-eval-{date_tag}.md](kg-eval-{date_tag}.md)",
         "",
         "## Archive (all reports)",
         "",
@@ -69,6 +70,12 @@ def main() -> int:
 
     rc |= run([str(PYTHON), "-m", "tools.quality_audit"])
     rc |= run([str(PYTHON), "-m", "tools.decisions_summary", "--window", "7d"])
+    # Layer D — retrieval quality. Non-fatal to the weekly run: a recall dip
+    # is a finding to surface, not a reason to fail the whole report. We OR
+    # its rc in for visibility but don't let it mask the other two.
+    eval_rc = run([str(PYTHON), "-m", "tools.kg_eval"])
+    if eval_rc != 0:
+        print(f"[weekly_report] kg_eval recall below gate (rc={eval_rc}) — see kg-eval report")
 
     update_index()
     print(f"[weekly_report] done rc={rc}")

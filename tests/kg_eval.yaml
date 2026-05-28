@@ -1,0 +1,86 @@
+# kg-hub retrieval eval set
+#
+# Layer D of the quality framework: the ultimate test of KG quality is
+# whether it can answer real questions. Each entry is a question a user
+# (OpenClaw / Feishu / Cursor / Claude Code) might actually ask, plus the
+# keywords we'd expect to surface in a good answer.
+#
+# Scoring (per question): we run the query through BOTH kg_search (semantic
+# edges) and kg_episode_search (fulltext episodes), concatenate the returned
+# text, lowercase it, and count how many `keywords` appear. The question
+# PASSES if matched_count >= threshold.
+#
+# This is deliberately keyword-recall, not exact-answer: LLM-extracted facts
+# phrase things many ways, so we test "did the relevant content surface at
+# all", which is what retrieval quality actually means.
+#
+# Keep keywords lowercase. Extend freely — this set should grow as the
+# project accumulates knowledge worth being able to retrieve.
+
+version: 1
+defaults:
+  num_edge_results: 10
+  num_episode_results: 5
+  threshold: 1          # min keywords that must appear to pass
+
+questions:
+  - id: writer-lock
+    q: "how do kg-hub writers coordinate to avoid concurrent graph writes"
+    keywords: ["writer.lock", "flock", "writer lock"]
+    tags: [infra, concurrency]
+
+  - id: graph-backend
+    q: "what database backs the kg-hub knowledge graph"
+    keywords: ["falkordb", "redis"]
+    tags: [infra]
+
+  - id: cursor-hooks-location
+    q: "where are cursor capture hooks configured"
+    keywords: [".cursor/hooks.json", "hooks.json"]
+    tags: [cursor, integration]
+
+  - id: shadow-filter
+    q: "how does kg-hub filter out low value observations before ingest"
+    keywords: ["shadow_mode", "ingest_filter", "threshold", "filter"]
+    threshold: 1
+    tags: [filter, quality]
+
+  - id: async-ingest
+    q: "how does kg-hub handle asynchronous ingestion of episodes"
+    keywords: ["async", "background", "202", "poll"]
+    tags: [infra, ingest]
+
+  - id: ingest-cadence
+    q: "how often does claude-mem sync observations into kg-hub"
+    keywords: ["15 min", "launchd", "claude-mem-ingest", "interval", "900"]
+    tags: [infra, automation]
+
+  - id: graphiti-uuid-update
+    q: "what happens when graphiti add_episode is called with an existing uuid"
+    keywords: ["update", "uuid", "add_episode"]
+    tags: [graphiti, gotcha]
+
+  - id: openclaw-read
+    q: "how does OpenClaw read knowledge from kg-hub"
+    keywords: ["openclaw", "tailscale", "kg-query", "feishu", "capsule"]
+    tags: [openclaw, integration]
+
+  - id: watchdog
+    q: "how does kg-hub detect operational anomalies and alert"
+    keywords: ["watchdog", "edge-triggered", "alert", "anomaly"]
+    tags: [monitoring]
+
+  - id: boot-race
+    q: "how does kg-hub avoid startup dependency race conditions on reboot"
+    keywords: ["wait_for_dependencies", "boot", "race", "falkordb"]
+    tags: [infra, reliability]
+
+  - id: embedding-model
+    q: "what embedding model does kg-hub use for semantic search"
+    keywords: ["fastembed", "onnx", "embedding"]
+    tags: [infra, search]
+
+  - id: cursor-platform-source
+    q: "how are cursor sessions tagged in claude-mem"
+    keywords: ["platform_source", "cursor", "sdk_sessions"]
+    tags: [cursor, schema]
