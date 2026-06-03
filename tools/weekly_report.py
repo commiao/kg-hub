@@ -49,6 +49,7 @@ def update_index() -> None:
         f"- [quality-baseline-{date_tag}.md](quality-baseline-{date_tag}.md)",
         f"- [decisions-7d-{date_tag}.md](decisions-7d-{date_tag}.md)",
         f"- [kg-eval-{date_tag}.md](kg-eval-{date_tag}.md)",
+        f"- [usage-ranking-{date_tag}.md](usage-ranking-{date_tag}.md)",
         "",
         "## Archive (all reports)",
         "",
@@ -76,6 +77,10 @@ def main() -> int:
     eval_rc = run([str(PYTHON), "-m", "tools.kg_eval"])
     if eval_rc != 0:
         print(f"[weekly_report] kg_eval recall below gate (rc={eval_rc}) — see kg-eval report")
+    # Lindy / usage ranking — informational only, never fails the report.
+    # Surfaces the implicit-feedback signal from the PUSH hook so promote/
+    # demote decisions can be made by looking, not guessing.
+    run([str(PYTHON), "-m", "tools.usage_ranking"])
 
     update_index()
     print(f"[weekly_report] done rc={rc}")
