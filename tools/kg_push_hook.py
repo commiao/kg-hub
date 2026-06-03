@@ -573,17 +573,23 @@ def main() -> int:
     if chip:
         print(chip, file=sys.stderr, flush=True)
 
-    # L2 inline fallback — Claude Code 2.1.x does NOT render SessionStart
-    # stderr or `systemMessage` reliably in the UI. To give the user a visible
-    # confirmation, we prepend a model-facing instruction at the very top of
-    # the additionalContext. The model sees this BEFORE its first response and
-    # will surface the chip line back to the user as a one-line ack.
+    # L2 inline fallback — no agent runtime (Claude Code 2.1.x, Cursor, Codex)
+    # reliably renders a SessionStart `systemMessage` / stderr line in its UI.
+    # So the ONLY cross-tool way to give the user a visible "PUSH is alive +
+    # here's what it referenced" signal is to ask the model to echo it.
+    #
+    # An HTML comment ("<!-- please echo -->") is too weak — Cursor's model
+    # ignored it in testing. We use an explicit, imperative instruction block
+    # that reads as a hard requirement, placed at the very top of the context
+    # so it's the first thing the model processes. Kept to two lines so it
+    # costs ~1 reply line and a trivial token slice.
     if chip and injection:
         l2_preamble = (
-            "<!-- kg-hub PUSH chip — please echo the line below verbatim "
-            "as the first line of your next reply so the user sees what was "
-            "auto-injected. -->\n"
-            f"> {chip}\n\n"
+            "[SYSTEM: kg-hub auto-injected context below. Begin your very next "
+            "reply with this exact line, verbatim, as a one-line acknowledgement "
+            "so the user can see what was pinned — then answer normally:]\n"
+            f"{chip}\n\n"
+            "---\n\n"
         )
         injection = l2_preamble + injection
 
@@ -594,7 +600,11 @@ def main() -> int:
     sys.stdout.flush()
 
     elapsed = time.time() - t0
-    log(f"OK kw={used_keyword} picked={len(picked)} inj_chars={inj_len} elapsed={elapsed:.2f}s")
+    # Log picked names + format so tools/push_status.py can report, per tool,
+    # what the hook referenced and whether it's still firing (anti-black-box).
+    picked_names = ",".join(p["name"] for p in picked)
+    log(f"OK fmt={args.format} kw={used_keyword} picked={len(picked)} "
+        f"names=[{picked_names}] inj_chars={inj_len} elapsed={elapsed:.2f}s")
 
     # Implicit-feedback signal: bump usage on the picked episodes. Best-effort,
     # fail-fast, and intentionally last — its outcome cannot affect the chip.
