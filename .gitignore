@@ -12,3 +12,5 @@ spike-graphiti/kuzu_db
 # These can contain personal notes, crawl tokens, and large database files.
 data/
 
+# codegraph local index (do not commit)
+.codegraph/

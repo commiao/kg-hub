@@ -129,8 +129,15 @@ def emit(output: dict) -> None:
     print(json.dumps(output, ensure_ascii=False))
 
 
-def _connect():
-    """Open a FalkorDB connection. Returns (graph, None) or (None, errmsg)."""
+def _connect(connect_timeout: float = 2.0, read_timeout: float = 2.0):
+    """Open a FalkorDB connection. Returns (graph, None) or (None, errmsg).
+
+    Timeouts are caller-tunable. The canonical-retrieval read path (which
+    produces the chip) gets the default budget; the best-effort usage-count
+    writeback passes a tighter, fail-fast timeout so it can never burn the hook
+    budget when FalkorDB is busy. FalkorDB is single-threaded, so a concurrent
+    heavy query stalls every other connection — including ours — and even the
+    INFO/AUTH handshake inside the client constructor can time out."""
     try:
         from falkordb import FalkorDB
     except Exception as exc:
@@ -142,11 +149,53 @@ def _connect():
             host = "127.0.0.1"
         port = int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379"))
         pw = os.environ.get("KG_HUB_FALKORDB_PASSWORD") or None
-        db = FalkorDB(host=host, port=port, password=pw)
+        # SessionStart hook has a hard wall-clock budget. Bound every redis
+        # round-trip so a FalkorDB hiccup can't burn the whole timeout.
+        # socket_connect_timeout: TCP handshake; socket_timeout: per-RPC.
+        db = FalkorDB(
+            host=host, port=port, password=pw,
+            socket_connect_timeout=connect_timeout,
+            socket_timeout=read_timeout,
+        )
         graph = db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
         return graph, None
     except Exception as exc:
         return None, f"falkordb connect failed: {type(exc).__name__}: {exc}"
+
+
+def _connect_read():
+    """Connect for the chip read path, with escalating timeouts that ride out a
+    cold FalkorDB.
+
+    The real cause of dropped chips at session start is a *cold* FalkorDB: right
+    after a Docker/launchd boot it accepts the TCP connection but is still
+    loading its graph from disk, so the INFO/AUTH handshake (and any query)
+    blocks until the load finishes. We can't probe for that LOADING state
+    cheaply — the probe blocks too — so we escalate the timeout instead:
+
+      1. Fast (2s): the warm, uncontended common case returns in ~10ms, so the
+         normal path pays nothing.
+      2. Cold-tolerant (4s): if the first attempt times out, assume the DB is
+         loading (or briefly congested) and wait longer to ride out the tail.
+
+    Only a *timeout* escalates; a hard error (auth, refused, import) won't fix
+    itself. Worst case ≈ 2 + 0.4 + 4 = 6.4s, within the 10s hook budget; the
+    usage bump runs after emit, so it never extends this path. FalkorDB itself
+    parallelises queries across a thread pool (THREAD_COUNT = cores), so steady
+    multi-client load does not stall this connect — only cold start does."""
+    timeouts = (2.0, 4.0)
+    last_err = None
+    for i, t in enumerate(timeouts):
+        graph, err = _connect(connect_timeout=t, read_timeout=t)
+        if graph is not None:
+            return graph, None
+        last_err = err
+        if "Timeout" not in (err or ""):
+            break
+        if i < len(timeouts) - 1:
+            log(f"read connect timed out at {t:.0f}s; retrying cold-tolerant ({timeouts[i + 1]:.0f}s)")
+            time.sleep(0.4)
+    return None, last_err
 
 
 def fast_falkordb_query(keyword: str, top_n: int) -> list[dict]:
@@ -161,7 +210,7 @@ def fast_falkordb_query(keyword: str, top_n: int) -> list[dict]:
 
     Returns list of dicts with name/content/source/score. Empty on failure.
     """
-    graph, err = _connect()
+    graph, err = _connect_read()
     if graph is None:
         log(err)
         return []
@@ -215,12 +264,19 @@ def fast_falkordb_query(keyword: str, top_n: int) -> list[dict]:
 
 def increment_usage(names: list[str]) -> int:
     """Best-effort: bump usage_count on the returned episodes.
-    Returns how many got incremented."""
+    Returns how many got incremented.
+
+    Runs AFTER the chip has been emitted, on a fail-fast (1s) connection.
+    FalkorDB is single-threaded, so this write can stall behind a concurrent
+    heavy query; a stall is expected and non-fatal, so we give up quietly
+    rather than burn the hook budget or spam the log with an error."""
     if not names:
         return 0
-    graph, err = _connect()
+    graph, err = _connect(connect_timeout=1.0, read_timeout=1.0)
     if graph is None:
-        log(err)
+        # A connect timeout here just means the DB was busy — not worth an error line.
+        if "Timeout" not in err:
+            log(err)
         return 0
     try:
         result = graph.query(
@@ -233,7 +289,10 @@ def increment_usage(names: list[str]) -> int:
         if result.result_set:
             return int(result.result_set[0][0])
     except Exception as exc:
-        log(f"usage_count update failed: {type(exc).__name__}: {exc}")
+        if "Timeout" in type(exc).__name__:
+            log("usage_count bump skipped (db busy)")
+        else:
+            log(f"usage_count update failed: {type(exc).__name__}: {exc}")
     return 0
 
 
@@ -248,6 +307,26 @@ def rank_and_pick(rows: list[dict], top_n: int) -> list[dict]:
     if len(picked) < top_n:
         picked.extend(others[: top_n - len(picked)])
     return picked
+
+
+def build_chip(picked: list[dict], project_keyword: str, inj_chars: int) -> str:
+    """Compact one-line visible status for the user (rendered as systemMessage).
+
+    Example:
+      📎 kg-hub: 3 canonical pinned (DESIGN, OBSERVATION-PHASE, ONBOARDING) · 1480 chars · cwd→kg-hub
+    """
+    if not picked:
+        return ""
+    short_names = []
+    for p in picked:
+        n = p["name"]
+        if n.startswith("kg-hub-canonical-"):
+            n = n[len("kg-hub-canonical-"):]
+        short_names.append(n)
+    return (
+        f"📎 kg-hub: {len(picked)} canonical pinned "
+        f"({', '.join(short_names)}) · {inj_chars} chars · cwd→{project_keyword}"
+    )
 
 
 def build_injection(picked: list[dict], project_keyword: str) -> str:
@@ -328,20 +407,51 @@ def main() -> int:
         emit(empty_output())
         return 0
 
-    # Implicit-feedback signal: bump usage on the picked episodes
-    if not args.dry:
-        bumped = increment_usage([p["name"] for p in picked])
-        log(f"bumped usage on {bumped} episodes")
+    # Build the visible chip from the pre-preamble injection length so the
+    # number the user sees matches the canonical payload (not the +preamble).
+    inj_len = len(injection)
+    chip = build_chip(picked, used_keyword or "?", inj_len)
 
-    elapsed = time.time() - t0
-    log(f"OK kw={used_keyword} picked={len(picked)} inj_chars={len(injection)} elapsed={elapsed:.2f}s")
+    # stderr fallback — Claude Code renders SessionStart hook stderr inline
+    # with a ⎿ prefix, which the systemMessage JSON field does not reliably do.
+    if chip:
+        print(chip, file=sys.stderr, flush=True)
 
+    # L2 inline fallback — Claude Code 2.1.x does NOT render SessionStart
+    # stderr or `systemMessage` reliably in the UI. To give the user a visible
+    # confirmation, we prepend a model-facing instruction at the very top of
+    # the additionalContext. The model sees this BEFORE its first response and
+    # will surface the chip line back to the user as a one-line ack.
+    if chip and injection:
+        l2_preamble = (
+            "<!-- kg-hub PUSH chip — please echo the line below verbatim "
+            "as the first line of your next reply so the user sees what was "
+            "auto-injected. -->\n"
+            f"> {chip}\n\n"
+        )
+        injection = l2_preamble + injection
+
+    # Emit the chip + injection FIRST. This is the time-critical output; do it
+    # before the best-effort usage bump so FalkorDB contention can never delay
+    # or suppress the chip.
     emit({
+        "systemMessage": chip,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": injection,
         }
     })
+    sys.stdout.flush()
+
+    elapsed = time.time() - t0
+    log(f"OK kw={used_keyword} picked={len(picked)} inj_chars={inj_len} elapsed={elapsed:.2f}s")
+
+    # Implicit-feedback signal: bump usage on the picked episodes. Best-effort,
+    # fail-fast, and intentionally last — its outcome cannot affect the chip.
+    if not args.dry:
+        bumped = increment_usage([p["name"] for p in picked])
+        if bumped:
+            log(f"bumped usage on {bumped} episodes")
     return 0
 
 
