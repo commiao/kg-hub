@@ -312,19 +312,37 @@ def rank_and_pick(rows: list[dict], top_n: int) -> list[dict]:
 def build_chip(picked: list[dict], project_keyword: str, inj_chars: int) -> str:
     """Compact one-line visible status for the user (rendered as systemMessage).
 
-    Example:
+    Truthful about mix: if all picked are canonical, says "N canonical pinned";
+    if mixed, says "N pinned (X canonical)"; if none canonical, says "N obs pinned".
+
+    Examples:
       📎 kg-hub: 3 canonical pinned (DESIGN, OBSERVATION-PHASE, ONBOARDING) · 1480 chars · cwd→kg-hub
+      📎 kg-hub: 3 pinned (2 canonical) (DESIGN, obs-2734, obs-1039) · 1480 chars · cwd→workspace_cursor
+      📎 kg-hub: 3 obs pinned (obs-2734, obs-1039, obs-1030) · 1480 chars · cwd→workspace_cursor
     """
     if not picked:
         return ""
+    n = len(picked)
     short_names = []
+    n_canonical = 0
     for p in picked:
-        n = p["name"]
-        if n.startswith("kg-hub-canonical-"):
-            n = n[len("kg-hub-canonical-"):]
-        short_names.append(n)
+        nm = p["name"]
+        if nm.startswith("kg-hub-canonical-"):
+            n_canonical += 1
+            nm = nm[len("kg-hub-canonical-"):]
+        elif nm.startswith("claude-mem-obs-"):
+            nm = "obs-" + nm[len("claude-mem-obs-"):]
+        short_names.append(nm)
+
+    if n_canonical == n:
+        label = f"{n} canonical pinned"
+    elif n_canonical == 0:
+        label = f"{n} obs pinned"
+    else:
+        label = f"{n} pinned ({n_canonical} canonical)"
+
     return (
-        f"📎 kg-hub: {len(picked)} canonical pinned "
+        f"📎 kg-hub: {label} "
         f"({', '.join(short_names)}) · {inj_chars} chars · cwd→{project_keyword}"
     )
 
