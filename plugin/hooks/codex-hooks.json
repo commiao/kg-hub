@@ -1,0 +1,18 @@
+{
+  "description": "kg-hub PUSH hook for Codex CLI — auto-injects canonical content at SessionStart and UserPromptSubmit",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/workspace_claudeCode/kg-hub/tools/kg_push_hook.py --format codex",
+            "timeout": 10,
+            "statusMessage": "Loading kg-hub canonical context"
+          }
+        ]
+      }
+    ]
+  }
+}

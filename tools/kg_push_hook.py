@@ -363,17 +363,155 @@ def build_injection(picked: list[dict], project_keyword: str) -> str:
     return out
 
 
+def read_cwd_from_stdin_json(payload: dict) -> str | None:
+    """For tools that pipe a JSON payload to stdin (Cursor / Codex), pull
+    the workspace directory. Falls back through several common field names."""
+    if not isinstance(payload, dict):
+        return None
+    # Cursor: workspace_roots is a list, cwd is sometimes also there
+    wr = payload.get("workspace_roots")
+    if isinstance(wr, list) and wr:
+        return wr[0]
+    # Codex / generic
+    for k in ("cwd", "workspaceFolder", "working_directory", "project_dir"):
+        if isinstance(payload.get(k), str) and payload[k]:
+            return payload[k]
+    return None
+
+
+def read_stdin_payload(timeout_seconds: float = 1.0) -> dict:
+    """Best-effort: read a JSON payload from stdin if one is present.
+    Returns {} on any failure / no stdin / non-JSON. Bounded by select() so
+    we never block the hook indefinitely."""
+    import select
+    try:
+        if sys.stdin.isatty():
+            return {}
+        # Wait briefly for stdin to have data
+        r, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+        if not r:
+            return {}
+        data = sys.stdin.read()
+        if not data.strip():
+            return {}
+        return json.loads(data)
+    except Exception:
+        return {}
+
+
+def emit_for_format(fmt: str, chip: str, injection: str, picked: list, used_keyword: str) -> None:
+    """Render the final hook response in the dialect of the target tool."""
+    if fmt == "claude":
+        # Claude Code SessionStart hook — current production behavior
+        emit({
+            "systemMessage": chip,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": injection,
+            },
+        })
+        return
+
+    if fmt == "cursor":
+        # Cursor beforeSubmitPrompt context handler. Cursor's hook response
+        # schema accepts {"continue": bool, "additionalContext": str}.
+        # Unknown fields are ignored gracefully so this is forward-safe.
+        emit({
+            "continue": True,
+            "additionalContext": injection,
+            # also pass the chip in a generic field for visibility
+            "systemMessage": chip,
+        })
+        return
+
+    if fmt == "codex":
+        # Codex CLI hook contract is not as well documented as Claude/Cursor.
+        # Emit a permissive shape that covers the common patterns; tools that
+        # don't read these keys treat the call as a no-op and the session
+        # continues normally.
+        emit({
+            "continue": True,
+            "context": injection,
+            "additionalContext": injection,
+            "message": chip,
+        })
+        return
+
+    if fmt == "json":
+        # Machine-readable: caller decides what to do with it.
+        emit({
+            "chip": chip,
+            "injection": injection,
+            "picked": [
+                {"name": p["name"], "source": p["source"], "score": p["score"]}
+                for p in picked
+            ],
+            "meta": {"keyword": used_keyword, "n_picked": len(picked)},
+        })
+        return
+
+    if fmt == "text":
+        # Plain markdown to stdout. Useful for piping into any prompt-builder.
+        if chip:
+            print(chip)
+            print()
+        print(injection)
+        return
+
+    # Unknown format — fall back to claude (least-surprise default)
+    log(f"unknown --format {fmt!r}, falling back to claude")
+    emit({
+        "systemMessage": chip,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": injection,
+        },
+    })
+
+
+def empty_for_format(fmt: str) -> None:
+    """Emit the no-op response in the requested dialect."""
+    if fmt == "cursor":
+        emit({"continue": True})
+        return
+    if fmt == "codex":
+        emit({"continue": True})
+        return
+    if fmt == "json":
+        emit({"chip": "", "injection": "", "picked": [], "meta": {}})
+        return
+    if fmt == "text":
+        return
+    # claude (default)
+    emit(empty_output())
+
+
 def main() -> int:
     t0 = time.time()
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true", help="don't update usage_count")
     ap.add_argument("--probe", action="store_true",
                     help="dump match candidates for current dir, no JSON output")
+    ap.add_argument(
+        "--format", choices=["claude", "cursor", "codex", "json", "text"],
+        default="claude",
+        help="output dialect (default: claude — current Claude Code SessionStart hook)",
+    )
     args = ap.parse_args()
 
-    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("PWD") or os.getcwd()
+    # For tools that pipe a JSON payload (Cursor, possibly Codex), read it.
+    # For Claude Code, stdin is empty / tty and this returns {}.
+    stdin_payload = read_stdin_payload() if args.format in ("cursor", "codex") else {}
+    cwd_from_stdin = read_cwd_from_stdin_json(stdin_payload)
+
+    cwd = (
+        cwd_from_stdin
+        or os.environ.get("CLAUDE_PROJECT_DIR")
+        or os.environ.get("PWD")
+        or os.getcwd()
+    )
     keywords = derive_project_keywords(cwd)
-    log(f"START cwd={cwd!r} keywords={keywords}")
+    log(f"START fmt={args.format} cwd={cwd!r} keywords={keywords}")
 
     if args.probe:
         print(f"cwd={cwd}")
@@ -396,7 +534,7 @@ def main() -> int:
 
     if not rows:
         log(f"no match; elapsed={time.time()-t0:.2f}s")
-        emit(empty_output())
+        empty_for_format(args.format)
         return 0
 
     picked = rank_and_pick(rows, TOP_N)
@@ -404,7 +542,7 @@ def main() -> int:
 
     if not injection:
         log(f"picked but empty injection; elapsed={time.time()-t0:.2f}s")
-        emit(empty_output())
+        empty_for_format(args.format)
         return 0
 
     # Build the visible chip from the pre-preamble injection length so the
@@ -433,14 +571,8 @@ def main() -> int:
 
     # Emit the chip + injection FIRST. This is the time-critical output; do it
     # before the best-effort usage bump so FalkorDB contention can never delay
-    # or suppress the chip.
-    emit({
-        "systemMessage": chip,
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": injection,
-        }
-    })
+    # or suppress the chip. Format-aware dispatch — see emit_for_format().
+    emit_for_format(args.format, chip, injection, picked, used_keyword or "?")
     sys.stdout.flush()
 
     elapsed = time.time() - t0
