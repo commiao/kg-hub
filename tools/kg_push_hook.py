@@ -381,6 +381,39 @@ def build_injection(picked: list[dict], project_keyword: str) -> str:
     return out
 
 
+def write_cursor_rules_file(cwd: str, injection: str, chip: str) -> str | None:
+    """Cursor does NOT consume hook-stdout `additionalContext` (its
+    beforeSubmitPrompt adapter only honors {continue}). The real injection
+    mechanism is a `.cursor/rules/*.mdc` file with `alwaysApply: true`
+    frontmatter, which Cursor natively loads into every conversation in the
+    workspace — this is exactly how claude-mem injects (see
+    claude-mem-context.mdc).
+
+    So for Cursor we WRITE the canonical content to
+    `<cwd>/.cursor/rules/kg-hub-canonical.mdc` (separate file, never clobbers
+    claude-mem's). The hook re-runs on every beforeSubmitPrompt, keeping it
+    fresh. Returns the file path on success, None on failure.
+    """
+    try:
+        rules_dir = Path(cwd) / ".cursor" / "rules"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        target = rules_dir / "kg-hub-canonical.mdc"
+        # injection already carries the [SYSTEM: echo chip] preamble; the
+        # frontmatter makes Cursor always-load it. Keep description short.
+        content = (
+            "---\n"
+            "alwaysApply: true\n"
+            'description: "kg-hub canonical context (auto-updated by PUSH hook)"\n'
+            "---\n\n"
+            f"{injection}\n"
+        )
+        target.write_text(content, encoding="utf-8")
+        return str(target)
+    except Exception as exc:
+        log(f"cursor rules write failed: {type(exc).__name__}: {exc}")
+        return None
+
+
 def read_cwd_from_stdin_json(payload: dict) -> str | None:
     """For tools that pipe a JSON payload to stdin (Cursor / Codex), pull
     the workspace directory. Falls back through several common field names."""
@@ -431,15 +464,12 @@ def emit_for_format(fmt: str, chip: str, injection: str, picked: list, used_keyw
         return
 
     if fmt == "cursor":
-        # Cursor beforeSubmitPrompt context handler. Cursor's hook response
-        # schema accepts {"continue": bool, "additionalContext": str}.
-        # Unknown fields are ignored gracefully so this is forward-safe.
-        emit({
-            "continue": True,
-            "additionalContext": injection,
-            # also pass the chip in a generic field for visibility
-            "systemMessage": chip,
-        })
+        # Cursor's beforeSubmitPrompt adapter ONLY honors {continue} from hook
+        # stdout — additionalContext is discarded (verified against claude-mem's
+        # cursor adapter formatOutput, which returns only {continue:true}).
+        # The actual injection happens by WRITING .cursor/rules/kg-hub-canonical.mdc
+        # in main() before this call. Here we just tell Cursor to proceed.
+        emit({"continue": True})
         return
 
     if fmt == "codex":
@@ -592,6 +622,13 @@ def main() -> int:
             "---\n\n"
         )
         injection = l2_preamble + injection
+
+    # Cursor injection is via a rules file, not hook stdout. Write it before
+    # emitting so the content is in place by the time Cursor proceeds.
+    if args.format == "cursor" and not args.dry:
+        mdc_path = write_cursor_rules_file(cwd, injection, chip)
+        if mdc_path:
+            log(f"wrote cursor rules file: {mdc_path}")
 
     # Emit the chip + injection FIRST. This is the time-critical output; do it
     # before the best-effort usage bump so FalkorDB contention can never delay
