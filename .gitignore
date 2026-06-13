@@ -14,3 +14,10 @@ data/
 
 # codegraph local index (do not commit)
 .codegraph/
+
+# 监控:真实 webhook 只留机器上,不入库
+webhook.conf
+**/webhook.conf
+notify.json
+dbpass.conf
+**/dbpass.conf

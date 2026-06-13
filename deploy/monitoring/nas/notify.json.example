@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR-WEBHOOK-ID",
+  "backlog_threshold": 20,
+  "stuck_threshold_min": 30,
+  "falkordb_slow_sec": 8
+}
