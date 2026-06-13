@@ -1,0 +1,138 @@
+# kg-hub on Synology NAS (Container Manager "Project" — Plan B / GUI deploy).
+#
+# This file lives at the REPO ROOT so Container Manager can use the repo as both
+# the Project folder AND the Docker build context (context: .). CM does not allow
+# a build context outside the selected project folder, so the compose must sit here.
+#
+# Layout on NAS:
+#   /volume1/docker/kg-hub-src/        <- this repo (Project folder = build context)
+#   /volume1/docker/kg-hub-data/falkordb  <- FalkorDB RDB+AOF (rsynced from Mac)
+#   /volume1/docker/kg-hub-data/models    <- fastembed bge-small cache
+#
+# Secrets come from .env in this same folder (see deploy/nas/.env.example).
+
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: kg-hub-falkordb
+    restart: unless-stopped
+    environment:
+      - FALKORDB_ARGS=TIMEOUT_MAX 60000 TIMEOUT_DEFAULT 30000 --requirepass ${FALKORDB_PASSWORD} --appendonly yes --appendfsync everysec
+      - BROWSER=1
+      # Needed INSIDE the container so the healthcheck's redis-cli -a "$FALKORDB_PASSWORD" works.
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379"   # NAS-local only — never exposed on the network
+      - "127.0.0.1:3001:3000"   # FalkorDB browser UI, NAS-local only
+    volumes:
+      - /volume1/docker/kg-hub-data/falkordb:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$FALKORDB_PASSWORD\" --no-auth-warning PING | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  kg_hub_server:
+    build:
+      context: .
+      dockerfile: deploy/nas/Dockerfile
+    image: kg-hub-server:latest
+    container_name: kg-hub-server
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      - KG_HUB_API_TOKEN=${KG_HUB_API_TOKEN}
+      - KG_HUB_BIND_HOST=0.0.0.0
+      - KG_HUB_BIND_PORT=8080
+      - KG_HUB_FALKORDB_HOST=falkordb
+      - KG_HUB_FALKORDB_PORT=6379
+      - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
+      - KG_HUB_FALKORDB_DATABASE=kg_hub
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - EMBEDDING_DIM=384
+      - FASTEMBED_CACHE_PATH=/models
+      # HF unreachable from NAS container; model pre-seeded in /models, force offline.
+      - FASTEMBED_LOCAL_FILES_ONLY=true
+      - HF_HUB_OFFLINE=1
+      # Durable backup of every /api/ingest episode body (survives graph loss).
+      - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
+      # Keep the NAS gentle: fully-serial LLM calls + rate cap (same as Mac).
+      - SEMAPHORE_LIMIT=1
+      - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
+    volumes:
+      - /volume1/docker/kg-hub-data/models:/models
+      - /volume1/docker/kg-hub-data/ingest-backup:/backup
+    ports:
+      # Bind to loopback only: closes the LAN exposure (192.168.x:8080). Tailscale
+      # userspace networking still forwards <tailscale-ip>:8080 -> 127.0.0.1:8080,
+      # so remote devices on the tailnet reach it; nothing else on the LAN can.
+      - "127.0.0.1:8080:8080"
+
+  # Always-on monitor: runs the watchdog in a loop INSIDE the NAS, so problems are
+  # caught even when the Mac is asleep. Alerts go to Feishu (edge-triggered).
+  # Checks: server /health, queue backlog/stuck/errors, and a timed /api/search
+  # probe that flags FalkorDB being unreachable or CPU-pegged (the original incident).
+  watchdog:
+    build:
+      context: .
+      dockerfile: deploy/nas/Dockerfile
+    image: kg-hub-server:latest        # same image as kg_hub_server (code + httpx)
+    container_name: kg-hub-watchdog
+    restart: unless-stopped
+    depends_on:
+      - kg_hub_server
+    environment:
+      - KG_HUB_URL=http://kg_hub_server:8080   # internal compose network
+      - KG_HUB_API_TOKEN=${KG_HUB_API_TOKEN}
+      - KG_HUB_FEISHU_WEBHOOK=${KG_HUB_FEISHU_WEBHOOK}
+      - KG_HUB_FALKORDB_SLOW_SEC=8
+      - KG_HUB_BACKLOG_THRESHOLD=20
+    volumes:
+      - /volume1/docker/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
+      - /volume1/docker/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
+    command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
+
+  # One-time rebuild driver: continues the claude-mem rebuild ON the NAS (always-on,
+  # so Mac going offline can't interrupt it). Reads a copy of claude-mem.db + the
+  # migrated watermark, writes directly to the local falkordb. Resumes via watermark
+  # if the container/NAS restarts. REMOVE this service once the rebuild is complete
+  # (and ongoing ingest moves to Mac-hook -> /api/ingest, task #6).
+  ingester:
+    build:
+      context: .
+      dockerfile: deploy/nas/Dockerfile
+    image: kg-hub-server:latest
+    container_name: kg-hub-ingester
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      - KG_HUB_FALKORDB_HOST=falkordb
+      - KG_HUB_FALKORDB_PORT=6379
+      - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
+      - KG_HUB_FALKORDB_DATABASE=kg_hub
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - EMBEDDING_DIM=384
+      - FASTEMBED_CACHE_PATH=/models
+      # HF is unreachable from the NAS container (EADDRNOTAVAIL). Model is pre-seeded
+      # into /models; force fully-offline so fastembed never contacts HuggingFace.
+      - FASTEMBED_LOCAL_FILES_ONLY=true
+      - HF_HUB_OFFLINE=1
+      - SEMAPHORE_LIMIT=1
+      - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
+    volumes:
+      - /volume1/docker/kg-hub-data/models:/models
+      - /volume1/docker/kg-hub-data/claude-mem/claude-mem.db:/root/.claude-mem/claude-mem.db:ro
+      - /volume1/docker/kg-hub-data/ingest-state:/app/data
+      - /volume1/docker/kg-hub-data/openclaw-src:/openclaw-src:ro
+    # One container = single writer (writer.lock works). All ingesters are idempotent
+    # (watermarks), run sequentially each loop: claude-mem (done) + openclaw + canonical.
+    command: ["sh", "-c", "sleep 30; while true; do echo '[rebuild] pass start'; python -m ingesters.claude_mem_obs || true; python -m ingesters.openclaw_capsule --snapshot /openclaw-src || true; python -m tools.ingest_canonical_docs || true; echo '[rebuild] pass done, idle 600s'; sleep 600; done"]

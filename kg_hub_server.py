@@ -26,6 +26,7 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -70,6 +71,12 @@ if not API_TOKEN:
 GROUP_ID = "kg_hub"
 HOST = os.environ.get("KG_HUB_BIND_HOST", "0.0.0.0")
 PORT = int(os.environ.get("KG_HUB_BIND_PORT", "8080"))
+
+# Append every incoming episode (raw body + metadata) to a local jsonl BEFORE
+# extraction, so content added via kg_add_episode / curl survives even if the
+# FalkorDB graph is later lost. This is the durable source-of-truth backup for
+# the otherwise-sourceless /api/ingest writes. Empty = disabled.
+INGEST_BACKUP_PATH = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
 
 # Stuck job cleanup: any IngestedKey with status='pending' older than this many
 # minutes is considered orphaned (worker died / server restarted mid-extract) and
@@ -284,6 +291,40 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "kg_hub_server"})
 
 
+def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
+    """Append the raw episode to KG_HUB_INGEST_BACKUP_PATH (jsonl) before extraction.
+
+    Best-effort and never raises — a backup failure must not break ingestion.
+    Captures the otherwise-unrecoverable content of sourceless /api/ingest writes.
+    """
+    if not INGEST_BACKUP_PATH:
+        return
+    try:
+        rec = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "source_description": body.source_description,
+            "source_obs_id": body.source_obs_id,
+            "name": body.name,
+            "reference_time": ref_time.isoformat(),
+            "episode_body": body.episode_body,
+        }
+        p = Path(INGEST_BACKUP_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.warning("[ingest:backup] backup write failed (non-fatal)", exc_info=True)
+
+
+# Writer-lock contention handling (see 2026-06-13 incident): instead of dropping
+# an ingest to 'error' the first time it can't grab the writer.lock, retry with
+# linear backoff. Concurrent batch ingests then serialize cleanly behind whichever
+# writer currently holds the lock, instead of all timing out and silently erroring.
+INGEST_LOCK_TIMEOUT_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_TIMEOUT_SEC", "180.0"))
+INGEST_LOCK_RETRIES = int(os.environ.get("KG_HUB_INGEST_LOCK_RETRIES", "5"))
+INGEST_LOCK_BACKOFF_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_BACKOFF_SEC", "5.0"))
+
+
 async def do_extract(
     graphiti,
     body: IngestBody,
@@ -302,28 +343,62 @@ async def do_extract(
     sd = body.source_description
     sid = body.source_obs_id
     started = datetime.now(tz=timezone.utc)
+    # Durable backup BEFORE extraction — survives even if extraction or the graph fails.
+    _backup_episode(body, ref_time)
     logger.info(
         "[ingest:start] source=%s sobsid=%s body_len=%d",
         sd, sid, len(body.episode_body),
     )
     try:
-        async with async_writer_lock(owner=f"api_ingest({sd})", timeout_seconds=180.0):
-            lock_acquired = datetime.now(tz=timezone.utc)
-            logger.info(
-                "[ingest:lock_acquired] sd=%s sid=%s waited=%.1fs",
-                sd, sid, (lock_acquired - started).total_seconds(),
-            )
-            result = await graphiti.add_episode(
-                name=body.name,
-                episode_body=body.episode_body,
-                source=EpisodeType.text,
-                source_description=sd,
-                reference_time=ref_time,
-                group_id=GROUP_ID,
-                entity_types=ENTITY_TYPES,
-                edge_types=EDGE_TYPES,
-                edge_type_map=EDGE_TYPE_MAP,
-            )
+        result = None
+        attempt = 0
+        while True:
+            try:
+                async with async_writer_lock(
+                    owner=f"api_ingest({sd})", timeout_seconds=INGEST_LOCK_TIMEOUT_SEC
+                ):
+                    lock_acquired = datetime.now(tz=timezone.utc)
+                    logger.info(
+                        "[ingest:lock_acquired] sd=%s sid=%s waited=%.1fs attempt=%d",
+                        sd, sid, (lock_acquired - started).total_seconds(), attempt + 1,
+                    )
+                    result = await graphiti.add_episode(
+                        name=body.name,
+                        episode_body=body.episode_body,
+                        source=EpisodeType.text,
+                        source_description=sd,
+                        reference_time=ref_time,
+                        group_id=GROUP_ID,
+                        entity_types=ENTITY_TYPES,
+                        edge_types=EDGE_TYPES,
+                        edge_type_map=EDGE_TYPE_MAP,
+                    )
+                break  # lock acquired + extraction completed
+            except WriterLockBusy:
+                attempt += 1
+                if attempt > INGEST_LOCK_RETRIES:
+                    await update_ingested_key_status(
+                        graphiti, sd, sid, "error",
+                        error_message=(
+                            f"writer.lock busy after {INGEST_LOCK_RETRIES} retries "
+                            f"(~{int(INGEST_LOCK_RETRIES * INGEST_LOCK_TIMEOUT_SEC)}s) — "
+                            "contention too high"
+                        ),
+                    )
+                    elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
+                    logger.error(
+                        "[ingest:error] sd=%s sid=%s elapsed=%.1fs "
+                        "reason=lock_timeout_exhausted attempts=%d",
+                        sd, sid, elapsed, attempt,
+                    )
+                    return
+                backoff = INGEST_LOCK_BACKOFF_SEC * attempt  # linear backoff
+                logger.warning(
+                    "[ingest:lock_retry] sd=%s sid=%s attempt=%d/%d backoff=%.1fs "
+                    "(another writer holds the lock; will retry, not dropping)",
+                    sd, sid, attempt, INGEST_LOCK_RETRIES, backoff,
+                )
+                await asyncio.sleep(backoff)
         nodes = len(result.nodes)
         edges = len(result.edges)
         episode_uuid = None
@@ -340,13 +415,6 @@ async def do_extract(
             "[ingest:done] sd=%s sid=%s uuid=%s elapsed=%.1fs nodes=%d edges=%d",
             sd, sid, episode_uuid, elapsed, nodes, edges,
         )
-    except WriterLockBusy:
-        await update_ingested_key_status(
-            graphiti, sd, sid, "error",
-            error_message="writer.lock timeout after 180s — another writer held it too long",
-        )
-        elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
-        logger.error("[ingest:error] sd=%s sid=%s elapsed=%.1fs reason=lock_timeout", sd, sid, elapsed)
     except Exception as exc:  # noqa: BLE001
         try:
             await update_ingested_key_status(
@@ -560,12 +628,14 @@ async def queue_stats(request: Request) -> JSONResponse:
     rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
         "RETURN k.status AS status, k.created_at AS created_at, "
-        "       k.updated_at AS updated_at"
+        "       k.updated_at AS updated_at, k.error_message AS error_message, "
+        "       k.source_obs_id AS sid, k.source_description AS sd"
     )
     pending = ok = errored = 0
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
     ok_last_1h = errored_last_1h = 0
+    recent_error_samples: list[dict] = []  # surface WHY ingests failed (e.g. timeouts)
     for r in rows:
         s = r.get("status")
         created = r.get("created_at")
@@ -586,6 +656,12 @@ async def queue_stats(request: Request) -> JSONResponse:
             try:
                 if updated and datetime.fromisoformat(updated.replace("Z", "+00:00")) > last_hour:
                     errored_last_1h += 1
+                    em = (r.get("error_message") or "").strip()
+                    recent_error_samples.append({
+                        "sid": r.get("sid"),
+                        "sd": r.get("sd"),
+                        "error": em[:200],
+                    })
             except Exception:
                 pass
 
@@ -607,6 +683,7 @@ async def queue_stats(request: Request) -> JSONResponse:
         "oldest_pending_at": oldest_pending,
         "oldest_pending_age_seconds": oldest_pending_age_seconds,
         "stuck_threshold_minutes": STUCK_THRESHOLD_MIN,
+        "recent_error_samples": recent_error_samples[:5],
     })
 
 
@@ -648,6 +725,116 @@ async def search(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "query": query, "mode": "falkordb_text", "results": results})
 
 
+async def canonical_context(request: Request) -> JSONResponse:
+    """GET /api/canonical_context?kw=<keyword>&top_n=3&bump=1
+
+    Server-side replacement for kg_push_hook.py's old direct-FalkorDB
+    read+bump. Runs the two-pass canonical/fulltext retrieval, ranks
+    (canonical first), and — when bump=1 — increments usage_count +
+    last_used_at on the picked episodes, all on localhost FalkorDB.
+
+    Why: after the NAS migration the SessionStart hook's cross-network
+    FalkorDB write (1s fail-fast) was silently dropped, so usage_count
+    stopped accumulating and the direct read drifted to ~3.6s (close to the
+    5s hook timeout). Moving read+bump here makes the hook a single tolerant
+    HTTP round-trip; the bump is now reliable because server↔falkordb is local.
+    """
+    kw = (request.query_params.get("kw") or "").strip()
+    if not kw:
+        return JSONResponse(
+            {"status": "error", "code": "bad_request", "message": "missing query param 'kw'"},
+            status_code=400,
+        )
+    try:
+        top_n = min(max(int(request.query_params.get("top_n", "3")), 1), 10)
+    except (TypeError, ValueError):
+        top_n = 3
+    bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
+    EXCERPT_CAP = 2000  # hook only excerpts ~400 chars; cap payload size
+
+    driver = get_status_driver()
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    # Pass 1: canonical nodes whose content CONTAINS the keyword (curated,
+    # high-trust → forced top score so they beat fulltext score).
+    try:
+        r1, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND n.content CONTAINS $kw "
+            "RETURN n.name AS name, n.content AS content, "
+            "       n.source_description AS source",
+            kw=kw,
+        )
+        for row in r1:
+            nm = row.get("name")
+            rows.append({
+                "name": nm,
+                "content": (row.get("content") or "")[:EXCERPT_CAP],
+                "source": row.get("source") or "",
+                "score": 100.0,
+                "is_canonical": True,
+            })
+            seen.add(nm)
+    except Exception as exc:
+        logger.warning("[canonical_context] pass1 failed for kw=%r: %s", kw, exc)
+
+    # Pass 2: general fulltext over Episodic to fill remaining slots.
+    if len(rows) < top_n:
+        try:
+            r2, _, _ = await driver.execute_query(
+                "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
+                "WHERE NOT node.name IN $exclude "
+                "RETURN node.name AS name, node.content AS content, "
+                "       node.source_description AS source, score AS score "
+                "ORDER BY score DESC LIMIT $lim",
+                q=kw,
+                exclude=list(seen),
+                lim=(top_n - len(rows)) * 3,
+            )
+            for row in r2:
+                nm = row.get("name")
+                rows.append({
+                    "name": nm,
+                    "content": (row.get("content") or "")[:EXCERPT_CAP],
+                    "source": row.get("source") or "",
+                    "score": float(row.get("score") or 0),
+                    "is_canonical": bool(nm and nm.startswith("kg-hub-canonical-")),
+                })
+        except Exception as exc:
+            logger.warning("[canonical_context] pass2 failed for q=%r: %s", kw, exc)
+
+    # rank_and_pick: canonical first (by score), then others (by score).
+    canonical = sorted([r for r in rows if r["is_canonical"]], key=lambda r: -r["score"])
+    others = sorted([r for r in rows if not r["is_canonical"]], key=lambda r: -r["score"])
+    picked = canonical[:top_n]
+    if len(picked) < top_n:
+        picked.extend(others[: top_n - len(picked)])
+
+    bumped = 0
+    if bump and picked:
+        try:
+            br, _, _ = await driver.execute_query(
+                "MATCH (n:Episodic) WHERE n.name IN $names "
+                "SET n.usage_count = coalesce(n.usage_count, 0) + 1, "
+                "    n.last_used_at = $now "
+                "RETURN count(n) AS c",
+                names=[p["name"] for p in picked],
+                now=datetime.now(tz=timezone.utc).isoformat(),
+            )
+            if br:
+                bumped = int(br[0].get("c") or 0)
+        except Exception as exc:
+            logger.warning("[canonical_context] usage bump failed: %s", exc)
+
+    return JSONResponse({
+        "status": "ok",
+        "keyword": kw,
+        "bumped": bumped,
+        "picked": picked,
+    })
+
+
 # ---------- App ----------
 app = Starlette(
     debug=False,
@@ -657,6 +844,7 @@ app = Starlette(
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
+        Route("/api/canonical_context", canonical_context, methods=["GET"]),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
 )

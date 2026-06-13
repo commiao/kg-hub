@@ -42,6 +42,9 @@ import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +59,14 @@ except Exception:
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOG_PATH = REPO_ROOT / "data" / ".push_hook.log"
 LOG_MAX_LINES = 200    # keep log small
+
+# kg-hub server (NAS). The hook talks HTTP only — read + usage_count bump both
+# happen server-side on localhost FalkorDB. This replaces the old direct
+# cross-network FalkorDB connection, which after the NAS migration was too slow
+# (~3.6s read) and silently dropped the 1s fail-fast usage bump.
+KG_HUB_URL = (os.environ.get("KG_HUB_URL") or "http://127.0.0.1:8080").rstrip("/")
+KG_HUB_API_TOKEN = os.environ.get("KG_HUB_API_TOKEN", "")
+HTTP_TIMEOUT_SEC = 2.5  # per-call; well under the 5s SessionStart hook budget
 
 # Bounds
 MAX_INJECTION_CHARS = 1500     # ~400 tokens
@@ -196,6 +207,36 @@ def _connect_read():
             log(f"read connect timed out at {t:.0f}s; retrying cold-tolerant ({timeouts[i + 1]:.0f}s)")
             time.sleep(0.4)
     return None, last_err
+
+
+def http_canonical_context(keyword: str, top_n: int, bump: bool) -> list[dict]:
+    """Fetch ranked canonical/fulltext context for a keyword from the kg-hub
+    server. The server runs the two-pass retrieval AND (when bump=True) bumps
+    usage_count + last_used_at server-side on localhost FalkorDB — reliably,
+    unlike the old cross-network 1s fail-fast write.
+
+    Returns the server's already-ranked `picked` list (dicts with
+    name/content/source/score), or [] on any failure (hook stays silent)."""
+    qs = urllib.parse.urlencode({
+        "kw": keyword,
+        "top_n": top_n,
+        "bump": "1" if bump else "0",
+    })
+    url = f"{KG_HUB_URL}/api/canonical_context?{qs}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {KG_HUB_API_TOKEN}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        picked = data.get("picked") or []
+        if bump and picked:
+            log(f"bumped usage on {data.get('bumped', 0)} episodes (server-side)")
+        return picked
+    except Exception as exc:
+        log(f"http canonical_context failed for kw={keyword!r}: "
+            f"{type(exc).__name__}: {exc}")
+        return []
 
 
 def fast_falkordb_query(keyword: str, top_n: int) -> list[dict]:
@@ -565,27 +606,28 @@ def main() -> int:
         print(f"cwd={cwd}")
         print(f"keywords={keywords}")
         for kw in keywords:
-            rows = fast_falkordb_query(kw, TOP_N)
-            print(f"\n--- keyword {kw!r}: {len(rows)} candidates ---")
+            rows = http_canonical_context(kw, TOP_N, bump=False)
+            print(f"\n--- keyword {kw!r}: {len(rows)} picked ---")
             for r in rows[:5]:
                 print(f"  score={r['score']:.3f}  name={r['name']}  ({len(r['content'])} chars)")
         return 0
 
-    # Try each keyword in priority order until we get hits
-    rows = []
+    # Try each keyword in priority order until we get hits. The server returns
+    # the already-ranked picks AND bumps usage_count server-side (unless --dry),
+    # so we no longer rank_and_pick or increment_usage on the client.
+    picked = []
     used_keyword = None
     for kw in keywords:
-        rows = fast_falkordb_query(kw, TOP_N)
-        if rows:
+        picked = http_canonical_context(kw, TOP_N, bump=(not args.dry))
+        if picked:
             used_keyword = kw
             break
 
-    if not rows:
+    if not picked:
         log(f"no match; elapsed={time.time()-t0:.2f}s")
         empty_for_format(args.format)
         return 0
 
-    picked = rank_and_pick(rows, TOP_N)
     injection = build_injection(picked, used_keyword or "?")
 
     if not injection:
@@ -643,12 +685,11 @@ def main() -> int:
     log(f"OK fmt={args.format} kw={used_keyword} picked={len(picked)} "
         f"names=[{picked_names}] inj_chars={inj_len} elapsed={elapsed:.2f}s")
 
-    # Implicit-feedback signal: bump usage on the picked episodes. Best-effort,
-    # fail-fast, and intentionally last — its outcome cannot affect the chip.
-    if not args.dry:
-        bumped = increment_usage([p["name"] for p in picked])
-        if bumped:
-            log(f"bumped usage on {bumped} episodes")
+    # NOTE: usage_count bump now happens server-side inside
+    # http_canonical_context() (bump=1), reliably on localhost FalkorDB — no
+    # client-side increment_usage() call needed. The legacy _connect /
+    # fast_falkordb_query / increment_usage functions are retained only for
+    # offline/debug use and are no longer on the hot path.
     return 0
 
 

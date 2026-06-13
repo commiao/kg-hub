@@ -17,6 +17,7 @@ function returns within milliseconds.
 
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import time
@@ -60,8 +61,15 @@ def wait_for_port(
 
 
 def wait_for_falkordb(timeout_seconds: float = 60.0) -> bool:
-    """Wait for the FalkorDB container to accept connections on 127.0.0.1:6379."""
-    return wait_for_port("127.0.0.1", 6379, timeout_seconds=timeout_seconds, label="FalkorDB")
+    """Wait for FalkorDB to accept connections.
+
+    Reads KG_HUB_FALKORDB_HOST/PORT so it works both locally (127.0.0.1) and in
+    Docker compose where FalkorDB is a separate service reachable by name
+    (e.g. host="falkordb"). Hardcoding 127.0.0.1 broke the NAS deployment.
+    """
+    host = os.environ.get("KG_HUB_FALKORDB_HOST", "127.0.0.1")
+    port = int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379"))
+    return wait_for_port(host, port, timeout_seconds=timeout_seconds, label="FalkorDB")
 
 
 def wait_for_kg_hub_server(timeout_seconds: float = 60.0) -> bool:

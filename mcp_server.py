@@ -55,6 +55,42 @@ from graphiti_client import build_graphiti
 KG_HUB_URL = os.environ.get("KG_HUB_URL", "http://127.0.0.1:8080")
 KG_HUB_API_TOKEN = os.environ.get("KG_HUB_API_TOKEN")
 
+# ---------- Client-side unreachable alert (L3 monitoring) ----------
+# If kg-hub is unreachable/timing out from where the MCP runs, proactively push a
+# Feishu alert. This is the client-vantage watcher (lives off the NAS), complementary
+# to the NAS sidecar + VPS probe. Cooldown prevents spam.
+import time as _time  # noqa: E402
+
+KG_HUB_FEISHU_WEBHOOK = os.environ.get("KG_HUB_FEISHU_WEBHOOK", "").strip()
+_alert_last: dict[str, float] = {}
+_ALERT_COOLDOWN_SEC = 600  # at most one alert per kind per 10 min
+
+
+def _looks_unreachable(exc: Exception) -> bool:
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return any(k in s for k in (
+        "connect", "timeout", "timed out", "refused", "unreachable",
+        "cannot assign", "reset by peer", "name or service",
+    ))
+
+
+async def _alert_unreachable(where: str, exc: Exception) -> None:
+    if not KG_HUB_FEISHU_WEBHOOK:
+        return
+    now = _time.time()
+    if now - _alert_last.get(where, 0.0) < _ALERT_COOLDOWN_SEC:
+        return
+    _alert_last[where] = now
+    text = (
+        f"🔴 kg-hub MCP 连不上\n位置: {where}\nKG_HUB_URL: {KG_HUB_URL}\n"
+        f"错误: {type(exc).__name__}: {str(exc)[:200]}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(KG_HUB_FEISHU_WEBHOOK, json={"msg_type": "text", "content": {"text": text}})
+    except Exception:
+        pass
+
 
 # ---------- Graphiti singleton, lazily initialized ----------
 _graphiti = None
@@ -66,14 +102,24 @@ async def get_graphiti():
     global _graphiti
     async with _init_lock:
         if _graphiti is None:
-            _graphiti = await build_graphiti(fresh=False)
+            try:
+                _graphiti = await build_graphiti(fresh=False)
+            except Exception as exc:
+                if _looks_unreachable(exc):
+                    await _alert_unreachable("graphiti_init", exc)
+                raise
     return _graphiti
 
 
 async def _query(cypher: str, **params) -> list[dict[str, Any]]:
     """Thin wrapper over driver.execute_query that returns records (list of dicts)."""
     g = await get_graphiti()
-    records, _header, _ = await g.driver.execute_query(cypher, **params)
+    try:
+        records, _header, _ = await g.driver.execute_query(cypher, **params)
+    except Exception as exc:
+        if _looks_unreachable(exc):
+            await _alert_unreachable("kg_query", exc)
+        raise
     return records or []
 
 
@@ -98,7 +144,12 @@ async def kg_search(query: str, num_results: int = 10) -> list[dict[str, Any]]:
         List of {"fact", "source_node", "target_node", "valid_at"} dicts.
     """
     g = await get_graphiti()
-    edges = await g.search(query=query, num_results=min(num_results, 30))
+    try:
+        edges = await g.search(query=query, num_results=min(num_results, 30))
+    except Exception as exc:
+        if _looks_unreachable(exc):
+            await _alert_unreachable("kg_search", exc)
+        raise
     out = []
     for e in edges:
         out.append({
@@ -289,7 +340,8 @@ async def kg_add_episode(
                 headers={"Authorization": f"Bearer {KG_HUB_API_TOKEN}"},
             )
         return r.json()
-    except httpx.ConnectError as exc:
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        await _alert_unreachable("kg_add_episode", exc)
         return {
             "status": "error",
             "code": "server_unreachable",

@@ -16,10 +16,17 @@ lock (Phase 1 → Phase 2 requires concurrent ingest + MCP read).
 import asyncio
 import os
 import threading
+import time
 from pathlib import Path
 
 # MUST be set before graphiti_core imports (EMBEDDING_DIM is a frozen pydantic field).
 os.environ.setdefault("EMBEDDING_DIM", "384")
+
+# Force fully-sequential LLM calls inside Graphiti (per-episode entity/edge
+# extraction otherwise fans out up to SEMAPHORE_LIMIT=20 concurrent calls, which
+# trips 百炼's "concurrency allocated quota exceeded" 429s). Set before any
+# graphiti_core import so helpers.SEMAPHORE_LIMIT picks it up.
+os.environ.setdefault("SEMAPHORE_LIMIT", "1")
 
 from dotenv import load_dotenv
 
@@ -32,6 +39,26 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client import LLMConfig
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+# --- Perf fix (task #7): make EDGE dedup vector-only ---------------------------
+# resolve_extracted_edges() runs EDGE_HYBRID_SEARCH_RRF (bm25 fulltext + cosine
+# vector) TWICE per extracted edge — once unfiltered over ALL edges. On FalkorDB
+# the bm25/fulltext leg costs seconds and scales with graph size (the 30s-timeout
+# / pegged-CPU root cause). Node dedup is already vector-only and fast. Rebind the
+# recipe object that edge_operations imported to cosine-only, so BOTH dedup
+# searches drop the slow fulltext leg. User-facing search imports the recipe from
+# the recipes module directly and is unaffected.
+import copy as _copy  # noqa: E402
+import graphiti_core.utils.maintenance.edge_operations as _edge_ops  # noqa: E402
+
+_vec_only = _copy.deepcopy(_edge_ops.EDGE_HYBRID_SEARCH_RRF)
+_cosine_methods = [
+    m for m in _vec_only.edge_config.search_methods
+    if "cosine" in str(getattr(m, "value", m)).lower()
+]
+if _cosine_methods:
+    _vec_only.edge_config.search_methods = _cosine_methods
+    _edge_ops.EDGE_HYBRID_SEARCH_RRF = _vec_only
 
 
 # FalkorDB connection (Docker container `kg-hub-falkordb`). Reads from
@@ -54,16 +81,36 @@ def build_llm() -> AnthropicClient:
     cfg = LLMConfig(api_key=auth_token, model=model, max_tokens=4096)
     # 百炼 coding plan has concurrent-request quota; bump retries so transient
     # 429s ride out within the SDK rather than failing whole episodes.
-    async_client = AsyncAnthropic(auth_token=auth_token, base_url=base_url, max_retries=5)
+    # timeout: without it, a half-open socket (e.g. after the Mac sleeps and the
+    # connection is silently dropped) wedges a request forever — the whole ingest
+    # hangs with 0 progress. A per-request timeout makes it fail fast and retry.
+    async_client = AsyncAnthropic(
+        auth_token=auth_token, base_url=base_url, max_retries=5, timeout=120.0
+    )
 
     # 百炼 qwen3.6-plus runs in thinking mode by default, which forbids
     # forced tool_choice. Inject thinking={"type":"disabled"} on every call.
     orig_create = async_client.messages.create
 
+    # Rate limit: 百炼 plan allows ~6000 calls / 5h (≈20/min). Enforce a minimum
+    # gap between call STARTS so we stay under quota and leave headroom for other
+    # apps. Default 4s ≈ 15/min ≈ 4500/5h (~75% of quota). Tune via
+    # KG_HUB_LLM_MIN_INTERVAL_SEC. Combined with SEMAPHORE_LIMIT=1, calls are fully
+    # sequential — the lock is held across the sleep so starts are strictly spaced.
+    min_interval = float(os.environ.get("KG_HUB_LLM_MIN_INTERVAL_SEC", "4.0"))
+    throttle_lock = asyncio.Lock()
+    last_call = {"t": 0.0}
+
     async def create_with_thinking_off(*args, **kwargs):
         extra_body = dict(kwargs.get("extra_body") or {})
         extra_body.setdefault("thinking", {"type": "disabled"})
         kwargs["extra_body"] = extra_body
+        if min_interval > 0:
+            async with throttle_lock:
+                wait = min_interval - (time.monotonic() - last_call["t"])
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                last_call["t"] = time.monotonic()
         return await orig_create(*args, **kwargs)
 
     async_client.messages.create = create_with_thinking_off  # type: ignore[assignment]

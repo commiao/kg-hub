@@ -107,13 +107,11 @@ async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
     path = repo_root / doc["path"]
     body = path.read_text(encoding="utf-8")
     ref = doc_reference_time(path)
-    # skip_extraction=True bypasses LLM entity/edge extraction.
-    # Canonical docs go in as Episodic nodes verbatim — queryable via
-    # kg_episode_search but no auto-extracted entities/relations.
-    # This is a deliberate design choice: ~0.03s per doc vs ~30-50 min for
-    # full extraction (see docs/BUG-add-episode-throughput.md). When/if the
-    # graphiti throughput issue is fixed upstream, change this to False to
-    # opt into automatic structuring.
+    # Full LLM extraction. The old skip_extraction=True was a workaround for the
+    # FalkorDB hybrid-search throughput problem — now fixed (edge dedup is
+    # vector-only, see graphiti_client.py). graphiti 0.29's add_episode no longer
+    # accepts skip_extraction, so it's removed; canonical docs get auto-structured
+    # like any other episode.
     result = await g.add_episode(
         name=doc["name"],
         episode_body=body,
@@ -124,7 +122,6 @@ async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
         entity_types=ENTITY_TYPES,
         edge_types=EDGE_TYPES,
         edge_type_map=EDGE_TYPE_MAP,
-        skip_extraction=True,
     )
     return len(result.nodes), len(result.edges)
 

@@ -1,0 +1,16 @@
+# Build context lives at repo root (used by deploy/nas/Dockerfile via compose context: ../..).
+# Keep the image small & reproducible — exclude venvs, data, git, logs, the kuzu spike.
+spike-graphiti/
+**/.venv/
+.venv/
+data/
+logs/
+kuzu_db
+**/__pycache__/
+*.pyc
+.git/
+*.bak-*
+# Never bake secrets into the image (compose reads .env from the host at runtime).
+.env
+**/.env
+deploy/nas/.env

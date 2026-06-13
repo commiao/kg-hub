@@ -51,6 +51,32 @@ ALERTS_LOG = Path.home() / ".kg-hub" / "logs" / "alerts.log"
 
 BACKLOG_THRESHOLD = int(os.environ.get("KG_HUB_BACKLOG_THRESHOLD", "5"))
 STUCK_SECONDS = int(os.environ.get("KG_HUB_STUCK_THRESHOLD_MIN", "30")) * 60
+# A timed /api/search probe exercises the FalkorDB query path. If it takes longer
+# than this, FalkorDB is likely overloaded (the runaway-query / pegged-CPU failure
+# that started this whole effort). Tune via KG_HUB_FALKORDB_SLOW_SEC.
+SLOW_SECONDS = float(os.environ.get("KG_HUB_FALKORDB_SLOW_SEC", "8"))
+
+# Hot-reloadable notification config: edit this JSON file (on a mounted volume) to
+# change webhook / thresholds / enable WITHOUT rebuilding the container — it is
+# re-read every watchdog cycle. Keys (all optional):
+#   {"enabled": true, "feishu_webhook": "...", "backlog_threshold": 20,
+#    "stuck_threshold_min": 30, "falkordb_slow_sec": 8}
+NOTIFY_CONFIG_PATH = Path(
+    os.environ.get("KG_HUB_NOTIFY_CONFIG", "/config/notify.json")
+)
+
+
+def load_notify_config() -> dict:
+    try:
+        return json.loads(NOTIFY_CONFIG_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _server_hostport() -> tuple[str, int]:
+    from urllib.parse import urlparse
+    u = urlparse(KG_HUB_URL)
+    return (u.hostname or "127.0.0.1"), (u.port or 8080)
 
 
 def now_iso() -> str:
@@ -65,6 +91,8 @@ def load_state() -> dict:
                 "queue_backlog": False,
                 "stuck_jobs": False,
                 "recent_errors": False,
+                "falkordb_unreachable": False,
+                "falkordb_slow": False,
             },
             "last_run": None,
         }
@@ -163,7 +191,49 @@ def check_queue() -> tuple[dict | None, str]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def check_search_probe() -> tuple[str, float, str]:
+    """Timed probe of /api/search — exercises the FalkorDB query path.
+
+    Returns (status, latency_sec, message); status in {ok, slow, error, skip}.
+    Detects FalkorDB unreachable (error) or CPU-pegged / runaway queries (slow).
+    """
+    if not KG_HUB_TOKEN:
+        return "skip", 0.0, "no token"
+    try:
+        t0 = time.monotonic()
+        r = httpx.get(
+            f"{KG_HUB_URL}/api/search",
+            params={"q": "__watchdog_probe__", "num_results": 1},
+            headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"},
+            timeout=20.0,
+        )
+        dt = time.monotonic() - t0
+        if r.status_code != 200:
+            return "error", dt, f"HTTP {r.status_code}: {r.text[:150]}"
+        if dt > SLOW_SECONDS:
+            return "slow", dt, f"search took {dt:.1f}s (> {SLOW_SECONDS:.0f}s) — FalkorDB may be overloaded"
+        return "ok", dt, f"{dt:.2f}s"
+    except Exception as exc:
+        return "error", 0.0, f"{type(exc).__name__}: {exc}"
+
+
 def main() -> int:
+    # Hot-read notification config (file on a mounted volume) — overrides env-derived
+    # defaults each cycle, so rules change without a rebuild/recreate.
+    global FEISHU_WEBHOOK, BACKLOG_THRESHOLD, STUCK_SECONDS, SLOW_SECONDS
+    cfg = load_notify_config()
+    if cfg.get("enabled") is False:
+        print("[watchdog] disabled via notify config")
+        return 0
+    if cfg.get("feishu_webhook"):
+        FEISHU_WEBHOOK = str(cfg["feishu_webhook"]).strip()
+    if "backlog_threshold" in cfg:
+        BACKLOG_THRESHOLD = int(cfg["backlog_threshold"])
+    if "stuck_threshold_min" in cfg:
+        STUCK_SECONDS = int(cfg["stuck_threshold_min"]) * 60
+    if "falkordb_slow_sec" in cfg:
+        SLOW_SECONDS = float(cfg["falkordb_slow_sec"])
+
     state = load_state()
     prev_anomalies = state.get("anomalies", {})
 
@@ -172,10 +242,11 @@ def main() -> int:
     # This prevents spurious server_down → server_up "flicker" alerts at boot.
     if state.get("last_run") is None:
         import socket
+        probe_host, probe_port = _server_hostport()
         deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline:
             try:
-                with socket.create_connection(("127.0.0.1", 8080), timeout=2.0):
+                with socket.create_connection((probe_host, probe_port), timeout=2.0):
                     break
             except OSError:
                 time.sleep(2.0)
@@ -184,6 +255,8 @@ def main() -> int:
         "queue_backlog": False,
         "stuck_jobs": False,
         "recent_errors": False,
+        "falkordb_unreachable": False,
+        "falkordb_slow": False,
     }
     details: dict[str, str] = {}
 
@@ -212,7 +285,24 @@ def main() -> int:
                 )
             if errored_1h > 0:
                 new_anomalies["recent_errors"] = True
-                details["recent_errors"] = f"{errored_1h} errored in last hour"
+                samples = stats.get("recent_error_samples") or []
+                sample_txt = "; ".join(
+                    f"{s.get('sid', '?')}: {s.get('error', '')}" for s in samples[:3]
+                )
+                details["recent_errors"] = (
+                    f"{errored_1h} errored in last hour"
+                    + (f" — {sample_txt}" if sample_txt else "")
+                )
+
+    # 2b. FalkorDB probe — timed /api/search (only if server alive)
+    if alive:
+        pstatus, plat, pmsg = check_search_probe()
+        if pstatus == "error":
+            new_anomalies["falkordb_unreachable"] = True
+            details["falkordb_unreachable"] = pmsg
+        elif pstatus == "slow":
+            new_anomalies["falkordb_slow"] = True
+            details["falkordb_slow"] = pmsg
 
     # 3. edge-triggered alerts (only on state transitions)
     for kind, is_bad_now in new_anomalies.items():
