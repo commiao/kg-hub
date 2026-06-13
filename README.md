@@ -19,16 +19,18 @@
 
 | 资源 | 位置 |
 |---|---|
-| **代码仓库（fork）** | `commiao/kg-hub`（本仓库，remote `origin` = `git@github-commiao:commiao/kg-hub.git`）|
+| **代码仓库** | `commiao/kg-hub`（本仓库，remote `origin` = `git@github-commiao:commiao/kg-hub.git`）|
+| **claude-mem 集成手册（独立 repo）** | https://github.com/commiao/claude-mem-integration-cookbook — 跨平台 / 跨 IDE 部署 claude-mem 的 cookbook（kg-hub 上游数据源） |
 | **飞书归档文档** | https://my.feishu.cn/docx/El2odQ8nBoZ9EuxnH3ec95annPd |
 
 **仓库内关键文档**
 
 | 主题 | 文件 |
 |---|---|
-| 架构与已锁决策 | [`DESIGN.md`](DESIGN.md) |
+| 🌐 **全栈架构总览**（kg-hub + claude-mem + cookbook + cc-switch + muxcp） | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| 架构与已锁决策（kg-hub 内部） | [`DESIGN.md`](DESIGN.md) |
 | 路线图 | [`ROADMAP.md`](ROADMAP.md) |
-| 跨平台 / 跨工具对接手册 | [`docs/INTEGRATION-GUIDE.md`](docs/INTEGRATION-GUIDE.md) |
+| 跨平台 / 跨工具对接手册（kg-hub 客户端） | [`docs/INTEGRATION-GUIDE.md`](docs/INTEGRATION-GUIDE.md) |
 | 事件复盘 + 最终架构 + 链路 / 能耗修复 | [`docs/incident-retrospective.md`](docs/incident-retrospective.md) |
 | 通知与监控体系 | [`docs/notification-system.md`](docs/notification-system.md) |
 | NAS 部署 / 迁移 | [`deploy/nas/MIGRATION.md`](deploy/nas/MIGRATION.md) |
