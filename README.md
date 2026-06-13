@@ -2,25 +2,38 @@
 
 > **维护者**：jingmiao@liblib.ai（Lovart）
 > **起始**：2026-05-14
-> **状态**：📝 规划阶段（未开工）
+> **状态**：✅ 生产运行中（已迁至常开 NAS · 持续摄入 + 三层监控自治）
 > **父项目**：claude-mem（`/Users/mac/workspace_claudeCode/claude-mem`）
 
-> ⚠️ **依赖一个 graphiti-core 本地 patch**：本仓库的 `tools/ingest_canonical_docs.py`
-> 使用 `add_episode(skip_extraction=True)`，这是 graphiti-core 上游尚未提供的参数。
-> 详见 [`docs/BUG-add-episode-throughput.md`](docs/BUG-add-episode-throughput.md)
-> （问题根因 + 4 个 fix 提案）和 [`docs/patches/graphiti-skip-extraction.patch`](docs/patches/graphiti-skip-extraction.patch)
-> （93 行 unified diff）。新机器 / CI 环境上需要在 venv 安装完成后执行：
->
-> ```bash
-> patch -p1 -d spike-graphiti/.venv/lib/python3.13/site-packages \
->       < docs/patches/graphiti-skip-extraction.patch
-> ```
->
-> 等上游 PR 合并后移除本依赖。
+> ℹ️ **历史说明**：早期为绕过 FalkorDB 混合检索吞吐问题用过 `add_episode(skip_extraction=True)`
+> 的本地 patch，**现已移除**——根因已由「边去重改纯向量（cosine-only）」根治，canonical
+> 文档走完整抽取。详见 [`docs/incident-retrospective.md`](docs/incident-retrospective.md)。
 
 ## 一句话
 
 把分散在多设备 / 多 IDE / 多 project 上的 claude-mem 本地 observations，**汇聚成一个中央知识图谱**，让所有 AI 工具通过 MCP 做跨设备跨项目的 RAG。
+
+## 📍 资源总索引（single source of navigation）
+
+> **本 README 是 kg-hub 所有资料的统一入口。** 约定:**代码 / 配置 / 可 diff 的文档以本仓库为准;叙事性长文复盘同步存档到飞书文档**。两处在此互相指向。
+
+| 资源 | 位置 |
+|---|---|
+| **代码仓库（fork）** | `commiao/kg-hub`（本仓库，remote `origin` = `git@github-commiao:commiao/kg-hub.git`）|
+| **飞书归档文档** | https://my.feishu.cn/docx/El2odQ8nBoZ9EuxnH3ec95annPd |
+
+**仓库内关键文档**
+
+| 主题 | 文件 |
+|---|---|
+| 架构与已锁决策 | [`DESIGN.md`](DESIGN.md) |
+| 路线图 | [`ROADMAP.md`](ROADMAP.md) |
+| 跨平台 / 跨工具对接手册 | [`docs/INTEGRATION-GUIDE.md`](docs/INTEGRATION-GUIDE.md) |
+| 事件复盘 + 最终架构 + 链路 / 能耗修复 | [`docs/incident-retrospective.md`](docs/incident-retrospective.md) |
+| 通知与监控体系 | [`docs/notification-system.md`](docs/notification-system.md) |
+| NAS 部署 / 迁移 | [`deploy/nas/MIGRATION.md`](deploy/nas/MIGRATION.md) |
+
+**飞书文档收录**（长文存档，与上方 repo 文档一一对应）:通知与监控体系 · 事件复盘 + 最终架构 · 切流量后链路体检与修复 · 能耗复发 + 记忆断流排查 · 跨平台 / 跨工具对接手册。
 
 ## 为什么独立成项目
 
