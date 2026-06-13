@@ -68,10 +68,11 @@ services:
       - /volume1/docker/kg-hub-data/models:/models
       - /volume1/docker/kg-hub-data/ingest-backup:/backup
     ports:
-      # Bind to loopback only: closes the LAN exposure (192.168.x:8080). Tailscale
-      # userspace networking still forwards <tailscale-ip>:8080 -> 127.0.0.1:8080,
-      # so remote devices on the tailnet reach it; nothing else on the LAN can.
-      - "127.0.0.1:8080:8080"
+      # Host port 17171 (off the common 8080) -> container 8080. Bind to loopback
+      # only: closes LAN exposure. Tailscale userspace networking auto-forwards
+      # <tailscale-ip>:17171 -> 127.0.0.1:17171, so tailnet devices reach it on
+      # 17171; nothing else on the LAN can. Container still listens on 8080 internally.
+      - "127.0.0.1:17171:8080"
 
   # Always-on monitor: runs the watchdog in a loop INSIDE the NAS, so problems are
   # caught even when the Mac is asleep. Alerts go to Feishu (edge-triggered).
@@ -97,11 +98,13 @@ services:
       - /volume1/docker/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
     command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
 
-  # One-time rebuild driver: continues the claude-mem rebuild ON the NAS (always-on,
-  # so Mac going offline can't interrupt it). Reads a copy of claude-mem.db + the
-  # migrated watermark, writes directly to the local falkordb. Resumes via watermark
-  # if the container/NAS restarts. REMOVE this service once the rebuild is complete
-  # (and ongoing ingest moves to Mac-hook -> /api/ingest, task #6).
+  # Ongoing ingest worker (runs ON the NAS, always-on). The one-time claude-mem
+  # rebuild is COMPLETE, so that step was dropped from the loop. This now drives
+  # the two pipelines that still receive new data:
+  #   - openclaw_capsule: ingests capsules that VPS openclaw-sync.sh syncs hourly
+  #   - ingest_canonical_docs: re-ingests canonical docs when they change
+  # Idle (resource-light) when nothing is new. Single container = single writer
+  # (writer.lock holds); both steps are idempotent via watermarks.
   ingester:
     build:
       context: .
@@ -130,9 +133,8 @@ services:
       - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
     volumes:
       - /volume1/docker/kg-hub-data/models:/models
-      - /volume1/docker/kg-hub-data/claude-mem/claude-mem.db:/root/.claude-mem/claude-mem.db:ro
       - /volume1/docker/kg-hub-data/ingest-state:/app/data
       - /volume1/docker/kg-hub-data/openclaw-src:/openclaw-src:ro
-    # One container = single writer (writer.lock works). All ingesters are idempotent
-    # (watermarks), run sequentially each loop: claude-mem (done) + openclaw + canonical.
-    command: ["sh", "-c", "sleep 30; while true; do echo '[rebuild] pass start'; python -m ingesters.claude_mem_obs || true; python -m ingesters.openclaw_capsule --snapshot /openclaw-src || true; python -m tools.ingest_canonical_docs || true; echo '[rebuild] pass done, idle 600s'; sleep 600; done"]
+    # Sequential each loop (idempotent via watermarks): openclaw capsules + canonical docs.
+    # claude-mem rebuild is done, so its step (and the claude-mem.db mount) was removed.
+    command: ["sh", "-c", "sleep 30; while true; do echo '[ingest] pass start'; python -m ingesters.openclaw_capsule --snapshot /openclaw-src || true; python -m tools.ingest_canonical_docs || true; echo '[ingest] pass done, idle 600s'; sleep 600; done"]

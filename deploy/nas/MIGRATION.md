@@ -7,7 +7,7 @@
 ```
 群晖 NAS (always-on)
   ├─ falkordb       :6379  仅绑 127.0.0.1(不对外)+ AOF + 查询超时
-  ├─ kg_hub_server  :8080  Bearer 鉴权,连 falkordb:6379(走容器内网/loopback)
+  ├─ kg_hub_server  :17171  Bearer 鉴权,连 falkordb:6379(走容器内网/loopback)
   └─ 数据 /volume1/docker/kg-hub/  + 群晖 Btrfs 快照
         ▲ 粗粒度 HTTP /api/ingest、/api/search,经 Tailscale
    各 Mac / 笔记本 / OpenClaw-VPS = 瘦客户端
@@ -72,18 +72,18 @@ docker exec kg-hub-falkordb redis-cli --no-auth-warning -a "$FALKORDB_PASSWORD" 
 ### 5. 起 server
 ```sh
 docker compose up -d           # 起 kg_hub_server(等 falkordb healthy 后启动)
-curl -s http://localhost:8080/health
+curl -s http://localhost:17171/health
 ```
 
 ### 6. 切客户端到 NAS
-- 查询客户端(`openclaw-deploy/scripts/kg-query.sh` 等):`KG_HUB_URL=http://<nas-tailscale>:8080`,`KG_HUB_TOKEN` 用同一 token。
-- claude-mem 摄入:让 hook 把新 observation **POST 到 `http://<nas-tailscale>:8080/api/ingest`**(碎活落 NAS)。
+- 查询客户端(`openclaw-deploy/scripts/kg-query.sh` 等):`KG_HUB_URL=http://<nas-tailscale>:17171`,`KG_HUB_TOKEN` 用同一 token。
+- claude-mem 摄入:让 hook 把新 observation **POST 到 `http://<nas-tailscale>:17171/api/ingest`**(碎活落 NAS)。
   > 注:当前 `ingesters/claude_mem_obs.py` 是**直连 FalkorDB**(`add_episode`),不是走 HTTP。持续摄入要改成 POST `/api/ingest`,或把 claude-mem.db 同步到 NAS 在本地跑 ingester。此项作为迁移后的收尾任务单独做。
 - 退役 Mac 本机的 falkordb 容器。
 
 ### 7. 安全
 - FalkorDB 6379 已 `127.0.0.1` 绑定,**不对外**。
-- 8080 **只经 Tailscale 访问**:DSM「控制面板 → 安全性 → 防火墙」放行仅 `tailscale0` 接口的 8080;**不要**在路由器做端口转发。
+- 对外端口 **17171**(容器内仍 8080)**只经 Tailscale 访问**:已 `127.0.0.1:17171` 绑定环回,Tailscale 用户态自动转发 `tailscale-ip:17171 → 127.0.0.1:17171`;**不要**在路由器做端口转发。
 - API token 与 FalkorDB 密码定期轮换。
 
 ### 8. 备份(补上 DESIGN 里没做完的"中央 KG 备份策略")
