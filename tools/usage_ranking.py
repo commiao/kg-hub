@@ -191,6 +191,28 @@ def render(stats: dict, top: list, promote: list, demote: list) -> str:
     return "\n".join(L)
 
 
+def fetch_ranking_http(top_n: int = TOP_N) -> dict:
+    """Fetch the ranking from kg-hub server (NAS-local FalkorDB read).
+
+    Replaces the old direct-FalkorDB connection (`_connect`), which the Mac can
+    no longer reach after the NAS migration — falkordb binds to NAS localhost,
+    not the tailnet. Same fix as the push hook: read goes through the HTTP API.
+    """
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    base = (os.environ.get("KG_HUB_URL") or "http://127.0.0.1:8080").rstrip("/")
+    token = os.environ.get("KG_HUB_API_TOKEN") or ""
+    qs = urllib.parse.urlencode({"top_n": top_n})
+    req = urllib.request.Request(
+        f"{base}/api/usage_ranking?{qs}",
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return _json.loads(resp.read())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-write", action="store_true",
@@ -198,21 +220,19 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        graph = _connect()
+        data = fetch_ranking_http()
+        if data.get("status") != "ok":
+            raise RuntimeError(data.get("message", "server returned non-ok"))
     except Exception as exc:
-        print(f"[usage_ranking] FATAL: cannot connect to FalkorDB — {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+        print(f"[usage_ranking] FATAL: cannot reach kg-hub /api/usage_ranking — "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        stats = query_stats(graph)
-        top = query_top_canonical_used(graph)
-        promote = query_promote_candidates(graph)
-        demote = query_demote_candidates(graph)
-    except Exception as exc:
-        print(f"[usage_ranking] query failed — {type(exc).__name__}: {exc}",
-              file=sys.stderr)
-        return 1
+    # Adapt server JSON → the tuple shapes render() expects.
+    stats = data["stats"]
+    top = [(x["name"], x["usage_count"], x.get("last_used_at")) for x in data["top_canonical"]]
+    promote = [(x["name"], x["usage_count"], x.get("preview")) for x in data["promote"]]
+    demote = [(x["name"], x.get("created_at")) for x in data["demote"]]
 
     md = render(stats, top, promote, demote)
     print(md)

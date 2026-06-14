@@ -835,6 +835,83 @@ async def canonical_context(request: Request) -> JSONResponse:
     })
 
 
+async def usage_ranking(request: Request) -> JSONResponse:
+    """GET /api/usage_ranking?top_n=10
+
+    Server-side usage-count ranking (the Lindy / implicit-feedback signal the
+    PUSH hook produces by bumping `usage_count` on injected canonical episodes).
+    Returns three rankings + summary stats as JSON, computed on localhost
+    FalkorDB. `tools/usage_ranking.py` fetches this over HTTP and renders the
+    markdown report — replacing its old direct-FalkorDB connection, which the
+    Mac can no longer reach after the NAS migration (falkordb binds localhost
+    only). Same lesson as the push hook: reads/writes收敛到与图同机的 server。
+    """
+    try:
+        top_n = min(max(int(request.query_params.get("top_n", "10")), 1), 50)
+    except (TypeError, ValueError):
+        top_n = 10
+    driver = get_status_driver()
+
+    async def q(cypher, **params):
+        rows, _, _ = await driver.execute_query(cypher, **params)
+        return rows
+
+    try:
+        r = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND coalesce(n.usage_count, 0) > 0 "
+            "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, n.last_used_at AS last "
+            "ORDER BY uc DESC LIMIT $n", n=top_n)
+        top_canonical = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
+                          "last_used_at": x.get("last")} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+            "AND coalesce(n.usage_count, 0) > 0 "
+            "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, "
+            "substring(coalesce(n.content, ''), 0, 80) AS preview "
+            "ORDER BY uc DESC LIMIT $n", n=top_n)
+        promote = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
+                    "preview": x.get("preview") or ""} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND coalesce(n.usage_count, 0) = 0 "
+            "RETURN n.name AS name, n.created_at AS created "
+            "ORDER BY n.created_at LIMIT $n", n=top_n)
+        demote = [{"name": x.get("name"), "created_at": x.get("created")} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) RETURN count(n) AS total, "
+            "sum(coalesce(n.usage_count, 0)) AS total_usage, "
+            "sum(CASE WHEN coalesce(n.usage_count, 0) > 0 THEN 1 ELSE 0 END) AS used_count")
+        row = r[0] if r else {}
+        rc = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "RETURN count(n) AS total, sum(coalesce(n.usage_count, 0)) AS used")
+        crow = rc[0] if rc else {}
+        stats = {
+            "total_episodes": int(row.get("total") or 0),
+            "total_usage_events": int(row.get("total_usage") or 0),
+            "episodes_with_usage": int(row.get("used_count") or 0),
+            "canonical_total": int(crow.get("total") or 0),
+            "canonical_total_usage": int(crow.get("used") or 0),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[usage_ranking] query failed")
+        return JSONResponse(
+            {"status": "error", "message": f"{type(exc).__name__}: {exc}"}, status_code=500
+        )
+
+    return JSONResponse({
+        "status": "ok",
+        "stats": stats,
+        "top_canonical": top_canonical,
+        "promote": promote,
+        "demote": demote,
+    })
+
+
 # ---------- App ----------
 app = Starlette(
     debug=False,
@@ -845,6 +922,7 @@ app = Starlette(
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
         Route("/api/canonical_context", canonical_context, methods=["GET"]),
+        Route("/api/usage_ranking", usage_ranking, methods=["GET"]),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
 )
