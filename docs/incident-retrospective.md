@@ -115,3 +115,30 @@ NAS 切换(约 06-09)后发现两条链路**静默中断了 5 天**——SSH/HTT
 - **根因**:`do_extract` 对锁超时是"一次性失败即丢",没有重试;而抽取吞吐受限流约束,锁持有时间天然可能超过等待方的超时窗口。
 - **修复**(`kg_hub_server.py`):锁获取失败不再立即判错,改为**线性退避重试**(`KG_HUB_INGEST_LOCK_RETRIES` 默认 5 次、`_BACKOFF_SEC` 默认 5s、`_TIMEOUT_SEC` 默认 180s),多次仍拿不到才判错。并发批量写由此**自动串行化排队**,不再静默丢失。
 - **经验**:有限流的串行写管线,锁争用要靠"重试/排队"消化,而不是"超时即丢"——否则高峰批量写会悄悄掉数据。
+
+---
+
+## 「调用量→排名→筛选有价值胶囊」回路修复(2026-06-14)
+
+用户反馈"看不到有价值胶囊排名"。端到端体检发现这条派生回路**三处同时断**,逐一修复后全绿。
+
+### 链路③ 排名报告:直连 FalkorDB 超时(已修)
+- **根因**:`tools/usage_ranking.py` 跑在 Mac、直连 NAS FalkorDB(6379),但迁移后 falkordb 只绑 NAS 本机、不对 tailnet 暴露 → 超时,报告自 06-07 断更。
+- **修复**:server 新增 `GET /api/usage_ranking`(三段排名 + 统计,NAS 本地查),客户端改 HTTP 取数 + 本地 render。与 push hook 同款"读写收敛到与图同机的 server"。已合并 main。
+
+### 链路② 工具 bump usage_count:push hook 没挂(已修)
+- **根因**:Claude Code 的 `settings.json` 根本没配 SessionStart→`kg_push_hook`,usage_count 只在手动测试时被 bump,真实会话不触发。
+- **修复**:`~/.claude/settings.json` 加 SessionStart 钩子(`spike-graphiti/.venv/bin/python tools/kg_push_hook.py --format claude`)。新会话已实测触发并 bump(DESIGN→30)。
+
+### 链路① claude-mem 捕获→生成:runtime 没装好(已修)
+- **现象**:obs 冻结 4632/最新 06-01;今日日志只有 MCP 搜索连接、**0 捕获事件**。
+- **根因**:`version-check` 报 `runtime not yet set up`——插件 05-31 更新后 runtime/启用没重建,捕获环没真正生成 obs(与 #2188 同片区域)。
+- **修复**:`npx claude-mem@latest install` 升级 **v13.6.0**、`enabledPlugins` 启用插件、装好 runtime 依赖、重启 worker(健康)。
+
+### 实时验证(全绿)
+- **①**:obs **4632 → 4650(+18)**,最新 `2026-06-14T06:53`——捕获→生成恢复。
+- **②**:本会话 SessionStart 钩子触发,canonical 使用事件 59 → **86**,`last_used_at` 更新为当日。
+- **③**:报告生成成功(`~/.kg-hub/reports/usage-ranking-2026-06-14.md`),Table 1 高价值 canonical(DESIGN 30 居首)/ Table 2 提拔候选 / Table 3 降权候选 一目了然。
+
+### 一条经验
+> "看不到"往往不是单点故障,而是**派生回路多环静默串断**:源头(产 obs)、信号(bump)、出口(报告)。逐环用"是否有新数据流过"端到端验证,比盯任一单点更快定位。三处里两处又是"迁移后直连 FalkorDB / 钩子未随迁移重挂"——再次印证:**迁移后要对每条读/写/同步链路逐一端到端验证**。
