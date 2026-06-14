@@ -80,6 +80,11 @@ CANONICAL_DOCS = [
         "name": "kg-hub-canonical-ONBOARDING",
         "desc": "kg-hub-canonical: ONBOARDING.md — self-service integration guide for new sources",
     },
+    {
+        "path": "docs/AGENT-TOOL-DISCOVERY.md",
+        "name": "kg-hub-canonical-AGENT-TOOL-DISCOVERY",
+        "desc": "kg-hub-canonical: AGENT-TOOL-DISCOVERY.md — meta rule for agent self-awareness, MCP vs Skill 双轨 (2026-06-14 lesson)",
+    },
 ]
 
 
