@@ -128,6 +128,14 @@ async def kg_search(query: str, num_results: int = 10) -> list[dict[str, Any]]:
     Returns:
         List of {"fact", "source_node", "target_node", "valid_at"} dicts.
     """
+    # /api/search_semantic = vector-only graphiti edge search (semantic recall,
+    # no slow bm25 fulltext). Falls back to literal /api/search if it errors.
+    try:
+        data = await _http_get("/api/search_semantic", q=query, num_results=min(num_results, 30))
+        if data.get("status") == "ok":
+            return data.get("results", [])
+    except Exception:
+        pass
     data = await _http_get("/api/search", q=query, num_results=min(num_results, 30))
     return data.get("results", [])
 

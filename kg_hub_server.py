@@ -1020,6 +1020,57 @@ async def path_between(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "paths": [r["names"] for r in rows if r.get("names")]})
 
 
+# Vector-only edge search config for /api/search_semantic. graphiti's user-facing
+# search defaults to bm25+cosine hybrid; the bm25 fulltext leg is the slow /
+# CPU-pegging path (see graphiti_client dedup note). Keep cosine_similarity only:
+# semantic recall without the slow fulltext leg.
+import copy as _copy_search  # noqa: E402
+from graphiti_core.search.search_config_recipes import (  # noqa: E402
+    EDGE_HYBRID_SEARCH_RRF as _EDGE_RRF_SRC,
+)
+
+_EDGE_VEC_ONLY = _copy_search.deepcopy(_EDGE_RRF_SRC)
+_cos_methods = [m for m in _EDGE_VEC_ONLY.edge_config.search_methods
+                if "cosine" in str(getattr(m, "value", m)).lower()]
+if _cos_methods:
+    _EDGE_VEC_ONLY.edge_config.search_methods = _cos_methods
+
+
+async def search_semantic(request: Request) -> JSONResponse:
+    """GET /api/search_semantic?q=&num_results= — vector-only semantic edge search.
+
+    The MCP kg_search tool calls this over one HTTP hop. Uses graphiti's edge
+    search with cosine_similarity only (drops the slow bm25 fulltext leg), so it
+    gives natural-language semantic recall without the CPU-pegging fulltext path.
+    Runs on NAS-local FalkorDB. For literal keyword / liveness probes use /api/search.
+    """
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        return JSONResponse({"status": "error", "message": "missing q"}, status_code=400)
+    try:
+        num = min(max(int(request.query_params.get("num_results", "10")), 1), 30)
+    except (TypeError, ValueError):
+        num = 10
+    try:
+        g = await get_graphiti()
+        cfg = _copy_search.deepcopy(_EDGE_VEC_ONLY)
+        cfg.limit = num
+        results = await g._search(query=q, config=cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[search_semantic] failed for q=%r", q)
+        return JSONResponse(
+            {"status": "error", "message": f"{type(exc).__name__}: {exc}"}, status_code=500
+        )
+    out = [{
+        "fact": e.fact,
+        "source_node_uuid": str(e.source_node_uuid),
+        "target_node_uuid": str(e.target_node_uuid),
+        "valid_at": e.valid_at.isoformat() if e.valid_at else None,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    } for e in results.edges]
+    return JSONResponse({"status": "ok", "query": q, "mode": "semantic_vector", "results": out})
+
+
 # ---------- App ----------
 app = Starlette(
     debug=False,
@@ -1029,6 +1080,7 @@ app = Starlette(
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
+        Route("/api/search_semantic", search_semantic, methods=["GET"]),
         Route("/api/canonical_context", canonical_context, methods=["GET"]),
         Route("/api/usage_ranking", usage_ranking, methods=["GET"]),
         Route("/api/stats", stats, methods=["GET"]),
