@@ -45,8 +45,6 @@ load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from graphiti_client import build_graphiti
-
 
 # ---------- HTTP client config for write path (Phase 3.B) ----------
 # kg_add_episode is a thin wrapper that POSTs to kg_hub_server's /api/ingest.
@@ -92,35 +90,22 @@ async def _alert_unreachable(where: str, exc: Exception) -> None:
         pass
 
 
-# ---------- Graphiti singleton, lazily initialized ----------
-_graphiti = None
-_init_lock = asyncio.Lock()
-
-
-async def get_graphiti():
-    """Lazy-init Graphiti so server starts fast; first call pays the embedder load."""
-    global _graphiti
-    async with _init_lock:
-        if _graphiti is None:
-            try:
-                _graphiti = await build_graphiti(fresh=False)
-            except Exception as exc:
-                if _looks_unreachable(exc):
-                    await _alert_unreachable("graphiti_init", exc)
-                raise
-    return _graphiti
-
-
-async def _query(cypher: str, **params) -> list[dict[str, Any]]:
-    """Thin wrapper over driver.execute_query that returns records (list of dicts)."""
-    g = await get_graphiti()
+# ---------- HTTP client to kg_hub_server (all reads go through the API) ----------
+# Previously this MCP opened a direct FalkorDB connection via Graphiti for every
+# read. After the NAS migration that path is a chatty Redis-protocol session over
+# tailscale that stalls when the relay flaps. Now every read is one HTTP GET to
+# kg_hub_server, which runs the query on localhost FalkorDB (NAS) and returns one
+# JSON response — a single tolerant round-trip. (kg_add_episode was already HTTP.)
+async def _http_get(path: str, **params) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {KG_HUB_API_TOKEN}"} if KG_HUB_API_TOKEN else {}
     try:
-        records, _header, _ = await g.driver.execute_query(cypher, **params)
-    except Exception as exc:
-        if _looks_unreachable(exc):
-            await _alert_unreachable("kg_query", exc)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(f"{KG_HUB_URL}{path}", params=params, headers=headers)
+            r.raise_for_status()
+            return r.json()
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        await _alert_unreachable(f"GET {path}", exc)
         raise
-    return records or []
 
 
 # ---------- MCP server ----------
@@ -143,23 +128,8 @@ async def kg_search(query: str, num_results: int = 10) -> list[dict[str, Any]]:
     Returns:
         List of {"fact", "source_node", "target_node", "valid_at"} dicts.
     """
-    g = await get_graphiti()
-    try:
-        edges = await g.search(query=query, num_results=min(num_results, 30))
-    except Exception as exc:
-        if _looks_unreachable(exc):
-            await _alert_unreachable("kg_search", exc)
-        raise
-    out = []
-    for e in edges:
-        out.append({
-            "fact": e.fact,
-            "source_node_uuid": str(e.source_node_uuid),
-            "target_node_uuid": str(e.target_node_uuid),
-            "valid_at": e.valid_at.isoformat() if e.valid_at else None,
-            "created_at": e.created_at.isoformat() if e.created_at else None,
-        })
-    return out
+    data = await _http_get("/api/search", q=query, num_results=min(num_results, 30))
+    return data.get("results", [])
 
 
 @mcp.tool()
@@ -174,39 +144,12 @@ async def kg_node_neighbors(name: str, limit: int = 20) -> dict[str, Any]:
     Returns:
         {"matched_node": str, "labels": [str], "neighbors": [{"name", "edge", "direction", "fact"}]}
     """
-    # exact-or-contains match
-    rows = await _query(
-        "MATCH (n:Entity) "
-        "WHERE n.name = $name OR n.name CONTAINS $name "
-        "RETURN n.name AS name, labels(n) AS labels LIMIT 1",
-        name=name,
-    )
-    if not rows:
-        return {"matched_node": None, "labels": [], "neighbors": []}
-
-    matched = rows[0]["name"]
-    labels = list(rows[0].get("labels") or [])
-
-    out_rows = await _query(
-        "MATCH (a:Entity {name: $name})-[e:RELATES_TO]->(b:Entity) "
-        "RETURN b.name AS name, e.name AS edge, e.fact AS fact "
-        "LIMIT $lim",
-        name=matched,
-        lim=int(limit),
-    )
-    in_rows = await _query(
-        "MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity {name: $name}) "
-        "RETURN a.name AS name, e.name AS edge, e.fact AS fact "
-        "LIMIT $lim",
-        name=matched,
-        lim=int(limit),
-    )
-
-    neighbors = (
-        [{**r, "direction": "out"} for r in out_rows]
-        + [{**r, "direction": "in"} for r in in_rows]
-    )
-    return {"matched_node": matched, "labels": labels, "neighbors": neighbors}
+    data = await _http_get("/api/node_neighbors", name=name, limit=int(limit))
+    return {
+        "matched_node": data.get("matched_node"),
+        "labels": data.get("labels", []),
+        "neighbors": data.get("neighbors", []),
+    }
 
 
 @mcp.tool()
@@ -222,15 +165,9 @@ async def kg_path_between(source: str, target: str, max_hops: int = 4) -> list[l
         target: Target entity name.
         max_hops: Maximum path length to consider (default 4).
     """
-    hops = max(1, min(int(max_hops), 6))  # clamp to 1..6 to avoid blow-up
-    cypher = (
-        "MATCH path = (a:Entity)-[:RELATES_TO*1.." + str(hops) + "]->(b:Entity) "
-        "WHERE a.name CONTAINS $src AND b.name CONTAINS $tgt "
-        "RETURN [n IN nodes(path) | n.name] AS names "
-        "LIMIT 3"
-    )
-    rows = await _query(cypher, src=source, tgt=target)
-    return [r["names"] for r in rows if r.get("names")]
+    data = await _http_get("/api/path_between", source=source, target=target,
+                           max_hops=int(max_hops))
+    return data.get("paths", [])
 
 
 @mcp.tool()
@@ -244,38 +181,8 @@ async def kg_episode_search(query: str, num_results: int = 5) -> list[dict[str, 
         query: Natural-language query.
         num_results: How many episodes to return (max 15).
     """
-    lim = max(1, min(int(num_results), 15))
-    # FalkorDB fulltext: CALL db.idx.fulltext.queryNodes(<label>, <query>) YIELD node, score
-    cypher = (
-        "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
-        "RETURN node.name AS name, node.content AS content, "
-        "node.source_description AS source, score "
-        "ORDER BY score DESC LIMIT " + str(lim)
-    )
-    try:
-        rows = await _query(cypher, q=query)
-    except Exception:
-        # FalkorDB fulltext query rejects some chars / empty stopword-only queries.
-        # Fall back to substring match over name + content.
-        rows = await _query(
-            "MATCH (n:Episodic) "
-            "WHERE n.name CONTAINS $q OR n.content CONTAINS $q "
-            "RETURN n.name AS name, n.content AS content, "
-            "n.source_description AS source, 0.0 AS score "
-            "LIMIT " + str(lim),
-            q=query,
-        )
-
-    out = []
-    for r in rows:
-        body = (r.get("content") or "")[:600]
-        out.append({
-            "name": r.get("name"),
-            "source": r.get("source"),
-            "score": r.get("score"),
-            "body_preview": body,
-        })
-    return out
+    data = await _http_get("/api/episode_search", q=query, num_results=int(num_results))
+    return data.get("results", [])
 
 
 @mcp.tool()
@@ -361,15 +268,11 @@ async def kg_stats() -> dict[str, Any]:
     """
     Quick sanity check: total entity / edge / episode counts and top node types.
     """
-    ent_rows = await _query("MATCH (n:Entity) RETURN count(n) AS c")
-    edge_rows = await _query(
-        "MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) RETURN count(e) AS c"
-    )
-    epi_rows = await _query("MATCH (n:Episodic) RETURN count(n) AS c")
+    data = await _http_get("/api/stats")
     return {
-        "entities": ent_rows[0]["c"] if ent_rows else 0,
-        "edges": edge_rows[0]["c"] if edge_rows else 0,
-        "episodes": epi_rows[0]["c"] if epi_rows else 0,
+        "entities": data.get("entities", 0),
+        "edges": data.get("edges", 0),
+        "episodes": data.get("episodes", 0),
     }
 
 

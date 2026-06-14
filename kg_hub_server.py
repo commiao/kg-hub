@@ -912,6 +912,114 @@ async def usage_ranking(request: Request) -> JSONResponse:
     })
 
 
+async def stats(request: Request) -> JSONResponse:
+    """GET /api/stats — entity/edge/episode counts (NAS-local read for kg_stats)."""
+    driver = get_status_driver()
+
+    async def c(cypher):
+        rows, _, _ = await driver.execute_query(cypher)
+        return rows
+
+    ent = await c("MATCH (n:Entity) RETURN count(n) AS c")
+    edg = await c("MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) RETURN count(e) AS c")
+    epi = await c("MATCH (n:Episodic) RETURN count(n) AS c")
+    return JSONResponse({
+        "status": "ok",
+        "entities": int(ent[0]["c"]) if ent else 0,
+        "edges": int(edg[0]["c"]) if edg else 0,
+        "episodes": int(epi[0]["c"]) if epi else 0,
+    })
+
+
+async def episode_search(request: Request) -> JSONResponse:
+    """GET /api/episode_search?q=&num_results= — fulltext over Episodic (+ substring fallback)."""
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        return JSONResponse({"status": "error", "message": "missing q"}, status_code=400)
+    try:
+        lim = min(max(int(request.query_params.get("num_results", "5")), 1), 15)
+    except (TypeError, ValueError):
+        lim = 5
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
+            "RETURN node.name AS name, node.content AS content, "
+            "node.source_description AS source, score "
+            f"ORDER BY score DESC LIMIT {lim}",
+            q=q,
+        )
+    except Exception:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.name CONTAINS $q OR n.content CONTAINS $q "
+            "RETURN n.name AS name, n.content AS content, "
+            f"n.source_description AS source, 0.0 AS score LIMIT {lim}",
+            q=q,
+        )
+    results = [{
+        "name": r.get("name"),
+        "source": r.get("source"),
+        "score": r.get("score"),
+        "body_preview": (r.get("content") or "")[:600],
+    } for r in rows]
+    return JSONResponse({"status": "ok", "results": results})
+
+
+async def node_neighbors(request: Request) -> JSONResponse:
+    """GET /api/node_neighbors?name=&limit= — fuzzy-match an Entity, return 1-hop neighbors."""
+    name = (request.query_params.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"status": "error", "message": "missing name"}, status_code=400)
+    try:
+        limit = min(max(int(request.query_params.get("limit", "20")), 1), 100)
+    except (TypeError, ValueError):
+        limit = 20
+    driver = get_status_driver()
+    m, _, _ = await driver.execute_query(
+        "MATCH (n:Entity) WHERE n.name = $name OR n.name CONTAINS $name "
+        "RETURN n.name AS name, labels(n) AS labels LIMIT 1",
+        name=name,
+    )
+    if not m:
+        return JSONResponse({"status": "ok", "matched_node": None, "labels": [], "neighbors": []})
+    matched = m[0]["name"]
+    labels = list(m[0].get("labels") or [])
+    out_rows, _, _ = await driver.execute_query(
+        "MATCH (a:Entity {name: $name})-[e:RELATES_TO]->(b:Entity) "
+        "RETURN b.name AS name, e.name AS edge, e.fact AS fact LIMIT $lim",
+        name=matched, lim=limit,
+    )
+    in_rows, _, _ = await driver.execute_query(
+        "MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity {name: $name}) "
+        "RETURN a.name AS name, e.name AS edge, e.fact AS fact LIMIT $lim",
+        name=matched, lim=limit,
+    )
+    neighbors = ([{**r, "direction": "out"} for r in out_rows]
+                 + [{**r, "direction": "in"} for r in in_rows])
+    return JSONResponse({"status": "ok", "matched_node": matched, "labels": labels,
+                         "neighbors": neighbors})
+
+
+async def path_between(request: Request) -> JSONResponse:
+    """GET /api/path_between?source=&target=&max_hops= — up to 3 paths between two entities."""
+    src = (request.query_params.get("source") or "").strip()
+    tgt = (request.query_params.get("target") or "").strip()
+    if not src or not tgt:
+        return JSONResponse({"status": "error", "message": "missing source/target"}, status_code=400)
+    try:
+        hops = min(max(int(request.query_params.get("max_hops", "4")), 1), 6)
+    except (TypeError, ValueError):
+        hops = 4
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        f"MATCH path = (a:Entity)-[:RELATES_TO*1..{hops}]->(b:Entity) "
+        "WHERE a.name CONTAINS $src AND b.name CONTAINS $tgt "
+        "RETURN [n IN nodes(path) | n.name] AS names LIMIT 3",
+        src=src, tgt=tgt,
+    )
+    return JSONResponse({"status": "ok", "paths": [r["names"] for r in rows if r.get("names")]})
+
+
 # ---------- App ----------
 app = Starlette(
     debug=False,
@@ -923,6 +1031,10 @@ app = Starlette(
         Route("/api/search", search, methods=["GET"]),
         Route("/api/canonical_context", canonical_context, methods=["GET"]),
         Route("/api/usage_ranking", usage_ranking, methods=["GET"]),
+        Route("/api/stats", stats, methods=["GET"]),
+        Route("/api/episode_search", episode_search, methods=["GET"]),
+        Route("/api/node_neighbors", node_neighbors, methods=["GET"]),
+        Route("/api/path_between", path_between, methods=["GET"]),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
 )
