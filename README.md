@@ -27,7 +27,8 @@
 
 | 主题 | 文件 |
 |---|---|
-| 🌐 **全栈架构总览**（kg-hub + claude-mem + cookbook + cc-switch + muxcp） | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| ⚡ **5 分钟速读版**（先看这个建立整体认知） | [`OVERVIEW.md`](OVERVIEW.md) |
+| 🌐 全栈架构总览（kg-hub + claude-mem + cookbook + cc-switch + muxcp 详细版） | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | 架构与已锁决策（kg-hub 内部） | [`DESIGN.md`](DESIGN.md) |
 | 路线图 | [`ROADMAP.md`](ROADMAP.md) |
 | 跨平台 / 跨工具对接手册（kg-hub 客户端） | [`docs/INTEGRATION-GUIDE.md`](docs/INTEGRATION-GUIDE.md) |
