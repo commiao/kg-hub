@@ -1,219 +1,173 @@
-# kg-hub 跨平台 / 跨工具对接手册
+# kg-hub 跨平台 / 跨工具对接手册(实战版)
 
-> 让 **同一个用户** 在 **不同设备(Mac / Windows / Linux)** 和 **不同工具(Claude Code / Cursor / Qoder / Codex / OpenClaw)** 上,都接到 **自己的那一套中央 kg-hub**,实现跨设备、跨工具的统一知识图谱。
+> 让 **同一个用户** 在 **不同设备(Mac / Windows / Linux)** 和 **不同工具(Claude Code / Cursor / Qoder桌面 / Qoder-IDEA插件 / Codex / OpenClaw)** 上,都接到 **自己的那一套中央 kg-hub**。
 >
-> 适用版本:server 含 `/api/canonical_context`(2026-06-12 起);PUSH hook 已 HTTP 化(纯 `urllib`,客户端零额外依赖)。
+> 本手册是 **实测过的步骤 + 踩过的坑**,换设备 / 新用户照着做即可。最后一节有一键自检脚本。
 
 ---
 
-## 0. 先理解三件事
+## 0. 三个核心概念
 
-**① 每个用户一套自己的中央仓库。**
-kg-hub 是「中央知识图谱」服务,跑在一台 **常开** 的机器上(推荐 NAS / 轻量服务器)。每个用户部署 **属于自己的** 一套(自己的 falkordb + server + token)。你所有的设备和工具,都只是 **客户端**,统一指向你自己的 `KG_HUB_URL`。换一个用户 = 换一套 URL + token,数据互不串。
+**① 每用户一套中央仓库。** kg-hub 跑在一台常开机器(NAS / 轻量服务器),每个用户部署自己的一套(自己的 falkordb + server + token)。所有设备/工具都是**客户端**,统一指向你自己的 `KG_HUB_URL`。
 
-**② 对接有三个「面」,按需选用(可叠加):**
+**② 对接有三个「面」,可叠加:**
 
-| 面 | 用途 | 谁用 | 依赖 |
-|---|---|---|---|
-| **HTTP API** | 最通用:检索 / 写入 / 健康检查 | 任何能发 HTTP 的工具、脚本、CI | 无(curl 即可) |
-| **MCP server** | 在 IDE 里直接调用 `kg_search` / `kg_add_episode` 等工具 | Claude Code / Cursor / Qoder / Codex 等支持 MCP 的 | 需克隆仓库 + venv |
-| **PUSH hook** | SessionStart 自动把相关 canonical 内容注入上下文(无需 LLM 记得查) | 支持会话启动 hook 的工具 | 纯 `python3`(stdlib) |
+| 面 | 作用 | 怎么连 |
+|---|---|---|
+| **MCP 读** | 工具里直接调 `kg_search`/`kg_stats`/`kg_add_episode` | **统一经 `muxcp` 网关**(各工具 MCP 配置加一个 muxcp 即可)|
+| **PUSH 注入** | 会话启动自动把相关 canonical 注入上下文 | `kg_push_hook.py --format <tool>`(纯 HTTP,零依赖)|
+| **capture** | 工具的工作 → claude-mem 生成 obs → 同步进图 | 各工具的 claude-mem 钩子/插件 |
 
-**③ 跨设备靠私有网。**
-各设备和中央机用 **Tailscale**(或同类)组到一个私网,`KG_HUB_URL` 填中央机的 tailscale IP(例:`http://100.123.208.32:17171`)。这样无论你在公司、家里还是外网,接的都是同一套图。**绝不把 token 放进 URL query,绝不把服务暴露公网。**
+**③ 重活全在中央机本地,客户端只走一个可容忍的 HTTP 往返。**
+血泪教训:**别让客户端直连 FalkorDB(6379)**——迁移后它只绑中央机 localhost、不对 tailnet 暴露,且 tailscale relay 会抖动。读/写/排名一律走 server 的 HTTP API(`:17171`),server 在本地查 FalkorDB。
 
 ```
-        你的设备(任意 OS / 任意工具)
-   Mac笔记本   Windows台式   Linux服务器
-      │            │             │
-      └──── Tailscale 私网 ───────┘
-                   │  HTTP(:17171, Bearer token)
-                   ▼
-        你的中央 kg-hub(常开 NAS/服务器)
-        falkordb + server + ingester + watchdog
+   各设备/工具 ──MCP(muxcp)/HTTP(:17171, Bearer)──▶ 中央 kg-hub(常开)
+                                                      falkordb(仅localhost) + server + ingester + watchdog
 ```
 
 ---
 
-## 1. 前置:部署你自己的中央仓库(每用户一次)
+## 1. 前置:部署中央仓库(每用户一次)
 
-在常开机器上(NAS / VPS / 一台老电脑):
-
-1. 克隆仓库,`docker compose -p kg-hub up -d`(含 `falkordb` + `kg_hub_server` + `ingester` + `watchdog`)。
-2. 设两个秘密:`FALKORDB_PASSWORD`、`KG_HUB_API_TOKEN`(随机长串)。
-3. 装 Tailscale,记下本机 tailscale IP → 这就是别的设备要填的 `KG_HUB_URL` 主机。
+1. 常开机克隆仓库 → `docker compose -p kg-hub up -d`(falkordb + kg_hub_server + ingester + watchdog)。
+2. 设 `FALKORDB_PASSWORD`、`KG_HUB_API_TOKEN`(随机长串)。
+3. 装 Tailscale;**server 端口经 tailscale 暴露**(本项目用 `127.0.0.1:17171→容器8080`,靠 NAS tailscale userspace 转发 inbound→localhost,所以 tailnet 设备用 `<tailscale-ip>:17171` 可达;falkordb 的 6379 **不**暴露)。
 4. 验证:`curl http://<tailscale-ip>:17171/health` → `{"status":"ok"}`。
 
-> 详细部署/持久化/监控见仓库 `docs/incident-retrospective.md` 的「最终架构」一节。
+> 部署/持久化/监控细节见 `docs/incident-retrospective.md`。
 
 ---
 
-## 2. 通用客户端配置(所有 OS、所有工具的公共第一步)
+## 2. 通用客户端配置(每设备一次)
 
-所有客户端都从一个 env 文件读连接信息。**约定路径:用户主目录下 `.claude-mem/.env`**(与 claude-mem 共用,省一份配置)。
+所有工具共用一份 env:**`~/.claude-mem/.env`**(Windows:`%USERPROFILE%\.claude-mem\.env`)。
 
 ```ini
-# ==== 必填:连接你自己的中央 kg-hub ====
-KG_HUB_URL=http://100.123.208.32:17171      # 你中央机的 tailscale IP:端口
+KG_HUB_URL=http://<tailscale-ip>:17171     # 中央机
 KG_HUB_API_TOKEN=<你的-token>
-
-# ==== 选填:仅当客户端要直连 falkordb(MCP 读)时需要 ====
-KG_HUB_FALKORDB_HOST=100.123.208.32
-KG_HUB_FALKORDB_PORT=6379
-KG_HUB_FALKORDB_PASSWORD=<你的-falkordb-密码>
-
-# ==== 选填:客户端连不上时推飞书告警 ====
-KG_HUB_FEISHU_WEBHOOK=<你的-webhook>
+KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
+# 注:KG_HUB_FALKORDB_* 现在客户端基本不需要(读写都走 HTTP)
 ```
 
-| OS | env 文件路径 |
-|---|---|
-| macOS / Linux | `~/.claude-mem/.env` |
-| Windows | `%USERPROFILE%\.claude-mem\.env`(即 `C:\Users\<你>\.claude-mem\.env`) |
-
-> **推荐对接顺序**:先 HTTP(验证连通)→ 再挂 PUSH hook(自动注入,性价比最高)→ 需要交互式图查询再加 MCP。
+**muxcp 网关**(各工具 MCP 都连它):确认 `~/.config/muxcp/run-muxcp.sh` 存在且其上游含 `kg_hub`(指向本机 `mcp_server.py`,纯 HTTP 客户端)。
 
 ---
 
-## 3. 按操作系统的差异
+## 3. 按工具对接(实测步骤)
 
-绝大多数差异只是 **路径** 和 **定时器**。命令逻辑一致。
+> 共性:**MCP** = 在该工具 MCP 配置加 `muxcp`;**PUSH/capture** = 各工具机制不同,见下。
 
-### macOS
-- env:`~/.claude-mem/.env`;python:系统 `python3` 即可(PUSH hook 纯 stdlib)。
-- 定时(如同步本机 claude-mem.db 到中央):`launchd`(`~/Library/LaunchAgents/*.plist`,`StartInterval`)。
-- 传文件到群晖 NAS:**用 `cat | ssh "cat > tmp && mv -f tmp dst"` 管道,别用 scp**(macOS 新版 scp 走 SFTP,群晖 sshd 默认未开 → `subsystem request failed`)。
-
-### Linux
-- env:`~/.claude-mem/.env`;python:`python3`。
-- 定时:`systemd --user` timer 或 `crontab -e`。
-- 传文件:`scp`/`rsync` 一般可用;目标是群晖时同样建议 `cat|ssh` 管道。
-
-### Windows
-- env:`%USERPROFILE%\.claude-mem\.env`;python:`py -3` 或 `python`(装官方 Python,勾选 PATH)。
-- 路径用反斜杠或加引号;hook 命令里写绝对路径 `C:\...\python.exe C:\...\kg_push_hook.py --format <tool>`。
-- 定时:任务计划程序(Task Scheduler)。
-- 传文件:WSL 里用 `cat|ssh`;或直接走 HTTP `/api/ingest` 免文件传输。
-- 连通性:`curl.exe`(Win10+ 自带)或 PowerShell `Invoke-RestMethod`。
-
----
-
-## 4. 按工具对接
-
-> 每个工具最多三步:**① 填 env(见 §2)→ ② 挂 MCP(可选)→ ③ 挂 PUSH hook(可选,强烈推荐)**。
-
-### 4.1 Claude Code(Mac / Win / Linux)
-
-**MCP**(在 `~/.claude/settings.json`,Windows 在 `%USERPROFILE%\.claude\settings.json`):
-```json
-{
-  "mcpServers": {
-    "kg-hub": {
-      "command": "/path/kg-hub/.venv/bin/python",
-      "args": ["/path/kg-hub/mcp_server.py"]
-    }
-  }
-}
-```
-> Windows 把 command 换成 venv 里的 `python.exe`,args 用 Windows 路径。MCP 暴露 `kg_search / kg_episode_search / kg_node_neighbors / kg_path_between / kg_stats / kg_add_episode`。
-
-**PUSH hook**(同一 `settings.json` 的 `hooks`):
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "matcher": "startup|resume",
-        "hooks": [ { "type": "command", "timeout": 10,
-          "command": "python3 /path/kg-hub/tools/kg_push_hook.py --format claude" } ] }
-    ]
-  }
-}
-```
-
-### 4.2 Cursor
-
-**MCP**(`~/.cursor/mcp.json`):同 §4.1 的 `mcpServers.kg-hub` 写法。
-
-**PUSH hook**:Cursor 的 `beforeSubmitPrompt` 不消费 hook stdout,真正注入机制是 **写规则文件**。PUSH hook 用 `--format cursor` 运行时,会把 canonical 内容写到当前工程的 `<cwd>/.cursor/rules/kg-hub-canonical.mdc`(`alwaysApply: true`),Cursor 每轮自动加载。触发方式:让 claude-mem 的 cursor 适配器或一个轻量 wrapper 在会话开始时跑:
-```bash
-python3 /path/kg-hub/tools/kg_push_hook.py --format cursor
-```
-
-### 4.3 Qoder
-
-Qoder 是支持 MCP 的 AI IDE,按 **「MCP + 规则文件」** 套路接(同 Cursor 思路):
-- **MCP**:在 Qoder 的 MCP 配置里加 `kg-hub` server(command/args 同 §4.1)。
-- **自动注入**:若 Qoder 支持工程级 always-apply 规则文件,用 `--format cursor` 产出的 `.mdc`,或直接 `--format text` 把内容写进 Qoder 的规则/记忆文件。
-- **兜底**:无论是否支持 hook,都能用 §5 的 HTTP API 在对话里手动检索。
-
-### 4.4 Codex CLI
-
-- **MCP**(`~/.codex/config.toml`):
-  ```toml
-  [mcp_servers.kg-hub]
-  command = "/path/kg-hub/.venv/bin/python"
-  args = ["/path/kg-hub/mcp_server.py"]
+### 3.1 Claude Code ✅
+- **MCP**:启动参数/`~/.claude.json` 里带 `muxcp`(本项目已是)。
+- **PUSH**:`~/.claude/settings.json`
+  ```json
+  "hooks": { "SessionStart": [ { "matcher": "startup|resume", "hooks": [
+    { "type":"command","timeout":10,
+      "command":"<venv>/bin/python /path/kg-hub/tools/kg_push_hook.py --format claude" } ] } ] }
   ```
-- **PUSH hook**:仓库已备 `plugin/hooks/codex-hooks.json`(`SessionStart` → `kg_push_hook.py --format codex`)。Codex 通过 **plugin/marketplace** 机制加载 hook,需把 kg-hub 注册为本地插件(详见 `docs/codex-push-integration.md`)。MCP 多上游聚合/发现性问题见 `docs/muxcp-resolution-and-install.md`。
+- **capture**:claude-mem 插件(`enabledPlugins: {"claude-mem@thedotmack": true}`);如长期没产 obs,跑 `npx claude-mem@latest install` 重建 runtime。
 
-### 4.5 OpenClaw
+### 3.2 Cursor ✅
+- **MCP**:`~/.cursor/mcp.json` 加 `muxcp`。
+- **PUSH + capture**:`<工程>/.cursor/hooks.json` 的 `beforeSubmitPrompt` 里挂两类——
+  - claude-mem 的 `hook cursor session-init/observation/...`(capture,写规则文件机制);
+  - `kg_push_hook.py --format cursor`(注入,写 `.cursor/rules/kg-hub-canonical.mdc`,`alwaysApply:true`)。
 
-OpenClaw 不是 IDE,是「胶囊」知识系统,走 **写入** 路径:
-- 把胶囊(`capsule-*.md` / `CAPSULE-*.md`,≥1500B)放进中央机的摄入源目录,或直接 `POST /api/ingest`。
-- 中央机的 `ingester` 循环按命名约定 + 水位线去重,自动把新胶囊抽取入图(LLM 在中央机跑,客户端只传小文件)。
-- 跨设备:各设备的 OpenClaw 胶囊定期同步到中央机(`cat|ssh` 管道或 HTTP ingest)即可。详见 `docs/openclaw-push-integration.md`。
+### 3.3 Qoder(桌面版 + IDEA 插件)✅
+**两个 Qoder 共用同一后端** `~/.qoder/shared_client`,都读 `~/.qoder/settings.json`。配一次,两者通用。
+- **MCP**:`~/.qoder/mcp.json` 加 `muxcp`(本项目已是)。
+- **PUSH + capture**:`~/.qoder/settings.json` 的 `hooks`(Claude-Code 式:`SessionStart`/`UserPromptSubmit`/`PostToolUse`/`Stop`):
+  - claude-mem 捕获钩子 **经 wrapper 调用** `tools/qoder_cm_hook.sh <mode>`(见下"坑3");
+  - `SessionStart` 追加一组(**不设 matcher = match-all**)跑 `kg_push_hook.py --format claude`(Qoder 的 SessionStart source 值和 Claude Code 不同,matcher 写死会不触发)。
+- ⚠️ **改完必须重启 Qoder 后端 daemon 才生效**(见"坑1")。
+
+### 3.4 Codex ✅
+- **MCP**:`~/.codex/config.toml` 的 `[mcp_servers.muxcp]`(本项目已是)。
+- **PUSH**:Codex 无 Claude-Code 式 SessionStart 命令钩子 → 走 **pull**:在 `~/.codex/AGENTS.md` 加一段"会话开始用 muxcp 的 kg_hub 工具按项目名拉 canonical 上下文"。
+- **capture**:用 **Codex 官方 CLI** 装 claude-mem 插件(钩子会自动解析到最新 13.6.0,安全):
+  ```bash
+  CX=/Applications/Codex.app/Contents/Resources/codex
+  "$CX" plugin marketplace add ~/.claude/plugins/marketplaces/thedotmack   # 注册(双格式 marketplace)
+  "$CX" plugin add claude-mem@claude-mem-local                              # installed, enabled, 13.6.0
+  ```
+  ⚠️ **不要**手动启用磁盘上缓存的 13.2.0(那是 #2188 烧 CPU 的版本)。
+
+### 3.5 OpenClaw
+胶囊系统,走写入:把 `capsule-*.md`/`CAPSULE-*.md`(≥1500B)同步到中央机摄入源目录(或 `POST /api/ingest`),ingester 自动按命名+水位线去重摄入。
+
+---
+
+## 4. ⚠️ 实战踩过的坑(换设备/重连必看)
+
+**坑1:Qoder 改了 `settings.json` 不生效。** Qoder(含 IDEA 插件)的后端 `~/.qoder/shared_client/.../Qoder` 是**常驻 daemon**,只在 daemon 启动时读配置;关标签/新会话/Cmd+Q 都不一定重启它。改完要**结束该 daemon 进程**(`pkill -f '.qoder/shared_client/bin'`),它会在下次用 Qoder 时带新配置重生。
+
+**坑2:`project` 被标成插件版本号(如 `13.6.0`)。** claude-mem 推导 project 是 `GEMINI_* ?? CLAUDE_PROJECT_DIR ?? process.cwd()`;某些工具(Qoder IDEA)调钩子时 cwd 落在插件目录 → 兜底成版本号。**修法**:用 `tools/qoder_cm_hook.sh` 包一层,从 `QODER_PROJECT_DIR`/payload.cwd 取真实项目 → 设 `CLAUDE_PROJECT_DIR`。
+
+**坑3:claude-mem 钩子要用稳定路径。** 钩子命令应解析 `~/.claude/plugins/marketplaces/thedotmack/plugin`(版本无关的 marketplace 路径)或 cache 里**最新**版本,别写死某版本目录(否则升级即断)。
+
+**坑4:Mac→群晖 传文件 `subsystem request failed`。** 新版 `scp` 走 SFTP,群晖 sshd 默认没开 → 改 `cat | ssh "cat>tmp && mv -f tmp dst"` 管道。
+
+**坑5:客户端直连 FalkorDB 偶发超时。** falkordb 只绑中央机 localhost(6379 不对 tailnet 暴露)+ relay 抖动。**所有读/写/排名走 HTTP `:17171`**;MCP server 也已改纯 HTTP(不再 import graphiti/连 falkordb)。
+
+**坑6:claude-mem worker 空转烧 CPU(#2188)。** bun-runner 收空 stdin 会死循环。已用 `tools/claude_mem_guard.sh` + launchd 兜底(累计 CPU>120s 的 claude-mem hook 进程自动清+告警)。换设备记得也装这个守护。
+
+**坑7:claude-mem 不产新 obs。** 多半是 runtime 没装好 / 找不到 `claude` 可执行文件 → `~/.claude-mem/settings.json` 设 `CLAUDE_CODE_PATH`,并 `npx claude-mem@latest install` 重建 + 重启 worker。
 
 ---
 
 ## 5. HTTP API 速查(任意工具/脚本通用)
 
-所有请求带 `Authorization: Bearer $KG_HUB_API_TOKEN`(`/health` 除外)。
+带 `Authorization: Bearer $KG_HUB_API_TOKEN`(`/health` 除外)。
 
 ```bash
-# 健康检查
 curl $KG_HUB_URL/health
-
-# 语义检索(边事实)
-curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/search?q=tailscale&num_results=5"
-
-# 取某工程相关的 canonical 上下文(并自动累计使用量;bump=0 只读不计数)
-curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/canonical_context?kw=kg-hub&top_n=3&bump=0"
-
-# 写入一条 episode(幂等:同 source 不重复)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$KG_HUB_URL/api/ingest" \
-  -d '{"name":"my-note","episode_body":"...正文...","source_description":"manual","source_obs_id":"uniq-1"}'
-
-# 摄入队列健康(监控用)
-curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/queue_stats"
+curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/search?q=关键词&num_results=5"            # 字面子串(快,probe 用)
+curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/search_semantic?q=自然语言问题&num_results=5" # 向量语义(kg_search 走这条)
+curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/canonical_context?kw=<项目名>&top_n=3&bump=1" # 取 canonical + 累计使用量
+curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/stats"                                       # 实体/边/episode 计数
+curl -H "Authorization: Bearer $TOKEN" "$KG_HUB_URL/api/usage_ranking?top_n=10"                      # 调用量排名(有价值胶囊)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$KG_HUB_URL/api/ingest" \
+  -d '{"name":"x","episode_body":"...","source_description":"manual","source_obs_id":"uniq-1","reference_time":"2026-01-01T00:00:00Z"}'
 ```
-> Windows 用 `curl.exe` 或 PowerShell `Invoke-RestMethod -Headers @{Authorization="Bearer $env:TOKEN"}`。
+> server 端点全在 NAS 本地查 FalkorDB;`/api/ingest` 锁竞争会自动退避重试(不丢数据)。
 
 ---
 
-## 6. 同一用户、跨设备 / 跨工具:一致性约定
+## 6. 同一用户跨设备/跨工具:一致性约定
 
-1. **所有设备的 `.env` 指向同一个 `KG_HUB_URL` + 同一个 token** → 全部聚合进你自己的中央图,天然跨设备、跨工具。
-2. **写入两条路**:
-   - 交互产生的工程记忆 → 各设备本机 claude-mem.db,定期同步到中央机由 ingester 摄入;
-   - 主动沉淀 → 直接 `POST /api/ingest`(带稳定的 `source_obs_id` 保证幂等,不会重复)。
-3. **读取统一**:任意工具用 MCP `kg_search` 或 HTTP `/api/search` 都查同一张图。
-4. **安全红线**:token 只放 `.env`(不进 URL query、不写进图);服务只在私网(Tailscale)可达,不暴露公网;客户端绝不直接拿别人的 token。
+1. 所有设备 `.env` 指向**同一个** `KG_HUB_URL` + token → 天然聚合进你自己的中央图。
+2. 写入两条路:交互记忆经 claude-mem→同步→ingester;主动沉淀直接 `POST /api/ingest`(稳定 `source_obs_id` 保证幂等)。
+3. 读取统一:任意工具 `kg_search`(经 muxcp)或 HTTP `/api/search*` 查同一张图。
+4. 安全红线:token 只放 `.env`(不进 URL query、不写进图);服务只在私网可达;客户端不直连别人的图。
 
 ---
 
-## 7. 验证与故障速查
+## 7. 验证与自检
+
+**一键快照**(用完某工具后跑,看哪条链路刚活动):
+```bash
+sh tools/verify_tool_links.sh     # 4工具 × 3链路(MCP/PUSH/capture)现状表
+```
+
+**手动核对信号**(中央机/Mac 终端):
+```bash
+tail -5 data/.push_hook.log                                            # PUSH 注入最近触发(fmt=claude/cursor/...)
+python3 -m tools.usage_ranking | head -20                              # usage_count 排名 + 最近 bump
+sqlite3 ~/.claude-mem/claude-mem.db \
+  "SELECT platform_source,count(*),max(started_at) FROM sdk_sessions GROUP BY platform_source"  # capture:各工具会话
+curl -s -H "Authorization: Bearer $TOKEN" $KG_HUB_URL/api/stats        # 图规模
+```
 
 | 现象 | 排查 |
 |---|---|
-| 连不上 | `tailscale status` 看设备在线;`curl $KG_HUB_URL/health`;token 是否正确 |
-| `/health` 通但工具没反应 | 工具的 hook/MCP 命令里 python 路径、脚本路径是否绝对且存在 |
-| PUSH 没注入 | 跑 `python3 tools/kg_push_hook.py --probe` 看是否有候选;确认该 python 能读到 `.env`(`KG_HUB_URL`/`KG_HUB_API_TOKEN`) |
-| 传文件到群晖失败 `subsystem request failed` | 群晖未开 SFTP,改用 `cat \| ssh "cat>tmp && mv -f tmp dst"` 管道,或改走 HTTP ingest |
-| 直连 falkordb 偶发慢/超时 | tailscale relay 抖动;**优先走 HTTP**(读写都收敛到中央机本地),少用客户端直连 falkordb |
-| usage_count 不涨 | 确认走的是 `/api/canonical_context?bump=1`(服务端自增),不是客户端直连写 |
+| 工具调 kg_* 无返回 | `tailscale status`;`curl $KG_HUB_URL/health`;muxcp 是否在该工具 MCP 配置里 |
+| PUSH 没注入 | `python3 tools/kg_push_hook.py --probe`;确认跑它的 python 能读到 `.env` |
+| capture 无新会话 | 看坑1(Qoder 重启 daemon)/坑6/坑7;`sdk_sessions` 是否有该工具平台的新行 |
+| project 标成版本号 | 坑2(wrapper 设 `CLAUDE_PROJECT_DIR`)|
+| 传文件群晖失败 | 坑4(`cat\|ssh` 管道)|
 
 ---
 
-### 一句话总结
-> **一套中央仓库(每用户)+ 一份 `.env`(每设备)+ 三个对接面(HTTP / MCP / PUSH,按需)**。跨设备跨工具,接的都是你自己那张图;所有跨网络的重活(检索、写入、计数)都收敛在中央机本地,客户端只留一个可容忍的 HTTP 往返。
+### 一句话
+> **一套中央仓库(每用户)+ 一份 `.env`(每设备)+ muxcp 统一 MCP + 各工具按机制挂 PUSH/capture**;跨网络重活全收敛到中央机,客户端只留一个可容忍的 HTTP 往返。换设备照本手册 §2→§3→§7 走一遍即可。
