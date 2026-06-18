@@ -54,36 +54,47 @@ GROUP_ID = "kg_hub"
 # `name` is the episode's stable identifier (used for graphiti dedup).
 # `desc` shows up in queries via source_description, so make it clear
 # this is canonical, not session noise.
+# `scope` is the PUSH-hook routing prior (kg_hub_server.CANONICAL_SCOPE mirror):
+#   "global"        → eligible in every session / tool / device (the commons)
+#   "project:<kw>"  → only injected when cwd keyword matches that project
+# Persisted onto the Episodic node so the server reads it from the graph; the
+# server keeps a built-in fallback for docs not (re-)ingested through here yet.
 CANONICAL_DOCS = [
     {
         "path": "DESIGN.md",
         "name": "kg-hub-canonical-DESIGN",
         "desc": "kg-hub-canonical: DESIGN.md — locked architecture decisions and project motivation",
+        "scope": "project:kg-hub",
     },
     {
         "path": "ROADMAP.md",
         "name": "kg-hub-canonical-ROADMAP",
         "desc": "kg-hub-canonical: ROADMAP.md — 4-phase roadmap with gates",
+        "scope": "project:kg-hub",
     },
     {
         "path": "docs/PHASE-3-REPORT.md",
         "name": "kg-hub-canonical-PHASE-3-REPORT",
         "desc": "kg-hub-canonical: PHASE-3-REPORT.md — phase 3 delivery report",
+        "scope": "project:kg-hub",
     },
     {
         "path": "docs/OBSERVATION-PHASE.md",
         "name": "kg-hub-canonical-OBSERVATION-PHASE",
         "desc": "kg-hub-canonical: OBSERVATION-PHASE.md — ingest filter shadow-phase guide",
+        "scope": "project:kg-hub",
     },
     {
         "path": "docs/ONBOARDING.md",
         "name": "kg-hub-canonical-ONBOARDING",
         "desc": "kg-hub-canonical: ONBOARDING.md — self-service integration guide for new sources",
+        "scope": "global",
     },
     {
         "path": "docs/AGENT-TOOL-DISCOVERY.md",
         "name": "kg-hub-canonical-AGENT-TOOL-DISCOVERY",
         "desc": "kg-hub-canonical: AGENT-TOOL-DISCOVERY.md — meta rule for agent self-awareness, MCP vs Skill 双轨 (2026-06-14 lesson)",
+        "scope": "global",
     },
 ]
 
@@ -106,6 +117,42 @@ def save_watermark(wm: dict[str, dict]) -> None:
 def doc_reference_time(path: Path) -> datetime:
     """Use file mtime — matches openclaw_capsule.py convention."""
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+
+async def read_capsule_meta(g, name: str) -> dict:
+    """Best-effort: read usage_count / last_used_at off an existing capsule node
+    BEFORE re-ingest, so we can restore them afterward. add_episode rebuilds the
+    Episodic node and would otherwise zero the PUSH-hook Lindy signal (the cause
+    of the 2026-06-14 usage_count reset). Returns {} on any failure."""
+    try:
+        r, _, _ = await g.driver.execute_query(
+            "MATCH (n:Episodic {name: $name}) "
+            "RETURN coalesce(n.usage_count, 0) AS uc, n.last_used_at AS last",
+            name=name,
+        )
+        if r:
+            return {"usage_count": int(r[0].get("uc") or 0), "last_used_at": r[0].get("last")}
+    except Exception as exc:  # noqa: BLE001
+        print(f"      [meta] read skipped for {name}: {type(exc).__name__}: {exc}")
+    return {}
+
+
+async def persist_capsule_meta(g, name: str, scope: str, prev: dict) -> None:
+    """Best-effort: stamp scope and restore the preserved usage_count /
+    last_used_at after re-ingest. Guarded so it can never fail the ingest."""
+    try:
+        await g.driver.execute_query(
+            "MATCH (n:Episodic {name: $name}) "
+            "SET n.scope = $scope, "
+            "    n.usage_count = $uc, "
+            "    n.last_used_at = coalesce($last, n.last_used_at)",
+            name=name,
+            scope=scope,
+            uc=prev.get("usage_count", 0),
+            last=prev.get("last_used_at"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"      [meta] persist skipped for {name}: {type(exc).__name__}: {exc}")
 
 
 async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
@@ -182,7 +229,9 @@ async def _do_main(args) -> int:
         size_kb = path.stat().st_size / 1024
         print(f"  [{i}/{len(todo)}] {doc['name']}  ({size_kb:.1f} KB)  — extracting...")
         try:
+            prev_meta = await read_capsule_meta(g, doc["name"])
             n, e = await ingest_one(g, doc, REPO_ROOT)
+            await persist_capsule_meta(g, doc["name"], doc.get("scope", "global"), prev_meta)
             total_n += n
             total_e += e
             wm[doc["name"]] = {

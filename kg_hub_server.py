@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import uuid as uuidlib
@@ -725,6 +726,39 @@ async def search(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "query": query, "mode": "falkordb_text", "results": results})
 
 
+# ---------------------------------------------------------------------------
+# Canonical capsule ranking config (DESIGN: PUSH-hook relevance, not coincidence)
+#
+# Scope is a SOFT routing prior, not a hard partition — the cross-tool/-device/
+# -session commons stays a single pool. A capsule is eligible in a session if it
+# is `global` (relevant everywhere), mentions the cwd keyword, or is explicitly
+# scoped to that project. `global` capsules compete in EVERY session; that is
+# what preserves公共性 (cross-* sharing). usage_count is used ONLY inverted, as
+# a bounded exploration term, so popular capsules can't crowd out the long tail
+# (anti rich-get-richer).
+#
+# CANONICAL_SCOPE is a built-in fallback so scoping works with ZERO DB migration
+# (FalkorDB is NAS-localhost-only; no remote write path). A node's own `n.scope`
+# property, once set by tools/ingest_canonical_docs.py, takes precedence.
+DEFAULT_SCOPE = "global"
+SCOPE_MATCH_BONUS = 0.5      # capsule scoped to the current project
+SCOPE_OTHER_PENALTY = -0.3   # capsule scoped to a *different* project (soft, not excluded)
+EXPLORE_C = 1.0              # UCB exploration coefficient (bounded to 1 reserved slot)
+CANONICAL_SCOPE = {
+    # kg-hub internal docs — only inject when actually working on kg-hub
+    "kg-hub-canonical-DESIGN": "project:kg-hub",
+    "kg-hub-canonical-ROADMAP": "project:kg-hub",
+    "kg-hub-canonical-PHASE-3-REPORT": "project:kg-hub",
+    "kg-hub-canonical-OBSERVATION-PHASE": "project:kg-hub",
+    "kg-hub-canonical-INCIDENT-RETRO": "project:kg-hub",
+    "kg-hub-canonical-NOTIFICATION": "project:kg-hub",
+    # cross-tool / cross-device commons — relevant in any session, any tool
+    "kg-hub-canonical-ONBOARDING": "global",
+    "kg-hub-canonical-INTEGRATION-GUIDE": "global",
+    "kg-hub-canonical-AGENT-TOOL-DISCOVERY": "global",
+}
+
+
 async def canonical_context(request: Request) -> JSONResponse:
     """GET /api/canonical_context?kw=<keyword>&top_n=3&bump=1
 
@@ -756,28 +790,65 @@ async def canonical_context(request: Request) -> JSONResponse:
     rows: list[dict] = []
     seen: set[str] = set()
 
-    # Pass 1: canonical nodes whose content CONTAINS the keyword (curated,
-    # high-trust → forced top score so they beat fulltext score).
+    # Pass 1: rank the canonical capsule set by real relevance + scope prior,
+    # with a single bounded exploration slot. Replaces the old flat score=100,
+    # which made every canonical a tie broken by insertion order + top_n cut —
+    # i.e. selection-by-coincidence (see capsule-usage-audit-2026-06-18).
+    proj_scope = f"project:{kw}"
+    kw_lc = kw.lower()
+    cand: list[dict] = []
     try:
         r1, _, _ = await driver.execute_query(
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
-            "AND n.content CONTAINS $kw "
             "RETURN n.name AS name, n.content AS content, "
-            "       n.source_description AS source",
-            kw=kw,
+            "       n.source_description AS source, "
+            "       coalesce(n.usage_count, 0) AS uc, n.scope AS scope",
         )
         for row in r1:
             nm = row.get("name")
-            rows.append({
+            content = row.get("content") or ""
+            scope = row.get("scope") or CANONICAL_SCOPE.get(nm, DEFAULT_SCOPE)
+            hits = content.lower().count(kw_lc)
+            # Eligibility: global (everywhere) OR mentions cwd OR this project.
+            if not (scope == "global" or hits > 0 or scope == proj_scope):
+                continue
+            if scope == proj_scope:
+                bonus = SCOPE_MATCH_BONUS
+            elif scope.startswith("project:"):
+                bonus = SCOPE_OTHER_PENALTY
+            else:  # global
+                bonus = 0.0
+            cand.append({
                 "name": nm,
-                "content": (row.get("content") or "")[:EXCERPT_CAP],
+                "content": content[:EXCERPT_CAP],
                 "source": row.get("source") or "",
-                "score": 100.0,
                 "is_canonical": True,
+                "uc": int(row.get("uc") or 0),
+                "relscore": math.log1p(hits) + bonus,
             })
             seen.add(nm)
     except Exception as exc:
-        logger.warning("[canonical_context] pass1 failed for kw=%r: %s", kw, exc)
+        logger.warning("[canonical_context] canonical pass failed for kw=%r: %s", kw, exc)
+
+    # Select: relevance fills all but the last slot; the final slot is reserved
+    # for the most under-exposed eligible capsule (deterministic UCB) so the
+    # long tail and newly-added capsules can't be permanently starved.
+    # Primary: relevance. Tie-break: lower usage first, so equally-relevant
+    # capsules rotate through the relevance slots too (not just the explore
+    # slot) — otherwise an incumbent with high usage keeps an arbitrary tie.
+    cand.sort(key=lambda r: (-r["relscore"], r["uc"]))
+    if len(cand) > top_n and top_n >= 2:
+        picked_canon = cand[:top_n - 1]
+        rest = cand[top_n - 1:]
+        T = sum(c["uc"] for c in cand) + 1
+        picked_canon.append(
+            max(rest, key=lambda r: EXPLORE_C * math.sqrt(math.log(T + 1) / (r["uc"] + 1)))
+        )
+    else:
+        picked_canon = cand[:top_n]
+    for c in picked_canon:
+        c["score"] = round(c["relscore"], 3)  # display/back-compat field
+    rows.extend(picked_canon)
 
     # Pass 2: general fulltext over Episodic to fill remaining slots.
     if len(rows) < top_n:
@@ -804,8 +875,9 @@ async def canonical_context(request: Request) -> JSONResponse:
         except Exception as exc:
             logger.warning("[canonical_context] pass2 failed for q=%r: %s", kw, exc)
 
-    # rank_and_pick: canonical first (by score), then others (by score).
-    canonical = sorted([r for r in rows if r["is_canonical"]], key=lambda r: -r["score"])
+    # rank_and_pick: canonical first (already relevance-ranked + exploration-
+    # padded above, so keep that order), then fulltext others by score.
+    canonical = [r for r in rows if r["is_canonical"]]
     others = sorted([r for r in rows if not r["is_canonical"]], key=lambda r: -r["score"])
     picked = canonical[:top_n]
     if len(picked) < top_n:
