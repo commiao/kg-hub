@@ -138,28 +138,34 @@ def match_session(inj: dict, by_proj: dict[str, list[dict]]) -> dict | None:
     return best
 
 
-def fetch_capsule_texts() -> dict[str, str]:
+def _get_json(path: str, timeout_seq=(15, 25, 35)) -> dict:
+    """GET kg-hub JSON with escalating timeouts — the NAS server is occasionally
+    cold/slow (see .push_hook.log timeouts), so a single 15s try drops valid data."""
+    import time as _time
     base = (os.environ.get("KG_HUB_URL") or "http://127.0.0.1:8080").rstrip("/")
     tok = os.environ.get("KG_HUB_API_TOKEN") or ""
     req = urllib.request.Request(
-        f"{base}/api/canonical_context?kw=kg-hub&top_n=20&bump=0",
-        headers={"Authorization": f"Bearer {tok}"} if tok else {},
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        d = json.loads(r.read())
+        f"{base}{path}", headers={"Authorization": f"Bearer {tok}"} if tok else {})
+    last = None
+    for i, t in enumerate(timeout_seq):
+        try:
+            with urllib.request.urlopen(req, timeout=t) as r:
+                return json.loads(r.read())
+        except Exception as exc:
+            last = exc
+            if i < len(timeout_seq) - 1:
+                _time.sleep(1.0)
+    raise last
+
+
+def fetch_capsule_texts() -> dict[str, str]:
+    d = _get_json("/api/canonical_context?kw=kg-hub&top_n=20&bump=0")
     return {x["name"]: (x["content"] or "") for x in d.get("picked", [])
             if x["name"].startswith("kg-hub-canonical-")}
 
 
 def fetch_usage() -> dict[str, int]:
-    base = (os.environ.get("KG_HUB_URL") or "http://127.0.0.1:8080").rstrip("/")
-    tok = os.environ.get("KG_HUB_API_TOKEN") or ""
-    req = urllib.request.Request(
-        f"{base}/api/usage_ranking?top_n=50",
-        headers={"Authorization": f"Bearer {tok}"} if tok else {},
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        d = json.loads(r.read())
+    d = _get_json("/api/usage_ranking?top_n=50")
     uc = {x["name"]: int(x["usage_count"]) for x in d.get("top_canonical", [])}
     for x in d.get("demote", []):
         uc.setdefault(x["name"], 0)
