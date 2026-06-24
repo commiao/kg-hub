@@ -206,3 +206,33 @@ reward = 1   若 outcome=成功 且 attribution=有
 - ⏳ Step 3：按上面方案 1 接入排序（写端点 + 排序读）。**待决策后做。**
 - ⏳ Step 4：护栏（探索地板已在排序里；周期抽审待加）。
 - 🔄 过渡：每日 cron（`com.kg-hub.self-evolve-update`）跑更新通路**攒真实得分**，等样本够了再接排序。当前排序仍用「相关性+探索」。
+
+---
+
+## 10. 连接架构修正（2026-06-24，**否决 session_id，改中心·项目级聚合**）
+
+### 背景：本地·会话级连接被否决
+实跑发现本地管道几乎产不出可判分事件（最近 42 次注入 34 次对不上会话）。曾考虑「在注入日志记 session_id，结算按 session_id 精确 join」——**已否决**。
+
+**否决理由（通用性）**：`session_id` 只活在单个工具的单次会话里，不同工具（Claude Code / Cursor / Codex / Qoder）格式各异、有的根本不暴露给 hook，且本质本地、易逝。拿它当连接键，等于把**跨设备/跨工具的公共系统**降级成单会话维度——与「按 cwd 硬分桶」同类错误，丢通用性。
+
+### 修正后的连接：中心·项目级，不碰 session
+**只有 `project`(cwd) + 时间在所有工具/设备上都存在**，且所有工具的 observations 本来就汇进 NAS 的图。所以连接上移到中心、按 `(胶囊, project)` 聚合：
+
+1. **服务端记录每次注入事件**（root fix）：PUSH hook 的 `bump=1` 请求已带 `kw`(=project) + 选中胶囊名——服务端正是靠它 `usage_count +1`。在那里**顺手把注入记成一条中心事件**（project、时间、胶囊名）。天然跨设备/跨工具，**无 session_id、不轮转、不依赖本地 `.push_hook.log`**。
+2. **attribution / outcome 在中心按 `(胶囊, project, 时间窗)` 聚合**，对图里已汇总的 obs：
+   - 不再要求「每次注入 1:1 对上一个 session」；注入数从注入事件聚合，参与/成功从该 project 的 obs 聚合，**两边各自统计、无需配对**。
+   - 那批「对不上 session」的注入（快速提问、无 obs 产出）自然落成「有曝光、无参与」——是**有意义的信号，不是丢失**。
+3. **学习单位本就是 `(胶囊, 场景/project)`，不是 `(胶囊, session)`** ——所以聚合级 attribution 与得分粒度天然一致，session 从头到尾都不该是单位。
+4. 这条路正好接上 **Tier-4 总体 A/B**（探索槽随机注入/不注入 → 比较 project 工作产出 lift），是最接近因果又完全 tool/device 无关的判分方式。
+
+### 对前文的影响
+- **§8 方案 1 修正**：不再「本地用 `.push_hook.log` + claude-mem.db 算分再推增量」，而是**注入事件 + 聚合判分都在服务端中心完成**（本地 hook 只负责触发 bump，已天然上报）。本地 `engagement_audit.py` / `self_evolve_update.py` 降为离线分析/原型工具。
+- **§4 attribution 不变**（术语重合的逻辑照用），只是**改在中心、按 project 聚合**跑，而非本地按 session。
+- **不变的硬骨头**：outcome 的诚实度仍是天花板（CONTRIBUTION-SIGNAL.md），换什么连接键都绕不开。
+
+### 修正后的落地顺序
+1. **服务端注入事件记录**：在 `canonical_context` 的 bump 处，多写一条 `(project, ts, capsules)` 到中心（图节点或旁路表）。
+2. **中心聚合判分**：按 `(胶囊, project, 窗)` 统计 曝光 / 参与(术语重合) / outcome → 更新 `(胶囊, project)` 得分。
+3. **排序读得分**（§8 方案1 的读侧不变）。
+4. 护栏 + 抽审。
