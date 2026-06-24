@@ -56,6 +56,16 @@ class ScoreStore:
         e = self._entry(capsule, scenario)
         e["exposures"] += 1
 
+    def seen(self, token: str) -> bool:
+        """Has this (session,capsule,scenario) update already been folded in?
+        Makes the update pass idempotent across overlapping reruns / daily cron."""
+        return token in self.data.get("__processed__", [])
+
+    def mark(self, token: str) -> None:
+        self.data.setdefault("__processed__", [])
+        if token not in self.data["__processed__"]:
+            self.data["__processed__"].append(token)
+
     def update(self, capsule: str, scenario: str, reward: float | None) -> None:
         """Fold one reward in [0,1] into the bucket. reward=None → abstain (no-op)."""
         if reward is None:
@@ -84,7 +94,10 @@ class ScoreStore:
         L = ["| 胶囊 | 场景 | 曝光 | 评判数 n | 奖励均值 | 后验均值 |",
              "|---|---|---|---|---|---|"]
         for key, e in sorted(self.data.items(),
-                             key=lambda kv: -(kv[1].get("exposures", 0))):
+                             key=lambda kv: -(kv[1].get("exposures", 0)
+                                              if isinstance(kv[1], dict) else 0)):
+            if key.startswith("__") or not isinstance(e, dict) or _SEP not in key:
+                continue
             cap, scen = key.split(_SEP)
             rmean = (e["reward_sum"] / e["n"]) if e["n"] else 0.0
             a, b = 1.0 + e["reward_sum"], 1.0 + (e["n"] - e["reward_sum"])
