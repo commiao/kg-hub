@@ -1389,7 +1389,13 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
 .row{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
 .bdg{font-size:11px;padding:1px 7px;border-radius:8px;flex:none;height:fit-content;background:color-mix(in srgb,CanvasText 10%,transparent)}
-.sn{flex:1;font-size:13px}.meta{color:GrayText;font-size:12px;margin-top:2px}.ts{color:GrayText;font-size:12px}</style></head><body>
+.sn{flex:1;font-size:13px}.meta{color:GrayText;font-size:12px;margin-top:2px}.ts{color:GrayText;font-size:12px}
+details{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}details .row{border-bottom:none}
+summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}
+summary:hover{background:color-mix(in srgb,CanvasText 5%,transparent)}
+.chev{color:GrayText;transition:transform .15s;flex:none;align-self:center}details[open] .chev{transform:rotate(90deg)}
+.src{font-size:11px;color:GrayText;margin:.2rem 0;word-break:break-all}
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin:.2rem 0 .7rem;max-height:440px;overflow:auto}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>知识库速览</h1>
 <div class=cards id=cards></div>
 <form method=get action="/dashboard/knowledge" style="display:flex;gap:8px;margin:1rem 0 .3rem">
@@ -1402,7 +1408,8 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 document.getElementById('cards').innerHTML='<div class=mc><div class=l>Episode 知识条目</div><div class=v>'+s.episodes+'</div></div><div class=mc><div class=l>实体 Entity</div><div class=v>'+s.entities+'</div></div><div class=mc><div class=l>关系 Edge</div><div class=v>'+s.edges+'</div></div>';
 document.getElementById('q').value=D.q||'';
 document.getElementById('lbl').textContent=D.q?('搜索结果："'+D.q+'" · '+D.items.length+' 条'):'最近知识 · 最新 observation（全图，非 canonical 胶囊）';
-document.getElementById('items').innerHTML=D.items.map(function(r){return '<div class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div></div>';}).join('')||'<div class=ts>'+(D.q?'无匹配':'暂无')+'</div>';
+document.getElementById('items').innerHTML=D.items.map(function(r,i){return '<details data-i="'+i+'"><summary class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>'+(D.q?'无匹配':'暂无')+'</div>';
+Array.prototype.forEach.call(document.querySelectorAll('#items details'),function(d){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var it=D.items[+d.dataset.i];d.querySelector('.src').textContent=(it.name||'')+(it.source?('  ·  '+it.source):'');d.querySelector('.dtl').textContent=it.detail||'(无内容)';d.dataset.done='1';}});});
 </script></body></html>"""
 
 
@@ -1427,21 +1434,21 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
             try:  # fulltext first (good for English / multi-word)
                 rows = await one(
                     "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
-                    "RETURN substring(coalesce(node.content,''),0,220) AS snippet, "
-                    "node.source_description AS source, node.created_at AS created "
+                    "RETURN substring(coalesce(node.content,''),0,4000) AS detail, "
+                    "node.name AS name, node.source_description AS source, node.created_at AS created "
                     "ORDER BY score DESC LIMIT 30", q=q)
             except Exception:
                 rows = []
             if not rows:  # substring fallback (handles Chinese / no fulltext hit)
                 rows = await one(
                     "MATCH (n:Episodic) WHERE n.content CONTAINS $q OR n.name CONTAINS $q "
-                    "RETURN substring(coalesce(n.content,''),0,220) AS snippet, "
-                    "n.source_description AS source, n.created_at AS created LIMIT 30", q=q)
+                    "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
+                    "n.name AS name, n.source_description AS source, n.created_at AS created LIMIT 30", q=q)
         else:  # no query → recent knowledge
             rows = await one(
                 "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
-                "RETURN substring(coalesce(n.content,''),0,180) AS snippet, "
-                "n.source_description AS source, n.created_at AS created "
+                "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
+                "n.name AS name, n.source_description AS source, n.created_at AS created "
                 "ORDER BY n.created_at DESC LIMIT 25")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>知识库取数失败: {exc}</p>", status_code=503)
@@ -1451,13 +1458,19 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
         src = r.get("source") or ""
         mt = _re.search(r"type=(\S+)", src)
         mp = _re.search(r"project=(\S+)", src)
-        sn = esc((r.get("snippet") or "").strip().replace("\n", " "))
+        full = r.get("detail") or ""
+        oneline = full.strip().replace("\n", " ")
+        snippet = esc(oneline[:180]) + ("…" if len(oneline) > 180 else "")
         items.append({"type": esc(mt.group(1)) if mt else "obs",
                       "project": esc(mp.group(1)) if mp else "—",
-                      "snippet": sn, "created": (r.get("created") or "")[:16]})
+                      "snippet": snippet, "created": (r.get("created") or "")[:16],
+                      "name": r.get("name") or "", "source": src, "detail": full})
     data = {"stats": {"entities": ent, "edges": edg, "episodes": epi},
             "q": esc(q), "items": items}
-    return HTMLResponse(_DASH_KNOWLEDGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+    # detail/name/source 走 textContent 安全；但 JSON 内嵌进内联 <script> 时，
+    # 原文里的 "</script>" 会截断脚本——把 "</" 转义为 "<\/"（JS 字符串等价）。
+    data_json = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_KNOWLEDGE_HTML.replace("__DATA__", data_json))
 
 
 app = Starlette(
