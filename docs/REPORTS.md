@@ -1,8 +1,14 @@
-# 如何往报表门户加一个报表
+# 如何往 kg-hub 加一个报表(看板)
 
-门户在常开 NAS 的 `kg-hub-server` 容器里（不是独立服务）。入口：
-`http://100.123.208.32:17171/portal`（tailnet 内任意设备）。
+> **架构提示（2026-06-25）**：报表门户已拆成**独立服务 `report-portal`**
+> （统一跨源入口 `http://100.123.208.32:17172/portal`）。
+> - 给 **kg-hub** 加报表的 3 步**不变**：`PORTAL_REPORTS` 加一条会**同时**进
+>   kg-hub 本地 `/portal` 和 `/portal_manifest`；独立门户抓 manifest 自动显示，
+>   **不用动 report-portal**。
+> - 若你想加的是**非 kg-hub 的全新数据源**，看 `report-portal/README.md` 的
+>   `PORTAL_SOURCES`，本文不适用。
 
+kg-hub 的看板**直读 NAS-local FalkorDB，必须留在数据旁边**（不能搬到门户）。
 源码是 build 时 COPY 进 Docker 镜像的，所以**改完代码要重建镜像+重启容器才生效**。
 
 ## 三步代码（都在 `kg_hub_server.py`）
