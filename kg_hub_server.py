@@ -1392,39 +1392,62 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .sn{flex:1;font-size:13px}.meta{color:GrayText;font-size:12px;margin-top:2px}.ts{color:GrayText;font-size:12px}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>知识库速览</h1>
 <div class=cards id=cards></div>
-<div class=lbl>最近知识 · 最新 observation（全图，非 canonical 胶囊）</div><div id=recent></div>
-<div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · 全图 = claude-mem 等工具汇入的知识</div>
+<form method=get action="/dashboard/knowledge" style="display:flex;gap:8px;margin:1rem 0 .3rem">
+<input id=q name=q placeholder="搜索全图知识（关键词，中英文均可）…" autocomplete=off style="flex:1;padding:6px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:Canvas;color:CanvasText;font-size:14px">
+<button style="padding:6px 14px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:transparent;color:inherit;cursor:pointer">搜索</button>
+</form>
+<div class=lbl id=lbl></div><div id=items></div>
+<div class=ts style="margin-top:1.5rem">搜索走全图 fulltext（+子串兜底）· 无关键词时显示最近知识 · 全图=claude-mem 等工具汇入</div>
 <script>var D=__DATA__;var s=D.stats;
 document.getElementById('cards').innerHTML='<div class=mc><div class=l>Episode 知识条目</div><div class=v>'+s.episodes+'</div></div><div class=mc><div class=l>实体 Entity</div><div class=v>'+s.entities+'</div></div><div class=mc><div class=l>关系 Edge</div><div class=v>'+s.edges+'</div></div>';
-document.getElementById('recent').innerHTML=D.recent.map(function(r){return '<div class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div></div>';}).join('')||'<div class=ts>暂无</div>';
+document.getElementById('q').value=D.q||'';
+document.getElementById('lbl').textContent=D.q?('搜索结果："'+D.q+'" · '+D.items.length+' 条'):'最近知识 · 最新 observation（全图，非 canonical 胶囊）';
+document.getElementById('items').innerHTML=D.items.map(function(r){return '<div class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div></div>';}).join('')||'<div class=ts>'+(D.q?'无匹配':'暂无')+'</div>';
 </script></body></html>"""
 
 
 async def dashboard_knowledge(request: Request) -> HTMLResponse:
     import re as _re
     driver = get_status_driver()
+    q = (request.query_params.get("q") or "").strip()
 
-    async def c(cy):
-        rows, _, _ = await driver.execute_query(cy)
+    async def one(cy, **p):
+        rows, _, _ = await driver.execute_query(cy, **p)
         return rows
 
     def esc(t):
         return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     try:
-        ent = int((await c("MATCH (n:Entity) RETURN count(n) AS c"))[0].get("c") or 0)
-        edg = int((await c("MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) RETURN count(e) AS c"))[0].get("c") or 0)
-        epi = int((await c("MATCH (n:Episodic) RETURN count(n) AS c"))[0].get("c") or 0)
-        recent = await c(
-            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
-            "RETURN substring(coalesce(n.content,''),0,180) AS snippet, "
-            "n.source_description AS source, n.created_at AS created "
-            "ORDER BY n.created_at DESC LIMIT 25")
+        ent = int((await one("MATCH (n:Entity) RETURN count(n) AS c"))[0].get("c") or 0)
+        edg = int((await one("MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) RETURN count(e) AS c"))[0].get("c") or 0)
+        epi = int((await one("MATCH (n:Episodic) RETURN count(n) AS c"))[0].get("c") or 0)
+        if q:
+            rows = []
+            try:  # fulltext first (good for English / multi-word)
+                rows = await one(
+                    "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
+                    "RETURN substring(coalesce(node.content,''),0,220) AS snippet, "
+                    "node.source_description AS source, node.created_at AS created "
+                    "ORDER BY score DESC LIMIT 30", q=q)
+            except Exception:
+                rows = []
+            if not rows:  # substring fallback (handles Chinese / no fulltext hit)
+                rows = await one(
+                    "MATCH (n:Episodic) WHERE n.content CONTAINS $q OR n.name CONTAINS $q "
+                    "RETURN substring(coalesce(n.content,''),0,220) AS snippet, "
+                    "n.source_description AS source, n.created_at AS created LIMIT 30", q=q)
+        else:  # no query → recent knowledge
+            rows = await one(
+                "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+                "RETURN substring(coalesce(n.content,''),0,180) AS snippet, "
+                "n.source_description AS source, n.created_at AS created "
+                "ORDER BY n.created_at DESC LIMIT 25")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>知识库取数失败: {exc}</p>", status_code=503)
 
     items = []
-    for r in recent:
+    for r in rows:
         src = r.get("source") or ""
         mt = _re.search(r"type=(\S+)", src)
         mp = _re.search(r"project=(\S+)", src)
@@ -1432,7 +1455,8 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
         items.append({"type": esc(mt.group(1)) if mt else "obs",
                       "project": esc(mp.group(1)) if mp else "—",
                       "snippet": sn, "created": (r.get("created") or "")[:16]})
-    data = {"stats": {"entities": ent, "edges": edg, "episodes": epi}, "recent": items}
+    data = {"stats": {"entities": ent, "edges": edg, "episodes": epi},
+            "q": esc(q), "items": items}
     return HTMLResponse(_DASH_KNOWLEDGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
