@@ -1155,6 +1155,8 @@ async def search_semantic(request: Request) -> JSONResponse:
 PORTAL_REPORTS = [
     {"name": "知识胶囊看板", "desc": "canonical 胶囊曝光 + 各 cwd 下实时排序与注入",
      "url": "/dashboard/capsules", "icon": "📎", "ready": True},
+    {"name": "使用排行", "desc": "胶囊累计注入排行 + 建议晋升 / 建议下线",
+     "url": "/dashboard/usage", "icon": "📊", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1261,12 +1263,102 @@ async def dashboard_capsules(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_CAPSULES_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
+_DASH_USAGE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 使用排行</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}
+.lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
+.row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.nm{flex:1;min-width:120px;font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all}
+.bar{width:110px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent)}
+.bar>i{display:block;height:100%}.ts{color:GrayText;font-size:12px}
+.empty{color:GrayText;font-size:13px;padding:6px 0}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>使用排行</h1>
+<div class=cards id=cards></div>
+<div class=lbl>胶囊累计注入排行 · canonical 被 PUSH 钩子注入的次数（Lindy / 隐式反馈信号）</div><div id=top></div>
+<div class=lbl>建议晋升 · 高频命中但尚非 canonical 的普通节点</div><div id=promote></div>
+<div class=lbl>建议下线 · 零曝光的 canonical 胶囊（按创建时间）</div><div id=demote></div>
+<div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · 曝光=被注入次数(非贡献度) · 数据同 /api/usage_ranking</div>
+<script>var D=__DATA__;var s=D.stats;
+document.getElementById('cards').innerHTML='<div class=mc><div class=l>胶囊总数</div><div class=v>'+s.canonical_total+'</div></div><div class=mc><div class=l>胶囊累计注入</div><div class=v>'+s.canonical_total_usage+'</div></div><div class=mc><div class=l>全图有曝光</div><div class=v>'+s.episodes_with_usage+' / '+s.total_episodes+'</div></div>';
+function fill(id,arr,render){var el=document.getElementById(id);if(!arr||!arr.length){el.innerHTML='<div class=empty>暂无</div>';return;}el.innerHTML=arr.map(render).join('');}
+var mu=Math.max.apply(null,D.top_canonical.map(function(x){return x.usage_count}).concat([1]));
+fill('top',D.top_canonical,function(x,i){return '<div class=row><span class=ts style="width:16px">'+(i+1)+'</span><span class=nm>'+x.name.replace('kg-hub-canonical-','')+'</span><div class=bar><i style="width:'+Math.round(x.usage_count/mu*100)+'%;background:#378ADD"></i></div><span style="width:32px;text-align:right;font-weight:500">'+x.usage_count+'</span><span class=ts style="width:80px;text-align:right">'+((x.last_used_at||'').slice(0,10)||'—')+'</span></div>';});
+fill('promote',D.promote,function(x){return '<div class=row><span class=nm>'+x.name+(x.preview?' <span class=ts>'+x.preview.replace(/[<>]/g,'')+'</span>':'')+'</span><span style="width:32px;text-align:right;font-weight:500">'+x.usage_count+'</span></div>';});
+fill('demote',D.demote,function(x){return '<div class=row><span class=nm>'+x.name.replace('kg-hub-canonical-','')+'</span><span class=ts style="width:90px;text-align:right">'+((x.created_at||'').slice(0,10)||'—')+'</span></div>';});
+</script></body></html>"""
+
+
+async def dashboard_usage(request: Request) -> HTMLResponse:
+    """Server-rendered view over the same data as /api/usage_ranking."""
+    driver = get_status_driver()
+
+    async def q(cypher, **params):
+        rows, _, _ = await driver.execute_query(cypher, **params)
+        return rows
+
+    top_n = 15
+    try:
+        r = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND coalesce(n.usage_count, 0) > 0 "
+            "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, n.last_used_at AS last "
+            "ORDER BY uc DESC LIMIT $n", n=top_n)
+        top_canonical = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
+                          "last_used_at": x.get("last")} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+            "AND coalesce(n.usage_count, 0) > 0 "
+            "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, "
+            "substring(coalesce(n.content, ''), 0, 80) AS preview "
+            "ORDER BY uc DESC LIMIT $n", n=top_n)
+        promote = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
+                    "preview": x.get("preview") or ""} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND coalesce(n.usage_count, 0) = 0 "
+            "RETURN n.name AS name, n.created_at AS created "
+            "ORDER BY n.created_at LIMIT $n", n=top_n)
+        demote = [{"name": x.get("name"), "created_at": x.get("created")} for x in r]
+
+        r = await q(
+            "MATCH (n:Episodic) RETURN count(n) AS total, "
+            "sum(coalesce(n.usage_count, 0)) AS total_usage, "
+            "sum(CASE WHEN coalesce(n.usage_count, 0) > 0 THEN 1 ELSE 0 END) AS used_count")
+        row = r[0] if r else {}
+        rc = await q(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "RETURN count(n) AS total, sum(coalesce(n.usage_count, 0)) AS used")
+        crow = rc[0] if rc else {}
+        stats = {
+            "total_episodes": int(row.get("total") or 0),
+            "total_usage_events": int(row.get("total_usage") or 0),
+            "episodes_with_usage": int(row.get("used_count") or 0),
+            "canonical_total": int(crow.get("total") or 0),
+            "canonical_total_usage": int(crow.get("used") or 0),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>dashboard 取数失败: {exc}</p>", status_code=503)
+
+    data = {"stats": stats, "top_canonical": top_canonical,
+            "promote": promote, "demote": demote}
+    return HTMLResponse(_DASH_USAGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+
+
 app = Starlette(
     debug=False,
     routes=[
         Route("/", portal, methods=["GET"]),
         Route("/portal", portal, methods=["GET"]),
         Route("/dashboard/capsules", dashboard_capsules, methods=["GET"]),
+        Route("/dashboard/usage", dashboard_usage, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
