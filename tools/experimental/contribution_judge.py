@@ -42,7 +42,7 @@ try:
 except Exception:
     pass
 
-from tools.engagement_audit import (  # reuse the Tier-1 join
+from tools.experimental.engagement_audit import (  # reuse the Tier-1 join
     REPORTS, fetch_capsule_texts, fetch_usage, load_injections, load_sessions,
     match_session, parse_ts,
 )

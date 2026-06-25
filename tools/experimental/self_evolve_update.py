@@ -22,10 +22,10 @@ import argparse
 import sys
 from collections import Counter
 
-from tools.engagement_audit import load_injections, parse_ts
-from tools.scenario_classifier import classify, load_session_features, sessions_by_project, match
-from tools.capsule_score import ScoreStore
-from tools.coding_reward import CodingReward
+from tools.experimental.engagement_audit import load_injections, parse_ts
+from tools.experimental.scenario_classifier import classify, load_session_features, sessions_by_project, match
+from tools.experimental.capsule_score import ScoreStore
+from tools.experimental.coding_reward import CodingReward
 
 # Scenario → RewardProvider. None = reserved/unimplemented → abstain.
 REWARD_PROVIDERS = {

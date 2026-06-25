@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from tools.engagement_audit import extract_terms, fetch_capsule_texts
+from tools.experimental.engagement_audit import extract_terms, fetch_capsule_texts
 
 # Conservative, specific outcome markers (lowercased substring match).
 _SUCCESS = ["测试通过", "tests passed", "test passed", "build passed", "build succeeded",

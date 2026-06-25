@@ -25,8 +25,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools.engagement_audit import CLAUDE_MEM_DB, load_injections, parse_ts
-from tools.capsule_score import ScoreStore
+from tools.experimental.engagement_audit import CLAUDE_MEM_DB, load_injections, parse_ts
+from tools.experimental.capsule_score import ScoreStore
 
 CODE_EXT = {"py", "go", "ts", "tsx", "js", "jsx", "java", "kt", "rs", "c", "cc",
             "cpp", "h", "hpp", "rb", "php", "swift", "scala", "sql", "sh", "vue", "m"}
