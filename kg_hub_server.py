@@ -45,7 +45,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse
 from starlette.routing import Route
 
 from graphiti_core.driver.falkordb_driver import FalkorDriver  # type: ignore
@@ -124,7 +124,11 @@ def get_status_driver():
 # ---------- Auth middleware ----------
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        path = request.url.path
+        # Public, read-only, tailnet-only surfaces: health + the report portal /
+        # dashboards. They render server-side (data baked in), so no client token
+        # is needed; 17171 is bound to NAS loopback + tailscale, never public LAN.
+        if path == "/health" or path == "/" or path.startswith("/portal") or path.startswith("/dashboard"):
             return await call_next(request)
         header = request.headers.get("authorization", "")
         if not header.startswith("Bearer "):
@@ -1144,9 +1148,125 @@ async def search_semantic(request: Request) -> JSONResponse:
 
 
 # ---------- App ----------
+# ---------- Report portal + dashboards (read-only, server-rendered) ----------
+# 统一入口：所有看板/报表收拢到 /portal。新增报表 = 在 PORTAL_REPORTS 加一条
+# {name,desc,url} + 写一个 /dashboard/* 处理器。数据服务端渲染进页面（免客户端
+# 二次鉴权）；17171 仅绑 NAS loopback + tailscale。
+PORTAL_REPORTS = [
+    {"name": "知识胶囊看板", "desc": "canonical 胶囊曝光 + 各 cwd 下实时排序与注入",
+     "url": "/dashboard/capsules", "icon": "📎", "ready": True},
+]
+
+_PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>kg-hub 报表门户</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+h1{font-size:20px;font-weight:500}.sub{color:GrayText;font-size:13px;margin-bottom:1.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+a.card{display:block;text-decoration:none;color:inherit;border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:12px;padding:1rem 1.1rem}
+a.card:hover{border-color:color-mix(in srgb,CanvasText 45%,transparent)}
+.t{font-size:15px;font-weight:500}.d{font-size:13px;color:GrayText;margin-top:4px}
+.soon{opacity:.5;pointer-events:none}.foot{color:GrayText;font-size:12px;margin-top:2rem}</style></head><body>
+<h1>kg-hub 报表门户</h1><div class=sub>所有看板/报表的统一入口 · 部署在常开 NAS · tailnet 内任意设备可访问</div>
+<div class=grid id=grid></div>
+<div class=foot>新增报表：kg_hub_server.PORTAL_REPORTS 加一条 + 写 /dashboard/* 处理器。</div>
+<script>document.getElementById('grid').innerHTML=(__DATA__).map(function(r){
+return '<a class="card'+(r.ready?'':' soon')+'" href="'+r.url+'"><div class=t>'+r.icon+' '+r.name+(r.ready?'':' · 即将上线')+'</div><div class=d>'+r.desc+'</div></a>';}).join('');</script></body></html>"""
+
+
+async def portal(request: Request) -> HTMLResponse:
+    return HTMLResponse(_PORTAL_HTML.replace("__DATA__", json.dumps(PORTAL_REPORTS, ensure_ascii=False)))
+
+
+_DASH_CAPSULES_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 知识胶囊看板</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}
+.lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
+.row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.nm{flex:1;min-width:120px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.bar{width:110px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent)}
+.bar>i{display:block;height:100%}.bdg{font-size:11px;padding:2px 8px;border-radius:8px}
+.g{background:#E1F5EE;color:#085041}.p{background:#EEEDFE;color:#3C3489}
+.inj{background:#E6F1FB;color:#185FA5;font-size:11px;padding:2px 6px;border-radius:8px}
+button{font-family:ui-monospace,monospace;font-size:13px;padding:4px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:transparent;color:inherit;cursor:pointer}
+button[aria-pressed=true]{background:color-mix(in srgb,CanvasText 12%,transparent)}
+.ts{color:GrayText;font-size:12px}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>知识胶囊看板</h1>
+<div class=cards id=cards></div>
+<div class=lbl>胶囊总览 · 按曝光排序</div><div id=caps></div>
+<div class=lbl>实时排序 · 选 cwd 关键词（<span style="color:#185FA5">注入</span> = 进 top-3 会被钉进会话）</div>
+<div id=kw style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:.5rem"></div><div id=rank></div>
+<div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · score = log1p(命中数)+scope加成 · 曝光=被注入次数(非贡献度)</div>
+<script>var D=__DATA__;
+function badge(s){var g=s==='global';return '<span class="bdg '+(g?'g':'p')+'">'+(g?'global':'kg-hub')+'</span>';}
+var s=D.stats;document.getElementById('cards').innerHTML='<div class=mc><div class=l>胶囊总数</div><div class=v>'+s.canonical_total+'</div></div><div class=mc><div class=l>累计注入</div><div class=v>'+s.canonical_total_usage+'</div></div><div class=mc><div class=l>有曝光</div><div class=v>'+s.with_usage+' / '+s.canonical_total+'</div></div>';
+var mu=Math.max.apply(null,D.caps.map(function(c){return c.usage}).concat([1]));
+document.getElementById('caps').innerHTML=D.caps.map(function(c){return '<div class=row><span class=nm>'+c.name+'</span>'+badge(c.scope)+'<div class=bar><i style="width:'+Math.round(c.usage/mu*100)+'%;background:#888780"></i></div><span style="width:32px;text-align:right;font-weight:500">'+c.usage+'</span><span class=ts style="width:80px;text-align:right">'+c.last+'</span></div>';}).join('');
+function rank(kw){var r=D.rankings[kw]||[];var mx=Math.max.apply(null,r.map(function(x){return x.score}).concat([0.001]));document.getElementById('rank').innerHTML=r.map(function(x,i){return '<div class=row><span class=ts style="width:16px">'+(i+1)+'</span><span class=nm>'+x.name+'</span>'+badge(x.scope)+'<div class=bar><i style="width:'+Math.round(x.score/mx*100)+'%;background:'+(x.injected?'#378ADD':'#B4B2A9')+'"></i></div><span style="width:38px;text-align:right">'+x.score.toFixed(2)+'</span><span style="width:46px;text-align:right">'+(x.injected?'<span class=inj>注入</span>':'')+'</span></div>';}).join('');}
+var kws=Object.keys(D.rankings);document.getElementById('kw').innerHTML=kws.map(function(k,i){return '<button data-k="'+k+'" aria-pressed="'+(i===0)+'">'+k+'</button>';}).join('');
+Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(b){b.onclick=function(){Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(x){x.setAttribute('aria-pressed','false')});b.setAttribute('aria-pressed','true');rank(b.dataset.k);};});
+rank(kws[0]);</script></body></html>"""
+
+_DASH_KWS = ["kg-hub", "workspace_claudeCode", "sd-server"]
+
+
+async def dashboard_capsules(request: Request) -> HTMLResponse:
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "RETURN n.name AS name, n.content AS content, "
+            "       coalesce(n.usage_count,0) AS uc, n.last_used_at AS last, n.scope AS scope")
+    except Exception as exc:
+        return HTMLResponse(f"<p>dashboard 取数失败: {exc}</p>", status_code=503)
+
+    caps_raw = []
+    for r in rows:
+        nm = r.get("name")
+        caps_raw.append({
+            "name": nm, "content": r.get("content") or "",
+            "scope": r.get("scope") or CANONICAL_SCOPE.get(nm, DEFAULT_SCOPE),
+            "usage": int(r.get("uc") or 0), "last": (r.get("last") or "")[:10] or "—",
+        })
+    caps = sorted(({"name": c["name"].replace("kg-hub-canonical-", ""), "scope": c["scope"],
+                    "usage": c["usage"], "last": c["last"]} for c in caps_raw),
+                  key=lambda c: -c["usage"])
+
+    rankings = {}
+    for kw in _DASH_KWS:
+        proj, kl, scored = f"project:{kw}", kw.lower(), []
+        for c in caps_raw:
+            hits = c["content"].lower().count(kl)
+            if not (c["scope"] == "global" or hits > 0 or c["scope"] == proj):
+                continue
+            bonus = (SCOPE_MATCH_BONUS if c["scope"] == proj
+                     else SCOPE_OTHER_PENALTY if c["scope"].startswith("project:") else 0.0)
+            scored.append({"name": c["name"].replace("kg-hub-canonical-", ""),
+                           "scope": c["scope"], "score": round(math.log1p(hits) + bonus, 3)})
+        scored.sort(key=lambda x: -x["score"])
+        for i, x in enumerate(scored):
+            x["injected"] = i < 3
+        rankings[kw] = scored
+
+    data = {"stats": {"canonical_total": len(caps_raw),
+                      "canonical_total_usage": sum(c["usage"] for c in caps_raw),
+                      "with_usage": sum(1 for c in caps_raw if c["usage"] > 0)},
+            "caps": caps, "rankings": rankings}
+    return HTMLResponse(_DASH_CAPSULES_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+
+
 app = Starlette(
     debug=False,
     routes=[
+        Route("/", portal, methods=["GET"]),
+        Route("/portal", portal, methods=["GET"]),
+        Route("/dashboard/capsules", dashboard_capsules, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
