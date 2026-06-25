@@ -1198,18 +1198,29 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .inj{background:#E6F1FB;color:#185FA5;font-size:11px;padding:2px 6px;border-radius:8px}
 button{font-family:ui-monospace,monospace;font-size:13px;padding:4px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:transparent;color:inherit;cursor:pointer}
 button[aria-pressed=true]{background:color-mix(in srgb,CanvasText 12%,transparent)}
-.ts{color:GrayText;font-size:12px}</style></head><body>
+.ts{color:GrayText;font-size:12px}
+details{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}details .row{border-bottom:none}
+summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}
+summary:hover{background:color-mix(in srgb,CanvasText 5%,transparent)}
+.chev{color:GrayText;transition:transform .15s;width:14px;text-align:center;flex:none}
+details[open] .chev{transform:rotate(90deg)}
+.body{padding:.4rem .2rem 1.1rem;font-size:14px;overflow-x:auto;border-left:2px solid color-mix(in srgb,CanvasText 12%,transparent);margin:.2rem 0 .6rem;padding-left:12px}
+.body pre{white-space:pre-wrap;font-size:12px}.body code{font-family:ui-monospace,monospace;font-size:12px}
+.body h1,.body h2,.body h3{font-size:15px;font-weight:500;margin:.7rem 0 .3rem}
+.body table{border-collapse:collapse;font-size:12px}.body td,.body th{border:1px solid color-mix(in srgb,CanvasText 15%,transparent);padding:3px 6px}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>知识胶囊看板</h1>
 <div class=cards id=cards></div>
 <div class=lbl>胶囊总览 · 按曝光排序</div><div id=caps></div>
 <div class=lbl>实时排序 · 选 cwd 关键词（<span style="color:#185FA5">注入</span> = 进 top-3 会被钉进会话）</div>
 <div id=kw style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:.5rem"></div><div id=rank></div>
 <div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · score = log1p(命中数)+scope加成 · 曝光=被注入次数(非贡献度)</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
 <script>var D=__DATA__;
 function badge(s){var g=s==='global';return '<span class="bdg '+(g?'g':'p')+'">'+(g?'global':'kg-hub')+'</span>';}
 var s=D.stats;document.getElementById('cards').innerHTML='<div class=mc><div class=l>胶囊总数</div><div class=v>'+s.canonical_total+'</div></div><div class=mc><div class=l>累计注入</div><div class=v>'+s.canonical_total_usage+'</div></div><div class=mc><div class=l>有曝光</div><div class=v>'+s.with_usage+' / '+s.canonical_total+'</div></div>';
 var mu=Math.max.apply(null,D.caps.map(function(c){return c.usage}).concat([1]));
-document.getElementById('caps').innerHTML=D.caps.map(function(c){return '<div class=row><span class=nm>'+c.name+'</span>'+badge(c.scope)+'<div class=bar><i style="width:'+Math.round(c.usage/mu*100)+'%;background:#888780"></i></div><span style="width:32px;text-align:right;font-weight:500">'+c.usage+'</span><span class=ts style="width:80px;text-align:right">'+c.last+'</span></div>';}).join('');
+document.getElementById('caps').innerHTML=D.caps.map(function(c){return '<details><summary class=row><span class=nm>'+c.name+'</span>'+badge(c.scope)+'<div class=bar><i style="width:'+Math.round(c.usage/mu*100)+'%;background:#888780"></i></div><span style="width:32px;text-align:right;font-weight:500">'+c.usage+'</span><span class=ts style="width:80px;text-align:right">'+c.last+'</span><span class=chev>›</span></summary><div class=body></div></details>';}).join('');
+Array.prototype.forEach.call(document.querySelectorAll('#caps details'),function(d,i){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var md=D.caps[i].content||'(无内容)';var b=d.querySelector('.body');try{b.innerHTML=marked.parse(md);}catch(e){var p=document.createElement('pre');p.textContent=md;b.innerHTML='';b.appendChild(p);}d.dataset.done='1';}});});
 function rank(kw){var r=D.rankings[kw]||[];var mx=Math.max.apply(null,r.map(function(x){return x.score}).concat([0.001]));document.getElementById('rank').innerHTML=r.map(function(x,i){return '<div class=row><span class=ts style="width:16px">'+(i+1)+'</span><span class=nm>'+x.name+'</span>'+badge(x.scope)+'<div class=bar><i style="width:'+Math.round(x.score/mx*100)+'%;background:'+(x.injected?'#378ADD':'#B4B2A9')+'"></i></div><span style="width:38px;text-align:right">'+x.score.toFixed(2)+'</span><span style="width:46px;text-align:right">'+(x.injected?'<span class=inj>注入</span>':'')+'</span></div>';}).join('');}
 var kws=Object.keys(D.rankings);document.getElementById('kw').innerHTML=kws.map(function(k,i){return '<button data-k="'+k+'" aria-pressed="'+(i===0)+'">'+k+'</button>';}).join('');
 Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(b){b.onclick=function(){Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(x){x.setAttribute('aria-pressed','false')});b.setAttribute('aria-pressed','true');rank(b.dataset.k);};});
@@ -1236,9 +1247,13 @@ async def dashboard_capsules(request: Request) -> HTMLResponse:
             "scope": r.get("scope") or CANONICAL_SCOPE.get(nm, DEFAULT_SCOPE),
             "usage": int(r.get("uc") or 0), "last": (r.get("last") or "")[:10] or "—",
         })
-    caps = sorted(({"name": c["name"].replace("kg-hub-canonical-", ""), "scope": c["scope"],
-                    "usage": c["usage"], "last": c["last"]} for c in caps_raw),
-                  key=lambda c: -c["usage"])
+    def _cap_view(c):
+        body = c["content"]
+        if len(body) > 8000:
+            body = body[:8000] + "\n\n…（已截断，完整见源文档）"
+        return {"name": c["name"].replace("kg-hub-canonical-", ""), "scope": c["scope"],
+                "usage": c["usage"], "last": c["last"], "content": body}
+    caps = sorted((_cap_view(c) for c in caps_raw), key=lambda c: -c["usage"])
 
     rankings = {}
     for kw in _DASH_KWS:
