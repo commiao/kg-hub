@@ -1157,6 +1157,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/capsules", "icon": "📎", "ready": True},
     {"name": "使用排行", "desc": "胶囊累计注入排行 + 建议晋升 / 建议下线",
      "url": "/dashboard/usage", "icon": "📊", "ready": True},
+    {"name": "知识库速览", "desc": "全图概览(Episode/实体/关系) + 最近知识",
+     "url": "/dashboard/knowledge", "icon": "🧠", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1178,6 +1180,14 @@ return '<a class="card'+(r.ready?'':' soon')+'" href="'+r.url+'"><div class=t>'+
 
 async def portal(request: Request) -> HTMLResponse:
     return HTMLResponse(_PORTAL_HTML.replace("__DATA__", json.dumps(PORTAL_REPORTS, ensure_ascii=False)))
+
+
+async def portal_manifest(request: Request) -> JSONResponse:
+    """GET /portal_manifest — this source's report cards, for the standalone
+    aggregator portal to fetch and merge. Auth-exempt (read-only card metadata
+    only; covered by the `/portal*` allowlist). URLs are relative to this
+    server's base; the aggregator prefixes them with this source's link base."""
+    return JSONResponse({"source": "kg-hub", "reports": PORTAL_REPORTS})
 
 
 _DASH_CAPSULES_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1367,13 +1377,74 @@ async def dashboard_usage(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_USAGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
+_DASH_KNOWLEDGE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 知识库速览</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}
+.lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
+.row{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.bdg{font-size:11px;padding:1px 7px;border-radius:8px;flex:none;height:fit-content;background:color-mix(in srgb,CanvasText 10%,transparent)}
+.sn{flex:1;font-size:13px}.meta{color:GrayText;font-size:12px;margin-top:2px}.ts{color:GrayText;font-size:12px}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>知识库速览</h1>
+<div class=cards id=cards></div>
+<div class=lbl>最近知识 · 最新 observation（全图，非 canonical 胶囊）</div><div id=recent></div>
+<div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · 全图 = claude-mem 等工具汇入的知识</div>
+<script>var D=__DATA__;var s=D.stats;
+document.getElementById('cards').innerHTML='<div class=mc><div class=l>Episode 知识条目</div><div class=v>'+s.episodes+'</div></div><div class=mc><div class=l>实体 Entity</div><div class=v>'+s.entities+'</div></div><div class=mc><div class=l>关系 Edge</div><div class=v>'+s.edges+'</div></div>';
+document.getElementById('recent').innerHTML=D.recent.map(function(r){return '<div class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div></div>';}).join('')||'<div class=ts>暂无</div>';
+</script></body></html>"""
+
+
+async def dashboard_knowledge(request: Request) -> HTMLResponse:
+    import re as _re
+    driver = get_status_driver()
+
+    async def c(cy):
+        rows, _, _ = await driver.execute_query(cy)
+        return rows
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    try:
+        ent = int((await c("MATCH (n:Entity) RETURN count(n) AS c"))[0].get("c") or 0)
+        edg = int((await c("MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) RETURN count(e) AS c"))[0].get("c") or 0)
+        epi = int((await c("MATCH (n:Episodic) RETURN count(n) AS c"))[0].get("c") or 0)
+        recent = await c(
+            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+            "RETURN substring(coalesce(n.content,''),0,180) AS snippet, "
+            "n.source_description AS source, n.created_at AS created "
+            "ORDER BY n.created_at DESC LIMIT 25")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>知识库取数失败: {exc}</p>", status_code=503)
+
+    items = []
+    for r in recent:
+        src = r.get("source") or ""
+        mt = _re.search(r"type=(\S+)", src)
+        mp = _re.search(r"project=(\S+)", src)
+        sn = esc((r.get("snippet") or "").strip().replace("\n", " "))
+        items.append({"type": esc(mt.group(1)) if mt else "obs",
+                      "project": esc(mp.group(1)) if mp else "—",
+                      "snippet": sn, "created": (r.get("created") or "")[:16]})
+    data = {"stats": {"entities": ent, "edges": edg, "episodes": epi}, "recent": items}
+    return HTMLResponse(_DASH_KNOWLEDGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+
+
 app = Starlette(
     debug=False,
     routes=[
         Route("/", portal, methods=["GET"]),
         Route("/portal", portal, methods=["GET"]),
+        Route("/portal_manifest", portal_manifest, methods=["GET"]),
         Route("/dashboard/capsules", dashboard_capsules, methods=["GET"]),
         Route("/dashboard/usage", dashboard_usage, methods=["GET"]),
+        Route("/dashboard/knowledge", dashboard_knowledge, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
