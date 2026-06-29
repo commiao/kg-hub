@@ -209,19 +209,22 @@ def _connect_read():
     return None, last_err
 
 
-def http_canonical_context(keyword: str, top_n: int, bump: bool) -> list[dict]:
+def http_canonical_context(keyword: str, top_n: int, bump: bool,
+                           tool: str | None = None) -> list[dict]:
     """Fetch ranked canonical/fulltext context for a keyword from the kg-hub
     server. The server runs the two-pass retrieval AND (when bump=True) bumps
     usage_count + last_used_at server-side on localhost FalkorDB — reliably,
     unlike the old cross-network 1s fail-fast write.
 
+    `tool` (the hook --format: claude/cursor/codex/…) is sent so the server can
+    tally per-tool injection usage — which tool is actually pulling kg-hub.
+
     Returns the server's already-ranked `picked` list (dicts with
     name/content/source/score), or [] on any failure (hook stays silent)."""
-    qs = urllib.parse.urlencode({
-        "kw": keyword,
-        "top_n": top_n,
-        "bump": "1" if bump else "0",
-    })
+    params = {"kw": keyword, "top_n": top_n, "bump": "1" if bump else "0"}
+    if tool:
+        params["tool"] = tool
+    qs = urllib.parse.urlencode(params)
     url = f"{KG_HUB_URL}/api/canonical_context?{qs}"
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {KG_HUB_API_TOKEN}"}
@@ -618,7 +621,7 @@ def main() -> int:
     picked = []
     used_keyword = None
     for kw in keywords:
-        picked = http_canonical_context(kw, TOP_N, bump=(not args.dry))
+        picked = http_canonical_context(kw, TOP_N, bump=(not args.dry), tool=args.format)
         if picked:
             used_keyword = kw
             break

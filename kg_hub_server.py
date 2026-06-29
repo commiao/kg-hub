@@ -788,6 +788,7 @@ async def canonical_context(request: Request) -> JSONResponse:
     except (TypeError, ValueError):
         top_n = 3
     bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
+    tool = (request.query_params.get("tool") or "").strip()[:32]  # which tool pulled (claude/cursor/codex/…)
     EXCERPT_CAP = 2000  # hook only excerpts ~400 chars; cap payload size
 
     driver = get_status_driver()
@@ -902,6 +903,15 @@ async def canonical_context(request: Request) -> JSONResponse:
                 bumped = int(br[0].get("c") or 0)
         except Exception as exc:
             logger.warning("[canonical_context] usage bump failed: %s", exc)
+        # Per-tool injection tally — which tool is actually pulling kg-hub.
+        if tool:
+            try:
+                await driver.execute_query(
+                    "MERGE (t:ToolStat {tool: $tool}) "
+                    "SET t.injections = coalesce(t.injections, 0) + 1, t.last_at = $now",
+                    tool=tool, now=datetime.now(tz=timezone.utc).isoformat())
+            except Exception as exc:
+                logger.warning("[canonical_context] tool stat failed: %s", exc)
 
     return JSONResponse({
         "status": "ok",
@@ -1161,6 +1171,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/knowledge", "icon": "🧠", "ready": True},
     {"name": "知识使用率", "desc": "全图/胶囊利用率 + 被取用知识 + 沉睡长尾",
      "url": "/dashboard/utilization", "icon": "📈", "ready": True},
+    {"name": "各工具与 kg-hub", "desc": "各工具贡献(写入) + 注入使用(读取)统计",
+     "url": "/dashboard/tools", "icon": "🛠", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1559,6 +1571,66 @@ async def dashboard_utilization(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_UTIL_HTML.replace("__DATA__", data_json))
 
 
+_DASH_TOOLS_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 各工具</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.lbl{font-size:12px;color:GrayText;margin:1.4rem 0 .3rem}
+.row{display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.nm{width:130px;flex:none;font-size:13px}
+.bar{flex:1;height:8px;border-radius:4px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent)}.bar>i{display:block;height:100%}
+.n{width:56px;text-align:right;font-weight:500;font-size:13px;flex:none}
+.ts{color:GrayText;font-size:12px}.empty{color:GrayText;font-size:13px;padding:6px 0}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>各工具与 kg-hub</h1>
+<div class=lbl>贡献（写入）· 各工具喂进 kg-hub 的知识条数（按 project 目录名归属）</div><div id=contrib></div>
+<div class=lbl>使用（读取）· 各工具被注入 kg-hub 胶囊的次数（PUSH hook 上报）</div><div id=usage></div>
+<div class=ts style="margin-top:1.5rem" id=note></div>
+<script>var D=__DATA__;
+function bars(el,arr,key,label,color){var mx=Math.max.apply(null,arr.map(function(x){return x[key]}).concat([1]));
+document.getElementById(el).innerHTML=arr.length?arr.map(function(x){return '<div class=row><span class=nm>'+label(x)+'</span><div class=bar><i style="width:'+Math.round(x[key]/mx*100)+'%;background:'+color+'"></i></div><span class=n>'+x[key]+'</span></div>';}).join(''):'<div class=empty>暂无（尚无上报）</div>';}
+bars('contrib',D.contrib,'count',function(x){return x.tool},'#1D9E75');
+bars('usage',D.usage,'n',function(x){return x.tool+(x.last?' <span class=ts>'+x.last+'</span>':'')},'#378ADD');
+document.getElementById('note').textContent='每 60s 刷新 · 贡献按 project=workspace_<工具> 归属，真实项目目录归"工具未知" · 使用=PUSH hook 注入上报（MCP 检索取知识暂未计入；当前多为 Claude Code）';
+</script></body></html>"""
+
+
+async def dashboard_tools(request: Request) -> HTMLResponse:
+    driver = get_status_driver()
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    async def cnt(cy, **p):
+        rows, _, _ = await driver.execute_query(cy, **p)
+        return int(rows[0].get("c") or 0) if rows else 0
+
+    TOOLS = [("Claude Code", "project=workspace_claudeCode "),
+             ("Codex", "project=workspace_codex "),
+             ("Cursor", "project=workspace_cursor "),
+             ("Qoder", "project=workspace_qoder ")]
+    try:
+        cm_total = await cnt("MATCH (n:Episodic) WHERE n.source_description CONTAINS 'claude-mem obs' "
+                             "RETURN count(n) AS c")
+        contrib, known = [], 0
+        for name, pat in TOOLS:
+            c = await cnt("MATCH (n:Episodic) WHERE n.source_description CONTAINS $p RETURN count(n) AS c", p=pat)
+            known += c
+            contrib.append({"tool": name, "count": c})
+        contrib.append({"tool": "工具未知", "count": max(cm_total - known, 0)})
+        rows, _, _ = await driver.execute_query(
+            "MATCH (t:ToolStat) RETURN t.tool AS tool, coalesce(t.injections,0) AS n, t.last_at AS last "
+            "ORDER BY n DESC")
+        usage = [{"tool": esc(r.get("tool")), "n": int(r.get("n") or 0),
+                  "last": (r.get("last") or "")[:10]} for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>工具统计取数失败: {exc}</p>", status_code=503)
+
+    data = {"contrib": [c for c in contrib if c["count"] > 0], "usage": usage}
+    return HTMLResponse(_DASH_TOOLS_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -1569,6 +1641,7 @@ app = Starlette(
         Route("/dashboard/usage", dashboard_usage, methods=["GET"]),
         Route("/dashboard/knowledge", dashboard_knowledge, methods=["GET"]),
         Route("/dashboard/utilization", dashboard_utilization, methods=["GET"]),
+        Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
