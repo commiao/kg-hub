@@ -1159,6 +1159,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/usage", "icon": "📊", "ready": True},
     {"name": "知识库速览", "desc": "全图概览(Episode/实体/关系) + 最近知识",
      "url": "/dashboard/knowledge", "icon": "🧠", "ready": True},
+    {"name": "知识使用率", "desc": "全图/胶囊利用率 + 被取用知识 + 沉睡长尾",
+     "url": "/dashboard/utilization", "icon": "📈", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1473,6 +1475,90 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_KNOWLEDGE_HTML.replace("__DATA__", data_json))
 
 
+_DASH_UTIL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 知识使用率</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}.mc .s{font-size:12px;color:GrayText}
+.lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
+.row{display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.uc{width:30px;text-align:right;font-weight:500;font-size:13px;flex:none}
+.bar{width:84px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent);flex:none}.bar>i{display:block;height:100%}
+.nm{flex:1;font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bdg{font-size:11px;padding:1px 7px;border-radius:8px;flex:none}.cap{background:#EEEDFE;color:#3C3489}.con{background:color-mix(in srgb,CanvasText 12%,transparent);color:GrayText}
+.chev{color:GrayText;transition:transform .15s;flex:none}details[open] .chev{transform:rotate(90deg)}
+details{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}details .row{border-bottom:none}
+summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}summary:hover{background:color-mix(in srgb,CanvasText 5%,transparent)}
+.src{font-size:11px;color:GrayText;margin:.2rem 0;word-break:break-all}
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin:.2rem 0 .7rem;max-height:440px;overflow:auto}
+.ts{color:GrayText;font-size:12px}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>知识使用率</h1>
+<div class=cards id=cards></div>
+<div class=lbl>被取用过的知识 · 按使用量排序（胶囊 + 普通知识）</div><div id=items></div>
+<div class=ts style="margin-top:1.5rem" id=note></div>
+<script>var D=__DATA__;var r=D.rates;
+document.getElementById('cards').innerHTML='<div class=mc><div class=l>全图利用率</div><div class=v>'+r.util_pct+'%</div><div class=s>'+r.used+' / '+r.total+' 被取用</div></div><div class=mc><div class=l>胶囊利用率</div><div class=v>'+r.canon_pct+'%</div><div class=s>'+r.canon_used+' / '+r.canon_total+'</div></div><div class=mc><div class=l>从未取用</div><div class=v>'+r.never+'</div><div class=s>沉睡知识</div></div>';
+var mu=Math.max.apply(null,D.items.map(function(x){return x.usage}).concat([1]));
+document.getElementById('items').innerHTML=D.items.map(function(x,i){return '<details data-i="'+i+'"><summary class=row><span class=uc>'+x.usage+'</span><div class=bar><i style="width:'+Math.round(x.usage/mu*100)+'%;background:'+(x.cap?'#7F77DD':'#888780')+'"></i></div><span class=nm>'+x.label+'</span><span class="bdg '+(x.cap?'cap':'con')+'">'+(x.cap?'胶囊':x.type)+'</span><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>暂无被取用的知识</div>';
+Array.prototype.forEach.call(document.querySelectorAll('#items details'),function(d){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var it=D.items[+d.dataset.i];d.querySelector('.src').textContent=(it.name||'')+(it.source?('  ·  '+it.source):'')+(it.last?('  ·  最近 '+it.last):'');d.querySelector('.dtl').textContent=it.detail||'(无内容)';d.dataset.done='1';}});});
+document.getElementById('note').textContent='每 60s 自动刷新 · usage = 被 PUSH hook 注入/填充次数（MCP 检索暂未计入，故为下限）· 利用率低=大量知识沉睡';
+</script></body></html>"""
+
+
+async def dashboard_utilization(request: Request) -> HTMLResponse:
+    import re as _re
+    driver = get_status_driver()
+
+    async def one(cy):
+        rows, _, _ = await driver.execute_query(cy)
+        return rows
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    try:
+        s = (await one("MATCH (n:Episodic) RETURN count(n) AS total, "
+                       "sum(CASE WHEN coalesce(n.usage_count,0)>0 THEN 1 ELSE 0 END) AS used"))[0]
+        cs = (await one("MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+                        "RETURN count(n) AS total, "
+                        "sum(CASE WHEN coalesce(n.usage_count,0)>0 THEN 1 ELSE 0 END) AS used"))[0]
+        top = await one(
+            "MATCH (n:Episodic) WHERE coalesce(n.usage_count,0)>0 "
+            "RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
+            "n.source_description AS source, coalesce(n.usage_count,0) AS uc, n.last_used_at AS last "
+            "ORDER BY uc DESC LIMIT 40")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>使用率取数失败: {exc}</p>", status_code=503)
+
+    total, used = int(s.get("total") or 0), int(s.get("used") or 0)
+    ct, cu = int(cs.get("total") or 0), int(cs.get("used") or 0)
+    items = []
+    for x in top:
+        nm = x.get("name") or ""
+        cap = nm.startswith("kg-hub-canonical-")
+        full = x.get("detail") or ""
+        src = x.get("source") or ""
+        mt = _re.search(r"type=(\S+)", src)
+        if cap:
+            label, typ = esc(nm.replace("kg-hub-canonical-", "")), "胶囊"
+        else:
+            oneline = full.strip().replace("\n", " ")
+            label = esc(oneline[:80]) + ("…" if len(oneline) > 80 else "")
+            typ = esc(mt.group(1)) if mt else "obs"
+        items.append({"label": label, "type": typ, "cap": cap,
+                      "usage": int(x.get("uc") or 0), "last": (x.get("last") or "")[:10],
+                      "name": nm, "source": src, "detail": full})
+    rates = {"total": total, "used": used, "util_pct": round(100 * used / max(total, 1), 1),
+             "canon_total": ct, "canon_used": cu, "canon_pct": round(100 * cu / max(ct, 1), 1),
+             "never": total - used}
+    data_json = json.dumps({"rates": rates, "items": items}, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_UTIL_HTML.replace("__DATA__", data_json))
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -1482,6 +1568,7 @@ app = Starlette(
         Route("/dashboard/capsules", dashboard_capsules, methods=["GET"]),
         Route("/dashboard/usage", dashboard_usage, methods=["GET"]),
         Route("/dashboard/knowledge", dashboard_knowledge, methods=["GET"]),
+        Route("/dashboard/utilization", dashboard_utilization, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
