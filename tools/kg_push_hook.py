@@ -589,7 +589,14 @@ def main() -> int:
         default="claude",
         help="output dialect (default: claude — current Claude Code SessionStart hook)",
     )
+    ap.add_argument(
+        "--tool", default=None,
+        help="tool identity for per-tool usage stats (e.g. qoder). Defaults to --format. "
+             "Use when a tool borrows another's output dialect (Qoder uses claude dialect "
+             "but should report tool=qoder).",
+    )
     args = ap.parse_args()
+    tool_id = args.tool or args.format
 
     # For tools that pipe a JSON payload (Cursor, possibly Codex), read it.
     # For Claude Code, stdin is empty / tty and this returns {}.
@@ -621,7 +628,7 @@ def main() -> int:
     picked = []
     used_keyword = None
     for kw in keywords:
-        picked = http_canonical_context(kw, TOP_N, bump=(not args.dry), tool=args.format)
+        picked = http_canonical_context(kw, TOP_N, bump=(not args.dry), tool=tool_id)
         if picked:
             used_keyword = kw
             break
