@@ -86,14 +86,17 @@ async def collect() -> dict:
     driver = _build_driver()
     ops_cfg = _load_ops_cfg()
 
-    # --- episode 总数 + 注入覆盖 ---
+    # --- episode 总数 + 注入覆盖 + active/archive 拆分 ---
     r = await _q(
         driver,
         "MATCH (n:Episodic) RETURN count(n) AS total, "
-        "sum(CASE WHEN coalesce(n.usage_count,0) > 0 THEN 1 ELSE 0 END) AS injected",
+        "sum(CASE WHEN coalesce(n.usage_count,0) > 0 THEN 1 ELSE 0 END) AS injected, "
+        "sum(CASE WHEN coalesce(n.archived,false) THEN 1 ELSE 0 END) AS archived",
     )
     total = int(r[0].get("total") or 0)
     injected = int(r[0].get("injected") or 0)
+    archived = int(r[0].get("archived") or 0)
+    active = total - archived
 
     # --- canonical 胶囊沉睡 ---
     rc = await _q(
@@ -143,6 +146,8 @@ async def collect() -> dict:
 
     return {
         "total_episodes": total,
+        "active_episodes": active,
+        "archived_episodes": archived,
         "injected_ever_count": injected,
         "injected_ever_rate_pct": rate(injected, total),  # ⚠️ 注入覆盖，非使用率
         "capsule_total": cap_total,
@@ -160,7 +165,7 @@ async def collect() -> dict:
 def _fmt_human(m: dict) -> str:
     return (
         "kg-hub 可用性体检\n"
-        f"  episodes 总数        : {m['total_episodes']}\n"
+        f"  episodes 总数        : {m['total_episodes']}  (active {m['active_episodes']} / archived {m['archived_episodes']})\n"
         f"  注入覆盖(非使用率!)  : {m['injected_ever_rate_pct']}%  ({m['injected_ever_count']})\n"
         f"  胶囊沉睡率           : {m['capsule_dormant_rate_pct']}%  "
         f"({m['capsule_dormant_count']}/{m['capsule_total']})\n"
