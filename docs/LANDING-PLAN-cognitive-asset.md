@@ -260,35 +260,32 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
    > `type_overrides` **保持不动**（decision/bugfix/security 仍各自 bypass）——收紧完全由 ops_noise 专项完成，语义更清晰、停用只需把 `enabled` 设回 false。
    > 配额那条不作为主杠杆（它不持久）；如未来要真日配额，另立工作流实现持久化 QuotaTracker，本方案不依赖它。
 
-4. **真实 obs 回放验证影响面**（用户强制要求：必须证明新增 reject 主要是运维自指，且真 bugfix 零误杀）。用**候选配置**（`enabled:true` 的临时副本，**不动线上 config**）对最近 N 条真实 obs 干跑新过滤器（shadow 计算 `would_accept`，不落库）：
+4. **真实 obs 回放验证影响面**（`tools/filter_replay.py`，本地读 claude-mem.db，纯读不落库）。脚本对每条 obs 跑两遍——现行 config vs **候选**（deepcopy + 仅 flip `ops_noise.enabled=true`），报告 **delta = 现行 accept→候选 reject** 的净增拦截，按 `is_ops_noise`/type 拆解，并硬断言「非运维 / 受保护类型不得进 delta」：
    ```bash
-   # 候选配置：拷一份线上 config，把 ops_noise.enabled 改 true，仅供 replay 用
-   cp config/ingest_filter.json /tmp/filter_cand.json  # 手改其 ops_noise.enabled=true
-   spike-graphiti/.venv/bin/python -m tools.filter_replay --last 500 --config /tmp/filter_cand.json \
-       --report data/ws3-replay-2026-07-09.json
-   # 报告须给出：新规则新增 reject 条数、其中 ops_noise 占比、被 reject 的 type 分布
+   spike-graphiti/.venv/bin/python -m tools.filter_replay --last 0 --report data/ws3-replay-2026-07-09.json
    ```
-   人工核对：抽 20 条新增 reject，确认为运维自指；确认 `decision/security_alert/security_note` 与他项目 bugfix **无一被新增 reject**。
+   **✅ 已跑（2026-07-09，全量 9162 条 obs）**：delta=**30**，其中 ops_noise **30（100%）**，非运维 **0**，受保护类型误杀 **0**，武装反而放行 **0**。样本全是困境二那批（full-chain repair / KeepAlive deadlock / FalkorDB auto-start…）。**签名在 9162 条真实 obs 上零误报。**
+   > delta（30）≠ 图里存量（26）：本回放测**未来流入**（当前靠 override 混入、武装后会被拦的），图里已存的是 WS-2 的活；两数同量级、互印证。
 
-5. 达标后**才** flip 线上 `config/ingest_filter.json` 的 `ops_noise.enabled` → `true`，提交并同步 NAS（`shadow_mode` 保持 `false`）：
+5. **⛔ 生产 gate（本方案边界之外，需单独放行）——达标后才 flip `enabled:true`**。flip 前必须先核清三件事（此前假设的"改配置下轮热加载"经查**不成立**）：
+   - **代码 baked 进镜像、config/源码无 bind-mount**（compose 只挂 data 卷）。改 `config/ingest_filter.json` 或 `utils/*.py` **不会**进运行中的容器 → 武装需 **rebuild 镜像 + recreate 容器**（真 redeploy，重启 server）。
+   - **claude-mem→kg 摄入当前是否在跑？** NAS ingester 容器循环**只跑 openclaw+canonical**，claude-mem 步骤已从 loop 删除；`sync_claude_mem_to_nas.sh` 只把 db 同步到 NAS、**不触发 ingest**。ingest_filter/ops_noise 治理的是 **claude_mem_obs 摄入路径**——若该路径当前休眠，武装治的是"未来重启摄入时"的流入（存量 30 条归 WS-2）。**flip 前先确认摄入在哪跑、还跑不跑。**
+   - decision/security 永远 bypass（不受 ops_noise 影响，已由 type gate + replay 证明）。
    ```bash
-   # 编辑 config/ingest_filter.json：ops_noise.enabled: false -> true
-   git add utils/ops_noise.py utils/ingest_filter.py config/ingest_filter.json tools/filter_replay.py
-   git commit -m "fix(filter): 武装运维自指 bugfix 专项规则（扣分+抬门槛+剥夺override），堵困境二噪音"
-   git push
-   # 按部署方式同步改动到 NAS 源；下轮 ingester 运行自动热加载（load_config 每轮重读）
+   # gate 放行后：编辑 config ops_noise.enabled: false -> true，然后
+   git add config/ingest_filter.json && git commit -m "arm(filter): 武装 ops_noise 专项闸" && git push
+   # 按摄入实际所在（NAS 容器则 rebuild+recreate；确认后执行）部署
    ```
-   （注：`utils/ops_noise.py` + evaluate() 接入代码 + `filter_replay.py` 可在 flip 前先随 WS-4 一并部署——因 enabled=false 时它们对线上零影响；本步只是把开关拨到 true。）
 
 **验收标准**：
-- [ ] `tools/filter_replay` 报告显示：新增 reject 中 **ops_noise 占比 ≥ 80%**（抽样 20 条人工确认 ≥18 条确为运维自指）。
-- [ ] **零误杀**（硬门槛）：回放中 `type in {decision, security_alert, security_note}` 及**非 kg-hub 项目**的 bugfix **无一**被新规则新增 reject。
+- [x] `tools/filter_replay` 报告（全量 9162 obs）：新增拦截 delta=30，ops_noise 占比 **100%**（≥80% 门槛）。
+- [x] **零误杀**（硬门槛）：delta 中非运维 **0**、受保护类型 **0**、武装反而放行 **0**。
 - [x] 单元测试（`tests/test_ops_noise.py`，**10/10 已绿**）：kg-hub 运维 bugfix→true；标记在 title→true；decision/security_note 含 kg-hub+Docker→false（钉子①）；他项目 infra bugfix 不提 kg-hub→false；Exit-node/tailscale 不提 kg-hub→false（对应实测排除集）；enabled=false 仍能分类（钉子②）。
-- [ ] 消费端测试：`enabled=false` 时，一条本会命中的运维 bugfix 的 `would_accept` 与今日一致（未武装＝零影响）；flip `enabled=true` 后同一条被 reject。
-- [ ] 生效后观测 3 天：`ingest_decisions.jsonl` 中 `layer=="ops_noise"` 的 reject 稳定出现，且都是运维自指。
-- [ ] 3 天后重跑 WS-4：新增 episode 的 `ops_noise_share` 相对基线**明显下降**（这是本 WS 是否「力臂够」的最终判据——若没降，说明签名漏了或门槛不够，回到步骤 3 调参）。
+- [x] 消费端行为不变：`enabled=false` 时一条会命中的运维 bugfix 仍 `layer=override / would_accept=True`（实测），未武装＝零影响。
+- [ ] （**gate 后**）flip `enabled=true` 生效后观测 3 天：`ingest_decisions.jsonl` 出现稳定的 `layer=="ops_noise"` reject。
+- [ ] （**gate 后**）重跑 WS-4：新增 episode 的 `ops_noise_share` 相对基线下降。
 
-**回滚**：`config/ingest_filter.json` 设 `"ops_noise": {"enabled": false}`，提交同步，下轮生效——代码路径立即短路，行为回到今日。零成本、无需改代码。
+**回滚**：`config/ingest_filter.json` 设 `ops_noise.enabled: false`，按与武装相同的部署方式生效（若武装走 NAS rebuild，则停用也需 recreate；若摄入在别处则同步该处）——代码路径立即短路，行为回到今日。无需改代码。
 
 ---
 
@@ -298,7 +295,10 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
 
 > ⚠️ 需**图谱写操作**，而 server 无写端点、FalkorDB 仅 NAS-local → 必须在 NAS 上跑受控管理脚本，**先 `--dry-run` 再 `--apply`**，且**先备份**。
 
-**前置——备份图谱**（不可跳过）：
+**前置 0 —— health_check 加 archive-aware 口径（用户钉子，WS-2 blocker）**：现行 `health_check` 查全库 `MATCH (n:Episodic)`，一旦 WS-2 把 26 条移出主集，就看不出「主集↓/归档↑/总量不变」。**WS-2 开动前必须先给 health_check 加 active/archive split**——报 `active_episodes` / `archived_episodes` / `total = active+archived`，使归档不变式可验。
+> 归档机制二选一（WS-2 定，决定 split 怎么写）：**(a) 节点属性** `archived=true`（同一 FalkorDB database，split=按属性过滤，最简）；**(b) 独立 database** `kg_hub_archive`（health_check 需连两个 database 求和）。**倾向 (a)**：单库、health_check 只加一个 WHERE、备份/回滚都在一处。`curate_ops_noise` 的 group_id 迁移方案据此定为「打属性」而非「换库」。
+
+**前置 1 —— 备份图谱**（不可跳过）：
 ```bash
 ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker compose -p kg-hub exec falkordb redis-cli SAVE && \
   sudo -n docker compose -p kg-hub exec falkordb sh -c "cp -a /data/dump.rdb /data/dump.pre-curate-2026-07-09.rdb"'
@@ -308,8 +308,8 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker comp
 **步骤**：
 
 **(a) 隔离运维自指 episode**（不删，降级出知识层）
-1. 写 `tools/curate_ops_noise.py`（NAS 上跑，`from utils.ops_noise import is_ops_noise` —— **复用 WS-4 建的同一签名，不重写**）：查命中 episode，`--dry-run` 列出候选（含 id/narrative 前 80 字），`--apply` 把命中节点 `group_id` 从 `kg_hub` 改为 `kg_hub_archive`，使 dashboard/`kg_search` 默认只查 `kg_hub`、归档区仍可专门查到——**不做物理删除**。
-   > **小回滚清单（关键，非整库回滚）**：`--apply` **必须**同时写出 manifest `data/curate-manifest-<ts>.json`，每条记录 `{episode_id, old_group_id, new_group_id, ts, matched_keywords}`；并提供 `--restore <manifest.json>` 逐条把 `group_id` 改回。这样误归档只需 `--restore`，RDB 备份降为最后一道大锤。
+1. 写 `tools/curate_ops_noise.py`（NAS 上跑，`from utils.ops_noise import is_ops_noise` —— **复用 WS-4 建的同一签名，不重写**；实测该签名命中图内 26 条、零误报）：查命中 episode，`--dry-run` 列出候选（含 id/narrative 前 80 字），`--apply` 给命中节点**打属性 `archived=true`（+ `archived_at`）**（前置 0 定的方案 (a)：同库属性，非换 database），使 dashboard/`kg_search` 默认加 `WHERE NOT coalesce(n.archived,false)` 过滤、归档区仍可专门查到——**不做物理删除**。
+   > **小回滚清单（关键，非整库回滚）**：`--apply` **必须**同时写出 manifest `data/curate-manifest-<ts>.json`，每条记录 `{episode_id, prev_archived, ts, matched_keywords}`；并提供 `--restore <manifest.json>` 逐条清除 `archived` 属性。这样误归档只需 `--restore`，RDB 备份降为最后一道大锤。
    ```bash
    # 干跑：只看会动谁（不写图、不写 manifest）
    ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker compose -p kg-hub exec ingester python -m tools.curate_ops_noise --dry-run'
@@ -330,12 +330,12 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker comp
 **验收标准**：
 - [ ] 备份 `dump.pre-curate-2026-07-09.rdb` 已生成且可用。
 - [ ] `curate_ops_noise --dry-run` 候选列表经人工抽样 20 条，**≥18 条确为运维自指**（精度 ≥90%，否则收紧签名再跑）。
-- [ ] `--apply` 后重跑 WS-4：`ops_noise_share` 相对基线下降；`total_episodes`（主 group）相应减少，归档 group 相应增加，**两者之和不变**（证明是隔离非丢失）。
+- [ ] `--apply` 后重跑 WS-4（已加 active/archive split）：`active_episodes` 减少约 26、`archived_episodes` 增加约 26、`total=active+archived` **不变**（证明是隔离非丢失）；`ops_noise_share`（按 active 计）下降。
 - [ ] `/api/canonical_context` 不再返回 INCIDENT-RETRO；其余 8 胶囊 usage_count 未被清零（或已记录一次性重置）。
 - [ ] `kg_search`/dashboard 默认视图不再被运维噪音刷屏（人工目测「问题/局限」类查询）。
 
 **回滚**（三级，由轻到重）：
-1. **首选 · manifest 精准撤销**：`curate_ops_noise --restore data/curate-manifest-2026-07-09.json` —— 只把本次动过的节点 `group_id` 改回，秒级、不影响其他数据、无需停服。
+1. **首选 · manifest 精准撤销**：`curate_ops_noise --restore data/curate-manifest-2026-07-09.json` —— 只清除本次动过节点的 `archived` 属性，秒级、不影响其他数据、无需停服。
 2. INCIDENT-RETRO 误归档 → 把 registry/`scope` 改回，重跑就地更新脚本。
 3. **兜底 · 整库大锤**（仅当 manifest 丢失/图谱状态错乱）：从备份恢复：
    ```bash
@@ -406,11 +406,12 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker comp
 ## 附：一页速查（执行清单）
 
 ```
-[ ] WS-0 存档本文档 + DESIGN 指针 → commit/push
-[ ] WS-1 tests/test_experimental_frozen.py → 直跑打印 PASS（含"植入真实 import 探针变红"验证）→ commit/push
-[ ] WS-4 utils/ops_noise.py(共享签名) + tools/health_check.py → NAS 跑 → 存 health-baseline-2026-07-09.json
-[ ] WS-3 ops_noise 专项规则(仅 type=bugfix；扣分+抬门槛+剥夺override，改 ingest_filter 代码，默认 enabled:false) → 候选配置 filter_replay 证 reject≥80%是运维噪音+真bugfix/decision/security零误杀 → 达标才 flip enabled:true → commit/push/同步 → 观测3天
-[ ] WS-2 备份 dump → curate_ops_noise --dry-run → 抽样≥90% → --apply(带 manifest) → 归档 INCIDENT-RETRO → 重跑 WS-4 出前后对比（误动用 --restore 秒回滚）
+[x] WS-0 存档本文档 + DESIGN 指针 → 已 commit/push
+[x] WS-1 tests/test_experimental_frozen.py → 直跑 PASS（含植入真实 import 探针变红验证）→ 已 commit/push
+[x] WS-4 utils/ops_noise.py + tools/health_check.py → NAS 实跑 → 基线已存（total 2267 / ops_noise 26 / capsule_dormant 0%）
+[x] WS-3 接线（is_ops_noise 接入 evaluate，enabled:false 短路）+ filter_replay → 全量 9162 obs 回放：delta 30 全是 ops_noise、零误杀、零反向放行 → 已 commit/push
+[ ] WS-3 ⛔gate：flip enabled:true（需先核摄入所在 + rebuild/recreate，属生产）
+[ ] WS-2 前置0：health_check 加 active/archive split → 备份 dump → curate_ops_noise --dry-run → --apply(打 archived 属性 + manifest) → 归档 INCIDENT-RETRO → 重跑 WS-4 对比（误动 --restore 秒回滚）
 [ ] WS-5 近重复回放 go/no-go → ingest_router 单测 → shadow 一周 → 达标生效
 [ ] 总验收：health_check --compare 出改造前后 diff，确认 ops_noise_share 真降
 ```

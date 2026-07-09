@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .ops_noise import is_ops_noise
+
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "ingest_filter.json"
 DECISIONS_LOG = Path(__file__).resolve().parent.parent / "data" / ".ingest_decisions.jsonl"
@@ -202,6 +204,20 @@ def evaluate(
     # --- Compute score regardless (always useful in log) ---
     score, breakdown = compute_score(obs, scoring_cfg)
     threshold = float(plat_cfg["score_threshold"])
+
+    # --- ops_noise 专项闸：kg-hub 自身运维自指 bugfix（WS-3）---
+    # 武装开关在消费端：enabled=false 时完全短路，行为与今日一致（分类器仍可被体检器独立调用）。
+    # 命中则：扣分 + 抬门槛(min_score) + 剥夺 type_override 豁免——刻意放在 override 分支之前，
+    # 使 bugfix 无法借 bypass 逃逸。仅极少数超高分运维记录能翻身（逃逸阀）。
+    if bool(cfg.get("ops_noise", {}).get("enabled", False)) and is_ops_noise(obs, cfg):
+        oc = cfg["ops_noise"]
+        score = round(score - float(oc.get("score_penalty", 100)), 2)
+        eff_threshold = max(threshold, float(oc.get("min_score", 120)))
+        accepted = score >= eff_threshold
+        reasons.append("ops_noise: penalized & override revoked")
+        reasons.append(f"ops_noise score {score} {'>=' if accepted else '<'} {eff_threshold}")
+        return _build(accepted, accepted, score, eff_threshold, reasons, "ops_noise",
+                      obs, type_, platform, project, shadow, breakdown=breakdown)
 
     # --- Type override: bypass threshold (decision/bugfix/security_alert) ---
     if overrides.get("bypass_threshold"):
