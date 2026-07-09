@@ -213,7 +213,7 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
   [c.update([json.loads(l).get('layer','?')]) for l in sys.stdin if l.strip()]; print(c)"
 ```
 
-**步骤**（**改代码 + 配置**，非纯开关；须走 commit→push→同步 NAS→热加载）：
+**步骤**（**改代码 + 配置**，非纯开关；接线可先随 WS-4 部署，武装须走 commit→push→**rebuild 镜像→recreate 容器**，见步骤 5 gate。⚠️ 非热加载：config 与代码都 baked 进镜像）：
 
 1. **共享签名 `is_ops_noise`**（单一真相源；文件 `utils/ops_noise.py` 已由 WS-4 先创建**并实测校正**，WS-3 是首个把它**接入过滤器**的消费者，WS-2 curate 也复用同一函数）。**已实现版本**（自我标记用文本、非 project；title 纳入检索）：
    ```python
@@ -245,7 +245,7 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
    - `enabled=false`（WS-4 落库时的默认）→ 即便 `is_ops_noise` 为真也**不惩罚**，行为与今日完全一致；分类器仍可被体检器独立调用。
    - 非 ops_noise → 逻辑完全不变（真 bugfix 仍 bypass、仍 90 分过线）。
 
-3. **配置**（`config/ingest_filter.json` 顶层加块，可热加载、可回滚）。⚠️ **钉子②：默认 `enabled: false`（未武装）**——该块由 WS-4 先落库时就是 false，故 WS-3 代码一部署**不会自动生效**；只有本 WS 用 replay 验证达标后，才显式 flip 成 true：
+3. **配置**（`config/ingest_filter.json` 顶层加块，可回滚。⚠️ **非热加载**——config baked 进镜像，改动须 rebuild+recreate 才生效，见步骤 5）。⚠️ **钉子②：默认 `enabled: false`（未武装）**——该块由 WS-4 先落库时就是 false，故 WS-3 代码一部署**不会自动生效**；只有本 WS 用 replay 验证达标后，才显式 flip 成 true：
    ```jsonc
    "ops_noise": {
      "enabled": false,                // WS-4 落库即 false；WS-3 replay 达标后才 flip true
@@ -269,7 +269,7 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
 
 5. **⛔ 生产 gate（本方案边界之外，需单独放行）——达标后才 flip `enabled:true`**。flip 前必须先核清三件事（此前假设的"改配置下轮热加载"经查**不成立**）：
    - **代码 baked 进镜像、config/源码无 bind-mount**（compose 只挂 data 卷）。改 `config/ingest_filter.json` 或 `utils/*.py` **不会**进运行中的容器 → 武装需 **rebuild 镜像 + recreate 容器**（真 redeploy，重启 server）。
-   - **claude-mem→kg 摄入当前是否在跑？** NAS ingester 容器循环**只跑 openclaw+canonical**，claude-mem 步骤已从 loop 删除；`sync_claude_mem_to_nas.sh` 只把 db 同步到 NAS、**不触发 ingest**。ingest_filter/ops_noise 治理的是 **claude_mem_obs 摄入路径**——若该路径当前休眠，武装治的是"未来重启摄入时"的流入（存量 30 条归 WS-2）。**flip 前先确认摄入在哪跑、还跑不跑。**
+   - **claude-mem→kg 摄入已确认休眠（实测 2026-07-09）**：图内 `claude-mem-obs` 最大 id=**4639**，本地 db 最大 id=**9194** → obs 4640–9194（**~4,555 条**）从未进图；决策日志 `.ingest_decisions.jsonl` 冻结在 **6/10**；NAS 无 `claude_mem_obs` 进程/cron。compose 注释表明 claude-mem 步骤是一次性 rebuild 后**主动从 loop 删除的**（休眠大概率**设计使然**，非故障）。**故 ops_noise 武装当前无活流量可治，是"未来若重启 claude-mem 摄入时的保险丝"**；图内存量 26 条归 WS-2。**flip 只在决定重启摄入时才有意义。**
    - decision/security 永远 bypass（不受 ops_noise 影响，已由 type gate + replay 证明）。
    ```bash
    # gate 放行后：编辑 config ops_noise.enabled: false -> true，然后

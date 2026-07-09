@@ -1,5 +1,5 @@
 {
-  "_doc": "kg-hub ingest filter — gates obs entering kg-hub from claude-mem.db. Edits hot-reload on next ingester run (no service restart needed). Default shadow_mode=true: log decisions but DO NOT block any obs. Flip to false only after reviewing data/.ingest_decisions.jsonl for a few days.",
+  "_doc": "kg-hub ingest filter — gates obs entering kg-hub from claude-mem.db (claude_mem_obs.py path). NOTE: config + code are BAKED into the image (compose has no bind-mount of config/ or src); edits do NOT hot-reload — a change requires rebuild + recreate of the container that runs claude_mem_obs. load_config() re-reads the (baked) file each ingester run, so 'hot-reload' only means within a running container, not host-file edits. shadow_mode is currently false (filter actively blocks). ops_noise.enabled currently false (unarmed).",
   "version": 1,
   "shadow_mode": false,
 
