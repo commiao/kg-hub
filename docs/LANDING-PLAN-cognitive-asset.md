@@ -309,9 +309,29 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
 
 ---
 
-## WS-2　一次性 curate：运维噪音 / 沉睡 / INCIDENT-RETRO（#11）
+## WS-2　一次性 curate：运维噪音 / INCIDENT-RETRO（#11 / G3）
 
-**目标**：执行那笔「欠了半个月的账」——你自己复盘认证过 ROI 最高的人工治理。WS-3 是**堵未来的水**，WS-2 是**清历史的库存**。
+**目标**：执行那笔「欠了半个月的账」。WS-3 是**堵未来的水**，WS-2 是**清历史的库存**。
+**范围（决策 2026-07-09）**：只 apply **A ops_noise 26 + C INCIDENT-RETRO 1 = 27 条**；**dup 整类不动**（dry-run 证明会误伤 decision 迭代/同主题独立记录/openclaw 同名节点，收益~1% 不值误伤知识型）。
+
+### G3 apply-prep 状态（2026-07-09，已提交 `68eaf26`，**未部署/未 apply**）
+
+| 前置 | 状态 |
+|---|---|
+| archive-aware 尺子 | ✅ `health_check` 加 active/archive/total（基线 total 2267 / active 2267 / archived 0） |
+| dry-run 候选 | ✅ `curate_ops_noise --dry-run`：A 26 + C 1 = **27**，dup 29 已剔除 |
+| 读路径 archived 过滤 | ✅ 已改 8 处**交付/搜索/内容**路径（canonical_context pass1+pass2、episode_search 主+兜底、dashboard capsules、dashboard knowledge fulltext+兜底+最近），Cypher 已 NAS 实跑验证非回归。**未部署**（rebuild=gate）。 |
+| 备份 | ✅ `tools/backup_graph.sh` 全量快照 dump.rdb+appendonlydir（appendonly=yes 只备 dump 无效），已留 pre-G3 恢复点 |
+| 主回滚 | `curate_ops_noise --restore <manifest>`（REMOVE archived，零停机、精确） |
+
+**读路径分类（诚实入册）**：**有意不过滤** = count/total 查询（守 total 不变）；**无法过滤** = `/api/search`（edge fact 无 obs-type）、`search_semantic`（graphiti 混合检索）——归档只隐藏 episode 级读，**edge 级 fact 仍在**（已知局限；ops_noise 的 edge 会残留，但它们本就低信噪，可接受）。
+
+### ⛔ G3 apply gate（需单独放行，按序）
+1. **就近重跑 `backup_graph.sh`** 取最新快照。
+2. **部署带 archived 过滤的 server**（commit→push→rebuild 镜像→recreate `kg_hub_server`；校验 NAS sha==git HEAD）。
+3. **`curate_ops_noise --apply --manifest data/curate-G3-<ts>.json`**（打 archived=true on 27）。
+4. **复验**：`health_check` 应 `total` 不变、`active` −27=2240、`archived` +27=27；`canonical_context` 不再返回 INCIDENT-RETRO；`episode_search`/dashboard 不再出那 26 条。
+5. 异常 → `curate_ops_noise --restore <manifest>`（秒级），兜底用备份恢复。
 
 > ⚠️ 需**图谱写操作**，而 server 无写端点、FalkorDB 仅 NAS-local → 必须在 NAS 上跑受控管理脚本，**先 `--dry-run` 再 `--apply`**，且**先备份**。
 
