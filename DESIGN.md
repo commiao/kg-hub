@@ -1,6 +1,8 @@
 # kg-hub 设计文档
 
 > 本文档**记录已做决策**与背后理由。新会话开干时**不要重开讨论已锁定的决策**，除非有新证据推翻原假设。
+>
+> 📌 **认知资产化改造计划见 [docs/LANDING-PLAN-cognitive-asset.md](docs/LANDING-PLAN-cognitive-asset.md)**（从囤积到经营：冻结→度量→降噪→防膨胀；含被拒处方清单——#2 讨论层 / #6 Discussion Insights 已明确否决，勿重启）。
 
 ---
 
