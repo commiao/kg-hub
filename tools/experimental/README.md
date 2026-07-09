@@ -1,6 +1,8 @@
 # tools/experimental — 胶囊「贡献度 / 自进化」探索代码（默认不接排序）
 
 > **状态：实验性。ROI 存疑。默认不驱动任何线上行为。**
+>
+> **冻结护栏**：`tests/test_experimental_frozen.py` 断言本目录**不得被任何线上代码 import**（server / ingesters / utils / tools 根目录）。要接回线上，**必须先删除该测试并书面说明理由**。护栏与本决策见 `docs/LANDING-PLAN-cognitive-asset.md`（WS-1）。
 
 这里是为「自动测量胶囊贡献度、让胶囊集自进化」做的探索。设计与结论见
 `docs/CONTRIBUTION-SIGNAL.md`、`docs/SELF-EVOLVING.md`。
