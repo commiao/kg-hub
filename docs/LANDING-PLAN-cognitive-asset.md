@@ -397,6 +397,34 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker comp
 
 ---
 
+## 交付分层（step 5 / G2 —— 主杠杆，对应 0.4 层③交付优先级）
+
+**问题**：「出」侧对图内 Episodic 的排序是**纯相关性**（fulltext score desc；见 `kg_hub_server` 的 `canonical_context` pass-2 填位 与 `episode_search`）。0.4 画像证明操作型占 55%——纯相关性下它们与 decision/security 平等争注入位，稀释高信噪知识。**这才是"让 kg-hub 发挥作用"的主杠杆**（比 G3 清 47 条收益大得多）。
+
+**设计（软加权，绝不硬删；`tools/delivery_replay.py` 内为可调常量）**：
+- `tscore = fulltext_score × TIER_WEIGHT[type]`：知识型（decision/security_*) **1.6**、discovery **1.0**、feature/refactor **0.7**、bugfix/change **0.6**、`ops_noise` **0.2**（**绝不置 0**——软加权铁律，保留翻身可能）。
+- **探索地板**：`top_n` 至少留 `EXPLORE_FLOOR_SLOTS=1` 个操作型席位；置换时**只牺牲最低分的「非知识型」项（优先 discovery/其他），绝不牺牲知识型**；若 `top_n` 全是知识型则尊重知识主导、不强插操作型。
+- **作用面**：仅限「按 score 排 Episodic」的交付面（`canonical_context` pass-2、`episode_search`）。**不含** `/api/search`（它排的是 edge fact、无 obs-type，不适用）。
+
+**离线验证（`tools/delivery_replay.py`，NAS 只读，8 真实查询，2026-07-09）**：
+- 先抓出地板 bug（初版会挤掉唯一 decision / 全 discovery 时不守地板）→ 修正为"只牺牲非知识型"。
+- 修正后三条铁证：**知识型不变量 8/8**（知识型计数永不下降）、**探索地板违规 0**、**知识型上浮 4/8**。
+- 例：`security`→security_note 顶 #1、知识 2→4；`dashboard`→被挤到 #4 的 decision 回 #1、底部留 1 feature；`falkordb`(全操作型)→顶部换 discovery、地板保住 1 refactor。
+
+**待办 / 未决**：
+- `?` type（source_description 无 `type=` 的 episode，疑为 openclaw 胶囊或旧格式）现取 DEFAULT 1.0——需**画像刻画后再定权重**。
+- 权重是拍的初值，非最优；上线前可再调（replay 随时复跑）。
+- **⛔ G5 生产 gate**：把 `tscore` 排序接入线上 `kg_hub_server`（`canonical_context` pass-2 + `episode_search`）**是改线上排序 + rebuild/recreate**，属生产动作，单独放行。本 step 只交付**设计 + 离线验证**，不碰线上。
+
+**验收标准**：
+- [x] 离线 replay：知识型不变量 8/8、探索地板违规 0、知识型上浮 ≥ 半数查询。
+- [ ] （G5 前）`?` type 刻画 + 权重复核。
+- [ ] （**G5 gate 后**）线上接入后重跑 replay 口径对照，且 decision/security 注入占比相对上升、操作型不为 0。
+
+**回滚**：交付分层是 `kg_hub_server` 排序处的加权系数——设 `TIER_WEIGHT` 全 1.0（等价纯相关性）即回到今日；或旁路加权函数。改线上须 rebuild/recreate。
+
+---
+
 ## 总验收（端到端）
 
 方案整体成功的判据（全部以 WS-4 体检器度量，对比 2026-07-09 基线）：
