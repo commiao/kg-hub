@@ -82,11 +82,11 @@ Phase D（唯一新工程 —— 加法）
 
 **步骤**：
 1. 本文件（`docs/LANDING-PLAN-cognitive-asset.md`）即存档主体，已含 0.3 的拒绝清单。
-2. 在 `docs/DESIGN.md` 或 `docs/REPORTS.md` 抬头加一行指针：`认知资产化改造计划见 docs/LANDING-PLAN-cognitive-asset.md`。
+2. 在根目录 `DESIGN.md`（注意：DESIGN.md 在仓库根，不在 `docs/`）抬头加一行指针：`认知资产化改造计划见 docs/LANDING-PLAN-cognitive-asset.md`。
 3. 提交（仅 docs，无需 redeploy）：
    ```bash
    cd /Users/mac/workspace_claudeCode/kg-hub
-   git add docs/LANDING-PLAN-cognitive-asset.md docs/DESIGN.md
+   git add docs/LANDING-PLAN-cognitive-asset.md DESIGN.md
    git commit -m "docs: 认知资产化改造落地方案（采纳/拒绝存档）"
    git push
    ```
@@ -140,17 +140,17 @@ grep -rn "experimental" . 2>/dev/null | grep -vE "tools/experimental/|__pycache_
 |---|---|---|
 | `total_episodes` | Episode 节点总数 | —（观测） |
 | `dormant_rate` | 从未被检索/注入命中的 episode 占比（近似：无 usage/无近 90 天 access 记录） | ↓ |
-| `ops_noise_share` | 「运维自指」episode 占比（见下方签名） | ↓ |
+| `ops_noise_share` | 「运维自指 **bugfix**」episode 占比（见下方签名，只统计 type=bugfix） | ↓ |
 | `orphan_rate` | 零出边或零入边的实体占比 | ↓ |
 | `dup_clusters` | 高相似（同 project + 术语重合 ≥ 阈值）episode 簇数 | ↓ |
 | `capsule_starvation` | canonical 胶囊中 usage=0 的个数 / 总数 | ↓ |
 
-**运维自指签名 `is_ops_noise`（本 WS 建立，WS-3/WS-2 复用 —— 单一真相源）**：`project` 属 kg-hub 自身，且 narrative/facts 命中运维关键词集 `{docker, falkordb, keepalive, push hook, l2 fallback, daemon, compose, watchdog, redeploy, container, tailscale, dump.rdb}` 中 ≥2 个。签名参数（关键词、命中数、自项目名）统一从 `config/ingest_filter.json` 的 `ops_noise` 块读，三处不得各写各的。
+**运维自指签名 `is_ops_noise`（本 WS 建立，WS-3/WS-2 复用 —— 单一真相源）**：`type == "bugfix"` **且** `project` 属 kg-hub 自身 **且** narrative/facts 命中运维关键词集 `{docker, falkordb, keepalive, push hook, l2 fallback, daemon, compose, watchdog, redeploy, container, tailscale, dump.rdb}` 中 ≥2 个。**type gate 前置**（钉子①）：非 bugfix 一律 false，从源头保证 decision/security 零误杀。**纯分类器，不看 `enabled`**（钉子②）：`enabled` 只在过滤器消费端控制是否惩罚，故本 WS 落 `enabled:false` 时体检器仍能测 `ops_noise_share`。签名参数统一从 `config/ingest_filter.json` 的 `ops_noise` 块读，三处不得各写各的。
 
-> **执行顺序注意**：WS-4 最先需要该签名，故由 WS-4 负责创建 `utils/ops_noise.py`（含 `is_ops_noise(obs, cfg)`）+ 在 `config/ingest_filter.json` 落 `ops_noise` 配置块。WS-3 的过滤器、WS-2 的 curate 直接 `from utils.ops_noise import is_ops_noise`，不重复定义。
+> **执行顺序注意**：WS-4 最先需要该签名，故由 WS-4 负责创建 `utils/ops_noise.py`（含纯分类器 `is_ops_noise(obs, cfg)`）+ 在 `config/ingest_filter.json` 落 `ops_noise` 配置块（**`enabled: false`，未武装**）。WS-3 的过滤器、WS-2 的 curate 直接 `from utils.ops_noise import is_ops_noise`，不重复定义。
 
 **步骤**：
-1. 建 `utils/ops_noise.py`（见 WS-3 步骤 1 的函数体）+ 往 `config/ingest_filter.json` 加 `ops_noise` 配置块（见 WS-3 步骤 3）。**注意**：此时只是「定义签名 + 供体检器读」，**尚未接入过滤器 evaluate()**（接入是 WS-3 的动作），所以本步对线上摄入零影响。
+1. 建 `utils/ops_noise.py`（见 WS-3 步骤 1 的纯分类器函数体）+ 往 `config/ingest_filter.json` 加 `ops_noise` 配置块，**`enabled: false`**（见 WS-3 步骤 3）。**注意**：此时只是「定义签名 + 供体检器读」，**尚未接入过滤器 evaluate()、且 enabled=false**，所以本步对线上摄入**零影响**（双重保险：既没接线、开关也没开）。
 2. 写 `tools/health_check.py`：接受 `--json`（机读）/ 默认人读 / `--baseline <path>`（把结果存为基线）/ `--compare <baseline>`（出前后 diff）。`ops_noise_share` 指标直接调 `is_ops_noise`。复用 `graphiti_client.py` 现有 FalkorDB 连接方式，**只读**，不写图。
 3. 提交并同步到 NAS（`utils/ops_noise.py` + `tools/health_check.py` + config 属运行时文件，需随镜像上 NAS 才能连库；按部署纪律走）：
    ```bash
@@ -198,30 +198,39 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
 1. **共享签名 `is_ops_noise`**（单一真相源；文件 `utils/ops_noise.py` 已由 WS-4 先创建，此处给出其规范函数体，WS-3 是首个把它**接入过滤器**的消费者，WS-2 curate 也复用同一函数，避免三处签名漂移）：
    ```python
    def is_ops_noise(obs: dict, cfg: dict) -> bool:
-       """kg-hub 自身运维自指记录：属自项目 且 narrative/facts 命中 >=N 个运维关键词。"""
-       oc = cfg.get("ops_noise", {})
-       if not oc.get("enabled", False):
+       """kg-hub 自身运维自指的 **bugfix**。
+
+       纯分类器：只判 type/project/关键词，**不看 enabled**——enabled 只控制
+       过滤器是否据此惩罚（见步骤 2）。这样 WS-4 体检器在 enabled=false 时
+       仍能测 ops_noise_share，不被开关短路。
+       """
+       # 钉子①：只治理 bugfix。decision/security_note 即使提到 Docker 也不命中，
+       #        从源头保证「decision/security 零误杀」。
+       if obs.get("type") != "bugfix":
            return False
+       oc = cfg.get("ops_noise", {})
        project = (obs.get("project") or "").lower()
-       if not any(sp in project for sp in oc["self_projects"]):
+       if not any(sp in project for sp in oc.get("self_projects", [])):
            return False
        text = ((obs.get("narrative") or "") + " " + str(obs.get("facts") or "")).lower()
-       hits = sum(1 for kw in oc["keywords"] if kw in text)
+       hits = sum(1 for kw in oc.get("keywords", []) if kw in text)
        return hits >= oc.get("min_keyword_hits", 2)
    ```
 
 2. **在 `utils/ingest_filter.py` 的 `evaluate()` 里接入**（在 type_override 分支**之前**判定，使 ops_noise 无法借 bugfix 的 override 逃逸）：
-   - 若 `is_ops_noise(obs, cfg)` 为真：
+   - **武装开关在消费端**：`armed = cfg.get("ops_noise", {}).get("enabled", False)`。
+   - 若 `armed and is_ops_noise(obs, cfg)`：
      - **剥夺 override**：跳过 `type_overrides` 的 bypass 分支（即便 type=bugfix 也不再豁免）；
      - **扣分**：`score -= cfg["ops_noise"]["score_penalty"]`（默认 100 → base 90 的运维 bugfix 变负分）；
      - **抬门槛（双保险）**：与 `max(platform_threshold, cfg["ops_noise"]["min_score"])` 比较（默认 min_score=120，只有超长叙事+高 relevance 的运维记录才可能翻身）；
      - 记 `reasons += ["ops_noise: penalized & override revoked"]`，`layer="ops_noise"`（便于日志审计与验收统计）。
+   - `enabled=false`（WS-4 落库时的默认）→ 即便 `is_ops_noise` 为真也**不惩罚**，行为与今日完全一致；分类器仍可被体检器独立调用。
    - 非 ops_noise → 逻辑完全不变（真 bugfix 仍 bypass、仍 90 分过线）。
 
-3. **配置新增**（`config/ingest_filter.json` 顶层加块，可热加载、可回滚）：
+3. **配置**（`config/ingest_filter.json` 顶层加块，可热加载、可回滚）。⚠️ **钉子②：默认 `enabled: false`（未武装）**——该块由 WS-4 先落库时就是 false，故 WS-3 代码一部署**不会自动生效**；只有本 WS 用 replay 验证达标后，才显式 flip 成 true：
    ```jsonc
    "ops_noise": {
-     "enabled": true,
+     "enabled": false,                // WS-4 落库即 false；WS-3 replay 达标后才 flip true
      "self_projects": ["kg-hub", "kg_hub", "workspace_claudecode/kg-hub"],
      "keywords": ["docker","falkordb","keepalive","push hook","l2 fallback",
                   "daemon","compose","watchdog","redeploy","container","tailscale","dump.rdb"],
@@ -230,29 +239,34 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
      "min_score": 120
    }
    ```
-   > `type_overrides` **保持不动**（decision/bugfix/security 仍各自 bypass）——收紧完全由 ops_noise 专项完成，语义更清晰、回滚只需 `enabled:false`。
+   > `type_overrides` **保持不动**（decision/bugfix/security 仍各自 bypass）——收紧完全由 ops_noise 专项完成，语义更清晰、停用只需把 `enabled` 设回 false。
    > 配额那条不作为主杠杆（它不持久）；如未来要真日配额，另立工作流实现持久化 QuotaTracker，本方案不依赖它。
 
-4. **真实 obs 回放验证影响面**（用户强制要求：必须证明新增 reject 主要是运维自指，且真 bugfix 零误杀）。新增一次性脚本/命令，用最近 N 条真实 obs 干跑新过滤器（shadow 计算 `would_accept`，不落库）：
+4. **真实 obs 回放验证影响面**（用户强制要求：必须证明新增 reject 主要是运维自指，且真 bugfix 零误杀）。用**候选配置**（`enabled:true` 的临时副本，**不动线上 config**）对最近 N 条真实 obs 干跑新过滤器（shadow 计算 `would_accept`，不落库）：
    ```bash
-   # 在 NAS 上跑（能连 claude-mem 源 + 用同一 filter 代码），或本地对导出的近 500 条 obs 回放
-   spike-graphiti/.venv/bin/python -m tools.filter_replay --last 500 --report data/ws3-replay-2026-07-09.json
+   # 候选配置：拷一份线上 config，把 ops_noise.enabled 改 true，仅供 replay 用
+   cp config/ingest_filter.json /tmp/filter_cand.json  # 手改其 ops_noise.enabled=true
+   spike-graphiti/.venv/bin/python -m tools.filter_replay --last 500 --config /tmp/filter_cand.json \
+       --report data/ws3-replay-2026-07-09.json
    # 报告须给出：新规则新增 reject 条数、其中 ops_noise 占比、被 reject 的 type 分布
    ```
    人工核对：抽 20 条新增 reject，确认为运维自指；确认 `decision/security_alert/security_note` 与他项目 bugfix **无一被新增 reject**。
 
-5. 达标后提交并同步 NAS（保持 `shadow_mode=false`）：
+5. 达标后**才** flip 线上 `config/ingest_filter.json` 的 `ops_noise.enabled` → `true`，提交并同步 NAS（`shadow_mode` 保持 `false`）：
    ```bash
+   # 编辑 config/ingest_filter.json：ops_noise.enabled: false -> true
    git add utils/ops_noise.py utils/ingest_filter.py config/ingest_filter.json tools/filter_replay.py
-   git commit -m "fix(filter): 运维自指 bugfix 专项规则（扣分+抬门槛+剥夺override），堵困境二噪音"
+   git commit -m "fix(filter): 武装运维自指 bugfix 专项规则（扣分+抬门槛+剥夺override），堵困境二噪音"
    git push
    # 按部署方式同步改动到 NAS 源；下轮 ingester 运行自动热加载（load_config 每轮重读）
    ```
+   （注：`utils/ops_noise.py` + evaluate() 接入代码 + `filter_replay.py` 可在 flip 前先随 WS-4 一并部署——因 enabled=false 时它们对线上零影响；本步只是把开关拨到 true。）
 
 **验收标准**：
 - [ ] `tools/filter_replay` 报告显示：新增 reject 中 **ops_noise 占比 ≥ 80%**（抽样 20 条人工确认 ≥18 条确为运维自指）。
 - [ ] **零误杀**（硬门槛）：回放中 `type in {decision, security_alert, security_note}` 及**非 kg-hub 项目**的 bugfix **无一**被新规则新增 reject。
-- [ ] 单元测试：`is_ops_noise` 对「kg-hub Docker 修复 bugfix」判 true、对「他项目功能 bugfix」判 false、对「decision」判 false（即使含关键词也因 override 前置判定不受扣分误伤——需专门测这条边界）。
+- [ ] 单元测试：`is_ops_noise` 对「kg-hub Docker 修复 **bugfix**」判 true；对「他项目功能 bugfix」判 false；对「kg-hub 的 **decision/security_note**，即使 narrative 写满 Docker/FalkorDB」也判 **false**（钉子①：type gate 直接挡掉——这是「decision/security 零误杀」的源头保证，必须专门测这条边界）。
+- [ ] 消费端测试：`enabled=false` 时，一条本会命中的运维 bugfix 的 `would_accept` 与今日一致（未武装＝零影响）；flip `enabled=true` 后同一条被 reject。
 - [ ] 生效后观测 3 天：`ingest_decisions.jsonl` 中 `layer=="ops_noise"` 的 reject 稳定出现，且都是运维自指。
 - [ ] 3 天后重跑 WS-4：新增 episode 的 `ops_noise_share` 相对基线**明显下降**（这是本 WS 是否「力臂够」的最终判据——若没降，说明签名漏了或门槛不够，回到步骤 3 调参）。
 
@@ -375,9 +389,9 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && sudo -n docker comp
 
 ```
 [ ] WS-0 存档本文档 + DESIGN 指针 → commit/push
-[ ] WS-1 tests/test_experimental_frozen.py → pytest 绿（含"故意引用变红"验证）→ commit/push
+[ ] WS-1 tests/test_experimental_frozen.py → 直跑打印 PASS（含"植入真实 import 探针变红"验证）→ commit/push
 [ ] WS-4 utils/ops_noise.py(共享签名) + tools/health_check.py → NAS 跑 → 存 health-baseline-2026-07-09.json
-[ ] WS-3 ops_noise 专项规则(扣分+抬门槛+剥夺override，改 ingest_filter 代码) → filter_replay 证 reject≥80%是运维噪音+真bugfix零误杀 → commit/push/同步 → 观测3天
+[ ] WS-3 ops_noise 专项规则(仅 type=bugfix；扣分+抬门槛+剥夺override，改 ingest_filter 代码，默认 enabled:false) → 候选配置 filter_replay 证 reject≥80%是运维噪音+真bugfix/decision/security零误杀 → 达标才 flip enabled:true → commit/push/同步 → 观测3天
 [ ] WS-2 备份 dump → curate_ops_noise --dry-run → 抽样≥90% → --apply(带 manifest) → 归档 INCIDENT-RETRO → 重跑 WS-4 出前后对比（误动用 --restore 秒回滚）
 [ ] WS-5 近重复回放 go/no-go → ingest_router 单测 → shadow 一周 → 达标生效
 [ ] 总验收：health_check --compare 出改造前后 diff，确认 ops_noise_share 真降
