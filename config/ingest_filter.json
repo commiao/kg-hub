@@ -50,5 +50,17 @@
     "bugfix":         { "bypass_threshold": true, "bypass_quota": true },
     "security_alert": { "bypass_threshold": true, "bypass_quota": true },
     "security_note":  { "bypass_threshold": true, "bypass_quota": false }
+  },
+
+  "_ops_noise_doc": "运维自指 bugfix 专项签名（WS-3/WS-4/WS-2 共用）。enabled=false 时未武装：分类器仍供体检器读，但过滤器不据此惩罚。WS-3 用 replay 达标后才 flip enabled=true。",
+  "ops_noise": {
+    "enabled": false,
+    "self_projects": ["kg-hub", "kg_hub", "workspace_claudecode/kg-hub"],
+    "keywords": ["docker", "falkordb", "keepalive", "push hook", "l2 fallback",
+                 "daemon", "compose", "watchdog", "redeploy", "container",
+                 "tailscale", "dump.rdb"],
+    "min_keyword_hits": 2,
+    "score_penalty": 100,
+    "min_score": 120
   }
 }
