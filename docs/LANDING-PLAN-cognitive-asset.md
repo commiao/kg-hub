@@ -326,12 +326,20 @@ ssh commiao@100.123.208.32 'tail -n 500 /volume1/docker/kg-hub-src/data/.ingest_
 
 **读路径分类（诚实入册）**：**有意不过滤** = count/total 查询（守 total 不变）；**无法过滤** = `/api/search`（edge fact 无 obs-type）、`search_semantic`（graphiti 混合检索）——归档只隐藏 episode 级读，**edge 级 fact 仍在**（已知局限；ops_noise 的 edge 会残留，但它们本就低信噪，可接受）。
 
-### ⛔ G3 apply gate（需单独放行，按序）
-1. **就近重跑 `backup_graph.sh`** 取最新快照。
-2. **部署带 archived 过滤的 server**（commit→push→rebuild 镜像→recreate `kg_hub_server`；校验 NAS sha==git HEAD）。
-3. **`curate_ops_noise --apply --manifest data/curate-G3-<ts>.json`**（打 archived=true on 27）。
-4. **复验**：`health_check` 应 `total` 不变、`active` −27=2240、`archived` +27=27；`canonical_context` 不再返回 INCIDENT-RETRO；`episode_search`/dashboard 不再出那 26 条。
-5. 异常 → `curate_ops_noise --restore <manifest>`（秒级），兜底用备份恢复。
+### ✅ G3 apply 已执行并全链路验证（2026-07-09，条件放行后）
+> 前置补丁：`health_check` 的 `ops_noise` 已按 archived 拆 `active/archived`（`69c4bbc`），使 apply 后 `active_ops_noise_share` 能证明降到 0（否则全量口径会看起来没降）。
+1. ✅ 就近全量备份（`backup-pre-G3-20260709-234744`，dump.rdb+appendonlydir 81M）。
+2. ✅ 部署带 archived 过滤的 server：sha256 校验 NAS==local、rebuild 镜像、recreate `kg_hub_server`、/health ok。
+3. ✅ `curate_ops_noise --apply --manifest data/curate-G3-2026-07-09.json`：27 条打 archived=true（26 ops + INCIDENT-RETRO），manifest 落盘。
+4. ✅ **复验（health_check --compare 基线）**：`total 2267 不变`、`active 2267→2240(−27)`、`archived 0→27(+27)`、`active_ops_noise 26→0`、`active_ops_noise_share 1.15%→0%`；图内 INCIDENT-RETRO.archived=True、活跃 canonical=8。
+5. ✅ **live 端点验证**：`canonical_context`（4 kw 遍历）0 次漏出 INCIDENT-RETRO；`episode_search "KeepAlive deadlock"` 0 次返回已归档 obs-4258。**读路径生效。**
+6. 回滚就绪（未触发）：`curate_ops_noise --restore data/curate-G3-2026-07-09.json`（秒级）；兜底备份。
+
+**结论：G3 完成 —— 没删、只隔离 27 条、总量不变、活跃噪音归零、注入/搜索不再吐归档内容。**
+
+---
+
+#### （历史）apply gate 原计划（供参考）
 
 > ⚠️ 需**图谱写操作**，而 server 无写端点、FalkorDB 仅 NAS-local → 必须在 NAS 上跑受控管理脚本，**先 `--dry-run` 再 `--apply`**，且**先备份**。
 
