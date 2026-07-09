@@ -109,21 +109,26 @@ async def collect() -> dict:
     cap_total = int(rc[0].get("total") or 0)
     cap_starved = int(rc[0].get("starved") or 0)
 
-    # --- ops_noise：拉全量 Episodic 重建 obs 后过分类器 ---
+    # --- ops_noise：拉全量 Episodic 重建 obs 后过分类器（按 archived 拆 active/archived）---
     rows = await _q(
         driver,
         "MATCH (n:Episodic) WHERE NOT n.name STARTS WITH $pfx "
         "RETURN n.name AS name, n.content AS content, "
-        "       n.source_description AS sd",
+        "       n.source_description AS sd, coalesce(n.archived,false) AS archived",
         pfx=CANONICAL_PREFIX,
     )
-    ops_noise = 0
+    active_ops = archived_ops = 0
     dup_map: dict[tuple[str, str], int] = {}
     for row in rows:
         obs = _obs_from_episodic(row.get("name") or "", row.get("content") or "",
                                  row.get("sd") or "")
         if is_ops_noise(obs, ops_cfg):
-            ops_noise += 1
+            if row.get("archived"):
+                archived_ops += 1
+            else:
+                active_ops += 1
+        if row.get("archived"):
+            continue  # dup 只在活跃集内统计
         # 廉价 dup 代理：同 project + 相同标题行（content 首行 = "[TYPE] title"）
         title = (row.get("content") or "").splitlines()[0].strip() if row.get("content") else ""
         key = (obs["project"], title)
@@ -153,8 +158,11 @@ async def collect() -> dict:
         "capsule_total": cap_total,
         "capsule_dormant_count": cap_starved,
         "capsule_dormant_rate_pct": rate(cap_starved, cap_total),
-        "ops_noise_count": ops_noise,
-        "ops_noise_share_pct": rate(ops_noise, total),
+        "active_ops_noise_count": active_ops,
+        "archived_ops_noise_count": archived_ops,
+        "ops_noise_count": active_ops + archived_ops,
+        "active_ops_noise_share_pct": rate(active_ops, active),  # 只按活跃集算 —— apply 后应降
+        "ops_noise_share_pct": rate(active_ops + archived_ops, total),  # 全量，参考
         "entity_total": ent_total,
         "orphan_count": orphans,
         "orphan_rate_pct": rate(orphans, ent_total),
@@ -169,7 +177,7 @@ def _fmt_human(m: dict) -> str:
         f"  注入覆盖(非使用率!)  : {m['injected_ever_rate_pct']}%  ({m['injected_ever_count']})\n"
         f"  胶囊沉睡率           : {m['capsule_dormant_rate_pct']}%  "
         f"({m['capsule_dormant_count']}/{m['capsule_total']})\n"
-        f"  运维自指 bugfix 占比 : {m['ops_noise_share_pct']}%  ({m['ops_noise_count']})\n"
+        f"  运维自指 bugfix       : active {m['active_ops_noise_count']}（活跃占比 {m['active_ops_noise_share_pct']}%）/ archived {m['archived_ops_noise_count']}\n"
         f"  孤儿实体率           : {m['orphan_rate_pct']}%  ({m['orphan_count']}/{m['entity_total']})\n"
         f"  近重复簇(廉价代理)   : {m['dup_clusters_approx']}\n"
     )
