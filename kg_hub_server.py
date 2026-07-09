@@ -804,7 +804,9 @@ async def canonical_context(request: Request) -> JSONResponse:
     cand: list[dict] = []
     try:
         r1, _, _ = await driver.execute_query(
+            # G3: 排除归档胶囊（如 INCIDENT-RETRO），不再进 canonical 注入候选
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND NOT coalesce(n.archived, false) "
             "RETURN n.name AS name, n.content AS content, "
             "       n.source_description AS source, "
             "       coalesce(n.usage_count, 0) AS uc, n.scope AS scope",
@@ -860,7 +862,7 @@ async def canonical_context(request: Request) -> JSONResponse:
         try:
             r2, _, _ = await driver.execute_query(
                 "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
-                "WHERE NOT node.name IN $exclude "
+                "WHERE NOT node.name IN $exclude AND NOT coalesce(node.archived, false) "
                 "RETURN node.name AS name, node.content AS content, "
                 "       node.source_description AS source, score AS score "
                 "ORDER BY score DESC LIMIT $lim",
@@ -1030,6 +1032,7 @@ async def episode_search(request: Request) -> JSONResponse:
     try:
         rows, _, _ = await driver.execute_query(
             "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
+            "WHERE NOT coalesce(node.archived, false) "
             "RETURN node.name AS name, node.content AS content, "
             "node.source_description AS source, score "
             f"ORDER BY score DESC LIMIT {lim}",
@@ -1037,7 +1040,8 @@ async def episode_search(request: Request) -> JSONResponse:
         )
     except Exception:
         rows, _, _ = await driver.execute_query(
-            "MATCH (n:Episodic) WHERE n.name CONTAINS $q OR n.content CONTAINS $q "
+            "MATCH (n:Episodic) WHERE (n.name CONTAINS $q OR n.content CONTAINS $q) "
+            "AND NOT coalesce(n.archived, false) "
             "RETURN n.name AS name, n.content AS content, "
             f"n.source_description AS source, 0.0 AS score LIMIT {lim}",
             q=q,
@@ -1258,6 +1262,7 @@ async def dashboard_capsules(request: Request) -> HTMLResponse:
     try:
         rows, _, _ = await driver.execute_query(
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
+            "AND NOT coalesce(n.archived, false) "
             "RETURN n.name AS name, n.content AS content, "
             "       coalesce(n.usage_count,0) AS uc, n.last_used_at AS last, n.scope AS scope")
     except Exception as exc:
@@ -1448,6 +1453,7 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
             try:  # fulltext first (good for English / multi-word)
                 rows = await one(
                     "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
+                    "WHERE NOT coalesce(node.archived, false) "
                     "RETURN substring(coalesce(node.content,''),0,4000) AS detail, "
                     "node.name AS name, node.source_description AS source, node.created_at AS created "
                     "ORDER BY score DESC LIMIT 30", q=q)
@@ -1455,12 +1461,14 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
                 rows = []
             if not rows:  # substring fallback (handles Chinese / no fulltext hit)
                 rows = await one(
-                    "MATCH (n:Episodic) WHERE n.content CONTAINS $q OR n.name CONTAINS $q "
+                    "MATCH (n:Episodic) WHERE (n.content CONTAINS $q OR n.name CONTAINS $q) "
+                    "AND NOT coalesce(n.archived, false) "
                     "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
                     "n.name AS name, n.source_description AS source, n.created_at AS created LIMIT 30", q=q)
         else:  # no query → recent knowledge
             rows = await one(
                 "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+                "AND NOT coalesce(n.archived, false) "
                 "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
                 "n.name AS name, n.source_description AS source, n.created_at AS created "
                 "ORDER BY n.created_at DESC LIMIT 25")

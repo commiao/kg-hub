@@ -115,18 +115,19 @@ async def _candidates(d, cfg) -> dict:
 def _report(c: dict) -> dict:
     ops_names = {r["name"] for r in c["ops"]}
     dup_names = {r["name"] for r in c["dup_extras"]}
-    overlap = ops_names & dup_names           # 既是 ops_noise 又是 dup 多余份
-    union = ops_names | dup_names | set(c["incident"])
+    # 决策 2026-07-09：dup 整类**不 apply**（dry-run 证明会误伤 decision 迭代/同主题独立记录/
+    # openclaw 同名节点，收益仅~1% 不值误伤知识型）。dup 仅作信息展示，不进 union。
+    union = ops_names | set(c["incident"])    # apply 范围 = A ops_noise ∪ C INCIDENT-RETRO
     return {
         "A_ops_noise": sorted(ops_names),
-        "B_dup_extras": sorted(dup_names),
-        "B_dup_clusters": c["dup_clusters"],
+        "B_dup_extras_EXCLUDED": sorted(dup_names),   # 仅展示，不 apply
+        "B_dup_clusters_EXCLUDED": c["dup_clusters"],
         "C_incident_retro": c["incident"],
-        "overlap_ops_and_dup": sorted(overlap),
         "counts": {
-            "ops_noise": len(ops_names), "dup_extras": len(dup_names),
-            "incident_retro": len(c["incident"]), "overlap": len(overlap),
-            "union_total": len(union),
+            "ops_noise": len(ops_names),
+            "dup_extras_excluded": len(dup_names),
+            "incident_retro": len(c["incident"]),
+            "apply_union_total": len(union),          # 拟 apply 的净条数（应=27）
             "active_noncanonical": c["n_active_noncanon"],
         },
         "union_names": sorted(union),
@@ -191,19 +192,16 @@ def main() -> int:
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2)); return 0
     c = rep["counts"]
-    print("=== G3 dry-run 候选（不写图；三类分列）===")
+    print("=== G3 dry-run 候选（不写图；A/C 拟 apply，B 排除）===")
     print(f"活跃非 canonical episode 总数: {c['active_noncanonical']}")
-    print(f"\nA. ops_noise（运维自指 bugfix，规则=is_ops_noise）: {c['ops_noise']} 条")
+    print(f"\n[拟 apply] A. ops_noise（is_ops_noise 规则）: {c['ops_noise']} 条")
     for n in rep["A_ops_noise"][:40]:
         print(f"   - {n}")
-    print(f"\nB. dup 多余份（每簇留最长一份，归档其余）: {c['dup_extras']} 条，{len(rep['B_dup_clusters'])} 簇")
-    for cl in rep["B_dup_clusters"]:
-        print(f"   簇[{cl['project']}] «{cl['title']}»  留 {cl['keep']}  归档 {cl['archive']}")
-    print(f"\nC. INCIDENT-RETRO 胶囊: {c['incident_retro']}  {rep['C_incident_retro']}")
-    print(f"\n重叠（ops_noise ∩ dup）: {c['overlap']} 条  {rep['overlap_ops_and_dup']}")
-    print(f"\n合计去重后拟归档（union）: {c['union_total']} 条"
-          f"（占活跃非canon {round(100*c['union_total']/max(c['active_noncanonical'],1),1)}%）")
-    print("\n⚠️ 本轮仅 dry-run。apply 前置：①备份图谱 ②读路径加 WHERE NOT archived（server 改动+rebuild=生产 gate）。")
+    print(f"\n[拟 apply] C. INCIDENT-RETRO 胶囊: {c['incident_retro']}  {rep['C_incident_retro']}")
+    print(f"\n[排除·不 apply] B. dup 多余份: {c['dup_extras_excluded']} 条，{len(rep['B_dup_clusters_EXCLUDED'])} 簇"
+          f"（决策 2026-07-09：dup 整类不动，误伤 decision 迭代风险 > 1% 收益）")
+    print(f"\n>>> 拟 apply 净条数（A+C，不含 B）: {c['apply_union_total']} 条 <<<")
+    print("\n⚠️ 本轮仅 dry-run。apply 前置：①读路径加 WHERE NOT archived（server 改动+rebuild=生产 gate）②备份图谱。")
     return 0
 
 
