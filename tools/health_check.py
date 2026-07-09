@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -196,7 +197,10 @@ def main() -> int:
         print(_diff(base.get("metrics", base), metrics))
     if args.baseline:
         Path(args.baseline).write_text(
-            json.dumps({"metrics": metrics}, ensure_ascii=False, indent=2)
+            json.dumps(
+                {"generated_at": datetime.now(timezone.utc).isoformat(), "metrics": metrics},
+                ensure_ascii=False, indent=2,
+            )
         )
         print(f"[baseline] 已写 {args.baseline}", file=sys.stderr)
     if args.json:

@@ -33,27 +33,40 @@ def is_ops_noise(obs: dict, cfg: dict) -> bool:
     """判定一条 obs 是否为 kg-hub 自身运维自指的 bugfix。
 
     Args:
-        obs: claude-mem 行 dict，至少含 type / project / narrative / facts。
+        obs: claude-mem 行 dict，含 type / title / narrative / facts。
         cfg: 完整过滤器配置 dict（读其 "ops_noise" 块）。
 
     Returns:
-        True 仅当：type==bugfix 且 project 属自项目 且 命中 >=N 个运维关键词。
+        True 仅当三者同时成立：
+          - type == "bugfix"（钉子①：type gate，decision/security 一律 false）
+          - 文本含自我标记 self_markers（如 "kg-hub"）—— 判「是否关于 kg-hub 自身」
+          - 文本命中 >= min_keyword_hits 个运维关键词
+
+    为何用文本标记而非 project：WS-4 实测发现这些运维 obs 的 project 全是
+    `workspace_claudeCode`（与其它 Claude Code 工作同一个 project），project
+    字段无法区分「kg-hub 自身维护」。改用「正文/标题提到 kg-hub」作判据：
+    实测命中 26 条真运维、正确排除 3 条非 kg-hub 的 infra bugfix。
     """
     # 钉子①：type gate 前置。非 bugfix 一律 false。
     if (obs.get("type") or "") != "bugfix":
         return False
 
     oc = cfg.get("ops_noise") or {}
-    self_projects = [p.lower() for p in oc.get("self_projects", [])]
-    if not self_projects:
-        return False
-    project = (obs.get("project") or "").lower()
-    if not any(sp in project for sp in self_projects):
+    # 检索文本 = 标题 + 叙事 + facts。摄入期 title 独立存在；图谱期 narrative
+    # 传入的是完整 content（首行即标题），两条路径都能覆盖到标题。
+    text = " ".join([
+        (obs.get("title") or ""),
+        (obs.get("narrative") or ""),
+        _decode(obs.get("facts")),
+    ]).lower()
+
+    # 自我标记：必须提到 kg-hub 本身，才算「自指」。fail-closed：未配则不判噪音。
+    markers = [m.lower() for m in oc.get("self_markers", [])]
+    if not markers or not any(m in text for m in markers):
         return False
 
     keywords = [k.lower() for k in oc.get("keywords", [])]
     if not keywords:
         return False
-    text = ((obs.get("narrative") or "") + " " + _decode(obs.get("facts"))).lower()
     hits = sum(1 for kw in keywords if kw in text)
     return hits >= int(oc.get("min_keyword_hits", 2))

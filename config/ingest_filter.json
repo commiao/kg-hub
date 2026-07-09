@@ -52,10 +52,10 @@
     "security_note":  { "bypass_threshold": true, "bypass_quota": false }
   },
 
-  "_ops_noise_doc": "运维自指 bugfix 专项签名（WS-3/WS-4/WS-2 共用）。enabled=false 时未武装：分类器仍供体检器读，但过滤器不据此惩罚。WS-3 用 replay 达标后才 flip enabled=true。",
+  "_ops_noise_doc": "运维自指 bugfix 专项签名（WS-3/WS-4/WS-2 共用）。判据=type==bugfix ∧ 文本含 self_markers ∧ 命中>=N 运维词。self_markers 用文本标记而非 project（WS-4 实测：运维 obs 的 project 全是 workspace_claudeCode，区分不了）。enabled=false 时未武装：分类器仍供体检器读，过滤器不据此惩罚。WS-3 replay 达标后才 flip enabled=true。",
   "ops_noise": {
     "enabled": false,
-    "self_projects": ["kg-hub", "kg_hub", "workspace_claudecode/kg-hub"],
+    "self_markers": ["kg-hub", "kg_hub"],
     "keywords": ["docker", "falkordb", "keepalive", "push hook", "l2 fallback",
                  "daemon", "compose", "watchdog", "redeploy", "container",
                  "tailscale", "dump.rdb"],
