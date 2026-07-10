@@ -101,7 +101,11 @@ G5 是"改排序偏好"（非 G3 那种"去坏东西"），必须看真实查询
 4. **保留条件**（全满足才留）：知识型占比上升；已知 decision/security 不被挤掉；操作型没被清零；探索地板仍在。
 5. **回退条件**（任一触发即 `enabled=false`+rebuild）：任一关键 query 的唯一知识型被挤掉，或结果明显变窄。
 
-> **⚠️ pre-flip 开放项（baseline 已暴露，2026-07-10）**：G6-lite 首批显示 **`episode_search` 交付 ~87% 是 `?` 型**（source_description 无 `type=`，多为 openclaw 胶囊/杂项），带 obs-type 的仅 ~13%。**含义：type 加权只对那 ~13% 有杠杆，对 `?` 型（权重默认 1.0）几乎不动 → G5 实际影响面可能远小于 delivery_replay 的乐观估计。** flip 前须决定 `?` 型（尤其 openclaw 胶囊）是否给权重/是否算知识。
+> **pre-flip `?` 画像已做（`tools/unknown_type_profile.py`，2026-07-10）—— 推翻了"87%"惊吓**：
+> - G6-lite 首批日志显示 episode_search 交付 ~87% 是 `?` 型 —— 但那是 **12 次探针查询的采样偏差**，非图谱真相。
+> - **图谱真实构成：活跃 2242 中 typed 2135（95.2%）/ untyped `?` 仅 107（4.8%）**（openclaw 胶囊 65 + misc 34 + canonical 胶囊 8）。**→ G5 type 加权对 95% 的 episode 有杠杆，不是"只动很小一层"。**
+> - **`?` 权重决策（定档）**：`?`=**1.0（中性）**即可 —— 107 条是胶囊重尾（openclaw/canonical 是文档资产，不该罚；canonical 又走 pass-1 不经 tiering），misc 保持 1.0。4.8% 量级上"`?` 稀释 G5"几乎不成立，无需拍脑袋升降。
+> - **仍需 real baseline**：`?` 的**图谱占比**已解（4.8%），但 `?` 的**真实交付占比**仍未知（探针 87% 不可信）；real baseline 才能给"真实查询到底端出什么 mix"。
 > **日志 cap（随 flip 一起 ship）**：`/backup/delivery-hits.jsonl` 现无界；flip rebuild 时**同批**给 `_log_delivery` 加 size-cap/rotate（别让 G6-lite 变成新的无界日志）。baseline 窗口内量小（KB），暂不单独 rebuild。
 
 ### G4 决策框架（勿惯性打开 —— 2026-07-09 定）
