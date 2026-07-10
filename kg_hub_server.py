@@ -30,6 +30,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import uuid as uuidlib
 from datetime import datetime, timedelta, timezone
@@ -763,6 +764,74 @@ CANONICAL_SCOPE = {
 }
 
 
+# ---------- G5 交付分层 + G6-lite 使用度量（0.4 层③；delivery_replay 已离线验证）----------
+# 对「按 score 排 Episodic」的交付面（canonical_context pass-2 填位 / episode_search）做
+# type 软加权 + 探索地板：知识型上浮、操作型降权但保留 1 席。config `delivery_tiering.enabled`
+# 门控，默认 false=inert（行为与今日一致）。config baked，flip 需 rebuild。
+_DT_TYPE_RE = re.compile(r"type=(\S+)")
+_DT_KNOWLEDGE = {"decision", "security_note", "security_alert"}
+_DT_OPERATIONAL = {"bugfix", "change", "feature", "refactor"}
+
+
+def _load_delivery_tiering() -> dict:
+    try:
+        p = Path(__file__).resolve().parent / "config" / "ingest_filter.json"
+        return json.loads(p.read_text()).get("delivery_tiering", {}) or {}
+    except Exception:
+        return {}
+
+
+_DELIVERY = _load_delivery_tiering()  # cached at import（config baked，重启即重读）
+
+
+def _ep_type(source_description: str) -> str:
+    m = _DT_TYPE_RE.search(source_description or "")
+    return m.group(1) if m else "?"
+
+
+def _tier_weight(typ: str) -> float:
+    return float((_DELIVERY.get("weights") or {}).get(typ, 1.0))
+
+
+def _tiered_rerank(items: list, n: int) -> list:
+    """items: dicts 含 'score' + 'source'(=source_description)。enabled=false 时纯按 score 取
+    top-n（与今日一致）。enabled=true：score×type权重 重排 + 1 席操作型探索地板（只牺牲最低分
+    非知识型，绝不牺牲知识型；全知识型不强插）。逻辑镜像 tools/delivery_replay.py。"""
+    for it in items:
+        it["_type"] = _ep_type(it.get("source") or "")
+    if not _DELIVERY.get("enabled"):
+        return sorted(items, key=lambda r: -(r.get("score") or 0))[:n]
+    for it in items:
+        it["_tscore"] = float(it.get("score") or 0) * _tier_weight(it["_type"])
+    ranked = sorted(items, key=lambda x: -x["_tscore"])
+    picked = ranked[:n]
+    if n <= 0 or any(c["_type"] in _DT_OPERATIONAL for c in picked):
+        return picked
+    rest_ops = [c for c in ranked[n:] if c["_type"] in _DT_OPERATIONAL]
+    non_know = [c for c in picked if c["_type"] not in _DT_KNOWLEDGE]
+    if rest_ops and non_know:
+        drop = min(non_know, key=lambda c: c["_tscore"])
+        picked = [c for c in picked if c is not drop] + [rest_ops[0]]
+    return picked
+
+
+def _log_delivery(endpoint: str, kw: str, picked: list) -> None:
+    """G6-lite：把每次注入/搜索的命中(name+type+是否tiered)追加到 /backup 卷。绝不因日志失败影响交付。"""
+    try:
+        rec = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "endpoint": endpoint, "kw": kw, "tiering": bool(_DELIVERY.get("enabled")),
+            "picked": [{"name": p.get("name"),
+                        "type": p.get("_type") or _ep_type(p.get("source") or "")}
+                       for p in picked],
+        }
+        path = os.environ.get("KG_HUB_DELIVERY_LOG", "/backup/delivery-hits.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 async def canonical_context(request: Request) -> JSONResponse:
     """GET /api/canonical_context?kw=<keyword>&top_n=3&bump=1
 
@@ -885,10 +954,12 @@ async def canonical_context(request: Request) -> JSONResponse:
     # rank_and_pick: canonical first (already relevance-ranked + exploration-
     # padded above, so keep that order), then fulltext others by score.
     canonical = [r for r in rows if r["is_canonical"]]
-    others = sorted([r for r in rows if not r["is_canonical"]], key=lambda r: -r["score"])
+    others_all = [r for r in rows if not r["is_canonical"]]
     picked = canonical[:top_n]
     if len(picked) < top_n:
-        picked.extend(others[: top_n - len(picked)])
+        # G5 交付分层：type-weighted 重排 others 填位（enabled=false 时等价原按 score 取）
+        picked.extend(_tiered_rerank(others_all, top_n - len(picked)))
+    _log_delivery("canonical_context", kw, picked)  # G6-lite：记录本次注入命中
 
     bumped = 0
     if bump and picked:
@@ -1029,13 +1100,15 @@ async def episode_search(request: Request) -> JSONResponse:
     except (TypeError, ValueError):
         lim = 5
     driver = get_status_driver()
+    # disabled 时 pool=lim（查询与今日字节一致，避免平局下返回不同子集）；enabled 时放大供重排
+    pool = min(lim * 3, 45) if _DELIVERY.get("enabled") else lim
     try:
         rows, _, _ = await driver.execute_query(
             "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
             "WHERE NOT coalesce(node.archived, false) "
             "RETURN node.name AS name, node.content AS content, "
             "node.source_description AS source, score "
-            f"ORDER BY score DESC LIMIT {lim}",
+            f"ORDER BY score DESC LIMIT {pool}",
             q=q,
         )
     except Exception:
@@ -1043,15 +1116,19 @@ async def episode_search(request: Request) -> JSONResponse:
             "MATCH (n:Episodic) WHERE (n.name CONTAINS $q OR n.content CONTAINS $q) "
             "AND NOT coalesce(n.archived, false) "
             "RETURN n.name AS name, n.content AS content, "
-            f"n.source_description AS source, 0.0 AS score LIMIT {lim}",
+            f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
             q=q,
         )
+    items = [{"name": r.get("name"), "source": r.get("source"),
+              "score": r.get("score"), "content": r.get("content")} for r in rows]
+    items = _tiered_rerank(items, lim)          # G5：type-weighted（enabled=false 时等价原样）
+    _log_delivery("episode_search", q, items)   # G6-lite
     results = [{
-        "name": r.get("name"),
-        "source": r.get("source"),
-        "score": r.get("score"),
-        "body_preview": (r.get("content") or "")[:600],
-    } for r in rows]
+        "name": it.get("name"),
+        "source": it.get("source"),
+        "score": it.get("score"),
+        "body_preview": (it.get("content") or "")[:600],
+    } for it in items]
     return JSONResponse({"status": "ok", "results": results})
 
 

@@ -62,5 +62,16 @@
     "min_keyword_hits": 2,
     "score_penalty": 100,
     "min_score": 120
+  },
+
+  "_delivery_tiering_doc": "G5 交付分层：对'按 score 排 Episodic'的交付面(canonical_context pass-2/episode_search)做 type 软加权+探索地板。enabled=false=inert(行为与今日一致，仅供 G6-lite 采基线)；离线验证见 tools/delivery_replay.py。config baked，flip enabled=true 需 rebuild(canary 微 gate)。",
+  "delivery_tiering": {
+    "enabled": false,
+    "weights": {
+      "decision": 1.6, "security_note": 1.6, "security_alert": 1.6,
+      "discovery": 1.0,
+      "feature": 0.7, "refactor": 0.7,
+      "bugfix": 0.6, "change": 0.6
+    }
   }
 }
