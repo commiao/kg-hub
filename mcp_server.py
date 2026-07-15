@@ -98,14 +98,26 @@ async def _alert_unreachable(where: str, exc: Exception) -> None:
 # JSON response — a single tolerant round-trip. (kg_add_episode was already HTTP.)
 async def _http_get(path: str, **params) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {KG_HUB_API_TOKEN}"} if KG_HUB_API_TOKEN else {}
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(f"{KG_HUB_URL}{path}", params=params, headers=headers)
-            r.raise_for_status()
-            return r.json()
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
-        await _alert_unreachable(f"GET {path}", exc)
-        raise
+    # Reads are idempotent, so retry across transient blips. The Mac↔NAS tailscale
+    # relay flaps for a second or two at a time; a single attempt then both fails the
+    # query AND fires a false "连不上" alert. Fast connect timeout (5s) so a blip fails
+    # quickly and the retry (1s, 2s backoff) usually sails through. Only alert after
+    # all attempts are exhausted — i.e. kg-hub is genuinely unreachable, not flapping.
+    timeout = httpx.Timeout(20.0, connect=5.0)
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(f"{KG_HUB_URL}{path}", params=params, headers=headers)
+                r.raise_for_status()
+                return r.json()
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(1.0 * (attempt + 1))
+                continue
+    await _alert_unreachable(f"GET {path}", last_exc)  # type: ignore[arg-type]
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------- MCP server ----------
