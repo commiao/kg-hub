@@ -1783,13 +1783,15 @@ button.ver.on{background:#1D9E75;border-color:#1D9E75}
 <form method=get action="/dashboard/curate" style="display:flex;gap:8px;margin-bottom:1rem">
 <input id=q name=q placeholder="搜索要整理的知识…" autocomplete=off style="flex:1;padding:6px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:Canvas;color:CanvasText;font-size:14px">
 <button>搜索</button></form>
+<div id=synthbar style="display:flex;gap:8px;align-items:center;margin:.4rem 0;font-size:13px"><span>已选 <b id=cnt>0</b> 条</span><button id=synth disabled>合成选中为案例包 ↴</button><span class=tip style="margin:0">勾选相关的几条 → 合成主结论/时间线/证据/结果/可迁移</span></div>
+<div id=cpresult></div>
 <div id=list></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json()}).then(cb).catch(function(){cb({ok:false})});}
 document.getElementById('q').value=D.q||'';
 document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class="vis'+(x.visibility===v[0]?' on':'')+'" data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
- return '<div class=item><div class=top><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
+ return '<div class=item><div class=top><input type=checkbox class=pick data-i="'+i+'" style="margin-top:3px"><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
    +'<div class=ctrl><span class=lb>可见性:</span>'+vb
    +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
    +'<button class=exp data-i="'+i+'">详情</button><span class=saved data-i="'+i+'">✓已存</span></div>'
@@ -1801,6 +1803,10 @@ document.getElementById('list').addEventListener('click',function(e){var b=e.tar
  else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
  else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
 });
+function selected(){return Array.prototype.filter.call(document.querySelectorAll('.pick'),function(c){return c.checked;}).map(function(c){return D.items[+c.dataset.i].name;});}
+document.getElementById('list').addEventListener('change',function(e){if(e.target.classList.contains('pick')){var n=selected().length;document.getElementById('cnt').textContent=n;document.getElementById('synth').disabled=n<1;}});
+document.getElementById('synth').addEventListener('click',function(){var names=selected();if(!names.length)return;var btn=this;btn.disabled=true;btn.textContent='合成中…';document.getElementById('cpresult').innerHTML='';
+fetch('/dashboard/casepack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names:names})}).then(function(r){return r.json();}).then(function(d){btn.textContent='合成选中为案例包 ↴';btn.disabled=false;var box=document.getElementById('cpresult');if(d.ok){var h=document.createElement('div');h.style.margin='.6rem 0 .2rem';h.innerHTML='<b>案例包已生成并保存：</b>'+d.name+' <span class=meta>（'+d.n+' 条合成；可在知识库搜到）</span>';var pre=document.createElement('pre');pre.className='dtl';pre.style.maxHeight='none';pre.textContent=d.markdown;box.appendChild(h);box.appendChild(pre);box.scrollIntoView({behavior:'smooth'});}else{box.textContent='合成失败：'+(d.error||'未知');}}).catch(function(){btn.textContent='合成选中为案例包 ↴';btn.disabled=false;document.getElementById('cpresult').textContent='请求失败';});});
 </script></body></html>"""
 
 
@@ -1847,6 +1853,91 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_CURATE_HTML.replace("__DATA__", data_json))
 
 
+async def _llm_complete(prompt: str, max_tokens: int = 1600) -> str:
+    """One-shot LLM completion via the server's existing 百炼-proxied Anthropic
+    endpoint (thinking disabled, like graphiti_client.build_llm). Used for
+    on-demand case-pack synthesis. Raises on failure (caller returns an error)."""
+    from anthropic import AsyncAnthropic
+    client = AsyncAnthropic(
+        auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
+        base_url=os.environ["ANTHROPIC_BASE_URL"],
+        max_retries=2, timeout=90.0,
+    )
+    resp = await client.messages.create(
+        model=os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus"),
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    return "".join(getattr(b, "text", "") for b in resp.content)
+
+
+CASEPACK_PROMPT = """你在把若干条零散的实践记录合成一个「案例包」，供写作 / 复用。
+**只用下面提供的内容**——缺的段落写「(证据不足)」，绝不编造数字、结果或时间。
+
+输出 markdown，正好五段：
+## 主结论
+一句话：这组记录的核心、可迁移的结论。
+## 时间线
+按时间列关键事件（带日期，取自记录）。
+## 证据
+来源（文件 / 报告 / 命令 / 状态）+ 记录里的具体点；没有就写 (证据不足)。
+## 结果
+成了吗？有什么数字 / 状态？没有明确结果就写 (证据不足)。
+## 可迁移经验
+下次遇到类似情况能复用什么；并写清**边界**（这个结论不能推出什么）。
+
+== 提供的记录（共 {n} 条）==
+{joined}
+"""
+
+
+async def dashboard_casepack(request: Request) -> JSONResponse:
+    """POST /dashboard/casepack {names:[...]} — 把选中的知识 LLM 合成为案例包，
+    存成一个 Episodic(case_pack=true) 节点(可检索、默认 visibility=professional-guide)。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    names = [n for n in (body.get("names") or []) if isinstance(n, str)][:12]
+    if not names:
+        return JSONResponse({"ok": False, "error": "no items selected"}, status_code=400)
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.name IN $names "
+            "RETURN n.name AS name, n.source_description AS source, "
+            "substring(coalesce(n.content,''),0,1600) AS content, n.created_at AS created",
+            names=names)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"query: {exc}"}, status_code=500)
+    if not rows:
+        return JSONResponse({"ok": False, "error": "selected items not found"}, status_code=404)
+    parts = []
+    for r in rows:
+        parts.append(f"[{(r.get('created') or '')[:10]}] 来源: {r.get('source') or '—'}\n"
+                     f"{(r.get('content') or '').strip()}")
+    joined = "\n\n---\n\n".join(parts)[:9000]
+    try:
+        md = await _llm_complete(CASEPACK_PROMPT.format(n=len(rows), joined=joined))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"LLM 不可用: {type(exc).__name__}"}, status_code=502)
+    if not md.strip():
+        return JSONResponse({"ok": False, "error": "LLM 空返回"}, status_code=502)
+    cpname = "casepack-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        await driver.execute_query(
+            "CREATE (n:Episodic {name:$name, uuid:$uuid, group_id:$gid, content:$content, "
+            "source_description:$src, created_at:$now, case_pack:true, sources:$srcs, "
+            "visibility:'professional-guide'})",
+            name=cpname, uuid=str(uuidlib.uuid4()), gid=GROUP_ID, content=md,
+            src=f"case-pack 合成自 {len(rows)} 条: {', '.join(names)}",
+            now=datetime.now(tz=timezone.utc).isoformat(), srcs=", ".join(names))
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"存储失败: {exc}", "markdown": md}, status_code=500)
+    return JSONResponse({"ok": True, "name": cpname, "markdown": md, "n": len(rows)})
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -1860,6 +1951,7 @@ app = Starlette(
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
+        Route("/dashboard/casepack", dashboard_casepack, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
