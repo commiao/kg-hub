@@ -1254,6 +1254,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/utilization", "icon": "📈", "ready": True},
     {"name": "各工具与 kg-hub", "desc": "各工具贡献(写入) + 注入使用(读取)统计",
      "url": "/dashboard/tools", "icon": "🛠", "ready": True},
+    {"name": "案例整理台", "desc": "给知识打标签(内部/方法/可公开)+验证,一键操作",
+     "url": "/dashboard/curate", "icon": "🗂", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1716,6 +1718,135 @@ async def dashboard_tools(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_TOOLS_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
+# 可见性枚举（写作素材分层）：内部留存 / 可提炼方法 / 可公开讲成案例
+_VIS = {"internal-note": "内部", "professional-guide": "方法", "public-story": "可公开"}
+
+
+async def dashboard_tag(request: Request) -> JSONResponse:
+    """POST /dashboard/tag  {name, visibility?, verified?} — 给一条知识打标签。
+    有界写：只能设 visibility(枚举) / verified(bool)，按 name 精确匹配 Episodic。
+    免鉴权但仅 tailnet 可达、且是本人的图，故可接受（同 /dashboard* 放行）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "missing name"}, status_code=400)
+    sets, params = [], {"name": name}
+    if "visibility" in body:
+        vis = body.get("visibility") or ""
+        if vis and vis not in _VIS:
+            return JSONResponse({"ok": False, "error": "bad visibility"}, status_code=400)
+        sets.append("n.visibility = $vis")
+        params["vis"] = vis
+    if "verified" in body:
+        sets.append("n.verified = $ver")
+        params["ver"] = bool(body.get("verified"))
+    if not sets:
+        return JSONResponse({"ok": False, "error": "nothing to set"}, status_code=400)
+    driver = get_status_driver()
+    try:
+        r, _, _ = await driver.execute_query(
+            f"MATCH (n:Episodic {{name: $name}}) SET {', '.join(sets)} "
+            "RETURN n.visibility AS visibility, coalesce(n.verified, false) AS verified",
+            **params)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    if not r:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "name": name,
+                         "visibility": r[0].get("visibility") or "",
+                         "verified": bool(r[0].get("verified"))})
+
+
+_DASH_CURATE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>kg-hub 案例整理台</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:880px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.tip{font-size:12px;color:GrayText;margin:.3rem 0 1rem}
+.item{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:10px;padding:10px 12px;margin:8px 0}
+.top{display:flex;gap:8px;align-items:flex-start}
+.bdg{font-size:11px;padding:1px 7px;border-radius:8px;flex:none;background:color-mix(in srgb,CanvasText 10%,transparent)}
+.sn{flex:1;font-size:13px}
+.ctrl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12px}
+.ctrl .lb{color:GrayText}
+button{font:inherit;font-size:12px;padding:3px 10px;border-radius:7px;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);background:transparent;color:inherit;cursor:pointer}
+button.on{background:#378ADD;color:#fff;border-color:#378ADD}
+button.ver.on{background:#1D9E75;border-color:#1D9E75}
+.saved{color:#1D9E75;font-size:12px;opacity:0;transition:opacity .2s}.saved.show{opacity:1}
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin-top:8px;max-height:420px;overflow:auto}
+.hidden{display:none}.meta{color:GrayText;font-size:12px;margin-top:2px}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>案例整理台</h1>
+<div class=tip>给知识分层，供写作/复用挑选：<b>内部</b>=只留存 · <b>方法</b>=可提炼方法 · <b>可公开</b>=可讲成案例；<b>✓已验证</b>=结论已核实。点按钮即存，无需命令。</div>
+<form method=get action="/dashboard/curate" style="display:flex;gap:8px;margin-bottom:1rem">
+<input id=q name=q placeholder="搜索要整理的知识…" autocomplete=off style="flex:1;padding:6px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:Canvas;color:CanvasText;font-size:14px">
+<button>搜索</button></form>
+<div id=list></div>
+<script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
+function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json()}).then(cb).catch(function(){cb({ok:false})});}
+document.getElementById('q').value=D.q||'';
+document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,i){
+ var vb=VIS.map(function(v){return '<button class="vis'+(x.visibility===v[0]?' on':'')+'" data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
+ return '<div class=item><div class=top><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
+   +'<div class=ctrl><span class=lb>可见性:</span>'+vb
+   +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
+   +'<button class=exp data-i="'+i+'">详情</button><span class=saved data-i="'+i+'">✓已存</span></div>'
+   +'<pre class="dtl hidden"></pre></div>';
+}).join(''):'<div class=tip>无匹配</div>';
+function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show')},1200);}}
+document.getElementById('list').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var i=+b.dataset.i;var it=D.items[i];var item=b.closest('.item');
+ if(b.classList.contains('vis')){var nv=(it.visibility===b.dataset.v)?'':b.dataset.v;tag(it.name,{visibility:nv},function(d){if(d.ok){it.visibility=d.visibility;item.querySelectorAll('.vis').forEach(function(x){x.classList.toggle('on',x.dataset.v===d.visibility&&d.visibility!=='');});saved(i);}});}
+ else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
+ else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+});
+</script></body></html>"""
+
+
+async def dashboard_curate(request: Request) -> HTMLResponse:
+    import re as _re
+    driver = get_status_driver()
+    q = (request.query_params.get("q") or "").strip()
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    async def one(cy, **p):
+        rows, _, _ = await driver.execute_query(cy, **p)
+        return rows
+
+    RET = ("RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
+           "n.source_description AS source, n.created_at AS created, "
+           "n.visibility AS visibility, coalesce(n.verified,false) AS verified ")
+    try:
+        if q:
+            rows = await one("MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+                             "AND (n.content CONTAINS $q OR n.name CONTAINS $q) " + RET + "LIMIT 40", q=q)
+        else:
+            rows = await one("MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+                             + RET + "ORDER BY n.created_at DESC LIMIT 30")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>整理台取数失败: {exc}</p>", status_code=503)
+
+    items = []
+    for r in rows:
+        src = r.get("source") or ""
+        mt = _re.search(r"type=(\S+)", src)
+        mp = _re.search(r"project=(\S+)", src)
+        full = r.get("detail") or ""
+        oneline = full.strip().replace("\n", " ")
+        items.append({"name": r.get("name") or "",
+                      "type": esc(mt.group(1)) if mt else "obs",
+                      "project": esc(mp.group(1)) if mp else "—",
+                      "snippet": esc(oneline[:120]) + ("…" if len(oneline) > 120 else ""),
+                      "created": (r.get("created") or "")[:16],
+                      "visibility": r.get("visibility") or "",
+                      "verified": bool(r.get("verified")), "detail": full})
+    data_json = json.dumps({"q": esc(q), "items": items}, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_CURATE_HTML.replace("__DATA__", data_json))
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -1727,6 +1858,8 @@ app = Starlette(
         Route("/dashboard/knowledge", dashboard_knowledge, methods=["GET"]),
         Route("/dashboard/utilization", dashboard_utilization, methods=["GET"]),
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
+        Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
+        Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
