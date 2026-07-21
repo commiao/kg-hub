@@ -1285,11 +1285,18 @@ async def portal(request: Request) -> HTMLResponse:
 
 
 async def portal_manifest(request: Request) -> JSONResponse:
-    """GET /portal_manifest — this source's report cards, for the standalone
-    aggregator portal to fetch and merge. Auth-exempt (read-only card metadata
-    only; covered by the `/portal*` allowlist). URLs are relative to this
-    server's base; the aggregator prefixes them with this source's link base."""
-    return JSONResponse({"source": "kg-hub", "reports": PORTAL_REPORTS})
+    """GET /portal_manifest — for the standalone aggregator (主门户) to fetch.
+
+    Advertises a SINGLE entry pointing at kg-hub 自带门户 `/portal` — NOT the full
+    dashboard list. Rationale (2026-07-22 用户澄清): the aggregator was expanding all
+    kg-hub 看板卡, duplicating kg-hub's own /portal. 收敛 = 主门户只留一个 kg-hub 入口,
+    具体功能都在 kg-hub /portal 里执行。kg-hub 自带 /portal 页仍用 PORTAL_REPORTS 显示全部。
+    URL 相对本 server;聚合器用本源 link base(:17171) 前缀 → :17171/portal。"""
+    return JSONResponse({"source": "kg-hub", "reports": [
+        {"name": "kg-hub 报表门户",
+         "desc": "胶囊/知识库/使用率/各工具/案例整理/运营反馈/反馈待办 等全部看板",
+         "url": "/portal", "icon": "🗂", "ready": True},
+    ]})
 
 
 _DASH_CAPSULES_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
