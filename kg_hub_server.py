@@ -1272,8 +1272,10 @@ h1{font-size:20px;font-weight:500}.sub{color:GrayText;font-size:13px;margin-bott
 a.card{display:block;text-decoration:none;color:inherit;border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:12px;padding:1rem 1.1rem}
 a.card:hover{border-color:color-mix(in srgb,CanvasText 45%,transparent)}
 .t{font-size:15px;font-weight:500}.d{font-size:13px;color:GrayText;margin-top:4px}
-.soon{opacity:.5;pointer-events:none}.foot{color:GrayText;font-size:12px;margin-top:2rem}</style></head><body>
-<h1>kg-hub 报表门户</h1><div class=sub>所有看板/报表的统一入口 · 部署在常开 NAS · tailnet 内任意设备可访问</div>
+.soon{opacity:.5;pointer-events:none}.foot{color:GrayText;font-size:12px;margin-top:2rem}
+a.back{font-size:13px;color:GrayText;text-decoration:none}</style></head><body>
+<a class=back href="http://100.123.208.32:17172/portal">← 返回主门户</a>
+<h1>kg-hub 报表门户</h1><div class=sub>kg-hub 的看板集合 · 从主门户进入 · 部署在常开 NAS · tailnet 内任意设备可访问</div>
 <div class=grid id=grid></div>
 <div class=foot>新增报表：kg_hub_server.PORTAL_REPORTS 加一条 + 写 /dashboard/* 处理器。</div>
 <script>document.getElementById('grid').innerHTML=(__DATA__).map(function(r){
