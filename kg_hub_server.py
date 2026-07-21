@@ -1256,6 +1256,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/tools", "icon": "🛠", "ready": True},
     {"name": "案例整理台", "desc": "给知识打标签(内部/方法/可公开)+验证,一键操作",
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
+    {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
+     "url": "/dashboard/feedback", "icon": "📣", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1938,6 +1940,115 @@ async def dashboard_casepack(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "name": cpname, "markdown": md, "n": len(rows)})
 
 
+async def feedback_submit(request: Request) -> JSONResponse:
+    """POST /dashboard/feedback — 记一篇文章的运营表现(手动录入)。
+    存成 :ArticleFeedback 节点(独立标签,不污染知识/Episodic)。这是把「哪条经验
+    真带来阅读/涨粉」接上真实 outcome 信号的写入口。"""
+    try:
+        b = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    title = (b.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"ok": False, "error": "标题必填"}, status_code=400)
+
+    def num(v):
+        try:
+            return int(float(v))
+        except Exception:
+            return 0
+    driver = get_status_driver()
+    fid = "fb-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        await driver.execute_query(
+            "CREATE (n:ArticleFeedback {id:$id, platform:$p, title:$t, url:$u, "
+            "reads:$reads, likes:$likes, shares:$shares, saves:$saves, comments:$comments, "
+            "followers_delta:$fd, published_at:$pub, linked_casepack:$link, created_at:$now})",
+            id=fid, p=(b.get("platform") or "").strip()[:20], t=title[:300],
+            u=(b.get("url") or "").strip()[:500],
+            reads=num(b.get("reads")), likes=num(b.get("likes")), shares=num(b.get("shares")),
+            saves=num(b.get("saves")), comments=num(b.get("comments")), fd=num(b.get("followers_delta")),
+            pub=(b.get("published_at") or "")[:10], link=(b.get("linked_casepack") or "").strip()[:120],
+            now=datetime.now(tz=timezone.utc).isoformat())
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"存储失败: {exc}"}, status_code=500)
+    return JSONResponse({"ok": True, "id": fid})
+
+
+_DASH_FEEDBACK_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>kg-hub 运营反馈</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:880px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.tip{font-size:12px;color:GrayText;margin:.3rem 0 1rem}
+.form{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:10px;padding:12px 14px;margin-bottom:1rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+label{font-size:12px;color:GrayText;display:block}
+input,select{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:7px;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);background:Canvas;color:CanvasText;font-size:14px}
+.wide{grid-column:1/-1}
+button{font:inherit;font-size:13px;padding:6px 16px;border-radius:8px;border:1px solid #378ADD;background:#378ADD;color:#fff;cursor:pointer;margin-top:10px}
+.saved{color:#1D9E75;font-size:13px;margin-left:10px}
+.row{display:flex;gap:8px;align-items:baseline;padding:8px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent);font-size:13px;flex-wrap:wrap}
+.ttl{font-weight:500;flex:1;min-width:180px}.pf{font-size:11px;padding:1px 7px;border-radius:8px;background:color-mix(in srgb,CanvasText 10%,transparent)}
+.m{color:GrayText;font-size:12px}.lk{color:#378ADD;font-size:12px}.meta{color:GrayText;font-size:12px}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>运营反馈</h1>
+<div class=tip>文章发出去后花 1 分钟录一条：让"哪条经验/案例真带来阅读和涨粉"变成数据，写回知识库。</div>
+<div class=form>
+  <div class=grid>
+    <div><label>平台</label><select id=platform><option>公众号</option><option>小红书</option><option>微博</option><option>知乎</option><option>其他</option></select></div>
+    <div><label>发布日期</label><input id=published type=date></div>
+    <div class=wide><label>标题 *</label><input id=title placeholder="文章标题"></div>
+    <div class=wide><label>链接</label><input id=url placeholder="https://…"></div>
+    <div><label>阅读</label><input id=reads type=number value=0></div>
+    <div><label>点赞</label><input id=likes type=number value=0></div>
+    <div><label>转发</label><input id=shares type=number value=0></div>
+    <div><label>收藏</label><input id=saves type=number value=0></div>
+    <div><label>评论</label><input id=comments type=number value=0></div>
+    <div><label>涨粉</label><input id=followers_delta type=number value=0></div>
+    <div class=wide><label>关联案例包（可选）</label><select id=linked_casepack></select></div>
+  </div>
+  <button id=save>保存这条反馈</button><span id=saved class=saved></span>
+</div>
+<h1 style="font-size:16px">已记录</h1><div id=list></div>
+<script>var D=__DATA__;
+document.getElementById('published').value=new Date().toISOString().slice(0,10);
+var sel=document.getElementById('linked_casepack');sel.innerHTML='<option value="">(无)</option>'+D.casepacks.map(function(c){return '<option value="'+c+'">'+c+'</option>';}).join('');
+function renderList(items){document.getElementById('list').innerHTML=items.length?items.map(function(x){return '<div class=row><span class=ttl>'+(x.url?'<a class=lk href="'+x.url+'" target=_blank>'+x.title+'</a>':x.title)+'</span><span class=pf>'+x.platform+'</span><span class=m>阅读 '+x.reads+' · 赞 '+x.likes+' · 转 '+x.shares+' · 藏 '+x.saves+' · 评 '+x.comments+' · 粉 '+(x.followers_delta>=0?'+':'')+x.followers_delta+'</span><span class=meta>'+(x.published_at||'')+(x.linked_casepack?(' · '+x.linked_casepack):'')+'</span></div>';}).join(''):'<div class=tip>还没有记录</div>';}
+renderList(D.items);
+document.getElementById('save').addEventListener('click',function(){var btn=this;var g=function(id){return document.getElementById(id).value;};var payload={platform:g('platform'),published_at:g('published'),title:g('title'),url:g('url'),reads:g('reads'),likes:g('likes'),shares:g('shares'),saves:g('saves'),comments:g('comments'),followers_delta:g('followers_delta'),linked_casepack:g('linked_casepack')};if(!payload.title.trim()){document.getElementById('saved').textContent='标题必填';return;}btn.disabled=true;
+fetch('/dashboard/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(d){btn.disabled=false;if(d.ok){document.getElementById('saved').textContent='✓ 已保存';var it={title:payload.title,url:payload.url,platform:payload.platform,reads:+payload.reads||0,likes:+payload.likes||0,shares:+payload.shares||0,saves:+payload.saves||0,comments:+payload.comments||0,followers_delta:+payload.followers_delta||0,published_at:payload.published_at,linked_casepack:payload.linked_casepack};D.items.unshift(it);renderList(D.items);['title','url'].forEach(function(id){document.getElementById(id).value='';});['reads','likes','shares','saves','comments','followers_delta'].forEach(function(id){document.getElementById(id).value=0;});setTimeout(function(){document.getElementById('saved').textContent='';},1500);}else{document.getElementById('saved').textContent='失败: '+(d.error||'');}}).catch(function(){btn.disabled=false;document.getElementById('saved').textContent='请求失败';});});
+</script></body></html>"""
+
+
+async def dashboard_feedback(request: Request) -> HTMLResponse:
+    driver = get_status_driver()
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (n:ArticleFeedback) RETURN n.title AS title, n.url AS url, n.platform AS platform, "
+            "coalesce(n.reads,0) AS reads, coalesce(n.likes,0) AS likes, coalesce(n.shares,0) AS shares, "
+            "coalesce(n.saves,0) AS saves, coalesce(n.comments,0) AS comments, "
+            "coalesce(n.followers_delta,0) AS fd, n.published_at AS pub, n.linked_casepack AS link "
+            "ORDER BY n.created_at DESC LIMIT 50")
+        cps, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.case_pack = true RETURN n.name AS name ORDER BY n.created_at DESC LIMIT 50")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>运营反馈取数失败: {exc}</p>", status_code=503)
+
+    items = [{"title": esc(r.get("title")), "url": esc(r.get("url")), "platform": esc(r.get("platform")),
+              "reads": int(r.get("reads") or 0), "likes": int(r.get("likes") or 0),
+              "shares": int(r.get("shares") or 0), "saves": int(r.get("saves") or 0),
+              "comments": int(r.get("comments") or 0), "followers_delta": int(r.get("fd") or 0),
+              "published_at": esc((r.get("pub") or "")[:10]), "linked_casepack": esc(r.get("link"))}
+             for r in rows]
+    casepacks = [esc(r.get("name")) for r in cps]
+    data_json = json.dumps({"items": items, "casepacks": casepacks}, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_FEEDBACK_HTML.replace("__DATA__", data_json))
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -1952,6 +2063,8 @@ app = Starlette(
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/casepack", dashboard_casepack, methods=["POST"]),
+        Route("/dashboard/feedback", dashboard_feedback, methods=["GET"]),
+        Route("/dashboard/feedback", feedback_submit, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
