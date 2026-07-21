@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,12 +46,20 @@ def fetch_usage() -> dict[str, int]:
         f"{base}/api/usage_ranking?top_n=50",
         headers={"Authorization": f"Bearer {tok}"} if tok else {},
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        d = json.loads(r.read())
-    uc = {x["name"]: int(x["usage_count"]) for x in d.get("top_canonical", [])}
-    for x in d.get("demote", []):
-        uc.setdefault(x["name"], 0)
-    return uc
+    last = None  # escalating timeouts ride out NAS cold-start / transient slowness
+    for i, t in enumerate((15, 25, 35)):
+        try:
+            with urllib.request.urlopen(req, timeout=t) as r:
+                d = json.loads(r.read())
+            uc = {x["name"]: int(x["usage_count"]) for x in d.get("top_canonical", [])}
+            for x in d.get("demote", []):
+                uc.setdefault(x["name"], 0)
+            return uc
+        except Exception as exc:
+            last = exc
+            if i < 2:
+                time.sleep(2.0)
+    raise last
 
 
 def short(n: str) -> str:
@@ -68,8 +77,11 @@ def main() -> int:
     try:
         cur = fetch_usage()
     except Exception as exc:
-        print(f"[capsule_watch] fetch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+        # Transient (NAS/tailscale blip) — a monitor missing one run is not an error;
+        # exit 0 so launchd/ops doesn't flag the agent "errored" for a network hiccup.
+        print(f"[capsule_watch] fetch failed (transient, skipping this run): "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 0
 
     names = sorted(set(base) | set(cur), key=lambda n: -cur.get(n, 0))
     watch = [n for n in base if base.get(n, 0) == 0]           # starved at baseline

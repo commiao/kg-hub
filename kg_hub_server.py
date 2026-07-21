@@ -1028,10 +1028,11 @@ async def usage_ranking(request: Request) -> JSONResponse:
             "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
             "AND coalesce(n.usage_count, 0) > 0 "
             "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, "
-            "substring(coalesce(n.content, ''), 0, 80) AS preview "
+            "substring(coalesce(n.content, ''), 0, 4000) AS detail "
             "ORDER BY uc DESC LIMIT $n", n=top_n)
         promote = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
-                    "preview": x.get("preview") or ""} for x in r]
+                    "preview": (x.get("detail") or "").strip().replace("\n", " ")[:90],
+                    "detail": x.get("detail") or ""} for x in r]
 
         r = await q(
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
@@ -1404,7 +1405,10 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .nm{flex:1;min-width:120px;font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all}
 .bar{width:110px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent)}
 .bar>i{display:block;height:100%}.ts{color:GrayText;font-size:12px}
-.empty{color:GrayText;font-size:13px;padding:6px 0}</style></head><body>
+.empty{color:GrayText;font-size:13px;padding:6px 0}
+details{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}details .row{border-bottom:none}
+summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}summary:hover{background:color-mix(in srgb,CanvasText 5%,transparent)}
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin:.2rem 0 .6rem;max-height:400px;overflow:auto}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>使用排行</h1>
 <div class=cards id=cards></div>
 <div class=lbl>胶囊累计注入排行 · canonical 被 PUSH 钩子注入的次数（Lindy / 隐式反馈信号）</div><div id=top></div>
@@ -1416,7 +1420,8 @@ document.getElementById('cards').innerHTML='<div class=mc><div class=l>胶囊总
 function fill(id,arr,render){var el=document.getElementById(id);if(!arr||!arr.length){el.innerHTML='<div class=empty>暂无</div>';return;}el.innerHTML=arr.map(render).join('');}
 var mu=Math.max.apply(null,D.top_canonical.map(function(x){return x.usage_count}).concat([1]));
 fill('top',D.top_canonical,function(x,i){return '<div class=row><span class=ts style="width:16px">'+(i+1)+'</span><span class=nm>'+x.name.replace('kg-hub-canonical-','')+'</span><div class=bar><i style="width:'+Math.round(x.usage_count/mu*100)+'%;background:#378ADD"></i></div><span style="width:32px;text-align:right;font-weight:500">'+x.usage_count+'</span><span class=ts style="width:80px;text-align:right">'+((x.last_used_at||'').slice(0,10)||'—')+'</span></div>';});
-fill('promote',D.promote,function(x){return '<div class=row><span class=nm>'+x.name+(x.preview?' <span class=ts>'+x.preview.replace(/[<>]/g,'')+'</span>':'')+'</span><span style="width:32px;text-align:right;font-weight:500">'+x.usage_count+'</span></div>';});
+fill('promote',D.promote,function(x,i){return '<details data-i="'+i+'"><summary class=row><span class=nm>'+x.name+(x.preview?' <span class=ts>'+x.preview.replace(/[<>]/g,'')+'</span>':'')+'</span><span style="width:32px;text-align:right;font-weight:500">'+x.usage_count+'</span><span class=ts>›</span></summary><pre class=dtl></pre></details>';});
+document.getElementById('promote').addEventListener('toggle',function(e){var d=e.target;if(d.tagName!=='DETAILS'||!d.open||d.dataset.done)return;var it=D.promote[+d.dataset.i];var p=d.querySelector('.dtl');if(p){p.textContent=(it&&it.detail)||'(无内容)';d.dataset.done='1';}},true);
 fill('demote',D.demote,function(x){return '<div class=row><span class=nm>'+x.name.replace('kg-hub-canonical-','')+'</span><span class=ts style="width:90px;text-align:right">'+((x.created_at||'').slice(0,10)||'—')+'</span></div>';});
 </script></body></html>"""
 
@@ -1443,10 +1448,11 @@ async def dashboard_usage(request: Request) -> HTMLResponse:
             "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
             "AND coalesce(n.usage_count, 0) > 0 "
             "RETURN n.name AS name, coalesce(n.usage_count, 0) AS uc, "
-            "substring(coalesce(n.content, ''), 0, 80) AS preview "
+            "substring(coalesce(n.content, ''), 0, 4000) AS detail "
             "ORDER BY uc DESC LIMIT $n", n=top_n)
         promote = [{"name": x.get("name"), "usage_count": int(x.get("uc") or 0),
-                    "preview": x.get("preview") or ""} for x in r]
+                    "preview": (x.get("detail") or "").strip().replace("\n", " ")[:90],
+                    "detail": x.get("detail") or ""} for x in r]
 
         r = await q(
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
@@ -1476,7 +1482,7 @@ async def dashboard_usage(request: Request) -> HTMLResponse:
 
     data = {"stats": stats, "top_canonical": top_canonical,
             "promote": promote, "demote": demote}
-    return HTMLResponse(_DASH_USAGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+    return HTMLResponse(_DASH_USAGE_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False).replace("</", "<\\/")))
 
 
 _DASH_KNOWLEDGE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
