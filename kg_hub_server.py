@@ -1580,7 +1580,7 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
         mp = _re.search(r"project=(\S+)", src)
         full = r.get("detail") or ""
         oneline = full.strip().replace("\n", " ")
-        snippet = esc(oneline[:180]) + ("…" if len(oneline) > 180 else "")
+        snippet = esc(oneline[:400]) + ("…" if len(oneline) > 400 else "")
         items.append({"type": esc(mt.group(1)) if mt else "obs",
                       "project": esc(mp.group(1)) if mp else "—",
                       "snippet": snippet, "created": (r.get("created") or "")[:16],
@@ -1813,7 +1813,7 @@ document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,
  return '<div class=item><div class=top><input type=checkbox class=pick data-i="'+i+'" style="margin-top:3px"><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
    +'<div class=ctrl><span class=lb>可见性:</span>'+vb
    +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
-   +'<button class=exp data-i="'+i+'">详情</button><span class=saved data-i="'+i+'">✓已存</span></div>'
+   +'<button class=exp data-i="'+i+'">展开全文 ▾</button><span class=saved data-i="'+i+'">✓已存</span></div>'
    +'<pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=tip>无匹配</div>';
 function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show')},1200);}}
@@ -1864,7 +1864,7 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
         items.append({"name": r.get("name") or "",
                       "type": esc(mt.group(1)) if mt else "obs",
                       "project": esc(mp.group(1)) if mp else "—",
-                      "snippet": esc(oneline[:120]) + ("…" if len(oneline) > 120 else ""),
+                      "snippet": esc(oneline[:400]) + ("…" if len(oneline) > 400 else ""),
                       "created": (r.get("created") or "")[:16],
                       "visibility": r.get("visibility") or "",
                       "verified": bool(r.get("verified")), "detail": full})
@@ -2140,7 +2140,7 @@ document.getElementById('c1').textContent=D.classify.length;document.getElementB
 document.getElementById('cls').innerHTML=D.classify.length?D.classify.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class=vis data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
  return '<div class=item data-i="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
-  +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">详情</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
+  +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">展开全文 ▾</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=empty>没有待分层的知识 🎉</div>';
 document.getElementById('fb').innerHTML=D.needfb.length?D.needfb.map(function(x){return '<div class=item><div class=sn>'+x.snippet+'<div class=meta>'+x.created+'</div></div><div class=ctrl><a class=go href="/dashboard/feedback?casepack='+encodeURIComponent(x.name)+'">录入表现 →</a></div></div>';}).join(''):'<div class=empty>没有待补数据 🎉</div>';
 function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show');},1200);}}
@@ -2191,7 +2191,7 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
         return {"name": r.get("name") or "",
                 "type": esc(mt.group(1)) if mt else "obs",
                 "project": esc(mp.group(1)) if mp else "—",
-                "snippet": esc(one_line[:120]) + ("…" if len(one_line) > 120 else ""),
+                "snippet": esc(one_line[:400]) + ("…" if len(one_line) > 400 else ""),
                 "created": (r.get("created") or "")[:16],
                 "visibility": r.get("visibility") or "", "verified": False,
                 "detail": (r.get("detail") or "")}
