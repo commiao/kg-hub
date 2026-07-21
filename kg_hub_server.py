@@ -1258,6 +1258,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
      "url": "/dashboard/feedback", "icon": "📣", "ready": True},
+    {"name": "反馈待办", "desc": "自动列出需你拍板的:待分层(AI已建议)+待补运营数据",
+     "url": "/dashboard/inbox", "icon": "📥", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -2045,8 +2047,149 @@ async def dashboard_feedback(request: Request) -> HTMLResponse:
               "published_at": esc((r.get("pub") or "")[:10]), "linked_casepack": esc(r.get("link"))}
              for r in rows]
     casepacks = [esc(r.get("name")) for r in cps]
-    data_json = json.dumps({"items": items, "casepacks": casepacks}, ensure_ascii=False).replace("</", "<\\/")
+    data_json = json.dumps({"items": items, "casepacks": casepacks,
+                            "prefill": esc(request.query_params.get("casepack") or "")},
+                           ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_FEEDBACK_HTML.replace("__DATA__", data_json))
+
+
+_SUGGEST_PROMPT = """给下面每条实践记录判定「写作可见性」，只输出一个 JSON 字符串数组，
+顺序与记录一一对应，每项取值：
+- "internal-note"        只该内部留存（纯操作日志/临时状态/无普遍价值）
+- "professional-guide"   有可提炼的方法或经验，适合内部方法库
+- "public-story"         有普遍价值、能讲成对读者有用的案例
+默认从严：拿不准归 internal-note。只输出数组，共 {n} 个，例：["internal-note","public-story",...]
+
+记录：
+{listing}
+"""
+
+
+async def dashboard_suggest_tags(request: Request) -> JSONResponse:
+    """POST /dashboard/suggest_tags {names:[...]} — LLM 批量建议可见性(一次调用)。
+    返回 {name: visibility}，供待办台预高亮，用户一键确认。"""
+    import re
+    try:
+        b = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    names = [n for n in (b.get("names") or []) if isinstance(n, str)][:15]
+    if not names:
+        return JSONResponse({"ok": True, "suggest": {}})
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (n:Episodic) WHERE n.name IN $names "
+        "RETURN n.name AS name, substring(coalesce(n.content,''),0,300) AS snip", names=names)
+    by = {r.get("name"): (r.get("snip") or "").strip().replace("\n", " ") for r in rows}
+    ordered = [n for n in names if n in by]
+    if not ordered:
+        return JSONResponse({"ok": True, "suggest": {}})
+    listing = "\n".join(f"{i+1}. {by[n][:200]}" for i, n in enumerate(ordered))
+    try:
+        out = await _llm_complete(_SUGGEST_PROMPT.format(n=len(ordered), listing=listing), max_tokens=400)
+        m = re.search(r"\[.*\]", out, re.S)
+        arr = json.loads(m.group(0)) if m else []
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"LLM: {type(exc).__name__}"}, status_code=502)
+    valid = {"internal-note", "professional-guide", "public-story"}
+    suggest = {}
+    for i, n in enumerate(ordered):
+        v = arr[i] if i < len(arr) else ""
+        suggest[n] = v if v in valid else "internal-note"
+    return JSONResponse({"ok": True, "suggest": suggest})
+
+
+_DASH_INBOX_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>kg-hub 反馈待办</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:880px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}h2{font-size:15px;font-weight:500;margin:1.2rem 0 .4rem}
+.tip{font-size:12px;color:GrayText;margin:.2rem 0 .6rem}
+.item{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:10px;padding:9px 12px;margin:7px 0}
+.sn{font-size:13px}.meta{color:GrayText;font-size:12px;margin-top:2px}
+.ctrl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12px}.lb{color:GrayText}
+button{font:inherit;font-size:12px;padding:3px 10px;border-radius:7px;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);background:transparent;color:inherit;cursor:pointer}
+button.on{background:#378ADD;color:#fff;border-color:#378ADD}button.ver.on{background:#1D9E75;border-color:#1D9E75}
+button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
+.sugtag{font-size:11px;color:#BA7517}
+.saved{color:#1D9E75;font-size:12px;opacity:0;transition:opacity .2s}.saved.show{opacity:1}
+.go{color:#378ADD;text-decoration:none;font-size:13px}.empty{color:GrayText;font-size:13px;padding:6px 0}
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin-top:6px;max-height:360px;overflow:auto}.hidden{display:none}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>反馈待办</h1>
+<div class=tip>系统自动列出「需要你拍板」的事，尽量一键清掉。<b id=aistat>正在让 AI 预判可见性…</b></div>
+<h2>① 待分层 · <span id=c1>0</span> 条（AI 已建议，点确认或改）</h2><div id=cls></div>
+<h2>② 待补运营数据 · <span id=c2>0</span> 条（标了可公开但没录表现）</h2><div id=fb></div>
+<script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
+function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
+document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;
+document.getElementById('cls').innerHTML=D.classify.length?D.classify.map(function(x,i){
+ var vb=VIS.map(function(v){return '<button class=vis data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
+ return '<div class=item data-i="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
+  +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">详情</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
+}).join(''):'<div class=empty>没有待分层的知识 🎉</div>';
+document.getElementById('fb').innerHTML=D.needfb.length?D.needfb.map(function(x){return '<div class=item><div class=sn>'+x.snippet+'<div class=meta>'+x.created+'</div></div><div class=ctrl><a class=go href="/dashboard/feedback?casepack='+encodeURIComponent(x.name)+'">录入表现 →</a></div></div>';}).join(''):'<div class=empty>没有待补数据 🎉</div>';
+function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show');},1200);}}
+document.getElementById('cls').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var i=+b.dataset.i;var it=D.classify[i];var item=b.closest('.item');
+ if(b.classList.contains('vis')){var nv=(it.visibility===b.dataset.v)?'':b.dataset.v;tag(it.name,{visibility:nv},function(d){if(d.ok){it.visibility=d.visibility;item.querySelectorAll('.vis').forEach(function(x){x.classList.toggle('on',x.dataset.v===d.visibility&&d.visibility!=='');});saved(i);}});}
+ else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
+ else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+});
+if(D.classify.length){fetch('/dashboard/suggest_tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names:D.classify.map(function(x){return x.name;})})}).then(function(r){return r.json();}).then(function(d){var st=document.getElementById('aistat');if(!d.ok){st.textContent='AI 建议不可用，手动分类即可。';return;}st.textContent='AI 已建议（橙框=建议值），点确认或改。';D.classify.forEach(function(x,i){var v=d.suggest[x.name];if(!v)return;x.suggested=v;var lbl=VIS.filter(function(z){return z[0]===v;})[0];var item=document.querySelector('.item[data-i="'+i+'"]');if(!item)return;item.querySelectorAll('.vis').forEach(function(bt){bt.classList.toggle('sug',bt.dataset.v===v);});var tg=item.querySelector('.sugtag');if(tg&&lbl)tg.textContent='AI建议:'+lbl[1];});}).catch(function(){document.getElementById('aistat').textContent='AI 建议请求失败，手动分类即可。';});}else{document.getElementById('aistat').textContent='';}
+</script></body></html>"""
+
+
+async def dashboard_inbox(request: Request) -> HTMLResponse:
+    import re as _re
+    driver = get_status_driver()
+
+    def esc(t):
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    async def one(cy, **p):
+        rows, _, _ = await driver.execute_query(cy, **p)
+        return rows
+
+    try:
+        untagged = await one(
+            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') AND n.visibility IS NULL "
+            "AND (n.source_description CONTAINS 'type=feature' OR n.source_description CONTAINS 'type=bugfix' "
+            "OR n.source_description CONTAINS 'type=decision' OR n.source_description CONTAINS 'type=refactor') "
+            "RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
+            "n.source_description AS source, n.created_at AS created "
+            "ORDER BY n.created_at DESC LIMIT 15")
+        pub = await one(
+            "MATCH (n:Episodic) WHERE n.visibility = 'public-story' "
+            "RETURN n.name AS name, substring(coalesce(n.content,''),0,160) AS snip, n.created_at AS created "
+            "ORDER BY n.created_at DESC LIMIT 50")
+        fbrows = await one("MATCH (f:ArticleFeedback) WHERE coalesce(f.linked_casepack,'') <> '' "
+                           "RETURN DISTINCT f.linked_casepack AS l")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
+
+    linked = {r.get("l") for r in fbrows}
+
+    def view(r, full_key="detail"):
+        src = r.get("source") or ""
+        mt = _re.search(r"type=(\S+)", src)
+        mp = _re.search(r"project=(\S+)", src)
+        one_line = (r.get(full_key) or r.get("snip") or "").strip().replace("\n", " ")
+        return {"name": r.get("name") or "",
+                "type": esc(mt.group(1)) if mt else "obs",
+                "project": esc(mp.group(1)) if mp else "—",
+                "snippet": esc(one_line[:120]) + ("…" if len(one_line) > 120 else ""),
+                "created": (r.get("created") or "")[:16],
+                "visibility": r.get("visibility") or "", "verified": False,
+                "detail": (r.get("detail") or "")}
+    classify = [view(r) for r in untagged]
+    needfb = []
+    for r in pub:
+        if r.get("name") not in linked:
+            sn = (r.get("snip") or "").strip().replace("\n", " ")
+            needfb.append({"name": r.get("name") or "",
+                           "snippet": esc(sn[:120]) + ("…" if len(sn) > 120 else ""),
+                           "created": (r.get("created") or "")[:16]})
+    data_json = json.dumps({"classify": classify, "needfb": needfb}, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
 
 app = Starlette(
@@ -2065,6 +2208,8 @@ app = Starlette(
         Route("/dashboard/casepack", dashboard_casepack, methods=["POST"]),
         Route("/dashboard/feedback", dashboard_feedback, methods=["GET"]),
         Route("/dashboard/feedback", feedback_submit, methods=["POST"]),
+        Route("/dashboard/inbox", dashboard_inbox, methods=["GET"]),
+        Route("/dashboard/suggest_tags", dashboard_suggest_tags, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
