@@ -1813,7 +1813,7 @@ document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,
  return '<div class=item><div class=top><input type=checkbox class=pick data-i="'+i+'" style="margin-top:3px"><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
    +'<div class=ctrl><span class=lb>可见性:</span>'+vb
    +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
-   +'<button class=exp data-i="'+i+'">展开全文 ▾</button><span class=saved data-i="'+i+'">✓已存</span></div>'
+   +'<button class=exp data-i="'+i+'">展开全文 ▾</button><button class=tr data-i="'+i+'">译中文</button><span class=saved data-i="'+i+'">✓已存</span></div>'
    +'<pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=tip>无匹配</div>';
 function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show')},1200);}}
@@ -1821,6 +1821,7 @@ document.getElementById('list').addEventListener('click',function(e){var b=e.tar
  if(b.classList.contains('vis')){var nv=(it.visibility===b.dataset.v)?'':b.dataset.v;tag(it.name,{visibility:nv},function(d){if(d.ok){it.visibility=d.visibility;item.querySelectorAll('.vis').forEach(function(x){x.classList.toggle('on',x.dataset.v===d.visibility&&d.visibility!=='');});saved(i);}});}
  else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
  else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+ else if(b.classList.contains('tr')){var p2=item.querySelector('.dtl');if(p2.classList.contains('hidden')){p2.textContent=it.detail||'';p2.classList.remove('hidden');}if(p2.dataset.tr){return;}var orig=p2.textContent;b.textContent='翻译中…';b.disabled=true;fetch('/dashboard/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:orig})}).then(function(r){return r.json();}).then(function(d){b.disabled=false;b.textContent='译中文';if(d.ok){p2.textContent=orig+'\\n\\n—— 中文翻译 ——\\n'+d.zh;p2.dataset.tr='1';}else{b.textContent='翻译失败';}}).catch(function(){b.disabled=false;b.textContent='翻译失败';});}
 });
 function selected(){return Array.prototype.filter.call(document.querySelectorAll('.pick'),function(c){return c.checked;}).map(function(c){return D.items[+c.dataset.i].name;});}
 document.getElementById('list').addEventListener('change',function(e){if(e.target.classList.contains('pick')){var n=selected().length;document.getElementById('cnt').textContent=n;document.getElementById('synth').disabled=n<1;}});
@@ -2140,7 +2141,7 @@ document.getElementById('c1').textContent=D.classify.length;document.getElementB
 document.getElementById('cls').innerHTML=D.classify.length?D.classify.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class=vis data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
  return '<div class=item data-i="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
-  +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">展开全文 ▾</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
+  +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">展开全文 ▾</button><button class=tr data-i="'+i+'">译中文</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=empty>没有待分层的知识 🎉</div>';
 document.getElementById('fb').innerHTML=D.needfb.length?D.needfb.map(function(x){return '<div class=item><div class=sn>'+x.snippet+'<div class=meta>'+x.created+'</div></div><div class=ctrl><a class=go href="/dashboard/feedback?casepack='+encodeURIComponent(x.name)+'">录入表现 →</a></div></div>';}).join(''):'<div class=empty>没有待补数据 🎉</div>';
 function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show');},1200);}}
@@ -2148,6 +2149,7 @@ document.getElementById('cls').addEventListener('click',function(e){var b=e.targ
  if(b.classList.contains('vis')){var nv=(it.visibility===b.dataset.v)?'':b.dataset.v;tag(it.name,{visibility:nv},function(d){if(d.ok){it.visibility=d.visibility;item.querySelectorAll('.vis').forEach(function(x){x.classList.toggle('on',x.dataset.v===d.visibility&&d.visibility!=='');});saved(i);}});}
  else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
  else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+ else if(b.classList.contains('tr')){var p2=item.querySelector('.dtl');if(p2.classList.contains('hidden')){p2.textContent=it.detail||'';p2.classList.remove('hidden');}if(p2.dataset.tr){return;}var orig=p2.textContent;b.textContent='翻译中…';b.disabled=true;fetch('/dashboard/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:orig})}).then(function(r){return r.json();}).then(function(d){b.disabled=false;b.textContent='译中文';if(d.ok){p2.textContent=orig+'\\n\\n—— 中文翻译 ——\\n'+d.zh;p2.dataset.tr='1';}else{b.textContent='翻译失败';}}).catch(function(){b.disabled=false;b.textContent='翻译失败';});}
 });
 if(D.classify.length){fetch('/dashboard/suggest_tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names:D.classify.map(function(x){return x.name;})})}).then(function(r){return r.json();}).then(function(d){var st=document.getElementById('aistat');if(!d.ok){st.textContent='AI 建议不可用，手动分类即可。';return;}st.textContent='AI 已建议（橙框=建议值），点确认或改。';D.classify.forEach(function(x,i){var v=d.suggest[x.name];if(!v)return;x.suggested=v;var lbl=VIS.filter(function(z){return z[0]===v;})[0];var item=document.querySelector('.item[data-i="'+i+'"]');if(!item)return;item.querySelectorAll('.vis').forEach(function(bt){bt.classList.toggle('sug',bt.dataset.v===v);});var tg=item.querySelector('.sugtag');if(tg&&lbl)tg.textContent='AI建议:'+lbl[1];});}).catch(function(){document.getElementById('aistat').textContent='AI 建议请求失败，手动分类即可。';});}else{document.getElementById('aistat').textContent='';}
 </script></body></html>"""
@@ -2207,6 +2209,31 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
 
+_TRANSLATE_PROMPT = """把下面内容翻译成**简体中文**。代码、命令、路径、标识符、URL、
+专有名词保持原样不译。已是中文的部分原样保留。只输出译文，不要任何解释或前缀。
+
+原文：
+{text}
+"""
+
+
+async def dashboard_translate(request: Request) -> JSONResponse:
+    """POST /dashboard/translate {text} — 把详情正文(常为英文)译成中文。复用 server
+    的 LLM 端点。有界:只吃 text、只回译文。免鉴权(tailnet+只读式)。"""
+    try:
+        b = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    text = (b.get("text") or "").strip()[:6000]
+    if not text:
+        return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
+    try:
+        zh = await _llm_complete(_TRANSLATE_PROMPT.format(text=text), max_tokens=2200)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"LLM: {type(exc).__name__}"}, status_code=502)
+    return JSONResponse({"ok": True, "zh": zh.strip()})
+
+
 app = Starlette(
     debug=False,
     routes=[
@@ -2225,6 +2252,7 @@ app = Starlette(
         Route("/dashboard/feedback", feedback_submit, methods=["POST"]),
         Route("/dashboard/inbox", dashboard_inbox, methods=["GET"]),
         Route("/dashboard/suggest_tags", dashboard_suggest_tags, methods=["POST"]),
+        Route("/dashboard/translate", dashboard_translate, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
