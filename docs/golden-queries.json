@@ -1,0 +1,22 @@
+{
+  "_doc": "黄金查询集 v1(北极星③召回度量基线)。ground-truth 用内容级关键词(gold_kw)定义相关 episode 集,独立于 /api/search 的 edge.fact 子串,以诚实暴露召回差距。mode=literal 查询词是内容里的字面词(子串检索应能命中);mode=nl 是自然语言/同义/跨语言表述(子串检索预期漏,语义检索应命中)——两类的差值就是③要补的空间。gold_kw 会做 toLower 子串匹配 episode.content。",
+  "queries": [
+    {"id": "s1-migration-lit",  "scenario": "S1", "mode": "literal", "query": "接口迁移", "gold_kw": "接口迁移", "note": "字面:迁移三层验收"},
+    {"id": "s1-migration-nl",   "scenario": "S1", "mode": "nl",      "query": "怎么确认接口迁移真的完成了而不只是旧代码清零", "gold_kw": "接口迁移", "note": "自然语言,同一主题"},
+    {"id": "s1-muxcp-lit",      "scenario": "S1", "mode": "literal", "query": "muxcp", "gold_kw": "muxcp", "note": "字面:子进程泄漏"},
+    {"id": "s1-muxcp-nl",       "scenario": "S1", "mode": "nl",      "query": "为什么 MCP 进程把内存占满了", "gold_kw": "muxcp", "note": "同义:泄漏症状而非名字"},
+    {"id": "s1-tailscale-lit",  "scenario": "S1", "mode": "literal", "query": "Tailscale", "gold_kw": "tailscale", "note": "字面"},
+    {"id": "s1-shumei-lit",     "scenario": "S1", "mode": "literal", "query": "ShuMei 图片审核", "gold_kw": "shumei", "note": "字面:数美审核 bug"},
+    {"id": "s1-shumei-nl",      "scenario": "S1", "mode": "nl",      "query": "数美内容审核报 Invalid Type 怎么修", "gold_kw": "shumei", "note": "跨语言:数美=ShuMei"},
+    {"id": "s1-sls-lit",        "scenario": "S1", "mode": "literal", "query": "SLS 日志查询", "gold_kw": "sls", "note": "字面"},
+    {"id": "s1-migration-guard-nl","scenario":"S1","mode": "nl",     "query": "迁移前怎么做守卫扫描防止遗漏旧调用", "gold_kw": "迁移守卫", "note": "方法论召回"},
+
+    {"id": "s2-reads-lit",      "scenario": "S2", "mode": "literal", "query": "公众号 阅读量", "gold_kw": "阅读量", "note": "字面:阅读断崖"},
+    {"id": "s2-reads-nl",       "scenario": "S2", "mode": "nl",      "query": "怎么让公众号文章发出去别掉流量", "gold_kw": "阅读量", "note": "自然语言素材诉求"},
+    {"id": "s2-gold-lit",       "scenario": "S2", "mode": "literal", "query": "黄金 行情", "gold_kw": "黄金", "note": "字面:投资素材"},
+
+    {"id": "s3-kghub-design",   "scenario": "S3", "mode": "literal", "query": "canonical 胶囊 注入", "gold_kw": "canonical", "note": "kg-hub 设计/生命周期"},
+    {"id": "s3-ranking-nl",     "scenario": "S3", "mode": "nl",      "query": "知识胶囊的排序机制是怎么演进的", "gold_kw": "排序", "note": "项目演进"},
+    {"id": "s3-finance-nl",     "scenario": "S3", "mode": "nl",      "query": "财务分析遵循什么原则", "gold_kw": "财务", "note": "跨域项目知识"}
+  ]
+}
