@@ -46,10 +46,12 @@ _TYPE_KIND = {
     "discovery": ("项目事实", 0.7),   # 最含糊:多为工作中的发现/事实,粗归项目事实
 }
 
-# time-bound 强信号:行情/快照/周期性报告。命中即 time-bound,否则默认 evergreen。
+# time-bound 强信号:周期性报告/行情/快照。**只看标题(name)**——标题是可靠信号
+# (报告就叫"金价晚报""daily-extract");正文提到"黄金法则""写日报的方法"是长期方法论,
+# 不该被误判 time-bound(审查发现#3)。宁可漏判 evergreen(不排除),不误判 time-bound(会排除)。
 _TIMEBOUND = re.compile(
-    r"行情|快照|日报|晚报|早报|金价|黄金|大盘|收盘|阅读量|流量|"
-    r"investment-watch|gold-market|daily-extract|advisory|盘前|盘后")
+    r"行情|快照|日报|晚报|早报|金价|黄金|大盘|收盘|盘前|盘后|阅读量|流量|"
+    r"investment-watch|gold-market|daily-extract|advisory")
 
 
 def derive_origin(name: str, source_description: str) -> dict:
@@ -94,8 +96,8 @@ def derive_origin(name: str, source_description: str) -> dict:
 
 
 def derive_durability(name: str, content: str) -> str:
-    hay = (name or "") + "\n" + (content or "")[:600]
-    return "time-bound" if _TIMEBOUND.search(hay) else "evergreen"
+    # 只扫标题:周期性报告/快照的标题可靠地含这些词;正文提及是噪音(审查#3)。
+    return "time-bound" if _TIMEBOUND.search(name or "") else "evergreen"
 
 
 def derive_kind(name: str, source_description: str) -> tuple[str, float]:

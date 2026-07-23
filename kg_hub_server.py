@@ -2134,21 +2134,27 @@ async def classify_kind(body: str) -> tuple[str, float]:
 async def _tag_schema_fields(graphiti, episode_uuid: str, body: "IngestBody") -> None:
     """给 episode 打一等来源/内容元数据(北极星 §9)。
     覆写优先 → 确定性派生 → kind 兜底 LLM 分类器 pass。低置信 kind = unclassified。"""
-    from utils.origin import derive_origin, derive_durability, derive_kind
+    from utils.origin import derive_origin, derive_durability, derive_kind, KINDS, DURABILITY
     o = derive_origin(body.name, body.source_description)
     device = body.origin_device or o["origin_device"]
     tool = body.origin_tool or o["origin_tool"]
     project = body.origin_project or o["origin_project"]
-    durability = body.durability or derive_durability(body.name, body.episode_body)
+    # 覆写值也要过白名单——北极星"自报不可信"对显式覆写同样成立,非法值不得落图
+    durability = body.durability if body.durability in DURABILITY \
+        else derive_durability(body.name, body.episode_body)
 
-    if body.kind:                       # 摄入方显式覆写:直接采信
+    if body.kind in KINDS and body.kind != "unclassified":  # 合法覆写:采信
         kind, conf = body.kind, 1.0
     else:
         kind, conf = derive_kind(body.name, body.source_description)
-        if conf < KIND_CONF_THRESHOLD and body.name.startswith("openclaw-capsule-"):
+        # kind 分类器 pass:胶囊 + 案例包(都无 type= 但承载知识)在低置信时兜底
+        if conf < KIND_CONF_THRESHOLD and (
+                body.name.startswith("openclaw-capsule-")
+                or body.name.startswith("case-pack")
+                or body.source_description.startswith("case-pack")):
             kind, conf = await classify_kind(body.episode_body)   # ④ LLM 分类器
     if conf < KIND_CONF_THRESHOLD:
-        kind, conf = "unclassified", conf
+        kind, conf = "unclassified", 0.0   # unclassified 一律 0 置信,不留误导性分值
 
     await graphiti.driver.execute_query(
         "MATCH (e:Episodic {uuid: $u}) SET "

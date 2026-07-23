@@ -53,25 +53,21 @@ def _graph():
     return db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
 
 
-async def _llm_kind(body: str) -> tuple[str, float]:
-    """独立分类器 pass(与 server.classify_kind 同 prompt/解析)。失败→unclassified。"""
-    from anthropic import AsyncAnthropic
+async def _llm_kind(client, body: str) -> tuple[str, float, bool]:
+    """独立分类器 pass(与 server.classify_kind 同 prompt/解析)。
+    返回 (kind, conf, failed);failed=True 表示 LLM 调用异常(区别于"跑成功但判 unclassified")。"""
     try:
-        client = AsyncAnthropic(
-            auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
-            base_url=os.environ["ANTHROPIC_BASE_URL"],
-            max_retries=2, timeout=90.0,
-        )
         resp = await client.messages.create(
             model=os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus"),
             max_tokens=120,
             messages=[{"role": "user", "content": KIND_PROMPT.format(body=(body or "")[:6000])}],
             extra_body={"thinking": {"type": "disabled"}},
         )
-        return parse_kind_json("".join(getattr(b, "text", "") for b in resp.content))
+        k, c = parse_kind_json("".join(getattr(b, "text", "") for b in resp.content))
+        return (k, c, False)
     except Exception as e:
         print(f"  [llm-fail] {type(e).__name__}: {e}")
-        return ("unclassified", 0.0)
+        return ("unclassified", 0.0, True)
 
 
 async def main() -> int:
@@ -79,28 +75,37 @@ async def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true", help="重算全部(默认只补未回填的)")
     ap.add_argument("--no-llm", action="store_true", help="不跑 LLM,胶囊 kind 留 unclassified")
+    ap.add_argument("--retry-llm", action="store_true",
+                    help="只重试 kind 仍 unclassified 的胶囊(修 D2:LLM 曾失败的重跑,不动其他)")
     args = ap.parse_args()
 
     g = _graph()
-    where = "" if args.force else "WHERE n.origin_device IS NULL "
+    if args.retry_llm:
+        where = ("WHERE n.name STARTS WITH 'openclaw-capsule-' "
+                 "AND (n.kind IS NULL OR n.kind = 'unclassified') ")
+    elif args.force:
+        where = ""
+    else:
+        where = "WHERE n.origin_device IS NULL "
     rows = g.query(
         "MATCH (n:Episodic) " + where +
         "RETURN n.uuid, n.name, n.source_description, substring(coalesce(n.content,''),0,6000), "
-        "n.origin_device, n.kind"
+        "n.kind, n.kind_confidence"
     ).result_set
     print(f"[backfill] {len(rows)} nodes to process{' (force)' if args.force else ''}")
     if not rows:
         print("[done] nothing to do")
         return 0
 
-    # 先算确定性部分 + 标记需要 LLM 的胶囊
+    # 先算确定性部分 + 标记需要 LLM 的胶囊。existing_* 用于 D1 不降级保护。
     plan = []
     need_llm = []
-    for uuid, name, sd, content, _dev, _k in rows:
+    for uuid, name, sd, content, ex_kind, ex_conf in rows:
         o = derive_origin(name or "", sd or "")
         dur = derive_durability(name or "", content or "")
         kind, conf = derive_kind(name or "", sd or "")
-        rec = dict(uuid=uuid, **o, durability=dur, kind=kind, kind_confidence=conf)
+        rec = dict(uuid=uuid, **o, durability=dur, kind=kind, kind_confidence=conf,
+                   _ex_kind=ex_kind, _ex_conf=ex_conf or 0.0)
         if conf < KIND_CONF_THRESHOLD and (name or "").startswith("openclaw-capsule-") and not args.no_llm:
             need_llm.append((rec, content))
         plan.append(rec)
@@ -113,13 +118,29 @@ async def main() -> int:
         print("  kind(确定性,LLM前):", dict(Counter(r["kind"] for r in plan)))
         return 0
 
-    # LLM 分类(仅胶囊,串行控速)
-    for rec, content in need_llm:
-        kind, conf = await _llm_kind(content)
-        if conf < KIND_CONF_THRESHOLD:
-            kind, conf = "unclassified", conf
-        rec["kind"], rec["kind_confidence"] = kind, conf
-        print(f"  [kind] {rec['uuid'][:12]} → {kind} ({conf})")
+    # LLM 分类(仅胶囊,串行控速;client 复用一个,修 D5)
+    llm_fail = 0
+    if need_llm:
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic(
+            auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
+            base_url=os.environ["ANTHROPIC_BASE_URL"], max_retries=2, timeout=90.0)
+        try:
+            for rec, content in need_llm:
+                kind, conf, failed = await _llm_kind(client, content)
+                llm_fail += 1 if failed else 0
+                if conf < KIND_CONF_THRESHOLD:
+                    kind, conf = "unclassified", 0.0   # 修 D3:unclassified 配 0 置信
+                rec["kind"], rec["kind_confidence"] = kind, conf
+                print(f"  [kind] {rec['uuid'][:12]} → {kind} ({conf}){' [FAILED]' if failed else ''}")
+        finally:
+            await client.close()
+
+    # D1 不降级保护:重算出的 unclassified 绝不覆盖已有的已分类值(人工/显式/上轮 LLM)。
+    for rec in plan:
+        if rec["kind"] == "unclassified" and rec["_ex_kind"] not in (None, "", "unclassified"):
+            rec["kind"], rec["kind_confidence"] = rec["_ex_kind"], rec["_ex_conf"]
+            rec["_preserved"] = True
 
     # 备份受影响节点旧值
     bak = g.query(
@@ -127,6 +148,7 @@ async def main() -> int:
         "RETURN n.uuid, n.origin_device, n.origin_tool, n.origin_project, "
         "n.durability, n.kind, n.kind_confidence",
         params={"us": [r["uuid"] for r in plan]}).result_set
+    Path("data").mkdir(exist_ok=True)   # 修 D4:不依赖 cwd 下 data/ 已存在
     bakpath = f"data/backfill-schema-backup-{datetime.now(tz=timezone.utc).strftime('%Y%m%d-%H%M%S')}.json"
     Path(bakpath).write_text(json.dumps(
         [dict(zip(["uuid", "origin_device", "origin_tool", "origin_project",
@@ -143,8 +165,15 @@ async def main() -> int:
             params={"u": r["uuid"], "dev": r["origin_device"], "tool": r["origin_tool"],
                     "proj": r["origin_project"], "dur": r["durability"],
                     "kind": r["kind"], "conf": r["kind_confidence"]})
-    print(f"[done] backfilled {len(plan)} nodes")
+    preserved = sum(1 for r in plan if r.get("_preserved"))
+    print(f"[done] backfilled {len(plan)} nodes"
+          + (f" (D1保护:保留了 {preserved} 个已分类值不被降级)" if preserved else ""))
     print("  final kind:", dict(Counter(r["kind"] for r in plan)))
+    if llm_fail:
+        # 修 D2:LLM 有失败就大声报警 + 非零退出;失败项可事后 --retry-llm 单独重跑
+        print(f"\n⚠️  [WARN] {llm_fail}/{len(need_llm)} 个胶囊 LLM 分类失败,已留 unclassified。")
+        print("    修复凭据/网络后跑:python -m tools.backfill_schema --retry-llm(只重试这些,不动其他)")
+        return 2
     return 0
 
 
