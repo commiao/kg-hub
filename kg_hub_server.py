@@ -898,17 +898,23 @@ async def search(request: Request) -> JSONResponse:
                 "MATCH (ep:Episodic) WHERE ep.uuid IN $u RETURN ep.uuid AS u, "
                 "coalesce(ep.provenance,'') AS prov, coalesce(ep.durability,'') AS dur, "
                 "coalesce(ep.verified,false) AS ver, coalesce(ep.usage_count,0) AS uc, "
-                "coalesce(ep.kind,'') AS kind, coalesce(ep.origin_project,'') AS proj",
+                "coalesce(ep.kind,'') AS kind, coalesce(ep.origin_project,'') AS proj, "
+                "coalesce(ep.archived,false) AS arch",
                 u=all_eps)
             for r in arows:
                 attr[str(r.get("u"))] = {"prov": r.get("prov"), "dur": r.get("dur"),
                                          "ver": bool(r.get("ver")), "uc": int(r.get("uc") or 0),
-                                         "kind": r.get("kind"), "proj": r.get("proj")}
+                                         "kind": r.get("kind"), "proj": r.get("proj"),
+                                         "arch": bool(r.get("arch"))}
         except Exception:  # noqa: BLE001
             attr = {}
 
     def agg(c):
-        eps = [attr[u] for u in c["episodes"] if u in attr]
+        backing = [attr[u] for u in c["episodes"] if u in attr]
+        # 退休生效:被归档的 episode 不作背书;fact 若只由已归档 episode 支撑则整体退休
+        eps = [a for a in backing if not a["arch"]]
+        if backing and not eps:
+            return None  # 全部背书已退休 → 该 fact 不再召回
         # internal 若有任一亲历背书;external 仅当全部背书都是 external
         external = bool(eps) and all(a["prov"].startswith("external") for a in eps)
         stale = bool(eps) and all(a["dur"] == "time-bound" for a in eps)
@@ -918,7 +924,10 @@ async def search(request: Request) -> JSONResponse:
 
     scored = []
     for c in cand.values():
-        eps, external, stale, verified, usage = agg(c)
+        agged = agg(c)
+        if agged is None:        # fact 的背书全被退休 → 不召回
+            continue
+        eps, external, stale, verified, usage = agged
         # facet 过滤:任一背书 episode 命中即保留(命中不了直接丢)
         if f_project and not any(a["proj"] == f_project for a in eps):
             continue
@@ -2513,7 +2522,7 @@ document.getElementById('retire').innerHTML=D.retire.length?('<div style="margin
 }).join('')):'<div class=empty>没有待退休内容 🎉</div>';
 function archiveOne(name,item,btn){btn.disabled=true;btn.textContent='归档中…';return fetch('/dashboard/archive_episode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(function(r){return r.json();}).then(function(d){if(d.ok){if(item)item.remove();return true;}btn.disabled=false;btn.textContent='失败';return false;}).catch(function(){btn.disabled=false;btn.textContent='失败';return false;});}
 document.getElementById('retire').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;
- if(b.id==='retireall'){if(!confirm('归档全部 '+D.retire.length+' 条过期内容?(可逆)'))return;b.disabled=true;b.textContent='批量归档中…';Promise.all(D.retire.map(function(x){return fetch('/dashboard/archive_episode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:x.name})});})).then(function(){document.getElementById('retire').innerHTML='<div class=empty>已全部归档 ✓</div>';});}
+ if(b.id==='retireall'){if(!confirm('归档全部 '+D.retire.length+' 条过期内容?(可逆)'))return;b.disabled=true;b.textContent='批量归档中…';Promise.all(D.retire.map(function(x){return fetch('/dashboard/archive_episode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:x.name})}).then(function(r){return r.json();}).then(function(d){return d&&d.ok;}).catch(function(){return false;});})).then(function(rs){var ok=rs.filter(Boolean).length,fail=rs.length-ok;document.getElementById('retire').innerHTML='<div class=empty>已归档 '+ok+' 条'+(fail?(' · '+fail+' 条失败,刷新重试'):' ✓')+'</div>';});}
  else if(b.classList.contains('arc')){var i=+b.dataset.ri;archiveOne(D.retire[i].name,b.closest('.item'),b);}
 });
 document.getElementById('quar').innerHTML=D.quar.length?D.quar.map(function(x,i){
@@ -2579,6 +2588,7 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
         retire_cut = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
         retirerows = await one(
             "MATCH (n:Episodic) WHERE n.durability='time-bound' AND NOT coalesce(n.archived,false) "
+            "AND NOT (n.name STARTS WITH 'kg-hub-canonical') "  # 注入胶囊不退休(掉出注入候选)
             "AND coalesce(n.created_at,'') < $cut "
             "RETURN n.name AS name, substring(coalesce(n.content,''),0,160) AS snip, "
             "n.created_at AS created, coalesce(n.origin_project,'') AS proj "
