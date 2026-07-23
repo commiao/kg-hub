@@ -132,7 +132,8 @@
 **② 治理 —— 核心已落地(2026-07-23)**:
 - **退休回路**(补"只进不出"缺口):反馈待办「④待退休」自动列过期 time-bound(行情/日报/快照 >30 天,当前 24 条),一键/批量归档(`archived=true` 可逆,看板与 search 均 `NOT archived` 过滤)。端点 `/dashboard/archive_episode`。只收 time-bound——evergreen+usage=0 是弱信号(usage 探针覆盖不全,会误伤 2228),不据此退休。
 - **分类器校准环**:`docs/kind-calibration.json`(14 人工标注)+ `tools/eval_kind.py`。基线 71%→ 发现系统偏差(日报/流水账被误判事故/决策)→ 给 KIND_PROMPT 加"整篇日报→项目事实"规则 → 容器重判 → **100%**。度量→修→再度量环跑通,即"自进化=持续治理"的实证。
-- 未做(已评估):预防式去重——VPS-sha 水印 + server (sd,sid) 幂等已覆盖主要向量,残留跨源同内容风险低;61 个 unclassified 多为无 type 的 codex/杂项尾巴(2.6%),接受为长尾,不强制分类。
+- **面板全维护(2026-07-23)**:案例整理台每条可改 可见性/已验证/**类型kind(下拉,纠正AI分类,人工覆写conf=1.0)/时效durability(长期⟷时效)/来源provenance(亲历/外文/社区)**,点即存(`dashboard_tag` 白名单有界写)。待办⑤待归类自动列 kind 未定数 + 一键跳 `curate?filter=unclassified` 集中归类。退休在待办④一键/批量。全部维护无需命令行。
+- 未做(已评估):预防式去重——VPS-sha 水印 + server (sd,sid) 幂等已覆盖主要向量,残留跨源同内容风险低;unclassified 长尾由待办⑤+整理台人工归类。
 
 **③ 召回 —— 已落地(2026-07-23)**:
 - `/api/search` 改 **hybrid**(语义主序+子串精确提权+多因子排序+facet 过滤)。基线:子串命中 3/15 → hybrid 12/15@10、14/15@20,追平/超过纯语义,且多了排序治理与分面。黄金集 `docs/golden-queries.json` + `tools/eval_recall.py`,详见 `docs/RETRIEVAL-BASELINE.md`。
