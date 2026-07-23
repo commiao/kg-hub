@@ -20,7 +20,9 @@ kg-push-capsules.py(cron 30min,确定性脚本)        ├─ claude-mem obs(cod
 
 **单一事实源**:跨工具共享的知识,以 **NAS 图为准**;OpenClaw 的 notes 是它自己的工作区(原料+成品混放),不是共享层。
 
-> **2026-07-23 直推割接**:原"VPS→Mac 拉取→Mac ingest"与隐藏的"VPS root cron :19 tar→NAS 容器 600s 轮询"**两条并行旧线曾双写重复入图**,同日全部退役(Mac plist 在 retired-launchagents/,VPS root crontab 注释行,容器循环只剩 canonical)。数据在哪从哪推、图在哪抽取在哪跑;Mac 不再是 OpenClaw 数据面的一环。历史双写造成的重复 episode 待专项去重。
+> **2026-07-23 直推割接**:原"VPS→Mac 拉取→Mac ingest"与隐藏的"VPS root cron :19 tar→NAS 容器 600s 轮询"**两条并行旧线曾双写重复入图**,同日全部退役(Mac plist 在 retired-launchagents/,VPS root crontab 注释行,容器循环只剩 canonical)。数据在哪从哪推、图在哪抽取在哪跑;Mac 不再是 OpenClaw 数据面的一环。
+>
+> **2026-07-23 历史重复去重**:33 对同名同内容胶囊(6 月原始入图 + 7-22 gz 支持上线重入图)已去重,105→72。用 `graphiti.remove_episode` 移除每对较新副本(保留较早、时间锚更准),并剔除幸存边 `episodes` 数组里的陈旧 uuid;零孤儿边。全文备份 `data/dedup-backup-20260723.json`,工具 `tools/dedup_capsules_once.py`。
 
 ## 2. 术语表(强制,消除歧义)
 
