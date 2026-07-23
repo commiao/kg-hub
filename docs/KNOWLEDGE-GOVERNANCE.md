@@ -67,5 +67,7 @@ OpenClaw (oc-vps)                Mac(桥,每 30 分钟)              NAS kg-hub(
 
 ## 6. 已知余留
 
-- OpenClaw 端 `session-knowledge-manager` 的胶囊提炼质量参差(文章派生占比在涨),必要时在 VPS 端收紧提炼规则——那是 OpenClaw 技能的事,不归本仓库。
+- 胶囊真实产线是 OpenClaw **内置 cron 的两个 LLM job**:`kb-001 胶囊提取`(每日 04:00,写 CAPSULE-*)与 `evo-002 记忆压缩`(每日 05:00,gzip 归档,标准逐日即兴——"假 .md.gz" 即它所致)。源头收紧要改 **kb-001 的 prompt**(`~/.openclaw/cron/jobs.json`),不归本仓库。
+  > 注意:VPS 上的 `session-knowledge-manager` 技能是**僵尸**(hook 从未被 gateway 加载、cron 行 4 月已删、核心模块全是桩),它文档里宣称的提炼/落库/归档实际由 kb-001/evo-002 完成——别被它的 SKILL.md 误导(2026-07-23 四维审计定论)。
+- 胶囊来源行格式会**漂移**(07-17 `**来源**:` 行首式 → 07-19 列表式 → 07-23 `## 来源` 标题式)。分类器目前只认 `**来源**:`,标题式会整篇判 firsthand——消费端跟进或在 kb-001 prompt 里固化模板,二选一必须做一个。
 - `docs/REPORTS.md` / `docs/PORTAL-HANDOFF.md` 属门户会话维护,勿在本会话改。
