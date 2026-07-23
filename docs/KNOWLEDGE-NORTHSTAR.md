@@ -124,10 +124,14 @@
 
 **已就位**:provenance 分类+降权、格式门+隔离区、VPS 直推(一跳)、待办人工一键回路、canonical 注入排序、历史重复已去重(72 胶囊)。
 
-**缺口(三赛道各自要补)**:
-- ① origin 三戳还在自由文本里 → 提为一等字段 + 存量回填;`kind`/`durability` 尚未引入。
-- ② 退休/衰减回路缺失(只进不出);去重是事后式,要转预防式。
-- ③ 召回是子串 grep(浪费了图+embedding);无多因子排序;**无黄金查询集(测不了就调不了)**。
+**① 采集/Schema —— 已完成(2026-07-23)**:
+- `origin_device/origin_tool/origin_project` + `durability` + `kind`/`kind_confidence` 已提为一等字段(`utils/origin.py` 纯派生;`kg_hub_server._tag_schema_fields` 在每次 ingest 打标;kind 走独立 LLM 分类器 pass,低置信弃权 unclassified)。
+- 存量 2302 节点全部回填完毕(`tools/backfill_schema.py`):0 空值。kind 分布 项目事实1532/事故397/决策276/方法论20/手册11/素材4/生命周期1/unclassified61(=~60 无 type 小尾巴 + 1 低置信胶囊)。
+- **运维教训**:Mac 的 `~/.claude-mem/.env` ANTHROPIC token 对直连 401 失效;胶囊 kind 的 LLM 分类改在 **NAS 容器内**跑(`docker exec kg-hub-ingester python -m tools.backfill_schema --retry-llm`,容器 token 有效)。回填工具的 D2 防护(失败计数+非零退出+--retry-llm)正是为此。
+
+**缺口(②③ 赛道,可并行开工)**:
+- ② 退休/衰减回路缺失(只进不出);去重转预防式;61 个 unclassified 待人工/分类器补(可扩展待办③区);分类器人工校准样本待建。
+- ③ 召回是子串 grep(浪费了图+embedding);无多因子排序(可复用 canonical 排序 + 新增 origin/kind/durability facet 过滤);**无黄金查询集(测不了就调不了)**。
 
 ---
 
