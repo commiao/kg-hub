@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -173,6 +174,30 @@ def post_ingest(url: str, tok: str, payload: dict) -> tuple[int, dict]:
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
+def poll_until_done(url: str, tok: str, sd: str, sid: str,
+                    max_wait: int = 300, interval: int = 8) -> str:
+    """异步 ingest 后轮询该条状态直到 ok/error,或超时。返回终态字符串。
+    这样一次只有一篇在抽取(发下一篇前等这篇完成),既串行避免 writer.lock 争用,
+    又不长挂 HTTP 连接(区别于 sync=true 的 client 超时)。"""
+    import time as _t
+    q = urllib.parse.urlencode({"source_description": sd, "source_obs_id": sid})
+    waited = 0
+    while waited < max_wait:
+        _t.sleep(interval)
+        waited += interval
+        req = urllib.request.Request(
+            f"{url}/api/ingest/status?{q}",
+            headers={"Authorization": f"Bearer {tok}"} if tok else {})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                st = json.loads(r.read() or b"{}").get("status", "")
+        except Exception:
+            continue   # 状态查询抖动,下轮再看
+        if st in ("ok", "skipped", "error", "not_found"):
+            return st
+    return "timeout"
+
+
 def main() -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = LOCK_FILE.open("w")
@@ -237,19 +262,27 @@ def main() -> int:
             "source_description": sd,
             "reference_time": ref,
             "source_obs_id": sha,
-            "sync": False,
+            "sync": False,   # async 发出 → 下面 poll_until_done 等它抽完再发下一篇
         })
         status = resp.get("status", "")
-        if code in (200, 202) and status in ("ok", "skipped", "in_progress", "accepted", "quarantined") or \
-           (code == 202 and not status):
-            state[rel] = {"sha": sha, "status": status or "accepted",
+        # 立即终态(skipped/quarantined):直接记账,不用 poll
+        if status in ("skipped", "quarantined"):
+            state[rel] = {"sha": sha, "status": status,
                           "at": datetime.now(tz=timezone.utc).isoformat()}
-            known_shas.add(sha)
-            pushed += 1
-            save_state(state)  # 每推成一条落一次盘:中途崩溃不丢已推水印
-            log(f"[push] {rel} → {code} {status}")
+            known_shas.add(sha); pushed += 1; save_state(state)
+            log(f"[push] {rel} → {status}")
             if status == "quarantined":
                 log(f"[gate] {rel} 被格式门拦截 → 反馈待办处理")
+        # 已受理(异步抽取中):轮询到终态,一次只跑一篇,避免 writer.lock 争用
+        elif code in (200, 202) and (status in ("accepted", "in_progress", "ok") or not status):
+            final = poll_until_done(url, tok, sd, sha)
+            if final in ("ok", "skipped"):
+                state[rel] = {"sha": sha, "status": final,
+                              "at": datetime.now(tz=timezone.utc).isoformat()}
+                known_shas.add(sha); pushed += 1; save_state(state)
+                log(f"[push] {rel} → {final}")
+            else:  # error/timeout:不记账,下轮重试(error 需先清 NAS 键)
+                log(f"[retry-next-run] {rel} → 终态={final}")
         elif code == 409:
             state[rel] = {"sha": sha, "status": "failed-409",
                           "at": datetime.now(tz=timezone.utc).isoformat()}
