@@ -52,8 +52,29 @@ def save_watermark(wm: dict[str, dict]) -> None:
     WATERMARK_PATH.write_text(json.dumps(wm, indent=2, ensure_ascii=False))
 
 
+def capsule_bytes(path: Path) -> bytes:
+    """Raw capsule content. OpenClaw gzips aging capsules in place
+    (CAPSULE-x.md → CAPSULE-x.md.gz) — read through the compression so a
+    capsule gzipped before its first successful ingest isn't silently lost
+    (this happened to the whole 07-17/07-18 batch).
+
+    Decompression is decided by gzip magic bytes, not filename: OpenClaw
+    occasionally writes plain markdown under a .md.gz name (seen in prod:
+    capsule-daily-extract-20260623.md.gz) — treat those as text, don't drop.
+    """
+    raw = path.read_bytes()
+    if path.name.endswith(".gz"):
+        if raw[:2] == b"\x1f\x8b":
+            import gzip
+            return gzip.decompress(raw)
+        print(f"  [warn] {path.name}: .gz name but not gzip payload — treating as plain text")
+    return raw
+
+
 def sha256_of(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # Hash the *decompressed* content: same capsule keeps the same identity
+    # across a later .md → .md.gz rename, so it won't re-ingest as a duplicate.
+    return hashlib.sha256(capsule_bytes(path)).hexdigest()
 
 
 def discover_capsules(snapshot_dir: Path, min_size: int = 1500) -> list[Path]:
@@ -81,26 +102,36 @@ def discover_capsules(snapshot_dir: Path, min_size: int = 1500) -> list[Path]:
 
     candidates: list[Path] = []
     for root in roots:
-        for p in root.rglob("*.md"):
-            name = p.name
-            # Capsule filename heuristic: starts with CAPSULE- or capsule-
-            if name.startswith("CAPSULE-") or name.startswith("capsule-"):
-                candidates.append(p)
+        for pattern in ("*.md", "*.md.gz"):
+            for p in root.rglob(pattern):
+                name = p.name
+                # Capsule filename heuristic: starts with CAPSULE- or capsule-
+                if name.startswith("CAPSULE-") or name.startswith("capsule-"):
+                    candidates.append(p)
 
     # Dedup by resolved path (some files appear under both absolute-path
     # and relative-path extraction sites after recursive untarring).
     seen: dict[str, Path] = {}
     for p in candidates:
         try:
-            key = p.read_bytes()[:200].decode("utf-8", "ignore")
+            key = capsule_bytes(p)[:200].decode("utf-8", "ignore")
         except Exception:
             key = str(p)
         if key not in seen:
             seen[key] = p
     deduped = sorted(seen.values())
 
-    # Filter trivially-empty stubs
-    sized = [p for p in deduped if p.stat().st_size >= min_size]
+    # Filter trivially-empty stubs (size of the *content*, not the .gz)
+    sized = []
+    for p in deduped:
+        try:
+            if len(capsule_bytes(p)) >= min_size:
+                sized.append(p)
+        except Exception as exc:  # noqa: BLE001 — truncated gz / IO error:
+            # skip so discovery survives, but never silently (silent loss is
+            # exactly what this ingester exists to prevent).
+            print(f"  [skip] {p.name}: unreadable capsule ({type(exc).__name__}: {exc})")
+            continue
     return sized
 
 
@@ -111,6 +142,10 @@ def capsule_reference_time(path: Path) -> datetime:
 
 
 def episode_name_from_path(path: Path) -> str:
+    name = path.name
+    for suf in (".md.gz", ".md"):  # CAPSULE-x.md.gz 的 stem 是 CAPSULE-x.md,要剥干净
+        if name.endswith(suf):
+            return f"openclaw-capsule-{name[: -len(suf)]}"
     return f"openclaw-capsule-{path.stem}"
 
 
@@ -122,7 +157,7 @@ GROUP_ID = "kg_hub"
 
 
 async def ingest_one(g, path: Path, source_desc: str, ref_time: datetime) -> tuple[int, int]:
-    body = path.read_text(encoding="utf-8")
+    body = capsule_bytes(path).decode("utf-8")
     result = await g.add_episode(
         name=episode_name_from_path(path),
         episode_body=body,
@@ -146,14 +181,26 @@ async def _do_main(args) -> int:
         WATERMARK_PATH.unlink()
     wm = load_watermark()
 
-    # filter to new/changed only
+    # filter to new/changed only。同内容跨路径也跳过(sha 集合):
+    # OpenClaw 会把已 ingest 的 CAPSULE-x.md 原地 gzip 成 .md.gz——路径变了
+    # 内容没变,不能重复入图。
+    known_shas = {v.get("sha256") for v in wm.values()}
     todo: list[Path] = []
+    aliased = 0
     for f in files:
         key = str(f.relative_to(snapshot))
         h = sha256_of(f)
         if wm.get(key, {}).get("sha256") == h:
             continue
+        if h in known_shas:
+            wm[key] = {"sha256": h, "ingested_at": "dedup-alias",
+                       "nodes": 0, "edges": 0}
+            aliased += 1
+            continue
         todo.append(f)
+    if aliased:
+        save_watermark(wm)  # persist aliases even when todo ends up empty
+        print(f"[plan] {aliased} renamed-but-unchanged capsules aliased (skip re-ingest)")
     print(f"[plan] {len(todo)} new/changed capsules to ingest ({len(files) - len(todo)} unchanged)")
 
     if args.limit > 0:

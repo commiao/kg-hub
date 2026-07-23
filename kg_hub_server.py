@@ -714,20 +714,45 @@ async def search(request: Request) -> JSONResponse:
         "WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $query "
         "RETURN e.fact AS fact, s.uuid AS source_node_uuid, "
         "       t.uuid AS target_node_uuid, e.valid_at AS valid_at, "
-        "       e.created_at AS created_at "
+        "       e.created_at AS created_at, e.episodes AS episodes "
         "LIMIT $limit",
         query=query.lower(),
-        limit=num_results,
+        # 超采 3 倍(≤90)再排序截断:底层无 ORDER BY,若直接按 num_results 截,
+        # external 可能挤满窗口把 firsthand 完全挤出(缓解,非保证)。
+        limit=min(num_results * 3, 90),
     )
+    # 溯源降权:fact 若源自 provenance=external-* 的胶囊(公众号/掘金文章、
+    # 社区采集派生),标注 provenance=external 并稳定后置——不过滤,只是让
+    # 亲历知识排前面。政策见 docs/KNOWLEDGE-GOVERNANCE.md。
+    ep_uuids: set[str] = set()
+    for row in rows:
+        for u in (row.get("episodes") or []):
+            ep_uuids.add(str(u))
+    ext_eps: set[str] = set()
+    if ep_uuids:
+        try:
+            erows, _, _ = await driver.execute_query(
+                "MATCH (ep:Episodic) WHERE ep.uuid IN $uuids "
+                "AND coalesce(ep.provenance,'') STARTS WITH 'external' "
+                "RETURN ep.uuid AS u",
+                uuids=sorted(ep_uuids),
+            )
+            ext_eps = {str(r.get("u")) for r in erows}
+        except Exception:  # noqa: BLE001 — 降权是增强,查不到就当全 internal
+            ext_eps = set()
     results = []
     for row in rows:
+        eps = [str(u) for u in (row.get("episodes") or [])]
         results.append({
             "fact": row.get("fact"),
             "source_node_uuid": str(row.get("source_node_uuid")),
             "target_node_uuid": str(row.get("target_node_uuid")),
             "valid_at": row.get("valid_at"),
             "created_at": row.get("created_at"),
+            "provenance": "external" if any(u in ext_eps for u in eps) else "internal",
         })
+    results.sort(key=lambda r: r["provenance"] == "external")  # 稳定排序:external 沉底
+    results = results[:num_results]
     return JSONResponse({"status": "ok", "query": query, "mode": "falkordb_text", "results": results})
 
 
@@ -1245,13 +1270,13 @@ async def search_semantic(request: Request) -> JSONResponse:
 # {name,desc,url} + 写一个 /dashboard/* 处理器。数据服务端渲染进页面（免客户端
 # 二次鉴权）；17171 仅绑 NAS loopback + tailscale。
 PORTAL_REPORTS = [
-    {"name": "知识胶囊看板", "desc": "canonical 胶囊曝光 + 各 cwd 下实时排序与注入",
+    {"name": "注入胶囊看板", "desc": "canonical 注入胶囊(项目预热文档)曝光 + 各 cwd 下实时排序与注入。OpenClaw 知识胶囊在「知识库速览」搜",
      "url": "/dashboard/capsules", "icon": "📎", "ready": True},
-    {"name": "使用排行", "desc": "胶囊累计注入排行 + 建议晋升 / 建议下线",
+    {"name": "使用排行", "desc": "注入胶囊(canonical)累计注入排行 + 建议晋升 / 建议下线",
      "url": "/dashboard/usage", "icon": "📊", "ready": True},
     {"name": "知识库速览", "desc": "全图概览(Episode/实体/关系) + 最近知识",
      "url": "/dashboard/knowledge", "icon": "🧠", "ready": True},
-    {"name": "知识使用率", "desc": "全图/胶囊利用率 + 被取用知识 + 沉睡长尾",
+    {"name": "知识使用率", "desc": "全图/注入胶囊利用率 + 被取用知识 + 沉睡长尾",
      "url": "/dashboard/utilization", "icon": "📈", "ready": True},
     {"name": "各工具与 kg-hub", "desc": "各工具贡献(写入) + 注入使用(读取)统计",
      "url": "/dashboard/tools", "icon": "🛠", "ready": True},
@@ -1303,7 +1328,7 @@ async def portal_manifest(request: Request) -> JSONResponse:
 
 _DASH_CAPSULES_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
-<title>kg-hub 知识胶囊看板</title>
+<title>kg-hub 注入胶囊看板</title>
 <style>:root{color-scheme:light dark}
 body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
 a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
@@ -1329,7 +1354,8 @@ details[open] .chev{transform:rotate(90deg)}
 .body pre{white-space:pre-wrap;font-size:12px}.body code{font-family:ui-monospace,monospace;font-size:12px}
 .body h1,.body h2,.body h3{font-size:15px;font-weight:500;margin:.7rem 0 .3rem}
 .body table{border-collapse:collapse;font-size:12px}.body td,.body th{border:1px solid color-mix(in srgb,CanvasText 15%,transparent);padding:3px 6px}</style></head><body>
-<a class=back href="/portal">← 报表门户</a><h1>知识胶囊看板</h1>
+<a class=back href="/portal">← 报表门户</a><h1>注入胶囊看板</h1>
+<div style="font-size:12px;color:GrayText">注入胶囊 = canonical 项目预热文档(SessionStart 注入)。OpenClaw 每日提炼的「知识胶囊」不在此列,在 <a href="/dashboard/knowledge" style="color:inherit">知识库速览</a> 搜索。</div>
 <div class=cards id=cards></div>
 <div class=lbl>胶囊总览 · 按曝光排序</div><div id=caps></div>
 <div class=lbl>实时排序 · 选 cwd 关键词（<span style="color:#185FA5">注入</span> = 进 top-3 会被钉进会话）</div>
@@ -1420,9 +1446,9 @@ summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:n
 .dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin:.2rem 0 .6rem;max-height:400px;overflow:auto}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>使用排行</h1>
 <div class=cards id=cards></div>
-<div class=lbl>胶囊累计注入排行 · canonical 被 PUSH 钩子注入的次数（Lindy / 隐式反馈信号）</div><div id=top></div>
+<div class=lbl>注入胶囊累计排行 · canonical 被 PUSH 钩子注入的次数（Lindy / 隐式反馈信号）</div><div id=top></div>
 <div class=lbl>建议晋升 · 高频命中但尚非 canonical 的普通节点</div><div id=promote></div>
-<div class=lbl>建议下线 · 零曝光的 canonical 胶囊（按创建时间）</div><div id=demote></div>
+<div class=lbl>建议下线 · 零曝光的 canonical 注入胶囊（按创建时间）</div><div id=demote></div>
 <div class=ts style="margin-top:1.5rem">每 60s 自动刷新 · 曝光=被注入次数(非贡献度) · 数据同 /api/usage_ranking</div>
 <script>var D=__DATA__;var s=D.stats;
 document.getElementById('cards').innerHTML='<div class=mc><div class=l>胶囊总数</div><div class=v>'+s.canonical_total+'</div></div><div class=mc><div class=l>胶囊累计注入</div><div class=v>'+s.canonical_total_usage+'</div></div><div class=mc><div class=l>全图有曝光</div><div class=v>'+s.episodes_with_usage+' / '+s.total_episodes+'</div></div>';
@@ -1525,7 +1551,7 @@ summary:hover{background:color-mix(in srgb,CanvasText 5%,transparent)}
 document.getElementById('cards').innerHTML='<div class=mc><div class=l>Episode 知识条目</div><div class=v>'+s.episodes+'</div></div><div class=mc><div class=l>实体 Entity</div><div class=v>'+s.entities+'</div></div><div class=mc><div class=l>关系 Edge</div><div class=v>'+s.edges+'</div></div>';
 document.getElementById('q').value=D.q||'';
 document.getElementById('lbl').textContent=D.q?('搜索结果："'+D.q+'" · '+D.items.length+' 条'):'最近知识 · 最新 observation（全图，非 canonical 胶囊）';
-document.getElementById('items').innerHTML=D.items.map(function(r,i){return '<details data-i="'+i+'"><summary class=row><span class=bdg>'+r.type+'</span><div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>'+(D.q?'无匹配':'暂无')+'</div>';
+document.getElementById('items').innerHTML=D.items.map(function(r,i){return '<details data-i="'+i+'"><summary class=row><span class=bdg>'+r.type+'</span>'+(r.prov&&r.prov.indexOf('external')===0?'<span class=bdg style="background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span>':'')+'<div class=sn>'+r.snippet+'<div class=meta>'+r.project+' · '+r.created+'</div></div><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>'+(D.q?'无匹配':'暂无')+'</div>';
 Array.prototype.forEach.call(document.querySelectorAll('#items details'),function(d){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var it=D.items[+d.dataset.i];d.querySelector('.src').textContent=(it.name||'')+(it.source?('  ·  '+it.source):'');d.querySelector('.dtl').textContent=it.detail||'(无内容)';d.dataset.done='1';}});});
 </script></body></html>"""
 
@@ -1553,7 +1579,8 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
                     "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
                     "WHERE NOT coalesce(node.archived, false) "
                     "RETURN substring(coalesce(node.content,''),0,4000) AS detail, "
-                    "node.name AS name, node.source_description AS source, node.created_at AS created "
+                    "node.name AS name, node.source_description AS source, node.created_at AS created, "
+                    "coalesce(node.provenance,'') AS prov "
                     "ORDER BY score DESC LIMIT 30", q=q)
             except Exception:
                 rows = []
@@ -1562,13 +1589,15 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
                     "MATCH (n:Episodic) WHERE (n.content CONTAINS $q OR n.name CONTAINS $q) "
                     "AND NOT coalesce(n.archived, false) "
                     "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
-                    "n.name AS name, n.source_description AS source, n.created_at AS created LIMIT 30", q=q)
+                    "n.name AS name, n.source_description AS source, n.created_at AS created, "
+                    "coalesce(n.provenance,'') AS prov LIMIT 30", q=q)
         else:  # no query → recent knowledge
             rows = await one(
                 "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
                 "AND NOT coalesce(n.archived, false) "
                 "RETURN substring(coalesce(n.content,''),0,4000) AS detail, "
-                "n.name AS name, n.source_description AS source, n.created_at AS created "
+                "n.name AS name, n.source_description AS source, n.created_at AS created, "
+                "coalesce(n.provenance,'') AS prov "
                 "ORDER BY n.created_at DESC LIMIT 25")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>知识库取数失败: {exc}</p>", status_code=503)
@@ -1581,10 +1610,13 @@ async def dashboard_knowledge(request: Request) -> HTMLResponse:
         full = r.get("detail") or ""
         oneline = full.strip().replace("\n", " ")
         snippet = esc(oneline[:400]) + ("…" if len(oneline) > 400 else "")
-        items.append({"type": esc(mt.group(1)) if mt else "obs",
+        nm = r.get("name") or ""
+        typ = "知识胶囊" if nm.startswith("openclaw-capsule-") else (esc(mt.group(1)) if mt else "obs")
+        items.append({"type": typ,
                       "project": esc(mp.group(1)) if mp else "—",
                       "snippet": snippet, "created": (r.get("created") or "")[:16],
-                      "name": r.get("name") or "", "source": src, "detail": full})
+                      "name": nm, "source": src, "detail": full,
+                      "prov": r.get("prov") or ""})
     data = {"stats": {"entities": ent, "edges": edg, "episodes": epi},
             "q": esc(q), "items": items}
     # detail/name/source 走 textContent 安全；但 JSON 内嵌进内联 <script> 时，
@@ -1619,9 +1651,9 @@ summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:n
 <div class=lbl>被取用过的知识 · 按使用量排序（胶囊 + 普通知识）</div><div id=items></div>
 <div class=ts style="margin-top:1.5rem" id=note></div>
 <script>var D=__DATA__;var r=D.rates;
-document.getElementById('cards').innerHTML='<div class=mc><div class=l>全图利用率</div><div class=v>'+r.util_pct+'%</div><div class=s>'+r.used+' / '+r.total+' 被取用</div></div><div class=mc><div class=l>胶囊利用率</div><div class=v>'+r.canon_pct+'%</div><div class=s>'+r.canon_used+' / '+r.canon_total+'</div></div><div class=mc><div class=l>从未取用</div><div class=v>'+r.never+'</div><div class=s>沉睡知识</div></div>';
+document.getElementById('cards').innerHTML='<div class=mc><div class=l>全图利用率</div><div class=v>'+r.util_pct+'%</div><div class=s>'+r.used+' / '+r.total+' 被取用</div></div><div class=mc><div class=l>注入胶囊利用率</div><div class=v>'+r.canon_pct+'%</div><div class=s>'+r.canon_used+' / '+r.canon_total+'</div></div><div class=mc><div class=l>从未取用</div><div class=v>'+r.never+'</div><div class=s>沉睡知识</div></div>';
 var mu=Math.max.apply(null,D.items.map(function(x){return x.usage}).concat([1]));
-document.getElementById('items').innerHTML=D.items.map(function(x,i){return '<details data-i="'+i+'"><summary class=row><span class=uc>'+x.usage+'</span><div class=bar><i style="width:'+Math.round(x.usage/mu*100)+'%;background:'+(x.cap?'#7F77DD':'#888780')+'"></i></div><span class=nm>'+x.label+'</span><span class="bdg '+(x.cap?'cap':'con')+'">'+(x.cap?'胶囊':x.type)+'</span><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>暂无被取用的知识</div>';
+document.getElementById('items').innerHTML=D.items.map(function(x,i){return '<details data-i="'+i+'"><summary class=row><span class=uc>'+x.usage+'</span><div class=bar><i style="width:'+Math.round(x.usage/mu*100)+'%;background:'+(x.cap?'#7F77DD':'#888780')+'"></i></div><span class=nm>'+x.label+'</span>'+(x.prov&&x.prov.indexOf('external')===0?'<span class=bdg style="background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span>':'')+'<span class="bdg '+(x.cap?'cap':'con')+'">'+(x.cap?'注入胶囊':x.type)+'</span><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>暂无被取用的知识</div>';
 Array.prototype.forEach.call(document.querySelectorAll('#items details'),function(d){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var it=D.items[+d.dataset.i];d.querySelector('.src').textContent=(it.name||'')+(it.source?('  ·  '+it.source):'')+(it.last?('  ·  最近 '+it.last):'');d.querySelector('.dtl').textContent=it.detail||'(无内容)';d.dataset.done='1';}});});
 document.getElementById('note').textContent='每 60s 自动刷新 · usage = 被 PUSH hook 注入/填充次数（MCP 检索暂未计入，故为下限）· 利用率低=大量知识沉睡';
 </script></body></html>"""
@@ -1647,7 +1679,8 @@ async def dashboard_utilization(request: Request) -> HTMLResponse:
         top = await one(
             "MATCH (n:Episodic) WHERE coalesce(n.usage_count,0)>0 "
             "RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
-            "n.source_description AS source, coalesce(n.usage_count,0) AS uc, n.last_used_at AS last "
+            "n.source_description AS source, coalesce(n.usage_count,0) AS uc, n.last_used_at AS last, "
+            "coalesce(n.provenance,'') AS prov "
             "ORDER BY uc DESC LIMIT 40")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>使用率取数失败: {exc}</p>", status_code=503)
@@ -1662,14 +1695,16 @@ async def dashboard_utilization(request: Request) -> HTMLResponse:
         src = x.get("source") or ""
         mt = _re.search(r"type=(\S+)", src)
         if cap:
-            label, typ = esc(nm.replace("kg-hub-canonical-", "")), "胶囊"
+            label, typ = esc(nm.replace("kg-hub-canonical-", "")), "注入胶囊"
         else:
             oneline = full.strip().replace("\n", " ")
             label = esc(oneline[:80]) + ("…" if len(oneline) > 80 else "")
-            typ = esc(mt.group(1)) if mt else "obs"
+            # OpenClaw 每日提炼的知识胶囊 ≠ canonical 注入胶囊,类型上区分开
+            typ = "知识胶囊" if nm.startswith("openclaw-capsule-") else (esc(mt.group(1)) if mt else "obs")
         items.append({"label": label, "type": typ, "cap": cap,
                       "usage": int(x.get("uc") or 0), "last": (x.get("last") or "")[:10],
-                      "name": nm, "source": src, "detail": full})
+                      "name": nm, "source": src, "detail": full,
+                      "prov": x.get("prov") or ""})
     rates = {"total": total, "used": used, "util_pct": round(100 * used / max(total, 1), 1),
              "canon_total": ct, "canon_used": cu, "canon_pct": round(100 * cu / max(ct, 1), 1),
              "never": total - used}
@@ -1691,7 +1726,7 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .ts{color:GrayText;font-size:12px}.empty{color:GrayText;font-size:13px;padding:6px 0}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>各工具与 kg-hub</h1>
 <div class=lbl>贡献（写入）· 各工具喂进 kg-hub 的知识条数（按 project 目录名归属）</div><div id=contrib></div>
-<div class=lbl>使用（读取）· 各工具被注入 kg-hub 胶囊的次数（PUSH hook 上报）</div><div id=usage></div>
+<div class=lbl>使用（读取）· 各工具被注入 kg-hub 注入胶囊的次数（PUSH hook 上报）</div><div id=usage></div>
 <div class=ts style="margin-top:1.5rem" id=note></div>
 <script>var D=__DATA__;
 function bars(el,arr,key,label,color){var mx=Math.max.apply(null,arr.map(function(x){return x[key]}).concat([1]));
@@ -1810,7 +1845,7 @@ function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Cont
 document.getElementById('q').value=D.q||'';
 document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class="vis'+(x.visibility===v[0]?' on':'')+'" data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
- return '<div class=item><div class=top><input type=checkbox class=pick data-i="'+i+'" style="margin-top:3px"><span class=bdg>'+x.type+'</span><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
+ return '<div class=item><div class=top><input type=checkbox class=pick data-i="'+i+'" style="margin-top:3px"><span class=bdg>'+x.type+'</span>'+(x.prov&&x.prov.indexOf('external')===0?'<span class=bdg style="background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span>':'')+'<div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div></div>'
    +'<div class=ctrl><span class=lb>可见性:</span>'+vb
    +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
    +'<button class=exp data-i="'+i+'">展开全文 ▾</button><button class=tr data-i="'+i+'">译中文</button><span class=saved data-i="'+i+'">✓已存</span></div>'
@@ -1844,7 +1879,8 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
 
     RET = ("RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
            "n.source_description AS source, n.created_at AS created, "
-           "n.visibility AS visibility, coalesce(n.verified,false) AS verified ")
+           "n.visibility AS visibility, coalesce(n.verified,false) AS verified, "
+           "coalesce(n.provenance,'') AS prov ")
     try:
         if q:
             rows = await one("MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
@@ -1862,13 +1898,15 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
         mp = _re.search(r"project=(\S+)", src)
         full = r.get("detail") or ""
         oneline = full.strip().replace("\n", " ")
-        items.append({"name": r.get("name") or "",
-                      "type": esc(mt.group(1)) if mt else "obs",
+        nm = r.get("name") or ""
+        items.append({"name": nm,
+                      "type": "知识胶囊" if nm.startswith("openclaw-capsule-") else (esc(mt.group(1)) if mt else "obs"),
                       "project": esc(mp.group(1)) if mp else "—",
                       "snippet": esc(oneline[:400]) + ("…" if len(oneline) > 400 else ""),
                       "created": (r.get("created") or "")[:16],
                       "visibility": r.get("visibility") or "",
-                      "verified": bool(r.get("verified")), "detail": full})
+                      "verified": bool(r.get("verified")), "detail": full,
+                      "prov": r.get("prov") or ""})
     data_json = json.dumps({"q": esc(q), "items": items}, ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_CURATE_HTML.replace("__DATA__", data_json))
 
@@ -2140,7 +2178,7 @@ function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Cont
 document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;
 document.getElementById('cls').innerHTML=D.classify.length?D.classify.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class=vis data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
- return '<div class=item data-i="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
+ return '<div class=item data-i="'+i+'"><div class=sn>'+(x.prov&&x.prov.indexOf('external')===0?'<span style="font-size:11px;padding:1px 7px;border-radius:8px;background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span> ':'')+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
   +'<div class=ctrl><span class=lb>可见性:</span>'+vb+'<button class=ver data-i="'+i+'">✓已验证</button><button class=exp data-i="'+i+'">展开全文 ▾</button><button class=tr data-i="'+i+'">译中文</button><span class=sugtag data-i="'+i+'"></span><span class=saved data-i="'+i+'">✓已存</span></div><pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=empty>没有待分层的知识 🎉</div>';
 document.getElementById('fb').innerHTML=D.needfb.length?D.needfb.map(function(x){return '<div class=item><div class=sn>'+x.snippet+'<div class=meta>'+x.created+'</div></div><div class=ctrl><a class=go href="/dashboard/feedback?casepack='+encodeURIComponent(x.name)+'">录入表现 →</a></div></div>';}).join(''):'<div class=empty>没有待补数据 🎉</div>';
@@ -2172,7 +2210,8 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "AND (n.source_description CONTAINS 'type=feature' OR n.source_description CONTAINS 'type=bugfix' "
             "OR n.source_description CONTAINS 'type=decision' OR n.source_description CONTAINS 'type=refactor') "
             "RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
-            "n.source_description AS source, n.created_at AS created "
+            "n.source_description AS source, n.created_at AS created, "
+            "coalesce(n.provenance,'') AS prov "
             "ORDER BY n.created_at DESC LIMIT 15")
         pub = await one(
             "MATCH (n:Episodic) WHERE n.visibility = 'public-story' "
@@ -2190,13 +2229,15 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
         mt = _re.search(r"type=(\S+)", src)
         mp = _re.search(r"project=(\S+)", src)
         one_line = (r.get(full_key) or r.get("snip") or "").strip().replace("\n", " ")
-        return {"name": r.get("name") or "",
-                "type": esc(mt.group(1)) if mt else "obs",
+        nm = r.get("name") or ""
+        return {"name": nm,
+                "type": "知识胶囊" if nm.startswith("openclaw-capsule-") else (esc(mt.group(1)) if mt else "obs"),
                 "project": esc(mp.group(1)) if mp else "—",
                 "snippet": esc(one_line[:400]) + ("…" if len(one_line) > 400 else ""),
                 "created": (r.get("created") or "")[:16],
                 "visibility": r.get("visibility") or "", "verified": False,
-                "detail": (r.get("detail") or "")}
+                "detail": (r.get("detail") or ""),
+                "prov": r.get("prov") or ""}
     classify = [view(r) for r in untagged]
     needfb = []
     for r in pub:

@@ -141,7 +141,17 @@ async def run_ingester(fresh: bool) -> int:
         cwd=str(KG_HUB_DIR),
     )
     await proc.wait()
-    return proc.returncode or 0
+    rc = proc.returncode or 0
+    if rc == 0:
+        # 补标 provenance(外部文章/社区派生 → 降权标记)。幂等:只碰未标节点,
+        # 新 ingest 的胶囊在这一步拿到标。失败不阻塞同步(下轮重试)。
+        tag_cmd = [str(venv_py), "-m", "tools.tag_provenance"]
+        print(f"[tag] {' '.join(tag_cmd)}")
+        tag_proc = await asyncio.create_subprocess_exec(*tag_cmd, cwd=str(KG_HUB_DIR))
+        await tag_proc.wait()
+        if tag_proc.returncode:
+            print(f"[tag] non-fatal: tag_provenance rc={tag_proc.returncode}")
+    return rc
 
 
 async def main() -> int:

@@ -6,7 +6,7 @@
 #   kg-query.sh <question> <num>        # custom num_results (1-30)
 #
 # Reads:
-#   KG_HUB_URL       e.g. http://mac-office:8080 (from ~/.openclaw/env.sh)
+#   KG_HUB_URL       e.g. http://100.123.208.32:17171 (NAS tailnet; from ~/.openclaw/env.sh)
 #   KG_HUB_TOKEN     Bearer token (same as Mac's KG_HUB_API_TOKEN)
 #
 # Exit codes:
