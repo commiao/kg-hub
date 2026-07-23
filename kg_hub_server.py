@@ -818,56 +818,131 @@ async def search(request: Request) -> JSONResponse:
         num_results = min(int(request.query_params.get("num_results", "10")), 30)
     except (TypeError, ValueError):
         num_results = 10
+    # 可选 facet 过滤(track① 一等字段):按 episode 的 origin_project/kind/durability 筛。
+    f_project = (request.query_params.get("project") or "").strip()
+    f_kind = (request.query_params.get("kind") or "").strip()
+    f_durability = (request.query_params.get("durability") or "").strip()
 
-    # Use a direct FalkorDB text search for the HTTP API. Graphiti's hybrid
-    # semantic search is still available to deeper callers, but it can take
-    # tens of seconds on this local graph and should not make /api/search hang.
     driver = get_status_driver()
-    rows, _, _ = await driver.execute_query(
-        "MATCH (s)-[e]->(t) "
-        "WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $query "
-        "RETURN e.fact AS fact, s.uuid AS source_node_uuid, "
-        "       t.uuid AS target_node_uuid, e.valid_at AS valid_at, "
-        "       e.created_at AS created_at, e.episodes AS episodes "
-        "LIMIT $limit",
-        query=query.lower(),
-        # 超采 3 倍(≤90)再排序截断:底层无 ORDER BY,若直接按 num_results 截,
-        # external 可能挤满窗口把 firsthand 完全挤出(缓解,非保证)。
-        limit=min(num_results * 3, 90),
-    )
-    # 溯源降权:fact 若源自 provenance=external-* 的胶囊(公众号/掘金文章、
-    # 社区采集派生),标注 provenance=external 并稳定后置——不过滤,只是让
-    # 亲历知识排前面。政策见 docs/KNOWLEDGE-GOVERNANCE.md。
-    ep_uuids: set[str] = set()
-    for row in rows:
-        for u in (row.get("episodes") or []):
-            ep_uuids.add(str(u))
-    ext_eps: set[str] = set()
-    if ep_uuids:
+    pool = min(num_results * 4, 60)
+
+    # —— 语义腿(主序):graphiti cosine 向量检索。亚秒级(本地 fastembed)。失败则回退。
+    cand: dict[str, dict] = {}   # fact → 候选(去重合并两腿)
+    sem_ok = False
+    try:
+        g = await get_graphiti()
+        cfg = _copy_search.deepcopy(_EDGE_VEC_ONLY)
+        cfg.limit = pool
+        sres = await g._search(query=query, config=cfg)
+        for rank, e in enumerate(sres.edges):
+            if not e.fact:
+                continue
+            cand[e.fact] = {
+                "fact": e.fact,
+                "source_node_uuid": str(e.source_node_uuid),
+                "target_node_uuid": str(e.target_node_uuid),
+                "valid_at": e.valid_at.isoformat() if e.valid_at else None,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "episodes": [],   # 统一在合并后按 fact 批量补,不依赖 EntityEdge.episodes
+                "sem": 1.0 - rank / max(len(sres.edges), 1),   # 排名转分
+                "exact": False,
+            }
+        sem_ok = True
+    except Exception:  # noqa: BLE001 — 语义腿失败不致命,靠子串腿兜底(保探针可用)
+        logger.exception("[search] semantic leg failed for q=%r; falling back to substring", query)
+
+    # —— 子串腿:精确关键词命中(高精度),给已有候选提权 / 补入新候选。
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $q "
+            "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+            "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
+            q=query.lower(), lim=pool)
+        for r in rows:
+            fact = r.get("fact")
+            if fact in cand:
+                cand[fact]["exact"] = True
+            else:
+                cand[fact] = {
+                    "fact": fact, "source_node_uuid": str(r.get("su")),
+                    "target_node_uuid": str(r.get("tu")), "valid_at": r.get("va"),
+                    "created_at": r.get("ca"),
+                    "episodes": [str(u) for u in (r.get("eps") or [])],
+                    "sem": 0.0, "exact": True,
+                }
+    except Exception:  # noqa: BLE001
+        logger.exception("[search] substring leg failed for q=%r", query)
+
+    if not cand:
+        return JSONResponse({"status": "ok", "query": query,
+                             "mode": "hybrid" if sem_ok else "substring_fallback", "results": []})
+
+    # —— 按 fact 批量补 episodes(语义腿候选没带,统一补齐才好排序/facet)——
+    try:
+        frows, _, _ = await driver.execute_query(
+            "MATCH ()-[e:RELATES_TO]->() WHERE e.fact IN $facts AND e.episodes IS NOT NULL "
+            "RETURN e.fact AS fact, e.episodes AS eps", facts=list(cand.keys()))
+        for r in frows:
+            c = cand.get(r.get("fact"))
+            if c is not None and not c["episodes"]:
+                c["episodes"] = [str(u) for u in (r.get("eps") or [])]
+    except Exception:  # noqa: BLE001 — 补不到就按无背书处理(不加 provenance 权)
+        pass
+
+    # —— 拉候选涉及的 episode 属性,供多因子排序 + facet 过滤 ——
+    all_eps = sorted({u for c in cand.values() for u in c["episodes"]})
+    attr: dict[str, dict] = {}
+    if all_eps:
         try:
-            erows, _, _ = await driver.execute_query(
-                "MATCH (ep:Episodic) WHERE ep.uuid IN $uuids "
-                "AND coalesce(ep.provenance,'') STARTS WITH 'external' "
-                "RETURN ep.uuid AS u",
-                uuids=sorted(ep_uuids),
-            )
-            ext_eps = {str(r.get("u")) for r in erows}
-        except Exception:  # noqa: BLE001 — 降权是增强,查不到就当全 internal
-            ext_eps = set()
-    results = []
-    for row in rows:
-        eps = [str(u) for u in (row.get("episodes") or [])]
-        results.append({
-            "fact": row.get("fact"),
-            "source_node_uuid": str(row.get("source_node_uuid")),
-            "target_node_uuid": str(row.get("target_node_uuid")),
-            "valid_at": row.get("valid_at"),
-            "created_at": row.get("created_at"),
-            "provenance": "external" if any(u in ext_eps for u in eps) else "internal",
-        })
-    results.sort(key=lambda r: r["provenance"] == "external")  # 稳定排序:external 沉底
-    results = results[:num_results]
-    return JSONResponse({"status": "ok", "query": query, "mode": "falkordb_text", "results": results})
+            arows, _, _ = await driver.execute_query(
+                "MATCH (ep:Episodic) WHERE ep.uuid IN $u RETURN ep.uuid AS u, "
+                "coalesce(ep.provenance,'') AS prov, coalesce(ep.durability,'') AS dur, "
+                "coalesce(ep.verified,false) AS ver, coalesce(ep.usage_count,0) AS uc, "
+                "coalesce(ep.kind,'') AS kind, coalesce(ep.origin_project,'') AS proj",
+                u=all_eps)
+            for r in arows:
+                attr[str(r.get("u"))] = {"prov": r.get("prov"), "dur": r.get("dur"),
+                                         "ver": bool(r.get("ver")), "uc": int(r.get("uc") or 0),
+                                         "kind": r.get("kind"), "proj": r.get("proj")}
+        except Exception:  # noqa: BLE001
+            attr = {}
+
+    def agg(c):
+        eps = [attr[u] for u in c["episodes"] if u in attr]
+        # internal 若有任一亲历背书;external 仅当全部背书都是 external
+        external = bool(eps) and all(a["prov"].startswith("external") for a in eps)
+        stale = bool(eps) and all(a["dur"] == "time-bound" for a in eps)
+        verified = any(a["ver"] for a in eps)
+        usage = max((a["uc"] for a in eps), default=0)
+        return eps, external, stale, verified, usage
+
+    scored = []
+    for c in cand.values():
+        eps, external, stale, verified, usage = agg(c)
+        # facet 过滤:任一背书 episode 命中即保留(命中不了直接丢)
+        if f_project and not any(a["proj"] == f_project for a in eps):
+            continue
+        if f_kind and not any(a["kind"] == f_kind for a in eps):
+            continue
+        if f_durability and not any(a["dur"] == f_durability for a in eps):
+            continue
+        score = c["sem"] + (0.5 if c["exact"] else 0.0)      # 语义分 + 精确命中提权
+        if external:
+            score *= 0.35                                     # external 沉底
+        if stale:
+            score *= 0.6                                      # 过期(time-bound)沉
+        if verified:
+            score *= 1.25                                     # 已验证提权
+        score += min(usage, 10) * 0.02                        # 使用量 Lindy 轻推(有界)
+        c["provenance"] = "external" if external else "internal"
+        c["score"] = round(score, 4)
+        c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None)
+        scored.append(c)
+
+    scored.sort(key=lambda r: -r["score"])
+    return JSONResponse({"status": "ok", "query": query,
+                         "mode": "hybrid" if sem_ok else "substring_fallback",
+                         "results": scored[:num_results]})
 
 
 # ---------------------------------------------------------------------------
