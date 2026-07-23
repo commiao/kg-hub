@@ -2294,9 +2294,11 @@ async def _tag_schema_fields(graphiti, episode_uuid: str, body: "IngestBody") ->
         kind, conf = body.kind, 1.0
     else:
         kind, conf = derive_kind(body.name, body.source_description)
-        # kind 分类器 pass:胶囊 + 案例包(都无 type= 但承载知识)在低置信时兜底
+        # kind 分类器 pass:胶囊 + 案例包 + OpenClaw 知识文档(标准/方法论,openclaw-kb-*)
+        # 都无 type= 但承载知识,低置信时兜底分类
         if conf < KIND_CONF_THRESHOLD and (
                 body.name.startswith("openclaw-capsule-")
+                or body.name.startswith("openclaw-kb-")
                 or body.name.startswith("case-pack")
                 or body.source_description.startswith("case-pack")):
             kind, conf = await classify_kind(body.episode_body)   # ④ LLM 分类器

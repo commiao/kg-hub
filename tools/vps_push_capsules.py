@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -35,6 +36,15 @@ from pathlib import Path
 
 CLAWD = Path(os.environ.get("CLAWD_DIR", str(Path.home() / "clawd")))
 SEARCH_ROOTS = ["notes", "memory", "plans", "reports", "capsules"]
+# 知识层目录(相对 clawd):这些目录下的所有 .md/.md.gz 都是可复用知识(标准/方法论/
+# 手册/方案),收进 NAS 标 openclaw-kb-*。2026-07-24 收拢:OpenClaw 不再自养知识库,
+# 知识统一进 NAS;运营/原料层(social-search/reports/investment/archive…)不在此列。
+KNOWLEDGE_DIRS = ["notes/standards", "notes/solutions", "notes/sop", "notes/knowledge-base",
+                  "notes/technical", "notes/strategy", "notes/areas", "notes/resources",
+                  "notes/analysis"]
+# 顶层散落的知识文档按文件名关键词识别(guide/rule/standard/advice/sop/规范/指南/标准)
+_KB_TOPLEVEL = re.compile(r"guide|rule|standard|advice|sop|规范|指南|标准|原则|manual",
+                          re.IGNORECASE)
 MIN_SIZE = 1500          # 解压后字节数;更小的是空壳存根
 MAX_PER_RUN = 50         # 单轮推送上限(端点异步,纯保险)
 STATE_DIR = Path.home() / ".kg-hub-push"
@@ -95,8 +105,11 @@ def capsule_stem(name: str) -> str:
 
 
 def discover() -> list[Path]:
-    """与 kg-hub ingesters/openclaw_capsule.discover_capsules 同规则。"""
-    candidates: list[Path] = []
+    """返回 [(path, category)],category ∈ {'capsule','kb'}。
+    capsule:SEARCH_ROOTS 下 CAPSULE-/capsule- 前缀(每日提炼胶囊,同 ingester 规则)。
+    kb:KNOWLEDGE_DIRS 下全部 .md/.md.gz + 顶层知识文档(标准/方法论/手册,收拢进 NAS)。"""
+    cat: dict[Path, str] = {}
+    # capsules
     for root in SEARCH_ROOTS:
         base = CLAWD / root
         if not base.is_dir():
@@ -104,9 +117,25 @@ def discover() -> list[Path]:
         for pattern in ("*.md", "*.md.gz"):
             for p in base.rglob(pattern):
                 if p.name.startswith(("CAPSULE-", "capsule-")):
-                    candidates.append(p)
+                    cat.setdefault(p, "capsule")
+    # knowledge dirs(整目录收)
+    for kd in KNOWLEDGE_DIRS:
+        base = CLAWD / kd
+        if not base.is_dir():
+            continue
+        for pattern in ("*.md", "*.md.gz"):
+            for p in base.rglob(pattern):
+                cat.setdefault(p, "kb")
+    # 顶层散落知识文档(按文件名关键词)
+    notes = CLAWD / "notes"
+    if notes.is_dir():
+        for pattern in ("*.md", "*.md.gz"):
+            for p in notes.glob(pattern):   # 只顶层,不递归
+                if _KB_TOPLEVEL.search(p.name):
+                    cat.setdefault(p, "kb")
+
     seen: dict[str, Path] = {}   # 同内容多路径去重(首 200 字节)
-    for p in sorted(candidates):
+    for p in sorted(cat.keys()):
         try:
             key = capsule_bytes(p)[:200].decode("utf-8", "ignore")
         except Exception as exc:
@@ -117,10 +146,10 @@ def discover() -> list[Path]:
     for p in seen.values():
         try:
             if len(capsule_bytes(p)) >= MIN_SIZE:
-                out.append(p)
+                out.append((p, cat[p]))
         except Exception as exc:
             log(f"[skip] {p.name}: unreadable ({type(exc).__name__}: {exc})")
-    return sorted(out)
+    return sorted(out, key=lambda t: str(t[0]))
 
 
 def post_ingest(url: str, tok: str, payload: dict) -> tuple[int, dict]:
@@ -178,7 +207,7 @@ def main() -> int:
 
     files = discover()
     todo = []
-    for p in files:
+    for p, category in files:
         rel = str(p.relative_to(CLAWD))
         sha = hashlib.sha256(capsule_bytes(p)).hexdigest()
         entry = state.get(rel)
@@ -187,17 +216,25 @@ def main() -> int:
         if sha in known_shas:  # md→gz 原地改名:内容没变,记别名即可
             state[rel] = {"sha": sha, "status": "alias", "at": datetime.now(tz=timezone.utc).isoformat()}
             continue
-        todo.append((p, rel, sha))
-    log(f"[plan] {len(files)} capsules discovered, {len(todo)} new/changed to push")
+        todo.append((p, rel, sha, category))
+    ncap = sum(1 for _, c in files if c == "capsule")
+    nkb = sum(1 for _, c in files if c == "kb")
+    log(f"[plan] {len(files)} discovered (capsule={ncap} kb={nkb}), {len(todo)} new/changed to push")
 
     pushed = 0
-    for p, rel, sha in todo[:MAX_PER_RUN]:
+    for p, rel, sha, category in todo[:MAX_PER_RUN]:
         body = capsule_bytes(p).decode("utf-8", "ignore")
         ref = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
+        if category == "kb":   # 知识文档:openclaw-kb-<relpath 去扩展名, /→->,便于唯一 & 溯源
+            nm = "openclaw-kb-" + re.sub(r"\.(md|md\.gz)$", "", rel).replace("/", "-")
+            sd = f"openclaw-vps-kb: {rel}"
+        else:
+            nm = f"openclaw-capsule-{capsule_stem(p.name)}"
+            sd = f"openclaw-vps: {rel}"
         code, resp = post_ingest(url, tok, {
-            "name": f"openclaw-capsule-{capsule_stem(p.name)}",
+            "name": nm,
             "episode_body": body,
-            "source_description": f"openclaw-vps: {rel}",
+            "source_description": sd,
             "reference_time": ref,
             "source_obs_id": sha,
             "sync": False,
