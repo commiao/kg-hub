@@ -29,23 +29,49 @@ PROV_FIRSTHAND = "firsthand"
 PROV_ARTICLE = "external-article"
 PROV_COMMUNITY = "external-community"
 
-# `- **来源**: 公众号文章《…》` — capsule metadata line (fullwidth or ASCII colon)
-_SRC_LINE = re.compile(r"\*\*来源\*\*[::]\s*(.+)")
+# `- **来源**: 公众号文章《…》` — capsule metadata line (fullwidth or ASCII colon).
+# 也吃 **数据来源**: / **来源会话**: 等变体(kb-001 的 LLM 逐日漂移的写法)。
+_SRC_LINE = re.compile(r"\*\*[^*\n]*来源[^*\n]*\*\*\s*[::]\s*(.+)")
+
+# `## 来源` / `### 🔗 来源` 标题式(2026-07-23 起 kb-001 改用) — 取标题后到下一个
+# 标题之前的整段,逐行作为来源行参与分类。
+_SRC_HEADING = re.compile(r"^#{2,4}[ \t]*[^\n#]*来源[^\n]*$", re.M)
+_NEXT_HEADING = re.compile(r"^#{1,6}[ \t]", re.M)
 
 # 文章《…》 covers 公众号文章《, 掘金文章《, 博客文章《 etc. The 《 is the key
 # discriminator: "用户查询公众号近5篇文章数据" (ops log) has 文章 but no 《.
 _ARTICLE = re.compile(r"文章《")
 
-_COMMUNITY_KEYWORDS = ("小红书", "知乎", "微博", "B站", "bilibili", "reddit", "推特", "twitter")
+# xhs / social-search: kb-001 有时把来源写成文件路径别名或 cron 名
+# (notes/social-search/topic-runs/xhs_analysis_*.md),不点名平台——按别名兜住。
+_COMMUNITY_KEYWORDS = ("小红书", "知乎", "微博", "B站", "bilibili", "reddit", "推特", "twitter",
+                       "xhs", "social-search")
+
+
+def _heading_sources(content: str) -> list[str]:
+    """Source lines from `## 来源` style sections (bullets stripped)."""
+    out: list[str] = []
+    for m in _SRC_HEADING.finditer(content):
+        rest = content[m.end():]
+        nxt = _NEXT_HEADING.search(rest)
+        block = rest[: nxt.start()] if nxt else rest
+        for line in block.splitlines():
+            line = line.strip().lstrip("-*").strip()
+            if line:
+                out.append(line)
+    return out
 
 
 def classify_provenance(content: str) -> str:
     """Classify a capsule body → provenance tag. Never raises."""
-    sources = [m.group(1) for m in _SRC_LINE.finditer(content or "")]
+    text = content or ""
+    sources = [m.group(1) for m in _SRC_LINE.finditer(text)]
+    sources += _heading_sources(text)
     if not sources:
         return PROV_FIRSTHAND
     if any(_ARTICLE.search(s) for s in sources):
         return PROV_ARTICLE
-    if any(any(k in s for k in _COMMUNITY_KEYWORDS) for s in sources):
+    low = [s.lower() for s in sources]
+    if any(k.lower() in s for k in _COMMUNITY_KEYWORDS for s in low):
         return PROV_COMMUNITY
     return PROV_FIRSTHAND
