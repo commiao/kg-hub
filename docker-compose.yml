@@ -135,6 +135,8 @@ services:
       - /volume1/docker/kg-hub-data/models:/models
       - /volume1/docker/kg-hub-data/ingest-state:/app/data
       - /volume1/docker/kg-hub-data/openclaw-src:/openclaw-src:ro
-    # Sequential each loop (idempotent via watermarks): openclaw capsules + canonical docs.
+    # canonical docs only. openclaw capsules 已改走 VPS 直推 /api/ingest
+    # (2026-07-23,见 docs/KNOWLEDGE-GOVERNANCE.md)——此前这里和 Mac launchd
+    # 各跑一条摄入线,双写重复入图;两条旧线同日退役,勿恢复。
     # claude-mem rebuild is done, so its step (and the claude-mem.db mount) was removed.
-    command: ["sh", "-c", "sleep 30; while true; do echo '[ingest] pass start'; python -m ingesters.openclaw_capsule --snapshot /openclaw-src || true; python -m tools.ingest_canonical_docs || true; echo '[ingest] pass done, idle 600s'; sleep 600; done"]
+    command: ["sh", "-c", "sleep 30; while true; do echo '[ingest] pass start'; python -m tools.ingest_canonical_docs || true; echo '[ingest] pass done, idle 600s'; sleep 600; done"]

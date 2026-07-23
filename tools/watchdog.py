@@ -254,6 +254,7 @@ def main() -> int:
         "server_down": False,
         "queue_backlog": False,
         "stuck_jobs": False,
+        "capsule_stale": False,
         "recent_errors": False,
         "falkordb_unreachable": False,
         "falkordb_slow": False,
@@ -277,6 +278,27 @@ def main() -> int:
             if pending > BACKLOG_THRESHOLD:
                 new_anomalies["queue_backlog"] = True
                 details["queue_backlog"] = f"pending={pending} > threshold {BACKLOG_THRESHOLD}"
+            # OpenClaw 直推链路新鲜度:kb-001 每日 04:00 产胶囊,VPS 直推
+            # 每 30 分钟一轮;账龄超阈(默认 30h)= 产出或直推断了。
+            # notify config 里 capsule_stale_hours<=0 可关闭。
+            stale_h = float(cfg.get("capsule_stale_hours", 30))
+            cap_age = stats.get("openclaw_capsule_age_hours")
+            if stale_h > 0:
+                if isinstance(cap_age, (int, float)):
+                    if cap_age > stale_h:
+                        new_anomalies["capsule_stale"] = True
+                        nq = stats.get("quarantined_capsules") or 0
+                        details["capsule_stale"] = (
+                            f"最新 OpenClaw 知识胶囊已 {cap_age}h 未入图 (阈值 {stale_h}h)。"
+                            + (f"隔离区积压 {nq} 条 → 先看 /dashboard/inbox ③格式异常;" if nq else "")
+                            + "再查 VPS kb-001 cron 与直推日志 ~/.kg-hub-push/push.log"
+                        )
+                else:
+                    # 取数暂态失败(字段缺失/null):沿用上一轮判定,避免 30h+ 长异常
+                    # 被一次抖动打成 resolved→again 的成对噪音
+                    new_anomalies["capsule_stale"] = bool(prev_anomalies.get("capsule_stale"))
+                    if new_anomalies["capsule_stale"]:
+                        details["capsule_stale"] = "胶囊账龄暂不可读(暂态),沿用上一轮 stale 判定"
             if isinstance(oldest_age, (int, float)) and oldest_age > STUCK_SECONDS:
                 new_anomalies["stuck_jobs"] = True
                 details["stuck_jobs"] = (

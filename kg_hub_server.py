@@ -61,6 +61,10 @@ from graphiti_client import (  # noqa: E402
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
+from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
+
+# provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
+PROV_VALUES = ("firsthand", "external-article", "external-community")
 
 
 # ---------- Config from env ----------
@@ -290,6 +294,10 @@ class IngestBody(BaseModel):
     reference_time: str
     source_obs_id: str
     sync: bool = False  # default async; old callers can request sync=true to keep blocking behavior
+    # 可选 provenance 覆写(firsthand/external-article/external-community)。
+    # 仅对 openclaw-capsule-* 生效:待办"格式异常"人工补标入图时使用;
+    # 未提供时由 utils.provenance 按内容自动分类。
+    provenance: str | None = None
 
 
 # ---------- Route handlers ----------
@@ -412,6 +420,17 @@ async def do_extract(
             episode_uuid = str(result.episode.uuid)  # type: ignore[attr-defined]
         except Exception:
             pass
+        # openclaw 知识胶囊:进图即打 provenance(直推链路的 NAS 侧自动打标,
+        # 取代原 Mac 侧 tools/tag_provenance 的每轮补标)。覆写优先,失败不阻塞。
+        if body.name.startswith("openclaw-capsule-") and episode_uuid:
+            try:
+                prov = body.provenance or classify_provenance(body.episode_body)
+                cy = "MATCH (e:Episodic {uuid: $u}) SET e.provenance = $p"
+                if prov.startswith("external"):
+                    cy += ", e.verified = coalesce(e.verified, false)"
+                await graphiti.driver.execute_query(cy, u=episode_uuid, p=prov)
+            except Exception:
+                logger.exception("[ingest:provenance_tag_failed] uuid=%s (non-fatal)", episode_uuid)
         await update_ingested_key_status(
             graphiti, sd, sid, "ok",
             episode_uuid=episode_uuid, nodes=nodes, edges=edges,
@@ -475,7 +494,64 @@ async def ingest(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    if body.provenance and body.provenance not in PROV_VALUES:
+        return JSONResponse(
+            {"status": "error", "code": "bad_provenance",
+             "message": f"provenance must be one of {PROV_VALUES}"},
+            status_code=400,
+        )
+
     g = await get_graphiti()
+
+    # 0. 格式门(仅 openclaw 知识胶囊):没有可识别的 **来源** 元数据 → 不入图,
+    #    进隔离区,由「反馈待办」人工补标或丢弃。把 fail-open 变 fail-closed:
+    #    kb-001 的 LLM 再怎么漂移格式,不合规内容进不了共享图。
+    if (body.name.startswith("openclaw-capsule-") and not body.provenance
+            and not has_recognizable_source(body.episode_body)):
+        # 已入图/在抽取中的重放(state 丢失后的重推)不该再进隔离区——先查幂等键
+        try:
+            krows, _, _ = await g.driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "RETURN k.status AS status, k.episode_uuid AS u",
+                sd=body.source_description, sid=body.source_obs_id)
+            if krows:
+                st = krows[0].get("status")
+                if st == "ok":
+                    return JSONResponse({"status": "skipped", "reason": "duplicate",
+                                         "episode_uuid": krows[0].get("u"),
+                                         "source_description": body.source_description,
+                                         "source_obs_id": body.source_obs_id})
+                if st == "pending":
+                    return JSONResponse({"status": "in_progress",
+                                         "source_description": body.source_description,
+                                         "source_obs_id": body.source_obs_id}, status_code=202)
+                # status=error → 落隔离区给人一个可操作的把手(requeue 会清错误键重试)
+        except Exception:  # noqa: BLE001 — 预检失败就按未见处理,走隔离
+            pass
+        try:
+            content = body.episode_body
+            if len(content) > 20000:  # 防超大节点;真实胶囊 <6K,截断带标记不静默
+                content = content[:20000] + f"\n\n[隔离区截断: 原文 {len(body.episode_body)} 字符,完整原文在 VPS notes/]"
+            await g.driver.execute_query(
+                "MERGE (q:QuarantinedCapsule {source_obs_id: $sid}) "
+                "ON CREATE SET q.name = $name, q.content = $content, "
+                "q.source_description = $sd, q.reason = $reason, q.created_at = $now",
+                sid=body.source_obs_id, name=body.name,
+                content=content, sd=body.source_description,
+                reason="缺少可识别的 **来源** 元数据行/段",
+                now=datetime.now(tz=timezone.utc).isoformat(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {"status": "error", "code": "quarantine_failed", "message": str(exc)},
+                status_code=500,
+            )
+        return JSONResponse(
+            {"status": "quarantined",
+             "reason": "missing recognizable **来源** metadata; held for manual review",
+             "review_url": "/dashboard/inbox",
+             "source_description": body.source_description,
+             "source_obs_id": body.source_obs_id})
 
     # 1. Piggyback cleanup of stuck-pending IngestedKey rows. Cheap when none stuck.
     try:
@@ -637,6 +713,26 @@ async def queue_stats(request: Request) -> JSONResponse:
         "       k.updated_at AS updated_at, k.error_message AS error_message, "
         "       k.source_obs_id AS sid, k.source_description AS sd"
     )
+    # OpenClaw 直推链路新鲜度:最新知识胶囊的账龄(小时)。VPS→NAS 断供时
+    # watchdog 据此告警(capsule_stale_hours,kb-001 每日 04:00 产出,默认阈值 30h)。
+    capsule_age_hours: float | None = None
+    quarantined_count = 0
+    try:
+        crows, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH 'openclaw-capsule-' "
+            "RETURN max(n.created_at) AS newest")
+        newest = crows[0].get("newest") if crows else None
+        if newest:
+            dt = datetime.fromisoformat(str(newest).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            capsule_age_hours = round(
+                (datetime.now(tz=timezone.utc) - dt).total_seconds() / 3600, 1)
+        qrows, _, _ = await driver.execute_query(
+            "MATCH (q:QuarantinedCapsule) RETURN count(q) AS c")
+        quarantined_count = int(qrows[0].get("c") or 0) if qrows else 0
+    except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
+        pass
     pending = ok = errored = 0
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
@@ -681,6 +777,8 @@ async def queue_stats(request: Request) -> JSONResponse:
 
     return JSONResponse({
         "status": "ok",
+        "openclaw_capsule_age_hours": capsule_age_hours,
+        "quarantined_capsules": quarantined_count,
         "pending": pending,
         "ok_total": ok,
         "errored_total": errored,
@@ -1776,6 +1874,81 @@ async def dashboard_tools(request: Request) -> HTMLResponse:
 _VIS = {"internal-note": "内部", "professional-guide": "方法", "public-story": "可公开"}
 
 
+async def capsule_requeue(request: Request) -> JSONResponse:
+    """POST /dashboard/capsule_requeue {source_obs_id, provenance} —
+    把「格式异常」隔离区的胶囊以人工指定的 provenance 入图。
+    有界写:只消费 QuarantinedCapsule 节点,provenance 限枚举;
+    抽取走标准 do_extract(异步),隔离节点在任务排队后即删
+    (do_extract 前有 durable backup,失败可从 IngestedKey 追责)。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    sid = (body.get("source_obs_id") or "").strip()
+    prov = (body.get("provenance") or "").strip()
+    if not sid or prov not in PROV_VALUES:
+        return JSONResponse({"ok": False, "error": "need source_obs_id + provenance∈" + str(PROV_VALUES)},
+                            status_code=400)
+    g = await get_graphiti()
+    rows, _, _ = await g.driver.execute_query(
+        "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) "
+        "RETURN q.name AS name, q.content AS content, "
+        "q.source_description AS sd, q.created_at AS created", sid=sid)
+    if not rows:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    r = rows[0]
+    try:
+        ref_time = datetime.fromisoformat(str(r.get("created")).replace("Z", "+00:00"))
+    except Exception:
+        ref_time = datetime.now(tz=timezone.utc)
+    ib = IngestBody(
+        name=r.get("name") or f"openclaw-capsule-requeue-{sid[:12]}",
+        episode_body=r.get("content") or "",
+        source_description=r.get("sd") or "openclaw-requeue",
+        reference_time=ref_time.isoformat(),
+        source_obs_id=sid, sync=False, provenance=prov,
+    )
+    merge_result = await merge_or_get_ingested_key(
+        g, ib.source_description, ib.source_obs_id, str(uuidlib.uuid4()))
+    if not merge_result["newly_created"]:
+        st = merge_result.get("status")
+        if st == "ok":  # 早已入图(重放产生的隔离残影)→ 清掉待办即可
+            await g.driver.execute_query(
+                "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q", sid=sid)
+            return JSONResponse({"ok": True, "queued": False, "already": "ok"})
+        if st == "pending":  # 别人在抽取:保留待办,让用户稍后刷新
+            return JSONResponse({"ok": False, "error": "该胶囊正在抽取中,稍后刷新再看"},
+                                status_code=409)
+        # status=error:上次抽取失败——清掉错误键,像人工排障那样重试一次
+        await g.driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) DELETE k",
+            sd=ib.source_description, sid=sid)
+        merge_result = await merge_or_get_ingested_key(
+            g, ib.source_description, ib.source_obs_id, str(uuidlib.uuid4()))
+        if not merge_result["newly_created"]:
+            return JSONResponse({"ok": False, "error": "重试竞争失败,请再点一次"}, status_code=409)
+    asyncio.create_task(do_extract(g, ib, ref_time))
+    await g.driver.execute_query(
+        "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q", sid=sid)
+    return JSONResponse({"ok": True, "queued": True, "provenance": prov})
+
+
+async def capsule_discard(request: Request) -> JSONResponse:
+    """POST /dashboard/capsule_discard {source_obs_id} — 丢弃隔离区胶囊(不入图)。
+    有界写:只删 QuarantinedCapsule 节点;原文仍在 VPS notes/ 里,非毁灭性。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    sid = (body.get("source_obs_id") or "").strip()
+    if not sid:
+        return JSONResponse({"ok": False, "error": "need source_obs_id"}, status_code=400)
+    g = await get_graphiti()
+    await g.driver.execute_query(
+        "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q", sid=sid)
+    return JSONResponse({"ok": True})
+
+
 async def dashboard_tag(request: Request) -> JSONResponse:
     """POST /dashboard/tag  {name, visibility?, verified?} — 给一条知识打标签。
     有界写：只能设 visibility(枚举) / verified(bool)，按 name 精确匹配 Episodic。
@@ -2173,9 +2346,19 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <div class=tip>系统自动列出「需要你拍板」的事，尽量一键清掉。<b id=aistat>正在让 AI 预判可见性…</b></div>
 <h2>① 待分层 · <span id=c1>0</span> 条（AI 已建议，点确认或改）</h2><div id=cls></div>
 <h2>② 待补运营数据 · <span id=c2>0</span> 条（标了可公开但没录表现）</h2><div id=fb></div>
+<h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
-document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;
+document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;
+document.getElementById('quar').innerHTML=D.quar.length?D.quar.map(function(x,i){
+ return '<div class=item data-qi="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.reason+' · '+x.created+'</div></div>'
+  +'<div class=ctrl><span class=lb>补标入图:</span><button class=rq data-qi="'+i+'" data-p="firsthand">亲历</button><button class=rq data-qi="'+i+'" data-p="external-article">外部文章</button><button class=rq data-qi="'+i+'" data-p="external-community">社区采集</button><button class=exq data-qi="'+i+'">展开全文 ▾</button><button class=dsq data-qi="'+i+'" style="color:#C0392B;border-color:#C0392B">丢弃</button></div><pre class="dtl hidden"></pre></div>';
+}).join(''):'<div class=empty>没有被拦截的胶囊 🎉</div>';
+document.getElementById('quar').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var i=+b.dataset.qi;var it=D.quar[i];var item=b.closest('.item');
+ if(b.classList.contains('exq')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+ else if(b.classList.contains('rq')){b.disabled=true;b.textContent='入图中…';fetch('/dashboard/capsule_requeue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_obs_id:it.sid,provenance:b.dataset.p})}).then(function(r){return r.json();}).then(function(d){if(d.ok){item.remove();}else{b.disabled=false;b.textContent='失败';}}).catch(function(){b.disabled=false;b.textContent='失败';});}
+ else if(b.classList.contains('dsq')){if(!confirm('丢弃该胶囊?(不入图;VPS 原文件仍在)'))return;fetch('/dashboard/capsule_discard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_obs_id:it.sid})}).then(function(r){return r.json();}).then(function(d){if(d.ok){item.remove();}});}
+});
 document.getElementById('cls').innerHTML=D.classify.length?D.classify.map(function(x,i){
  var vb=VIS.map(function(v){return '<button class=vis data-i="'+i+'" data-v="'+v[0]+'">'+v[1]+'</button>';}).join('');
  return '<div class=item data-i="'+i+'"><div class=sn>'+(x.prov&&x.prov.indexOf('external')===0?'<span style="font-size:11px;padding:1px 7px;border-radius:8px;background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span> ':'')+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div>'
@@ -2219,6 +2402,12 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "ORDER BY n.created_at DESC LIMIT 50")
         fbrows = await one("MATCH (f:ArticleFeedback) WHERE coalesce(f.linked_casepack,'') <> '' "
                            "RETURN DISTINCT f.linked_casepack AS l")
+        quarrows = await one(
+            "MATCH (q:QuarantinedCapsule) "
+            "RETURN q.name AS name, q.source_obs_id AS sid, "
+            "substring(coalesce(q.content,''),0,4000) AS detail, "
+            "q.reason AS reason, q.created_at AS created "
+            "ORDER BY q.created_at DESC LIMIT 20")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2246,7 +2435,16 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             needfb.append({"name": r.get("name") or "",
                            "snippet": esc(sn[:120]) + ("…" if len(sn) > 120 else ""),
                            "created": (r.get("created") or "")[:16]})
-    data_json = json.dumps({"classify": classify, "needfb": needfb}, ensure_ascii=False).replace("</", "<\\/")
+    quar = []
+    for r in quarrows:
+        full = r.get("detail") or ""
+        one_line = full.strip().replace("\n", " ")
+        quar.append({"name": r.get("name") or "", "sid": r.get("sid") or "",
+                     "snippet": esc(one_line[:400]) + ("…" if len(one_line) > 400 else ""),
+                     "reason": esc(r.get("reason") or ""),
+                     "created": (r.get("created") or "")[:16], "detail": full})
+    data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar},
+                           ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
 
@@ -2288,6 +2486,8 @@ app = Starlette(
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
+        Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
+        Route("/dashboard/capsule_discard", capsule_discard, methods=["POST"]),
         Route("/dashboard/casepack", dashboard_casepack, methods=["POST"]),
         Route("/dashboard/feedback", dashboard_feedback, methods=["GET"]),
         Route("/dashboard/feedback", feedback_submit, methods=["POST"]),

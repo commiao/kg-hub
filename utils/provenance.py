@@ -62,6 +62,14 @@ def _heading_sources(content: str) -> list[str]:
     return out
 
 
+def has_recognizable_source(content: str) -> bool:
+    """Format gate: does the capsule carry any recognizable 来源 metadata?
+    Used by /api/ingest to quarantine non-conforming OpenClaw capsules
+    instead of letting them into the graph as full-weight firsthand."""
+    text = content or ""
+    return bool(_SRC_LINE.search(text)) or bool(_heading_sources(text))
+
+
 def classify_provenance(content: str) -> str:
     """Classify a capsule body → provenance tag. Never raises."""
     text = content or ""
