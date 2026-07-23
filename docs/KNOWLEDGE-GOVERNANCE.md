@@ -6,18 +6,21 @@
 ## 1. 全景架构(谁存什么)
 
 ```
-OpenClaw (oc-vps)                Mac(桥,每 30 分钟)              NAS kg-hub(中央图 FalkorDB)
-─────────────────                ─────────────────               ───────────────────────────
-~/clawd/notes/**                 sync_openclaw.py                Episodic/Entity/RELATES_TO
-  ├─ capsules/  ← 每日提炼        │ ① ssh+tar 拉快照              ├─ openclaw-capsule-*(知识胶囊)
-  ├─ 其余 1000+ 笔记(原料,不进图) │ ② ingester 只灌胶囊           ├─ claude-mem obs(coding 会话)
-~/.openclaw/memory/main.sqlite    │ ③ tag_provenance 补来源标     ├─ kg-hub-canonical-*(注入胶囊×9)
-  = 空,未启用,仅摆设 ⚠           ▼                              └─ 案例包 / ArticleFeedback / ToolStat
-        ▲                                                                │
-        └────────── kg-query.sh(读,tailnet)──────────────────────────────┘
+OpenClaw (oc-vps, 7×24)                          NAS kg-hub(中央图, 7×24)
+─────────────────────                            ─────────────────────────
+~/clawd/notes/capsules ← kb-001 04:00 提炼        Episodic/Entity/RELATES_TO
+        │                                        ├─ openclaw-capsule-*(知识胶囊)
+kg-push-capsules.py(cron 30min,确定性脚本)        ├─ claude-mem obs(coding 会话,Mac 推)
+        └────── POST /api/ingest ───────────────▶├─ kg-hub-canonical-*(注入胶囊×9)
+                 │格式门:无**来源**→隔离区         └─ 案例包 / ArticleFeedback / ToolStat
+                 │入图即自动打 provenance                  │
+        ◀────── kg-query.sh(读,external 沉底)──────────────┘
+其余 1000+ 笔记(原料)不进图;main.sqlite=空壳未启用 ⚠
 ```
 
 **单一事实源**:跨工具共享的知识,以 **NAS 图为准**;OpenClaw 的 notes 是它自己的工作区(原料+成品混放),不是共享层。
+
+> **2026-07-23 直推割接**:原"VPS→Mac 拉取→Mac ingest"与隐藏的"VPS root cron :19 tar→NAS 容器 600s 轮询"**两条并行旧线曾双写重复入图**,同日全部退役(Mac plist 在 retired-launchagents/,VPS root crontab 注释行,容器循环只剩 canonical)。数据在哪从哪推、图在哪抽取在哪跑;Mac 不再是 OpenClaw 数据面的一环。历史双写造成的重复 episode 待专项去重。
 
 ## 2. 术语表(强制,消除歧义)
 
