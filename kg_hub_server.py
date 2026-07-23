@@ -65,6 +65,8 @@ from utils.provenance import classify_provenance, has_recognizable_source  # noq
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
+# kind 置信度阈值:低于此值(含确定性派生的弱信号)标 unclassified,进人工待办。
+KIND_CONF_THRESHOLD = 0.7
 
 
 # ---------- Config from env ----------
@@ -298,6 +300,13 @@ class IngestBody(BaseModel):
     # 仅对 openclaw-capsule-* 生效:待办"格式异常"人工补标入图时使用;
     # 未提供时由 utils.provenance 按内容自动分类。
     provenance: str | None = None
+    # 一等来源/内容元数据(北极星 §9 契约)。全部可选:未提供则由
+    # utils.origin 确定性派生 + kind 走 LLM 分类器 pass。摄入方可显式覆写。
+    origin_device: str | None = None
+    origin_tool: str | None = None
+    origin_project: str | None = None
+    kind: str | None = None
+    durability: str | None = None
 
 
 # ---------- Route handlers ----------
@@ -431,6 +440,13 @@ async def do_extract(
                 await graphiti.driver.execute_query(cy, u=episode_uuid, p=prov)
             except Exception:
                 logger.exception("[ingest:provenance_tag_failed] uuid=%s (non-fatal)", episode_uuid)
+        # 一等来源/内容元数据(北极星 §9):覆写优先,否则确定性派生;
+        # kind 派生不出(unclassified/低置信)且是胶囊时,走 LLM 分类器 pass。失败不阻塞。
+        if episode_uuid:
+            try:
+                await _tag_schema_fields(graphiti, episode_uuid, body)
+            except Exception:
+                logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", episode_uuid)
         await update_ingested_key_status(
             graphiti, sd, sid, "ok",
             episode_uuid=episode_uuid, nodes=nodes, edges=edges,
@@ -2101,6 +2117,46 @@ async def _llm_complete(prompt: str, max_tokens: int = 1600) -> str:
         extra_body={"thinking": {"type": "disabled"}},
     )
     return "".join(getattr(b, "text", "") for b in resp.content)
+
+
+async def classify_kind(body: str) -> tuple[str, float]:
+    """独立 LLM 分类器 pass(北极星 §2 生产者④):给胶囊定 kind + 置信度。
+    与生成方(kb-001)无关、不评判内容好坏、且低置信由调用方弃权转人工。
+    失败/解析不出 → ('unclassified', 0.0),绝不抛。prompt+解析共用 utils.origin。"""
+    from utils.origin import KIND_PROMPT, parse_kind_json
+    try:
+        raw = await _llm_complete(KIND_PROMPT.format(body=(body or "")[:6000]), max_tokens=120)
+        return parse_kind_json(raw)
+    except Exception:
+        return ("unclassified", 0.0)
+
+
+async def _tag_schema_fields(graphiti, episode_uuid: str, body: "IngestBody") -> None:
+    """给 episode 打一等来源/内容元数据(北极星 §9)。
+    覆写优先 → 确定性派生 → kind 兜底 LLM 分类器 pass。低置信 kind = unclassified。"""
+    from utils.origin import derive_origin, derive_durability, derive_kind
+    o = derive_origin(body.name, body.source_description)
+    device = body.origin_device or o["origin_device"]
+    tool = body.origin_tool or o["origin_tool"]
+    project = body.origin_project or o["origin_project"]
+    durability = body.durability or derive_durability(body.name, body.episode_body)
+
+    if body.kind:                       # 摄入方显式覆写:直接采信
+        kind, conf = body.kind, 1.0
+    else:
+        kind, conf = derive_kind(body.name, body.source_description)
+        if conf < KIND_CONF_THRESHOLD and body.name.startswith("openclaw-capsule-"):
+            kind, conf = await classify_kind(body.episode_body)   # ④ LLM 分类器
+    if conf < KIND_CONF_THRESHOLD:
+        kind, conf = "unclassified", conf
+
+    await graphiti.driver.execute_query(
+        "MATCH (e:Episodic {uuid: $u}) SET "
+        "e.origin_device=$dev, e.origin_tool=$tool, e.origin_project=$proj, "
+        "e.durability=$dur, e.kind=$kind, e.kind_confidence=$conf",
+        u=episode_uuid, dev=device, tool=tool, proj=project,
+        dur=durability, kind=kind, conf=conf,
+    )
 
 
 CASEPACK_PROMPT = """你在把若干条零散的实践记录合成一个「案例包」，供写作 / 复用。
