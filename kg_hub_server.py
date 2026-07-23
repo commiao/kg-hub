@@ -926,14 +926,16 @@ async def search(request: Request) -> JSONResponse:
             continue
         if f_durability and not any(a["dur"] == f_durability for a in eps):
             continue
-        score = c["sem"] + (0.5 if c["exact"] else 0.0)      # 语义分 + 精确命中提权
+        # 相关性(语义)为主;来源/时效/验证/使用是**次级加减 nudge**,不做大乘子——
+        # 否则把相关但 external 的结果踢出 top-k,反伤召回(实测 ×0.35 会掉召回)。
+        score = c["sem"] + (0.15 if c["exact"] else 0.0)      # 语义分 + 精确命中小提权
         if external:
-            score *= 0.35                                     # external 沉底
+            score -= 0.12                                     # external 温和沉底(不吃相关性)
         if stale:
-            score *= 0.6                                      # 过期(time-bound)沉
+            score -= 0.08                                     # 过期(time-bound)轻沉
         if verified:
-            score *= 1.25                                     # 已验证提权
-        score += min(usage, 10) * 0.02                        # 使用量 Lindy 轻推(有界)
+            score += 0.08                                     # 已验证轻提
+        score += min(usage, 10) * 0.01                        # 使用量 Lindy 轻推(有界)
         c["provenance"] = "external" if external else "internal"
         c["score"] = round(score, 4)
         c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None)
