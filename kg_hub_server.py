@@ -2070,9 +2070,12 @@ async def capsule_discard(request: Request) -> JSONResponse:
 
 
 async def dashboard_tag(request: Request) -> JSONResponse:
-    """POST /dashboard/tag  {name, visibility?, verified?} — 给一条知识打标签。
-    有界写：只能设 visibility(枚举) / verified(bool)，按 name 精确匹配 Episodic。
-    免鉴权但仅 tailnet 可达、且是本人的图，故可接受（同 /dashboard* 放行）。"""
+    """POST /dashboard/tag {name, visibility?, verified?, kind?, durability?, provenance?}
+    — 给一条知识打标签(面板维护)。有界写:各字段过白名单(visibility/kind/
+    durability/provenance 枚举, verified bool),按 name 精确匹配 Episodic。
+    kind 为人工覆写 → kind_confidence 置 1.0(人工判定最权威)。
+    免鉴权但仅 tailnet 可达、且是本人的图,故可接受(同 /dashboard* 放行)。"""
+    from utils.origin import KINDS, DURABILITY
     try:
         body = await request.json()
     except Exception:
@@ -2090,13 +2093,34 @@ async def dashboard_tag(request: Request) -> JSONResponse:
     if "verified" in body:
         sets.append("n.verified = $ver")
         params["ver"] = bool(body.get("verified"))
+    if "kind" in body:
+        kd = body.get("kind") or ""
+        if kd not in KINDS:
+            return JSONResponse({"ok": False, "error": "bad kind"}, status_code=400)
+        sets.append("n.kind = $kind")
+        sets.append("n.kind_confidence = 1.0")   # 人工判定=最高权威
+        params["kind"] = kd
+    if "durability" in body:
+        du = body.get("durability") or ""
+        if du not in DURABILITY:
+            return JSONResponse({"ok": False, "error": "bad durability"}, status_code=400)
+        sets.append("n.durability = $dur")
+        params["dur"] = du
+    if "provenance" in body:
+        pv = body.get("provenance") or ""
+        if pv not in PROV_VALUES:
+            return JSONResponse({"ok": False, "error": "bad provenance"}, status_code=400)
+        sets.append("n.provenance = $prov")
+        params["prov"] = pv
     if not sets:
         return JSONResponse({"ok": False, "error": "nothing to set"}, status_code=400)
     driver = get_status_driver()
     try:
         r, _, _ = await driver.execute_query(
             f"MATCH (n:Episodic {{name: $name}}) SET {', '.join(sets)} "
-            "RETURN n.visibility AS visibility, coalesce(n.verified, false) AS verified",
+            "RETURN n.visibility AS visibility, coalesce(n.verified, false) AS verified, "
+            "coalesce(n.kind,'') AS kind, coalesce(n.durability,'') AS durability, "
+            "coalesce(n.provenance,'') AS provenance",
             **params)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
@@ -2104,7 +2128,10 @@ async def dashboard_tag(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     return JSONResponse({"ok": True, "name": name,
                          "visibility": r[0].get("visibility") or "",
-                         "verified": bool(r[0].get("verified"))})
+                         "verified": bool(r[0].get("verified")),
+                         "kind": r[0].get("kind") or "",
+                         "durability": r[0].get("durability") or "",
+                         "provenance": r[0].get("provenance") or ""})
 
 
 _DASH_CURATE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -2126,7 +2153,7 @@ button.ver.on{background:#1D9E75;border-color:#1D9E75}
 .dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin-top:8px;max-height:420px;overflow:auto}
 .hidden{display:none}.meta{color:GrayText;font-size:12px;margin-top:2px}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>案例整理台</h1>
-<div class=tip>给知识分层，供写作/复用挑选：<b>内部</b>=只留存 · <b>方法</b>=可提炼方法 · <b>可公开</b>=可讲成案例；<b>✓已验证</b>=结论已核实。点按钮即存，无需命令。</div>
+<div class=tip>给知识分层，供写作/复用挑选：<b>内部</b>=只留存 · <b>方法</b>=可提炼方法 · <b>可公开</b>=可讲成案例；<b>✓已验证</b>=结论已核实。第二行可改<b>类型/时效/来源</b>(纠正 AI 分类)。点即存，无需命令。</div>
 <form method=get action="/dashboard/curate" style="display:flex;gap:8px;margin-bottom:1rem">
 <input id=q name=q placeholder="搜索要整理的知识…" autocomplete=off style="flex:1;padding:6px 10px;border-radius:8px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);background:Canvas;color:CanvasText;font-size:14px">
 <button>搜索</button></form>
@@ -2134,6 +2161,8 @@ button.ver.on{background:#1D9E75;border-color:#1D9E75}
 <div id=cpresult></div>
 <div id=list></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
+var KINDS=["方法论","手册","决策","事故","项目事实","生命周期事件","素材","公开故事","unclassified"];
+var PROV=[["firsthand","亲历"],["external-article","外文"],["external-community","社区"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json()}).then(cb).catch(function(){cb({ok:false})});}
 document.getElementById('q').value=D.q||'';
 document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,i){
@@ -2142,6 +2171,9 @@ document.getElementById('list').innerHTML=D.items.length?D.items.map(function(x,
    +'<div class=ctrl><span class=lb>可见性:</span>'+vb
    +'<button class="ver'+(x.verified?' on':'')+'" data-i="'+i+'">✓已验证</button>'
    +'<button class=exp data-i="'+i+'">展开全文 ▾</button><button class=tr data-i="'+i+'">译中文</button><span class=saved data-i="'+i+'">✓已存</span></div>'
+   +'<div class=ctrl><span class=lb>类型:</span><select class=kindsel data-i="'+i+'"><option value="">(选类型)</option>'+KINDS.map(function(k){return '<option value="'+k+'"'+(x.kind===k?' selected':'')+'>'+k+'</option>';}).join('')+'</select>'
+   +'<span class=lb>时效:</span><button class=dur data-i="'+i+'">'+(x.durability==='time-bound'?'⏳时效':(x.durability==='evergreen'?'♾长期':'时效?'))+'</button>'
+   +'<span class=lb>来源:</span>'+PROV.map(function(p){return '<button class="prov'+(x.prov===p[0]?' on':'')+'" data-i="'+i+'" data-p="'+p[0]+'">'+p[1]+'</button>';}).join('')+'</div>'
    +'<pre class="dtl hidden"></pre></div>';
 }).join(''):'<div class=tip>无匹配</div>';
 function saved(i){var s=document.querySelector('.saved[data-i="'+i+'"]');if(s){s.classList.add('show');setTimeout(function(){s.classList.remove('show')},1200);}}
@@ -2149,10 +2181,14 @@ document.getElementById('list').addEventListener('click',function(e){var b=e.tar
  if(b.classList.contains('vis')){var nv=(it.visibility===b.dataset.v)?'':b.dataset.v;tag(it.name,{visibility:nv},function(d){if(d.ok){it.visibility=d.visibility;item.querySelectorAll('.vis').forEach(function(x){x.classList.toggle('on',x.dataset.v===d.visibility&&d.visibility!=='');});saved(i);}});}
  else if(b.classList.contains('ver')){tag(it.name,{verified:!it.verified},function(d){if(d.ok){it.verified=d.verified;b.classList.toggle('on',d.verified);saved(i);}});}
  else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+ else if(b.classList.contains('dur')){var nd=(it.durability==='time-bound')?'evergreen':'time-bound';tag(it.name,{durability:nd},function(d){if(d.ok){it.durability=d.durability;b.textContent=d.durability==='time-bound'?'⏳时效':'♾长期';saved(i);}});}
+ else if(b.classList.contains('prov')){tag(it.name,{provenance:b.dataset.p},function(d){if(d.ok){it.prov=d.provenance;item.querySelectorAll('.prov').forEach(function(x){x.classList.toggle('on',x.dataset.p===d.provenance);});saved(i);}});}
+ else if(b.classList.contains('exp')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
  else if(b.classList.contains('tr')){var p2=item.querySelector('.dtl');if(p2.classList.contains('hidden')){p2.textContent=it.detail||'';p2.classList.remove('hidden');}if(p2.dataset.tr){return;}var orig=p2.textContent;b.textContent='翻译中…';b.disabled=true;fetch('/dashboard/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:orig})}).then(function(r){return r.json();}).then(function(d){b.disabled=false;b.textContent='译中文';if(d.ok){p2.textContent=orig+'\\n\\n—— 中文翻译 ——\\n'+d.zh;p2.dataset.tr='1';}else{b.textContent='翻译失败';}}).catch(function(){b.disabled=false;b.textContent='翻译失败';});}
 });
 function selected(){return Array.prototype.filter.call(document.querySelectorAll('.pick'),function(c){return c.checked;}).map(function(c){return D.items[+c.dataset.i].name;});}
-document.getElementById('list').addEventListener('change',function(e){if(e.target.classList.contains('pick')){var n=selected().length;document.getElementById('cnt').textContent=n;document.getElementById('synth').disabled=n<1;}});
+document.getElementById('list').addEventListener('change',function(e){if(e.target.classList.contains('pick')){var n=selected().length;document.getElementById('cnt').textContent=n;document.getElementById('synth').disabled=n<1;return;}
+ if(e.target.classList.contains('kindsel')){var i=+e.target.dataset.i;var it=D.items[i];if(!e.target.value)return;tag(it.name,{kind:e.target.value},function(d){if(d.ok){it.kind=d.kind;saved(i);}});}});
 document.getElementById('synth').addEventListener('click',function(){var names=selected();if(!names.length)return;var btn=this;btn.disabled=true;btn.textContent='合成中…';document.getElementById('cpresult').innerHTML='';
 fetch('/dashboard/casepack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names:names})}).then(function(r){return r.json();}).then(function(d){btn.textContent='合成选中为案例包 ↴';btn.disabled=false;var box=document.getElementById('cpresult');if(d.ok){var h=document.createElement('div');h.style.margin='.6rem 0 .2rem';h.innerHTML='<b>案例包已生成并保存：</b>'+d.name+' <span class=meta>（'+d.n+' 条合成；可在知识库搜到）</span>';var pre=document.createElement('pre');pre.className='dtl';pre.style.maxHeight='none';pre.textContent=d.markdown;box.appendChild(h);box.appendChild(pre);box.scrollIntoView({behavior:'smooth'});}else{box.textContent='合成失败：'+(d.error||'未知');}}).catch(function(){btn.textContent='合成选中为案例包 ↴';btn.disabled=false;document.getElementById('cpresult').textContent='请求失败';});});
 </script></body></html>"""
@@ -2173,9 +2209,15 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
     RET = ("RETURN n.name AS name, substring(coalesce(n.content,''),0,4000) AS detail, "
            "n.source_description AS source, n.created_at AS created, "
            "n.visibility AS visibility, coalesce(n.verified,false) AS verified, "
-           "coalesce(n.provenance,'') AS prov ")
+           "coalesce(n.provenance,'') AS prov, coalesce(n.kind,'') AS kind, "
+           "coalesce(n.durability,'') AS durability ")
+    filt = (request.query_params.get("filter") or "").strip()
     try:
-        if q:
+        if filt == "unclassified":   # 从待办"待归类"跳来:只列 kind 未定的,便于集中归类
+            rows = await one("MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+                             "AND (n.kind IS NULL OR n.kind = 'unclassified') " + RET
+                             + "ORDER BY n.created_at DESC LIMIT 40")
+        elif q:
             rows = await one("MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
                              "AND (n.content CONTAINS $q OR n.name CONTAINS $q) " + RET + "LIMIT 40", q=q)
         else:
@@ -2199,7 +2241,8 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
                       "created": (r.get("created") or "")[:16],
                       "visibility": r.get("visibility") or "",
                       "verified": bool(r.get("verified")), "detail": full,
-                      "prov": r.get("prov") or ""})
+                      "prov": r.get("prov") or "",
+                      "kind": r.get("kind") or "", "durability": r.get("durability") or ""})
     data_json = json.dumps({"q": esc(q), "items": items}, ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_CURATE_HTML.replace("__DATA__", data_json))
 
@@ -2514,9 +2557,11 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <h2>② 待补运营数据 · <span id=c2>0</span> 条（标了可公开但没录表现）</h2><div id=fb></div>
 <h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
 <h2>④ 待退休 · <span id=c4>0</span> 条（过期时效内容:行情/日报/快照 >30天，一键归档，可逆）</h2><div id=retire></div>
+<h2>⑤ 待归类 · <span id=c5>0</span> 条（kind 未定，去整理台集中归类）</h2><div id=uncls></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
-document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;
+document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;document.getElementById('c5').textContent=D.uncls;
+document.getElementById('uncls').innerHTML=D.uncls?('<div class=item><div class=sn>有 <b>'+D.uncls+'</b> 条知识 kind 未定(AI 判不了或没判)。</div><div class=ctrl><a class=go href="/dashboard/curate?filter=unclassified">去整理台集中归类 →</a></div></div>'):'<div class=empty>没有待归类 🎉</div>';
 document.getElementById('retire').innerHTML=D.retire.length?('<div style="margin:.3rem 0"><button id=retireall style="border-color:#C0392B;color:#C0392B">全部归档 ('+D.retire.length+')</button></div>'+D.retire.map(function(x,i){
  return '<div class=item data-ri="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div><div class=ctrl><button class=arc data-ri="'+i+'">归档退休</button></div></div>';
 }).join('')):'<div class=empty>没有待退休内容 🎉</div>';
@@ -2593,6 +2638,10 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "RETURN n.name AS name, substring(coalesce(n.content,''),0,160) AS snip, "
             "n.created_at AS created, coalesce(n.origin_project,'') AS proj "
             "ORDER BY n.created_at ASC LIMIT 40", cut=retire_cut)
+        unclsrows = await one(
+            "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
+            "AND (n.kind IS NULL OR n.kind='unclassified') AND NOT coalesce(n.archived,false) "
+            "RETURN count(n) AS c")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2635,7 +2684,9 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                        "snippet": esc(sn[:120]) + ("…" if len(sn) > 120 else ""),
                        "created": (r.get("created") or "")[:10],
                        "project": esc(r.get("proj") or "—")})
-    data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar, "retire": retire},
+    uncls = int(unclsrows[0].get("c") or 0) if unclsrows else 0
+    data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar,
+                            "retire": retire, "uncls": uncls},
                            ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
