@@ -2026,6 +2026,24 @@ async def capsule_requeue(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "queued": True, "provenance": prov})
 
 
+async def archive_episode(request: Request) -> JSONResponse:
+    """POST /dashboard/archive_episode {name} — 退休(归档)一条知识。
+    有界写:只置 n.archived=true(可逆,看板一律 NOT archived 过滤,search 也不返回);
+    不删数据。补"只进不出"缺口:过期 time-bound 一键退休。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "need name"}, status_code=400)
+    g = await get_graphiti()
+    await g.driver.execute_query(
+        "MATCH (n:Episodic {name: $n}) SET n.archived = true, "
+        "n.archived_at = $now", n=name, now=datetime.now(tz=timezone.utc).isoformat())
+    return JSONResponse({"ok": True})
+
+
 async def capsule_discard(request: Request) -> JSONResponse:
     """POST /dashboard/capsule_discard {source_obs_id} — 丢弃隔离区胶囊(不入图)。
     有界写:只删 QuarantinedCapsule 节点;原文仍在 VPS notes/ 里,非毁灭性。"""
@@ -2486,9 +2504,18 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <h2>① 待分层 · <span id=c1>0</span> 条（AI 已建议，点确认或改）</h2><div id=cls></div>
 <h2>② 待补运营数据 · <span id=c2>0</span> 条（标了可公开但没录表现）</h2><div id=fb></div>
 <h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
+<h2>④ 待退休 · <span id=c4>0</span> 条（过期时效内容:行情/日报/快照 >30天，一键归档，可逆）</h2><div id=retire></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
-document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;
+document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;
+document.getElementById('retire').innerHTML=D.retire.length?('<div style="margin:.3rem 0"><button id=retireall style="border-color:#C0392B;color:#C0392B">全部归档 ('+D.retire.length+')</button></div>'+D.retire.map(function(x,i){
+ return '<div class=item data-ri="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div><div class=ctrl><button class=arc data-ri="'+i+'">归档退休</button></div></div>';
+}).join('')):'<div class=empty>没有待退休内容 🎉</div>';
+function archiveOne(name,item,btn){btn.disabled=true;btn.textContent='归档中…';return fetch('/dashboard/archive_episode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(function(r){return r.json();}).then(function(d){if(d.ok){if(item)item.remove();return true;}btn.disabled=false;btn.textContent='失败';return false;}).catch(function(){btn.disabled=false;btn.textContent='失败';return false;});}
+document.getElementById('retire').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;
+ if(b.id==='retireall'){if(!confirm('归档全部 '+D.retire.length+' 条过期内容?(可逆)'))return;b.disabled=true;b.textContent='批量归档中…';Promise.all(D.retire.map(function(x){return fetch('/dashboard/archive_episode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:x.name})});})).then(function(){document.getElementById('retire').innerHTML='<div class=empty>已全部归档 ✓</div>';});}
+ else if(b.classList.contains('arc')){var i=+b.dataset.ri;archiveOne(D.retire[i].name,b.closest('.item'),b);}
+});
 document.getElementById('quar').innerHTML=D.quar.length?D.quar.map(function(x,i){
  return '<div class=item data-qi="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.reason+' · '+x.created+'</div></div>'
   +'<div class=ctrl><span class=lb>补标入图:</span><button class=rq data-qi="'+i+'" data-p="firsthand">亲历</button><button class=rq data-qi="'+i+'" data-p="external-article">外部文章</button><button class=rq data-qi="'+i+'" data-p="external-community">社区采集</button><button class=exq data-qi="'+i+'">展开全文 ▾</button><button class=dsq data-qi="'+i+'" style="color:#C0392B;border-color:#C0392B">丢弃</button></div><pre class="dtl hidden"></pre></div>';
@@ -2547,6 +2574,15 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "substring(coalesce(q.content,''),0,4000) AS detail, "
             "q.reason AS reason, q.created_at AS created "
             "ORDER BY q.created_at DESC LIMIT 20")
+        # ④ 退休候选:过期的 time-bound(行情/日报/快照,创建 >30 天)。退休回路补"只进不出"缺口。
+        # 只收 time-bound——evergreen+usage=0 是弱信号(usage 探针覆盖不全),不据此退休,免误伤。
+        retire_cut = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
+        retirerows = await one(
+            "MATCH (n:Episodic) WHERE n.durability='time-bound' AND NOT coalesce(n.archived,false) "
+            "AND coalesce(n.created_at,'') < $cut "
+            "RETURN n.name AS name, substring(coalesce(n.content,''),0,160) AS snip, "
+            "n.created_at AS created, coalesce(n.origin_project,'') AS proj "
+            "ORDER BY n.created_at ASC LIMIT 40", cut=retire_cut)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2582,7 +2618,14 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                      "snippet": esc(one_line[:400]) + ("…" if len(one_line) > 400 else ""),
                      "reason": esc(r.get("reason") or ""),
                      "created": (r.get("created") or "")[:16], "detail": full})
-    data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar},
+    retire = []
+    for r in retirerows:
+        sn = (r.get("snip") or "").strip().replace("\n", " ")
+        retire.append({"name": r.get("name") or "",
+                       "snippet": esc(sn[:120]) + ("…" if len(sn) > 120 else ""),
+                       "created": (r.get("created") or "")[:10],
+                       "project": esc(r.get("proj") or "—")})
+    data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar, "retire": retire},
                            ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
@@ -2626,6 +2669,7 @@ app = Starlette(
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
+        Route("/dashboard/archive_episode", archive_episode, methods=["POST"]),
         Route("/dashboard/capsule_discard", capsule_discard, methods=["POST"]),
         Route("/dashboard/casepack", dashboard_casepack, methods=["POST"]),
         Route("/dashboard/feedback", dashboard_feedback, methods=["GET"]),

@@ -1,0 +1,19 @@
+{
+  "_doc": "kind 分类器校准集 v1(北极星④生产者的托底)。gold_kind 是人工据内容独立判定的正确类别(不看分类器输出),用于度量 LLM 分类器准确率、发现系统性偏差。改 KIND_PROMPT / 阈值后,在容器内重跑分类(backfill --retry-llm --force)再 python -m tools.eval_kind 打分,防回归。name 用 openclaw-capsule- 全名精确匹配。",
+  "labels": [
+    {"name": "openclaw-capsule-CAPSULE-2026-07-18-002", "gold_kind": "方法论", "note": "接口迁移三层验收=可复用框架"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-20-001", "gold_kind": "方法论", "note": "自动任务三层验收方法"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-19-003", "gold_kind": "方法论", "note": "投资多因子冲突检测框架"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-20-002", "gold_kind": "方法论", "note": "内容生产分层架构解耦"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-23-001", "gold_kind": "方法论", "note": "文章读取容错三层验证策略"},
+    {"name": "openclaw-capsule-capsule-2026-06-12-lark-migration", "gold_kind": "生命周期事件", "note": "飞书接口迁移=项目演进节点"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-02", "gold_kind": "项目事实", "note": "系统运行日报(Gateway响应/cron计数),无事故——分类器易误判'事故'"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-03", "gold_kind": "项目事实", "note": "同上,系统日常日志非事故"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-04", "gold_kind": "项目事实", "note": "系统运行日报"},
+    {"name": "openclaw-capsule-capsule-daily-extract-20260516", "gold_kind": "项目事实", "note": "每日提取日报,非单一事故"},
+    {"name": "openclaw-capsule-capsule-daily-extract-20260525", "gold_kind": "项目事实", "note": "每日提取日报"},
+    {"name": "openclaw-capsule-capsule-daily-extract-20260711", "gold_kind": "项目事实", "note": "每日提取日报——分类器误判'决策'"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-22-002", "gold_kind": "方法论", "note": "长时Cron超时=统一超时策略(可复用)"},
+    {"name": "openclaw-capsule-CAPSULE-2026-07-22-001", "gold_kind": "方法论", "note": "公众号48h流量生死线=可复用运营认知"}
+  ]
+}
