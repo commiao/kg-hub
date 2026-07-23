@@ -175,7 +175,7 @@ def post_ingest(url: str, tok: str, payload: dict) -> tuple[int, dict]:
 
 
 def poll_until_done(url: str, tok: str, sd: str, sid: str,
-                    max_wait: int = 300, interval: int = 8) -> str:
+                    max_wait: int = 600, interval: int = 8) -> str:
     """异步 ingest 后轮询该条状态直到 ok/error,或超时。返回终态字符串。
     这样一次只有一篇在抽取(发下一篇前等这篇完成),既串行避免 writer.lock 争用,
     又不长挂 HTTP 连接(区别于 sync=true 的 client 超时)。"""
