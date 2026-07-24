@@ -899,13 +899,14 @@ async def search(request: Request) -> JSONResponse:
                 "coalesce(ep.provenance,'') AS prov, coalesce(ep.durability,'') AS dur, "
                 "coalesce(ep.verified,false) AS ver, coalesce(ep.usage_count,0) AS uc, "
                 "coalesce(ep.kind,'') AS kind, coalesce(ep.origin_project,'') AS proj, "
-                "coalesce(ep.archived,false) AS arch",
+                "coalesce(ep.archived,false) AS arch, "
+                "coalesce(ep.reference_time, ep.created_at, '') AS ref",
                 u=all_eps)
             for r in arows:
                 attr[str(r.get("u"))] = {"prov": r.get("prov"), "dur": r.get("dur"),
                                          "ver": bool(r.get("ver")), "uc": int(r.get("uc") or 0),
                                          "kind": r.get("kind"), "proj": r.get("proj"),
-                                         "arch": bool(r.get("arch"))}
+                                         "arch": bool(r.get("arch")), "ref": r.get("ref") or ""}
         except Exception:  # noqa: BLE001
             attr = {}
 
@@ -920,14 +921,15 @@ async def search(request: Request) -> JSONResponse:
         stale = bool(eps) and all(a["dur"] == "time-bound" for a in eps)
         verified = any(a["ver"] for a in eps)
         usage = max((a["uc"] for a in eps), default=0)
-        return eps, external, stale, verified, usage
+        newest_ref = max((a["ref"] for a in eps if a["ref"]), default="")  # 最新背书时间
+        return eps, external, stale, verified, usage, newest_ref
 
     scored = []
     for c in cand.values():
         agged = agg(c)
         if agged is None:        # fact 的背书全被退休 → 不召回
             continue
-        eps, external, stale, verified, usage = agged
+        eps, external, stale, verified, usage, newest_ref = agged
         # facet 过滤:任一背书 episode 命中即保留(命中不了直接丢)
         if f_project and not any(a["proj"] == f_project for a in eps):
             continue
@@ -945,6 +947,18 @@ async def search(request: Request) -> JSONResponse:
         if verified:
             score += 0.08                                     # 已验证轻提
         score += min(usage, 10) * 0.01                        # 使用量 Lindy 轻推(有界)
+        # 新鲜度 nudge:主要给"相似/同主题"里较新者小幅优先(旧版不冒充当前),
+        # 不惩罚好的老 evergreen——只近30天小提、超1年微降,幅度小于语义主项。
+        if newest_ref:
+            try:
+                age_d = (datetime.now(tz=timezone.utc)
+                         - datetime.fromisoformat(newest_ref.replace("Z", "+00:00"))).days
+                if age_d <= 30:
+                    score += 0.05
+                elif age_d > 365:
+                    score -= 0.03
+            except Exception:
+                pass
         c["provenance"] = "external" if external else "internal"
         c["score"] = round(score, 4)
         c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None)
