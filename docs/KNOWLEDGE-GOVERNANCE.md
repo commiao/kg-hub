@@ -55,6 +55,21 @@ kg-push-capsules.py(cron 30min,确定性脚本)        ├─ claude-mem obs(cod
 ### 人工闸门(唯一需要人的地方)
 反馈待办 `/dashboard/inbox` 自动列队:AI 预判可见性 → 人一键确认 `visibility` / `verified` → 整理台合成案例包 → 运营反馈录表现。📰 外部 badge 帮你识别二手内容,**别把文章派生的"知识"误标为已验证**。
 
+## 3.5 使用现场反馈闭环(2026-07-24 上线)
+
+素材→案例库缺的"效果反馈",不靠人事后逐条审,靠**使用现场**:
+
+```
+用户说「使用知识库 <话题>」→ kg-use skill(全工具,~/.skillshub/kg-use 软链分发+OpenClaw 副本)
+  → /api/search?verbose=1(hybrid,命中即 bump usage_count——检索计入使用度量)
+  → 知识用于当前任务 → 回复末尾固定格式「📚 知识库使用报告」
+  → 非"仍准确"的评价 POST /api/knowledge_feedback(stale/conflict/supplement/inaccurate)
+  → 反馈待办⑥「使用反馈」→ 人一键:采纳标已验证 / 采纳退休(可逆) / 忽略
+```
+
+护栏:模型评价**永不直接改知识**(只进 pending 队列);bump 只计数**不进排序权重**
+(防刷分);eval 工具传 `bump=0` 不污染统计;同知识同 verdict 去重刷新不堆积。
+
 ## 4. 明确不做的事(边界)
 
 - **不合并两库**:OpenClaw notes 里 1000+ 原料笔记不进图。图是案例库不是素材矿(见 LANDING-PLAN-cognitive-asset.md)。
