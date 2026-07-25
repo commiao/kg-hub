@@ -2793,7 +2793,11 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 .sugtag{font-size:11px;color:#BA7517}
 .saved{color:#1D9E75;font-size:12px;opacity:0;transition:opacity .2s}.saved.show{opacity:1}
 .go{color:#378ADD;text-decoration:none;font-size:13px}.empty{color:GrayText;font-size:13px;padding:6px 0}
-.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin-top:6px;max-height:360px;overflow:auto}.hidden{display:none}</style></head><body>
+.dtl{white-space:pre-wrap;font-size:12px;font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:8px;padding:10px;margin-top:6px;max-height:360px;overflow:auto}.hidden{display:none}
+details.how{font-size:12px;margin:.2rem 0 .5rem}details.how summary{cursor:pointer;color:#378ADD;list-style:none}details.how summary::-webkit-details-marker{display:none}
+.howbody{background:color-mix(in srgb,CanvasText 5%,transparent);border-radius:10px;padding:10px 14px;margin-top:6px;line-height:1.7}
+.howbody table{border-collapse:collapse;margin:.4rem 0;width:100%}.howbody th,.howbody td{border:1px solid color-mix(in srgb,CanvasText 18%,transparent);padding:4px 9px;font-size:12px;text-align:left}
+.howbody th{background:color-mix(in srgb,CanvasText 8%,transparent);font-weight:500}.howbody .dim{color:GrayText}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>反馈待办</h1>
 <div class=tip>系统自动列出「需要你拍板」的事，尽量一键清掉。<b id=aistat>正在让 AI 预判可见性…</b></div>
 <h2>① 待分层 · <span id=c1>0</span> 条（AI 已建议，点确认或改）</h2><div id=cls></div>
@@ -2801,7 +2805,23 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
 <h2>④ 待退休 · <span id=c4>0</span> 条（过期时效内容:行情/日报/快照 >30天，一键归档，可逆）</h2><div id=retire></div>
 <h2>⑤ 待归类 · <span id=c5>0</span> 条（kind 未定，去整理台集中归类）</h2><div id=uncls></div>
-<h2>⑥ 使用反馈 · <span id=c6>0</span> 条待拍板（证据够格的已自动处理，见下方灰列表，可撤销）</h2><div id=usefb></div>
+<h2>⑥ 使用反馈 · <span id=c6>0</span> 条待拍板</h2>
+<details class=how><summary>❓ 这个分区怎么运作 —— 自动执行 + 事后否决(点开看规则)</summary><div class=howbody>
+<b>来源</b>:你在任何工具里说「使用知识库」,模型用完知识后对每条提交评价(过时/冲突/可补充/不准确)。<br>
+<b>处理</b>:证据够格的<b>系统直接执行</b>,不等你;只有真争议才进上面的待拍板列表。
+<table>
+<tr><th>评价</th><th>自动执行的条件(须全部满足)</th><th>系统动作</th></tr>
+<tr><td>⚠ 过时 / ❌ 不准确</td><td>替代知识已写入图 <span class=dim>或</span> 同一判定被 ≥2 次独立上报;且不是注入胶囊、没被你标过✓已验证</td><td>🤖 自动退休(归档,<b>可逆</b>)</td></tr>
+<tr><td>➕ 可补充</td><td>补充内容已写回图</td><td>🤖 自动关闭</td></tr>
+<tr><td>❌ 冲突</td><td class=dim>一律不自动——推翻性判断留给人</td><td>👤 等你拍板</td></tr>
+<tr><td>任何评价</td><td class=dim>目标是注入胶囊(canonical),或你标过 ✓已验证</td><td>👤 等你拍板</td></tr>
+</table>
+<b>你的监督(两个入口,都是事后)</b>:<br>
+① 每天 09:35 飞书「使用反馈日报」列出 24h 自动处理清单;<br>
+② 本区底部灰色「最近自动处理(7天)」,点 <b>↩ 撤销</b> 即回滚——退休类会恢复该知识、反馈退回待拍板。<br>
+<span class=dim><b>为什么不每条等你批</b>:本系统实证"事前批准队列"会烂尾(①待分层曾积压 1305 条,人工只处理过 2 条)。改为"自动执行+事后否决":可逆的、有证据的不占用你;不可逆的、有争议的才找你。</span>
+</div></details>
+<div id=usefb></div>
 <div id=autofb style="margin-top:6px"></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
