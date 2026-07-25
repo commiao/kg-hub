@@ -2619,10 +2619,18 @@ async def knowledge_feedback(request: Request) -> JSONResponse:
     """POST /api/knowledge_feedback  {episode_name, verdict, note?, tool?}
 
     使用现场反馈(kg-use skill 上报):模型在会话里刚用过某条知识,对它的评价
-    (stale 过时 / conflict 冲突 / supplement 可补充 / inaccurate 不准确)进
-    待办队列(UsageFeedback, status=pending)。**绝不直接改知识本身**——人在
-    反馈待办⑥里拍板采纳/忽略。有界写:verdict 枚举、note 截断、episode 必须存在;
-    同一知识同一 verdict 已有 pending 时刷新说明而不是堆新条目。"""
+    (stale 过时 / conflict 冲突 / supplement 可补充 / inaccurate 不准确)。
+
+    处理策略(2026-07-25 起 veto-after,事前批准队列在本系统实证会烂尾——
+    ①待分层积压 1305:人工处理 2):**证据够格就自动执行,人事后可撤销**;
+    不够格才进待办⑥等拍板。自动规则(全部满足才自动):
+      - auto_retire:verdict∈{stale,inaccurate} 且 非canonical 且 未被人工verified
+        且(replacement_name 指向的替代知识已在图 或 同判定被≥2次独立上报)
+        → episode archived=true(可逆,同治理②退休语义)
+      - auto_noted:verdict=supplement 且补充内容已写回(replacement_name 在图)
+      - conflict 一律进队列(推翻性判断留人);verified=true 的知识一律留人。
+    有界写:verdict 枚举、note 截断、episode 必须存在;同知识同 verdict 的
+    pending 去重刷新并累计 report_count。撤销:待办⑥「最近自动处理」。"""
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -2631,6 +2639,7 @@ async def knowledge_feedback(request: Request) -> JSONResponse:
     verdict = str(body.get("verdict") or "").strip()
     note = str(body.get("note") or "").strip()[:600]
     tool = str(body.get("tool") or "").strip()[:40]
+    replacement = str(body.get("replacement_name") or "").strip()
     if not name or verdict not in _UF_VERDICTS:
         return JSONResponse(
             {"ok": False,
@@ -2639,21 +2648,89 @@ async def knowledge_feedback(request: Request) -> JSONResponse:
     driver = get_status_driver()
     try:
         rows, _, _ = await driver.execute_query(
-            "MATCH (n:Episodic {name: $name}) RETURN count(n) AS c", name=name)
-        if not rows or not int(rows[0].get("c") or 0):
+            "MATCH (n:Episodic {name: $name}) "
+            "RETURN coalesce(n.verified,false) AS ver LIMIT 1", name=name)
+        if not rows:
             return JSONResponse({"ok": False, "error": "unknown episode_name"}, status_code=404)
+        ep_verified = bool(rows[0].get("ver"))
+        canonical = name.startswith("kg-hub-canonical")
+        repl_ok = False
+        if replacement:
+            rrows, _, _ = await driver.execute_query(
+                "MATCH (r:Episodic {name: $r}) WHERE NOT coalesce(r.archived,false) "
+                "RETURN count(r) AS c", r=replacement)
+            repl_ok = bool(rrows and int(rrows[0].get("c") or 0))
         now = datetime.now(tz=timezone.utc).isoformat()
         fid = uuidlib.uuid4().hex[:12]
         rows, _, _ = await driver.execute_query(
             "MERGE (f:UsageFeedback {episode_name: $name, verdict: $verdict, status: 'pending'}) "
-            "ON CREATE SET f.id = $fid, f.created_at = $now "
-            "SET f.note = $note, f.tool = $tool, f.updated_at = $now "
-            "RETURN f.id AS id",
-            name=name, verdict=verdict, fid=fid, now=now, note=note, tool=tool)
-        return JSONResponse({"ok": True, "id": (rows[0].get("id") if rows else fid),
-                             "status": "pending"})
+            "ON CREATE SET f.id = $fid, f.created_at = $now, f.report_count = 1 "
+            "ON MATCH SET f.report_count = coalesce(f.report_count, 1) + 1 "
+            "SET f.note = $note, f.tool = $tool, f.updated_at = $now"
+            + (", f.replacement_name = $repl " if repl_ok else " ") +
+            "RETURN f.id AS id, f.report_count AS rc",
+            name=name, verdict=verdict, fid=fid, now=now, note=note, tool=tool,
+            repl=replacement)
+        out_id = rows[0].get("id") if rows else fid
+        rc = int(rows[0].get("rc") or 1) if rows else 1
+        # —— 自动处理判定 ——
+        action = None
+        if (verdict in ("stale", "inaccurate") and not canonical and not ep_verified
+                and (repl_ok or rc >= 2)):
+            action = "auto_retire"
+        elif verdict == "supplement" and repl_ok:
+            action = "auto_noted"
+        if action:
+            if action == "auto_retire":
+                await driver.execute_query(
+                    "MATCH (n:Episodic {name: $name}) SET n.archived = true", name=name)
+            await driver.execute_query(
+                "MATCH (f:UsageFeedback {id: $fid}) "
+                "SET f.status = 'auto_handled', f.handled_action = $a, f.handled_at = $now",
+                fid=out_id, a=action, now=now)
+            return JSONResponse({"ok": True, "id": out_id, "status": "auto_handled",
+                                 "action": action,
+                                 "undo": "反馈待办⑥「最近自动处理」可一键撤销"})
+        return JSONResponse({"ok": True, "id": out_id, "status": "pending",
+                             "report_count": rc})
     except Exception as exc:  # noqa: BLE001
         logger.exception("[knowledge_feedback] failed")
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=503)
+
+
+async def usage_feedback_undo(request: Request) -> JSONResponse:
+    """POST /dashboard/usage_feedback_undo {id} — 撤销一条已(自动)处理的使用反馈。
+
+    veto-after 的"否决"入口:退休类动作回滚 episode(archived=false),反馈
+    退回 pending 由人重新拍板。有界写:只碰该 feedback 与其 episode 的 archived。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    fid = str(body.get("id") or "").strip()
+    if not fid:
+        return JSONResponse({"ok": False, "error": "need id"}, status_code=400)
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (f:UsageFeedback {id: $fid}) "
+            "WHERE f.status IN ['auto_handled','handled'] "
+            "RETURN f.episode_name AS name, f.handled_action AS act", fid=fid)
+        if not rows:
+            return JSONResponse({"ok": False, "error": "feedback not found or not handled"},
+                                status_code=404)
+        name, act = rows[0].get("name") or "", rows[0].get("act") or ""
+        if act in ("retire", "auto_retire"):
+            await driver.execute_query(
+                "MATCH (n:Episodic {name: $name}) SET n.archived = false", name=name)
+        await driver.execute_query(
+            "MATCH (f:UsageFeedback {id: $fid}) "
+            "SET f.status = 'pending', f.handled_action = NULL, f.handled_at = NULL", fid=fid)
+        return JSONResponse({"ok": True, "restored": act in ("retire", "auto_retire"),
+                             "episode_name": name})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[usage_feedback_undo] failed")
         return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
                             status_code=503)
 
@@ -2724,7 +2801,8 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
 <h2>④ 待退休 · <span id=c4>0</span> 条（过期时效内容:行情/日报/快照 >30天，一键归档，可逆）</h2><div id=retire></div>
 <h2>⑤ 待归类 · <span id=c5>0</span> 条（kind 未定，去整理台集中归类）</h2><div id=uncls></div>
-<h2>⑥ 使用反馈 · <span id=c6>0</span> 条（会话现场对知识的评价，你拍板采纳或忽略）</h2><div id=usefb></div>
+<h2>⑥ 使用反馈 · <span id=c6>0</span> 条待拍板（证据够格的已自动处理，见下方灰列表，可撤销）</h2><div id=usefb></div>
+<div id=autofb style="margin-top:6px"></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
 document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;document.getElementById('c5').textContent=D.uncls;document.getElementById('c6').textContent=D.usefb.length;
@@ -2738,6 +2816,12 @@ document.getElementById('usefb').addEventListener('click',function(e){var b=e.ta
  else if(b.classList.contains('ufr')){if(confirm('归档退休该知识?(可逆)'))resolve('retire');}
  else if(b.classList.contains('ufd')){resolve('dismiss');}
  else if(b.classList.contains('ufe')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+});
+document.getElementById('autofb').innerHTML=D.autofb.length?('<div style="font-size:12px;color:GrayText;margin:.4rem 0 .2rem">最近自动处理(7天) · 事后可否决:</div>'+D.autofb.map(function(x,i){
+ return '<div class=item data-ai="'+i+'" style="opacity:.75"><div class=sn style="font-size:12px"><b>['+x.verdict+'→'+x.act+']</b> '+x.name+(x.retired?'':'')+'<div class=meta>'+(x.note||'')+' · '+x.at+'</div></div><div class=ctrl><button class=ufu data-ai="'+i+'">↩ 撤销'+(x.retired?'(恢复该知识)':'')+'</button></div></div>';
+}).join('')):'';
+document.getElementById('autofb').addEventListener('click',function(e){var b=e.target.closest('button.ufu');if(!b)return;var it=D.autofb[+b.dataset.ai];b.disabled=true;b.textContent='撤销中…';
+ fetch('/dashboard/usage_feedback_undo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok){b.textContent='已撤销,退回待拍板(刷新可见)';}else{b.disabled=false;b.textContent='失败:'+(d.error||'');}}).catch(function(){b.disabled=false;b.textContent='失败';});
 });
 document.getElementById('uncls').innerHTML=D.uncls?('<div class=item><div class=sn>有 <b>'+D.uncls+'</b> 条知识 kind 未定(AI 判不了或没判)。</div><div class=ctrl><a class=go href="/dashboard/curate?filter=unclassified">去整理台集中归类 →</a></div></div>'):'<div class=empty>没有待归类 🎉</div>';
 document.getElementById('retire').innerHTML=D.retire.length?('<div style="margin:.3rem 0"><button id=retireall style="border-color:#C0392B;color:#C0392B">全部归档 ('+D.retire.length+')</button></div>'+D.retire.map(function(x,i){
@@ -2829,6 +2913,14 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "coalesce(f.updated_at, f.created_at) AS created, "
             "substring(coalesce(n.content,''),0,4000) AS detail "
             "ORDER BY created DESC LIMIT 30")
+        # ⑥ 底部:最近 7 天自动处理(veto-after 的否决入口)
+        auto_cut = (datetime.now(tz=timezone.utc) - timedelta(days=7)).isoformat()
+        autorows = await one(
+            "MATCH (f:UsageFeedback) WHERE f.status = 'auto_handled' "
+            "AND coalesce(f.handled_at,'') >= $cut "
+            "RETURN f.id AS id, f.episode_name AS name, f.verdict AS verdict, "
+            "f.handled_action AS act, coalesce(f.note,'') AS note, "
+            "f.handled_at AS at ORDER BY at DESC LIMIT 12", cut=auto_cut)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2884,8 +2976,18 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                       "created": (r.get("created") or "")[:16],
                       "snippet": esc(one_line[:300]) + ("…" if len(one_line) > 300 else ""),
                       "detail": full})
+    _ALABEL = {"auto_retire": "已自动退休", "auto_noted": "已记录(补充已写回)"}
+    autofb = []
+    for r in autorows:
+        autofb.append({"id": r.get("id") or "", "name": esc(r.get("name") or ""),
+                       "verdict": _VLABEL.get(r.get("verdict"), esc(r.get("verdict") or "")),
+                       "act": _ALABEL.get(r.get("act"), esc(r.get("act") or "")),
+                       "retired": (r.get("act") == "auto_retire"),
+                       "note": esc((r.get("note") or "")[:160]),
+                       "at": (r.get("at") or "")[:16]})
     data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar,
-                            "retire": retire, "uncls": uncls, "usefb": usefb},
+                            "retire": retire, "uncls": uncls, "usefb": usefb,
+                            "autofb": autofb},
                            ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
@@ -2938,6 +3040,7 @@ app = Starlette(
         Route("/dashboard/suggest_tags", dashboard_suggest_tags, methods=["POST"]),
         Route("/dashboard/translate", dashboard_translate, methods=["POST"]),
         Route("/dashboard/usage_feedback_resolve", usage_feedback_resolve, methods=["POST"]),
+        Route("/dashboard/usage_feedback_undo", usage_feedback_undo, methods=["POST"]),
         Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
