@@ -899,14 +899,15 @@ async def search(request: Request) -> JSONResponse:
                 "coalesce(ep.provenance,'') AS prov, coalesce(ep.durability,'') AS dur, "
                 "coalesce(ep.verified,false) AS ver, coalesce(ep.usage_count,0) AS uc, "
                 "coalesce(ep.kind,'') AS kind, coalesce(ep.origin_project,'') AS proj, "
-                "coalesce(ep.archived,false) AS arch, "
+                "coalesce(ep.archived,false) AS arch, coalesce(ep.name,'') AS nm, "
                 "coalesce(ep.reference_time, ep.created_at, '') AS ref",
                 u=all_eps)
             for r in arows:
                 attr[str(r.get("u"))] = {"prov": r.get("prov"), "dur": r.get("dur"),
                                          "ver": bool(r.get("ver")), "uc": int(r.get("uc") or 0),
                                          "kind": r.get("kind"), "proj": r.get("proj"),
-                                         "arch": bool(r.get("arch")), "ref": r.get("ref") or ""}
+                                         "arch": bool(r.get("arch")), "ref": r.get("ref") or "",
+                                         "nm": r.get("nm") or ""}
         except Exception:  # noqa: BLE001
             attr = {}
 
@@ -961,13 +962,44 @@ async def search(request: Request) -> JSONResponse:
                 pass
         c["provenance"] = "external" if external else "internal"
         c["score"] = round(score, 4)
+        # 保留活背书 uuid,供命中后 bump + verbose 报告用(返回前再剥掉)
+        c["_eps_live"] = [u for u in c["episodes"] if u in attr and not attr[u]["arch"]] \
+            or c["episodes"]
         c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None)
         scored.append(c)
 
     scored.sort(key=lambda r: -r["score"])
+    top = scored[:num_results]
+
+    # —— 检索即使用:命中即 bump 背书 episode 的 usage_count(2026-07-24 起,
+    # MCP/HTTP 检索计入使用度量,不再只有 PUSH hook)。bump=0 关闭(eval 工具用,
+    # 免评估跑分污染统计)。只加计数,不进排序权重(防刷分回路)。
+    do_bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
+    if do_bump and top:
+        bump_eps = sorted({u for c in top for u in (c.get("_eps_live") or [])})
+        if bump_eps:
+            try:
+                await driver.execute_query(
+                    "MATCH (ep:Episodic) WHERE ep.uuid IN $u "
+                    "SET ep.usage_count = coalesce(ep.usage_count,0)+1, "
+                    "    ep.retrieval_count = coalesce(ep.retrieval_count,0)+1, "
+                    "    ep.last_used_at = $now",
+                    u=bump_eps, now=datetime.now(tz=timezone.utc).isoformat())
+            except Exception as exc:  # noqa: BLE001 — 计数失败不影响检索
+                logger.warning("[search] retrieval bump failed: %s", exc)
+
+    # verbose=1:附带背书 episode 元数据(kg-use skill 的使用报告要 name/verified 等)
+    verbose = (request.query_params.get("verbose", "") or "").lower() in ("1", "true", "yes")
+    for c in top:
+        if verbose:
+            c["backing"] = [{"name": attr[u]["nm"], "kind": attr[u]["kind"],
+                             "durability": attr[u]["dur"], "verified": attr[u]["ver"],
+                             "provenance": attr[u]["prov"], "project": attr[u]["proj"]}
+                            for u in (c.get("_eps_live") or []) if u in attr]
+        c.pop("_eps_live", None)
     return JSONResponse({"status": "ok", "query": query,
                          "mode": "hybrid" if sem_ok else "substring_fallback",
-                         "results": scored[:num_results]})
+                         "results": top})
 
 
 # ---------------------------------------------------------------------------
@@ -1363,6 +1395,19 @@ async def episode_search(request: Request) -> JSONResponse:
               "score": r.get("score"), "content": r.get("content")} for r in rows]
     items = _tiered_rerank(items, lim)          # G5：type-weighted（enabled=false 时等价原样）
     _log_delivery("episode_search", q, items)   # G6-lite
+    # 检索即使用:episode 全文被交付 = 实打实的取用(MCP kg_episode_search)。bump=0 关闭。
+    do_bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
+    names = [it.get("name") for it in items if it.get("name")]
+    if do_bump and names:
+        try:
+            await driver.execute_query(
+                "MATCH (n:Episodic) WHERE n.name IN $names "
+                "SET n.usage_count = coalesce(n.usage_count,0)+1, "
+                "    n.retrieval_count = coalesce(n.retrieval_count,0)+1, "
+                "    n.last_used_at = $now",
+                names=names, now=datetime.now(tz=timezone.utc).isoformat())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[episode_search] retrieval bump failed: %s", exc)
     results = [{
         "name": it.get("name"),
         "source": it.get("source"),
@@ -1475,6 +1520,22 @@ async def search_semantic(request: Request) -> JSONResponse:
         "valid_at": e.valid_at.isoformat() if e.valid_at else None,
         "created_at": e.created_at.isoformat() if e.created_at else None,
     } for e in results.edges]
+    # 检索即使用:bump 命中 fact 的背书 episode(MCP kg_search 的真实取用)。bump=0 关闭。
+    do_bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
+    facts = [o["fact"] for o in out if o.get("fact")]
+    if do_bump and facts:
+        try:
+            driver = get_status_driver()
+            await driver.execute_query(
+                "MATCH ()-[e:RELATES_TO]->() WHERE e.fact IN $facts AND e.episodes IS NOT NULL "
+                "UNWIND e.episodes AS epu "
+                "MATCH (ep:Episodic {uuid: epu}) "
+                "SET ep.usage_count = coalesce(ep.usage_count,0)+1, "
+                "    ep.retrieval_count = coalesce(ep.retrieval_count,0)+1, "
+                "    ep.last_used_at = $now",
+                facts=facts, now=datetime.now(tz=timezone.utc).isoformat())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[search_semantic] retrieval bump failed: %s", exc)
     return JSONResponse({"status": "ok", "query": q, "mode": "semantic_vector", "results": out})
 
 
@@ -1869,7 +1930,7 @@ document.getElementById('cards').innerHTML='<div class=mc><div class=l>全图利
 var mu=Math.max.apply(null,D.items.map(function(x){return x.usage}).concat([1]));
 document.getElementById('items').innerHTML=D.items.map(function(x,i){return '<details data-i="'+i+'"><summary class=row><span class=uc>'+x.usage+'</span><div class=bar><i style="width:'+Math.round(x.usage/mu*100)+'%;background:'+(x.cap?'#7F77DD':'#888780')+'"></i></div><span class=nm>'+x.label+'</span>'+(x.prov&&x.prov.indexOf('external')===0?'<span class=bdg style="background:#F6E3C5;color:#8A4B08" title="来源为外部文章/社区采集,未验证">📰 外部</span>':'')+'<span class="bdg '+(x.cap?'cap':'con')+'">'+(x.cap?'注入胶囊':x.type)+'</span><span class=chev>›</span></summary><div class=src></div><pre class=dtl></pre></details>';}).join('')||'<div class=ts>暂无被取用的知识</div>';
 Array.prototype.forEach.call(document.querySelectorAll('#items details'),function(d){d.addEventListener('toggle',function(){if(d.open&&!d.dataset.done){var it=D.items[+d.dataset.i];d.querySelector('.src').textContent=(it.name||'')+(it.source?('  ·  '+it.source):'')+(it.last?('  ·  最近 '+it.last):'');d.querySelector('.dtl').textContent=it.detail||'(无内容)';d.dataset.done='1';}});});
-document.getElementById('note').textContent='每 60s 自动刷新 · usage = 被 PUSH hook 注入/填充次数（MCP 检索暂未计入，故为下限）· 利用率低=大量知识沉睡';
+document.getElementById('note').textContent='每 60s 自动刷新 · usage = PUSH hook 注入 + MCP/HTTP 检索命中（2026-07-24 起检索计入）· 利用率低=大量知识沉睡';
 </script></body></html>"""
 
 
@@ -1947,7 +2008,7 @@ function bars(el,arr,key,label,color){var mx=Math.max.apply(null,arr.map(functio
 document.getElementById(el).innerHTML=arr.length?arr.map(function(x){return '<div class=row><span class=nm>'+label(x)+'</span><div class=bar><i style="width:'+Math.round(x[key]/mx*100)+'%;background:'+color+'"></i></div><span class=n>'+x[key]+'</span></div>';}).join(''):'<div class=empty>暂无（尚无上报）</div>';}
 bars('contrib',D.contrib,'count',function(x){return x.tool},'#1D9E75');
 bars('usage',D.usage,'n',function(x){return x.tool+(x.last?' <span class=ts>'+x.last+'</span>':'')},'#378ADD');
-document.getElementById('note').textContent='每 60s 刷新 · 贡献按 project=workspace_<工具> 归属，真实项目目录归"工具未知" · 使用=PUSH hook 注入上报（MCP 检索取知识暂未计入；当前多为 Claude Code）';
+document.getElementById('note').textContent='每 60s 刷新 · 贡献按 project=workspace_<工具> 归属，真实项目目录归"工具未知" · 使用=PUSH hook 注入上报（检索取用已计入全图 usage，但此处按工具拆分仍只覆盖 hook）';
 </script></body></html>"""
 
 
@@ -2551,6 +2612,95 @@ async def dashboard_suggest_tags(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "suggest": suggest})
 
 
+_UF_VERDICTS = {"stale", "conflict", "supplement", "inaccurate"}
+
+
+async def knowledge_feedback(request: Request) -> JSONResponse:
+    """POST /api/knowledge_feedback  {episode_name, verdict, note?, tool?}
+
+    使用现场反馈(kg-use skill 上报):模型在会话里刚用过某条知识,对它的评价
+    (stale 过时 / conflict 冲突 / supplement 可补充 / inaccurate 不准确)进
+    待办队列(UsageFeedback, status=pending)。**绝不直接改知识本身**——人在
+    反馈待办⑥里拍板采纳/忽略。有界写:verdict 枚举、note 截断、episode 必须存在;
+    同一知识同一 verdict 已有 pending 时刷新说明而不是堆新条目。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    name = str(body.get("episode_name") or "").strip()
+    verdict = str(body.get("verdict") or "").strip()
+    note = str(body.get("note") or "").strip()[:600]
+    tool = str(body.get("tool") or "").strip()[:40]
+    if not name or verdict not in _UF_VERDICTS:
+        return JSONResponse(
+            {"ok": False,
+             "error": f"episode_name required; verdict must be one of {sorted(_UF_VERDICTS)}"},
+            status_code=400)
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (n:Episodic {name: $name}) RETURN count(n) AS c", name=name)
+        if not rows or not int(rows[0].get("c") or 0):
+            return JSONResponse({"ok": False, "error": "unknown episode_name"}, status_code=404)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        fid = uuidlib.uuid4().hex[:12]
+        rows, _, _ = await driver.execute_query(
+            "MERGE (f:UsageFeedback {episode_name: $name, verdict: $verdict, status: 'pending'}) "
+            "ON CREATE SET f.id = $fid, f.created_at = $now "
+            "SET f.note = $note, f.tool = $tool, f.updated_at = $now "
+            "RETURN f.id AS id",
+            name=name, verdict=verdict, fid=fid, now=now, note=note, tool=tool)
+        return JSONResponse({"ok": True, "id": (rows[0].get("id") if rows else fid),
+                             "status": "pending"})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[knowledge_feedback] failed")
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=503)
+
+
+async def usage_feedback_resolve(request: Request) -> JSONResponse:
+    """POST /dashboard/usage_feedback_resolve  {id, action}  action: verified|retire|dismiss
+
+    人对一条使用反馈拍板。有界写:verified→episode.verified=true;retire→archived=true
+    (可逆,同退休回路;canonical 注入胶囊不可退休);dismiss→仅关闭反馈,不动知识。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    fid = str(body.get("id") or "").strip()
+    action = str(body.get("action") or "").strip()
+    if not fid or action not in ("verified", "retire", "dismiss"):
+        return JSONResponse({"ok": False, "error": "id required; action ∈ verified|retire|dismiss"},
+                            status_code=400)
+    driver = get_status_driver()
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (f:UsageFeedback {id: $fid}) WHERE f.status = 'pending' "
+            "RETURN f.episode_name AS name", fid=fid)
+        if not rows:
+            return JSONResponse({"ok": False, "error": "feedback not found or already handled"},
+                                status_code=404)
+        name = rows[0].get("name") or ""
+        if action == "retire" and name.startswith("kg-hub-canonical"):
+            return JSONResponse({"ok": False, "error": "canonical 注入胶囊不可退休"}, status_code=400)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        if action == "verified":
+            await driver.execute_query(
+                "MATCH (n:Episodic {name: $name}) SET n.verified = true", name=name)
+        elif action == "retire":
+            await driver.execute_query(
+                "MATCH (n:Episodic {name: $name}) SET n.archived = true", name=name)
+        await driver.execute_query(
+            "MATCH (f:UsageFeedback {id: $fid}) "
+            "SET f.status = 'handled', f.handled_action = $a, f.handled_at = $now",
+            fid=fid, a=action, now=now)
+        return JSONResponse({"ok": True, "action": action, "episode_name": name})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[usage_feedback_resolve] failed")
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=503)
+
+
 _DASH_INBOX_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>kg-hub 反馈待办</title>
 <style>:root{color-scheme:light dark}
@@ -2574,9 +2724,21 @@ button.sug{border-color:#EF9F27;box-shadow:0 0 0 1px #EF9F27 inset}
 <h2>③ 格式异常胶囊 · <span id=c3>0</span> 条（缺来源元数据被拦截，补标入图或丢弃）</h2><div id=quar></div>
 <h2>④ 待退休 · <span id=c4>0</span> 条（过期时效内容:行情/日报/快照 >30天，一键归档，可逆）</h2><div id=retire></div>
 <h2>⑤ 待归类 · <span id=c5>0</span> 条（kind 未定，去整理台集中归类）</h2><div id=uncls></div>
+<h2>⑥ 使用反馈 · <span id=c6>0</span> 条（会话现场对知识的评价，你拍板采纳或忽略）</h2><div id=usefb></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
-document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;document.getElementById('c5').textContent=D.uncls;
+document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;document.getElementById('c5').textContent=D.uncls;document.getElementById('c6').textContent=D.usefb.length;
+document.getElementById('usefb').innerHTML=D.usefb.length?D.usefb.map(function(x,i){
+ return '<div class=item data-ui="'+i+'"><div class=sn><b>['+x.verdict+']</b> '+(x.note||'(无说明)')+'<div class=meta>'+x.name+(x.tool?' · '+x.tool:'')+' · '+x.created+'</div><div class=meta>知识摘录: '+x.snippet+'</div></div>'
+  +'<div class=ctrl><button class=ufv data-ui="'+i+'">✓采纳·标已验证</button><button class=ufr data-ui="'+i+'" style="color:#C0392B;border-color:#C0392B">采纳·退休</button><button class=ufd data-ui="'+i+'">忽略</button><button class=ufe data-ui="'+i+'">展开全文 ▾</button><a class=go href="/dashboard/curate?q='+encodeURIComponent(x.name)+'">去整理台 →</a></div><pre class="dtl hidden"></pre></div>';
+}).join(''):'<div class=empty>没有待处理的使用反馈 🎉</div>';
+document.getElementById('usefb').addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var i=+b.dataset.ui;var it=D.usefb[i];var item=b.closest('.item');
+ function resolve(action){b.disabled=true;fetch('/dashboard/usage_feedback_resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id,action:action})}).then(function(r){return r.json();}).then(function(d){if(d.ok){item.remove();}else{b.disabled=false;b.textContent='失败:'+(d.error||'');}}).catch(function(){b.disabled=false;b.textContent='失败';});}
+ if(b.classList.contains('ufv')){resolve('verified');}
+ else if(b.classList.contains('ufr')){if(confirm('归档退休该知识?(可逆)'))resolve('retire');}
+ else if(b.classList.contains('ufd')){resolve('dismiss');}
+ else if(b.classList.contains('ufe')){var p=item.querySelector('.dtl');if(p.classList.contains('hidden')){p.textContent=it.detail||'(无内容)';p.classList.remove('hidden');}else{p.classList.add('hidden');}}
+});
 document.getElementById('uncls').innerHTML=D.uncls?('<div class=item><div class=sn>有 <b>'+D.uncls+'</b> 条知识 kind 未定(AI 判不了或没判)。</div><div class=ctrl><a class=go href="/dashboard/curate?filter=unclassified">去整理台集中归类 →</a></div></div>'):'<div class=empty>没有待归类 🎉</div>';
 document.getElementById('retire').innerHTML=D.retire.length?('<div style="margin:.3rem 0"><button id=retireall style="border-color:#C0392B;color:#C0392B">全部归档 ('+D.retire.length+')</button></div>'+D.retire.map(function(x,i){
  return '<div class=item data-ri="'+i+'"><div class=sn>'+x.snippet+'<div class=meta>'+x.project+' · '+x.created+'</div></div><div class=ctrl><button class=arc data-ri="'+i+'">归档退休</button></div></div>';
@@ -2658,6 +2820,15 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "MATCH (n:Episodic) WHERE NOT (n.name STARTS WITH 'kg-hub-canonical') "
             "AND (n.kind IS NULL OR n.kind='unclassified') AND NOT coalesce(n.archived,false) "
             "RETURN count(n) AS c")
+        # ⑥ 使用反馈:kg-use skill 在会话现场对刚用过知识的评价,等人拍板
+        ufrows = await one(
+            "MATCH (f:UsageFeedback) WHERE f.status = 'pending' "
+            "OPTIONAL MATCH (n:Episodic {name: f.episode_name}) "
+            "RETURN f.id AS id, f.episode_name AS name, f.verdict AS verdict, "
+            "coalesce(f.note,'') AS note, coalesce(f.tool,'') AS tool, "
+            "coalesce(f.updated_at, f.created_at) AS created, "
+            "substring(coalesce(n.content,''),0,4000) AS detail "
+            "ORDER BY created DESC LIMIT 30")
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2701,8 +2872,20 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                        "created": (r.get("created") or "")[:10],
                        "project": esc(r.get("proj") or "—")})
     uncls = int(unclsrows[0].get("c") or 0) if unclsrows else 0
+    _VLABEL = {"stale": "过时", "conflict": "冲突", "supplement": "可补充", "inaccurate": "不准确"}
+    usefb = []
+    for r in ufrows:
+        full = r.get("detail") or ""
+        one_line = full.strip().replace("\n", " ")
+        usefb.append({"id": r.get("id") or "", "name": esc(r.get("name") or ""),
+                      "verdict": _VLABEL.get(r.get("verdict"), esc(r.get("verdict") or "")),
+                      "note": esc((r.get("note") or "")[:300]),
+                      "tool": esc(r.get("tool") or ""),
+                      "created": (r.get("created") or "")[:16],
+                      "snippet": esc(one_line[:300]) + ("…" if len(one_line) > 300 else ""),
+                      "detail": full})
     data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar,
-                            "retire": retire, "uncls": uncls},
+                            "retire": retire, "uncls": uncls, "usefb": usefb},
                            ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
@@ -2754,6 +2937,8 @@ app = Starlette(
         Route("/dashboard/inbox", dashboard_inbox, methods=["GET"]),
         Route("/dashboard/suggest_tags", dashboard_suggest_tags, methods=["POST"]),
         Route("/dashboard/translate", dashboard_translate, methods=["POST"]),
+        Route("/dashboard/usage_feedback_resolve", usage_feedback_resolve, methods=["POST"]),
+        Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),

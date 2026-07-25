@@ -65,7 +65,8 @@ def recalled_gold(g, returned_facts: list[str], gold: set[str]) -> set[str]:
 
 
 def search(base: str, tok: str, endpoint: str, q: str, k: int) -> list[str]:
-    url = f"{base}{endpoint}?" + urllib.parse.urlencode({"q": q, "num_results": k})
+    # bump=0:评估跑分不计入 usage 统计(检索即 bump 是给真实取用的)
+    url = f"{base}{endpoint}?" + urllib.parse.urlencode({"q": q, "num_results": k, "bump": 0})
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"} if tok else {})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
