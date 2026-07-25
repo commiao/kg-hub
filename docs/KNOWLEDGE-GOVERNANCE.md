@@ -67,8 +67,17 @@ kg-push-capsules.py(cron 30min,确定性脚本)        ├─ claude-mem obs(cod
   → 反馈待办⑥「使用反馈」→ 人一键:采纳标已验证 / 采纳退休(可逆) / 忽略
 ```
 
-护栏:模型评价**永不直接改知识**(只进 pending 队列);bump 只计数**不进排序权重**
-(防刷分);eval 工具传 `bump=0` 不污染统计;同知识同 verdict 去重刷新不堆积。
+护栏:bump 只计数**不进排序权重**(防刷分);eval 工具传 `bump=0` 不污染统计;
+同知识同 verdict 去重刷新并累计 report_count。
+
+**处理策略 = veto-after(2026-07-25 定,取代"人拍板每条")**。依据:事前批准队列
+在本系统实证烂尾(①待分层积压 1305 条,人工处理过 2 条)。分界线是**可逆性×证据**:
+- **自动执行**(全部满足):stale/inaccurate + 非 canonical + 未人工 verified +
+  (replacement 已入图 或 ≥2 次独立上报)→ auto_retire(archived=true,可逆);
+  supplement + 补充已写回 → auto_noted。
+- **留人**:conflict 一律(推翻性判断);verified=true 的知识一律;canonical 一律。
+- **监督**:每日 09:35 飞书日报(launchd com.kg-hub.feedback-digest)列自动处理
+  清单;待办⑥底部「最近自动处理(7天)」一键撤销(退休类会恢复 episode)。
 
 ## 4. 明确不做的事(边界)
 
