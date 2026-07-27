@@ -23,7 +23,10 @@ from __future__ import annotations
 import json
 import re
 
-PREDIGEST_MIN_CHARS = 1500     # 低于此长度的文档粒度可接受,不预拆
+# 阈值按 UTF-8 **字节**——与 vps_push 的 MIN_SIZE=1500 字节口径对齐。中文 1500
+# 字节≈500 字符,按字符卡 1500 会漏掉大量中文胶囊(《断崖衰减》873 字符≈2.5KB,
+# 部署实测被字符口径误放行)。凡是过了推送门的胶囊,预拆都该接得住。
+PREDIGEST_MIN_BYTES = 1500
 MAX_OBS = 8                    # 单文档最多拆出的 observation 数(LLM 预算上限)
 PREDIGEST_PREFIXES = ("openclaw-capsule-", "openclaw-kb-")
 
@@ -63,7 +66,7 @@ def predigest_route(name: str, body: str) -> str | None:
         return None
     if is_catalog(name, body):
         return "catalog"
-    if len(body or "") >= PREDIGEST_MIN_CHARS:
+    if len((body or "").encode("utf-8", "ignore")) >= PREDIGEST_MIN_BYTES:
         return "split"
     return None
 
