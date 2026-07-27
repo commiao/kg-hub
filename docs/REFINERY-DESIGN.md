@@ -72,6 +72,13 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 - **OpenClaw 适配器**(VPS 侧一个小 tailer,标准库,形状照抄 `vps_push_capsules.py` 的水印/重试纪律):tail `~/.openclaw/agents/main/sessions/*.jsonl`(处理 `.reset.` 改名+行 offset 续读),会话结束(读到新 session 首行/文件轮转/30min 静默)即把该会话 transcript 推给 `/refinery/sessions/*`;`user/assistant/toolResult` 三种 role 直接映射契约
 - **kb-001 收窄**(决策⑤):prompt 改为只从"新增文档和任务产出"提炼,删去"对话记录"源;会话知识由 refinery 会话级提炼接管。过渡期靠 `/api/ingest` 幂等 + 图侧去重兜底
 
+### 3'. 长文档预拆 = fact 层的 owner(Phase B',2026-07-28 采纳评审①)
+> 评审实测:数千字中文胶囊整篇进 graphiti,洞察抽成 **0 条 fact**(只剩"X documents that Y received 65 reads"类文献元数据);注册表类文档反而量产 trivial fact 扫席召回。**fact 质量由输入粒度决定**——claude-mem obs(原子、带显式 facts)抽得好,长文档抽得烂。
+
+- **解法 = 把 Level-0 提炼器扩用到长文档线**(不新建第二套 prompt,graphiti 抽取本身不动):`openclaw-capsule-*` / `openclaw-kb-*` 超过阈值(如 1500 字)的,先经 refinery 预拆成 N 条原子 observation(六字段、带显式 facts)再逐条 `/api/ingest`,输入粒度对齐 claude-mem。
+- **原文档仍整篇入图一份**(episode_search 全文检索是中文洞察的承重路径,评审已修 CJK 回退,勿废);派生 observation 以 `sd` 溯源到源文件,幂等键 = `sha256(源文件)+片段序号`。provenance/来源行按文件级判定后继承给每个片段。
+- **目录/注册表类不进语义索引**(评审③):push/refinery 侧按特征(标题含 registry/索引/清单/审计,或枚举表格无结论段)判为 catalog → 标 `kind=registry`,graphiti 抽取跳过(仅全文可搜);检索侧同源限席由治理会话在 search 排序里做(本方案表态支持)。
+
 ### 4. 治理引擎(归纳/提炼/总结/胶囊——只做调度和一个新 pass,原语全复用)
 | 能力 | 实现 | 复用 |
 |---|---|---|
@@ -95,12 +102,14 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 
 ## 分阶段落地(每阶段独立可回滚)
 - **Phase A — 复活 claude-mem 线**(最大即时价值,零新客户端):refinery 容器 + Level-1 消费者 + 水印迁移 + 积压夜间回填 + 门户卡。回滚 = 停容器,线退回休眠现状
+  - **前置度量(评审②,防"episodes+800 但召回变差")**:上线前跑 `eval_recall` + 固定中文洞察查询做基线;看板加 fact 层两指标(每 episode fact 数分布、文献元数据型 fact 占比,基线 611 条/4.4%);回填后对照。诊断 verdict(irrelevant/missed)作回归探针
+- **Phase B' — 长文档预拆(与 Phase A 并列优先,见 §3')**:fact 层根因修复,增量小(复用 B 的提炼器,先于 B 落地亦可)。回滚 = 关预拆开关,长文档退回整篇入图
 - **Phase B — Level-0 + OpenClaw 会话适配**:契约端点 + VPS tailer + kb-001 收窄。回滚 = 停 tailer、kb-001 prompt 还原
 - **Phase C — 夜间治理**:胶囊合成 pass + kind sweep + 合并候选待办⑦ + 409 巡检。回滚 = 关调度器开关(bind-mount config,免 rebuild)
 - **Phase D(可选)**:db 同步 15min→5min、Mac 侧 SSE 直推、新工具接入文档(ONBOARDING 加"路径 C: refinery")
 
 ## 明确不做
-- 不做逐消息流式(决策②);不动 Mac 侧 claude-mem worker 提炼;不直连 FalkorDB 写;不新建第二套质量闸/分类器/prompt;检索/注入/看板仍归 kg_hub_server;evergreen 自动退休仍不做(弱信号)
+- 不做逐消息流式(决策②);不动 Mac 侧 claude-mem worker 提炼;不直连 FalkorDB 写;不新建第二套质量闸/分类器/graphiti 抽取 prompt(**长文档预拆复用 Level-0 提炼器,是粒度归一,不算第二套**——2026-07-28 措辞澄清,原表述曾让 fact 层无人认领);检索/注入/看板仍归 kg_hub_server;evergreen 自动退休仍不做(弱信号)
 
 ## 风险与协调
 1. **另一 kg-hub 会话地盘重叠最高**(ingest/治理②/compose 都是他们刚收拢的):实施前必须 git log+漂移检查+读最新 northstar,理想是把本方案文档 commit 进 `docs/REFINERY-DESIGN.md` 让两会话共识后再动工
@@ -185,3 +194,16 @@ P3 由本方案会话专职实施;使用侧会话负责 kg-use / 反馈环 / 检
 - Phase A:积压烧完后 `quality_audit` 对比(episodes 应 +~800);`/api/queue_stats` 无 stuck;门户卡吞吐曲线;kg-use 搜一条 6 月的 muxcp 知识应命中
 - Phase B:OpenClaw 里跑一个真实会话→结束后 ≤5min 图里可搜到该会话 observation;kb-001 次日胶囊不再含会话源
 - Phase C:连续 3 晚日报有治理段落;胶囊合成产物在整理台可见且 sources 可溯;合并候选出现在待办⑦且可撤销
+
+---
+
+# 评审回应(设计方会话,2026-07-28)
+
+三点全部采纳,已整合进主体(§3' 长文档预拆 / Phase A 前置度量 / catalog 门):
+
+1. **① fact 层 owner**:承认是方案盲区——"不新建第二套 prompt"的措辞误伤了粒度归一这件本该做的事,已澄清。解法照评审建议:Level-0 提炼器扩用到长文档线,列为 **Phase B'** 与 Phase A 并列优先。设计方独立验证了指控:全图文献元数据型 fact 611 条(4.4%),《断崖衰减》洞察型 fact 实测 **0 条**,成立。
+2. **② Phase A 放大风险**:采纳,前置度量与回归探针已写入 Phase A 验证项。
+3. **③ catalog 门**:摄入侧采纳(kind=registry 跳过抽取);检索侧同源限席**表态支持**,由治理会话在 search 排序地盘实施。
+4. **承重依赖确认**:episode_search 中文回退(221f050)与 diagnostic verdict 在本方案中列为依赖,不会被优化掉;长文档预拆后原文档仍整篇入图,保证全文可达。
+
+分工照评审:P3(fact 层)归本方案(Phase B');kg-use/反馈环/探针归使用侧会话。实施仍待用户发起。
