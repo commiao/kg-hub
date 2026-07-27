@@ -115,7 +115,7 @@ def fetch_rows(min_id_exclusive: int | None = None, max_id_inclusive: int | None
                limit: int = 500) -> list[dict]:
     if not DB_PATH.exists():
         raise FileNotFoundError(f"claude-mem db not found at {DB_PATH}")
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     where, params = [], []
     if min_id_exclusive is not None:
@@ -137,7 +137,7 @@ def fetch_rows(min_id_exclusive: int | None = None, max_id_inclusive: int | None
 
 
 def max_db_id() -> int:
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     v = conn.execute("SELECT coalesce(max(id), 0) FROM observations").fetchone()[0]
     conn.close()
     return int(v)
@@ -146,7 +146,7 @@ def max_db_id() -> int:
 def fetch_ids(min_id_exclusive: int | None = None,
               max_id_inclusive: int | None = None) -> list[int]:
     """只取 id 列(积压/游标计算用,避免每 90s 全列拉 1.3 万行大字段)。"""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     where, params = [], []
     if min_id_exclusive is not None:
         where.append("id > ?"); params.append(min_id_exclusive)
@@ -162,7 +162,7 @@ def fetch_ids(min_id_exclusive: int | None = None,
 def fetch_rows_by_ids(ids: list[int]) -> list[dict]:
     if not ids:
         return []
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     ph = ",".join("?" * len(ids))
     sql = (
