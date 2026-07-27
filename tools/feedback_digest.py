@@ -30,7 +30,8 @@ except Exception:
 FEISHU_SEND = Path.home() / ".claude" / "skills" / "feishu-notify" / "scripts" / "send.py"
 INBOX_URL = "http://100.123.208.32:17171/dashboard/inbox"
 
-_VLABEL = {"stale": "过时", "conflict": "冲突", "supplement": "可补充", "inaccurate": "不准确"}
+_VLABEL = {"stale": "过时", "conflict": "冲突", "supplement": "可补充", "inaccurate": "不准确",
+           "irrelevant": "召回离题", "missed": "该召回却没召回"}
 _ALABEL = {"auto_retire": "自动退休", "auto_noted": "已记录", "verified": "人工·标已验证",
            "retire": "人工·退休", "dismiss": "人工·忽略"}
 
@@ -60,8 +61,14 @@ def main() -> int:
         "MATCH (f:UsageFeedback) WHERE f.status = 'pending' "
         "RETURN f.episode_name, f.verdict, coalesce(f.updated_at, f.created_at) "
         "ORDER BY 3 ASC LIMIT 10").result_set
+    # 检索质量诊断(不需拍板,只报数——搜得准不准的体温计)
+    diag = g.query(
+        "MATCH (f:UsageFeedback) WHERE f.status = 'diagnostic' "
+        "AND coalesce(f.updated_at, f.created_at) >= $cut "
+        "RETURN coalesce(f.query,''), f.verdict, coalesce(f.report_count,1) "
+        "ORDER BY 3 DESC LIMIT 5", params={"cut": cut}).result_set
 
-    if not handled and not pending and not args.always:
+    if not handled and not pending and not diag and not args.always:
         print("[digest] no activity in 24h, nothing pending — skip")
         return 0
 
@@ -79,7 +86,11 @@ def main() -> int:
         L.append(f"⏳ 待你拍板 {len(pending)} 条(conflict/已验证知识类,机器不代劳):")
         for name, verdict, _ in pending[:5]:
             L.append(f"  · {name} [{_VLABEL.get(verdict, verdict)}]")
-    if not handled and not pending:
+    if diag:
+        L.append(f"🔍 检索质量:{len(diag)} 条离题/漏召回上报(只是度量,不用你处理):")
+        for q, verdict, rc in diag[:3]:
+            L.append(f"  · 「{q}」{_VLABEL.get(verdict, verdict)}" + (f" ×{rc}" if rc > 1 else ""))
+    if not handled and not pending and not diag:
         L.append("(无活动,心跳确认)")
     L.append(INBOX_URL)
     msg = "\n".join(L)

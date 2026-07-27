@@ -1374,6 +1374,7 @@ async def episode_search(request: Request) -> JSONResponse:
     driver = get_status_driver()
     # disabled 时 pool=lim（查询与今日字节一致，避免平局下返回不同子集）；enabled 时放大供重排
     pool = min(lim * 3, 45) if _DELIVERY.get("enabled") else lim
+    rows = []
     try:
         rows, _, _ = await driver.execute_query(
             "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
@@ -1384,6 +1385,12 @@ async def episode_search(request: Request) -> JSONResponse:
             q=q,
         )
     except Exception:
+        rows = []
+    # 中文必须走这条:FalkorDB fulltext 无 CJK 分词,中文查询**成功但返回 0 行**
+    # (不抛异常),所以只在 except 里回退等于中文正文永远搜不到——中文分析型
+    # 知识因此在图里不可达(2026-07-26 实测 q=公众号 → 0 条,正文明确含该词)。
+    # 与 dashboard_knowledge 的处理保持一致(那里早有 `if not rows` 回退)。
+    if not rows:
         rows, _, _ = await driver.execute_query(
             "MATCH (n:Episodic) WHERE (n.name CONTAINS $q OR n.content CONTAINS $q) "
             "AND NOT coalesce(n.archived, false) "
@@ -2612,7 +2619,13 @@ async def dashboard_suggest_tags(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "suggest": suggest})
 
 
-_UF_VERDICTS = {"stale", "conflict", "supplement", "inaccurate"}
+_UF_VERDICTS = {"stale", "conflict", "supplement", "inaccurate",
+                # 检索质量类(2026-07-26):主语是**这次查询**而不是知识本身。
+                # irrelevant=该条被召回但离题;missed=该条本该被召回却没进结果。
+                # 知识本身没毛病,所以**不进拍板队列**(否则又是一个没人排的队),
+                # 存成 status='diagnostic' 只做度量:面板只读展示 + 进每日日报。
+                "irrelevant", "missed"}
+_UF_RETRIEVAL = {"irrelevant", "missed"}
 
 
 async def knowledge_feedback(request: Request) -> JSONResponse:
@@ -2640,6 +2653,7 @@ async def knowledge_feedback(request: Request) -> JSONResponse:
     note = str(body.get("note") or "").strip()[:600]
     tool = str(body.get("tool") or "").strip()[:40]
     replacement = str(body.get("replacement_name") or "").strip()
+    query = str(body.get("query") or "").strip()[:200]   # 检索质量类必带:哪次查询
     if not name or verdict not in _UF_VERDICTS:
         return JSONResponse(
             {"ok": False,
@@ -2654,13 +2668,31 @@ async def knowledge_feedback(request: Request) -> JSONResponse:
             return JSONResponse({"ok": False, "error": "unknown episode_name"}, status_code=404)
         ep_verified = bool(rows[0].get("ver"))
         canonical = name.startswith("kg-hub-canonical")
+        now = datetime.now(tz=timezone.utc).isoformat()
+        # —— 检索质量类:纯度量,不动知识、不排队 ——
+        if verdict in _UF_RETRIEVAL:
+            if not query:
+                return JSONResponse(
+                    {"ok": False, "error": "irrelevant/missed 必须带 query(说明是哪次检索)"},
+                    status_code=400)
+            fid = uuidlib.uuid4().hex[:12]
+            rows, _, _ = await driver.execute_query(
+                "MERGE (f:UsageFeedback {episode_name: $name, verdict: $verdict, "
+                "                        query: $q, status: 'diagnostic'}) "
+                "ON CREATE SET f.id = $fid, f.created_at = $now, f.report_count = 1 "
+                "ON MATCH SET f.report_count = coalesce(f.report_count, 1) + 1 "
+                "SET f.note = $note, f.tool = $tool, f.updated_at = $now "
+                "RETURN f.id AS id",
+                name=name, verdict=verdict, q=query, fid=fid, now=now, note=note, tool=tool)
+            return JSONResponse({"ok": True, "id": (rows[0].get("id") if rows else fid),
+                                 "status": "diagnostic",
+                                 "note": "已记录为检索质量度量(不改知识、不需你拍板)"})
         repl_ok = False
         if replacement:
             rrows, _, _ = await driver.execute_query(
                 "MATCH (r:Episodic {name: $r}) WHERE NOT coalesce(r.archived,false) "
                 "RETURN count(r) AS c", r=replacement)
             repl_ok = bool(rrows and int(rrows[0].get("c") or 0))
-        now = datetime.now(tz=timezone.utc).isoformat()
         fid = uuidlib.uuid4().hex[:12]
         rows, _, _ = await driver.execute_query(
             "MERGE (f:UsageFeedback {episode_name: $name, verdict: $verdict, status: 'pending'}) "
@@ -2815,6 +2847,7 @@ details.how{font-size:12px;margin:.2rem 0 .5rem}details.how summary{cursor:point
 <tr><td>➕ 可补充</td><td>补充内容已写回图</td><td>🤖 自动关闭</td></tr>
 <tr><td>❌ 冲突</td><td class=dim>一律不自动——推翻性判断留给人</td><td>👤 等你拍板</td></tr>
 <tr><td>任何评价</td><td class=dim>目标是注入胶囊(canonical),或你标过 ✓已验证</td><td>👤 等你拍板</td></tr>
+<tr><td>🔍 召回离题 / 该召回却没召回</td><td class=dim>说的是"搜得准不准",知识本身没问题</td><td>📊 只记度量(本区底部+日报),<b>不排队</b></td></tr>
 </table>
 <b>你的监督(两个入口,都是事后)</b>:<br>
 ① 每天 09:35 飞书「使用反馈日报」列出 24h 自动处理清单;<br>
@@ -2823,6 +2856,7 @@ details.how{font-size:12px;margin:.2rem 0 .5rem}details.how summary{cursor:point
 </div></details>
 <div id=usefb></div>
 <div id=autofb style="margin-top:6px"></div>
+<div id=diagfb style="margin-top:10px"></div>
 <script>var D=__DATA__;var VIS=[["internal-note","内部"],["professional-guide","方法"],["public-story","可公开"]];
 function tag(name,patch,cb){fetch('/dashboard/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({name:name},patch))}).then(function(r){return r.json();}).then(cb).catch(function(){cb({ok:false});});}
 document.getElementById('c1').textContent=D.classify.length;document.getElementById('c2').textContent=D.needfb.length;document.getElementById('c3').textContent=D.quar.length;document.getElementById('c4').textContent=D.retire.length;document.getElementById('c5').textContent=D.uncls;document.getElementById('c6').textContent=D.usefb.length;
@@ -2839,6 +2873,9 @@ document.getElementById('usefb').addEventListener('click',function(e){var b=e.ta
 });
 document.getElementById('autofb').innerHTML=D.autofb.length?('<div style="font-size:12px;color:GrayText;margin:.4rem 0 .2rem">最近自动处理(7天) · 事后可否决:</div>'+D.autofb.map(function(x,i){
  return '<div class=item data-ai="'+i+'" style="opacity:.75"><div class=sn style="font-size:12px"><b>['+x.verdict+'→'+x.act+']</b> '+x.name+(x.retired?'':'')+'<div class=meta>'+(x.note||'')+' · '+x.at+'</div></div><div class=ctrl><button class=ufu data-ai="'+i+'">↩ 撤销'+(x.retired?'(恢复该知识)':'')+'</button></div></div>';
+}).join('')):'';
+document.getElementById('diagfb').innerHTML=D.diagfb.length?('<div style="font-size:12px;color:GrayText;margin:.4rem 0 .2rem">🔍 检索质量诊断(7天,只读度量 · 不需你拍板;反映"搜得准不准",非知识本身问题):</div>'+D.diagfb.map(function(x){
+ return '<div class=item style="opacity:.7"><div class=sn style="font-size:12px"><b>['+x.verdict+']</b> 查询「'+x.q+'」'+(x.rc>1?(' ×'+x.rc):'')+'<div class=meta>'+x.name+' · '+(x.note||'')+' · '+x.at+'</div></div></div>';
 }).join('')):'';
 document.getElementById('autofb').addEventListener('click',function(e){var b=e.target.closest('button.ufu');if(!b)return;var it=D.autofb[+b.dataset.ai];b.disabled=true;b.textContent='撤销中…';
  fetch('/dashboard/usage_feedback_undo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:it.id})}).then(function(r){return r.json();}).then(function(d){if(d.ok){b.textContent='已撤销,退回待拍板(刷新可见)';}else{b.disabled=false;b.textContent='失败:'+(d.error||'');}}).catch(function(){b.disabled=false;b.textContent='失败';});
@@ -2941,6 +2978,15 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
             "RETURN f.id AS id, f.episode_name AS name, f.verdict AS verdict, "
             "f.handled_action AS act, coalesce(f.note,'') AS note, "
             "f.handled_at AS at ORDER BY at DESC LIMIT 12", cut=auto_cut)
+        # 检索质量诊断(只读度量,不需拍板):近 7 天离题/漏召回上报
+        diagrows = await one(
+            "MATCH (f:UsageFeedback) WHERE f.status = 'diagnostic' "
+            "AND coalesce(f.updated_at, f.created_at) >= $cut "
+            "RETURN coalesce(f.query,'') AS q, f.verdict AS verdict, "
+            "f.episode_name AS name, coalesce(f.note,'') AS note, "
+            "coalesce(f.report_count,1) AS rc, "
+            "coalesce(f.updated_at, f.created_at) AS at ORDER BY at DESC LIMIT 15",
+            cut=auto_cut)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>待办取数失败: {exc}</p>", status_code=503)
 
@@ -2984,7 +3030,8 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                        "created": (r.get("created") or "")[:10],
                        "project": esc(r.get("proj") or "—")})
     uncls = int(unclsrows[0].get("c") or 0) if unclsrows else 0
-    _VLABEL = {"stale": "过时", "conflict": "冲突", "supplement": "可补充", "inaccurate": "不准确"}
+    _VLABEL = {"stale": "过时", "conflict": "冲突", "supplement": "可补充", "inaccurate": "不准确",
+               "irrelevant": "召回离题", "missed": "该召回却没召回"}
     usefb = []
     for r in ufrows:
         full = r.get("detail") or ""
@@ -3005,9 +3052,16 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
                        "retired": (r.get("act") == "auto_retire"),
                        "note": esc((r.get("note") or "")[:160]),
                        "at": (r.get("at") or "")[:16]})
+    diagfb = []
+    for r in diagrows:
+        diagfb.append({"q": esc(r.get("q") or ""),
+                       "verdict": _VLABEL.get(r.get("verdict"), esc(r.get("verdict") or "")),
+                       "name": esc(r.get("name") or ""),
+                       "note": esc((r.get("note") or "")[:160]),
+                       "rc": int(r.get("rc") or 1), "at": (r.get("at") or "")[:16]})
     data_json = json.dumps({"classify": classify, "needfb": needfb, "quar": quar,
                             "retire": retire, "uncls": uncls, "usefb": usefb,
-                            "autofb": autofb},
+                            "autofb": autofb, "diagfb": diagfb},
                            ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
