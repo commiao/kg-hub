@@ -64,9 +64,14 @@ services:
       # Keep the NAS gentle: fully-serial LLM calls + rate cap (same as Mac).
       - SEMAPHORE_LIMIT=1
       - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
+      # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
+      - KG_HUB_PREDIGEST=${KG_HUB_PREDIGEST:-0}
+      # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
+      - KG_HUB_REFINERY_STATUS=/refinery-state/status.json
     volumes:
       - /volume1/docker/kg-hub-data/models:/models
       - /volume1/docker/kg-hub-data/ingest-backup:/backup
+      - /volume1/docker/kg-hub-data/refinery-state:/refinery-state:ro
     ports:
       # Host port 17171 (off the common 8080) -> container 8080. Bind to loopback
       # only: closes LAN exposure. Tailscale userspace networking auto-forwards
@@ -138,5 +143,31 @@ services:
     # canonical docs only. openclaw capsules 已改走 VPS 直推 /api/ingest
     # (2026-07-23,见 docs/KNOWLEDGE-GOVERNANCE.md)——此前这里和 Mac launchd
     # 各跑一条摄入线,双写重复入图;两条旧线同日退役,勿恢复。
-    # claude-mem rebuild is done, so its step (and the claude-mem.db mount) was removed.
+    # claude-mem 线由 refinery 服务经 /api/ingest 复活(2026-07-28),此处不加回。
     command: ["sh", "-c", "sleep 30; while true; do echo '[ingest] pass start'; python -m tools.ingest_canonical_docs || true; echo '[ingest] pass done, idle 600s'; sleep 600; done"]
+
+  # kg-refinery Phase A(REFINERY-DESIGN):Level-1 claude-mem 消费者。
+  # 复活休眠线:读已在同步的 db 副本 → ingest_filter 质量闸 → POST /api/ingest
+  # (全治理:幂等/备份/kind链/预拆),poll-drain 串行尊重单写者。
+  # 积压(boundary_id 前)只在 23:00-07:00 夜间窗口烧,白天只处理新增。
+  refinery:
+    build:
+      context: .
+      dockerfile: deploy/nas/Dockerfile
+    image: kg-hub-server:latest
+    container_name: kg-hub-refinery
+    restart: unless-stopped
+    depends_on:
+      - kg_hub_server
+    environment:
+      - KG_HUB_URL=http://kg_hub_server:8080
+      - KG_HUB_API_TOKEN=${KG_HUB_API_TOKEN}
+      - KG_HUB_REFINERY_DB=/data/claude-mem/claude-mem.db
+      - KG_HUB_REFINERY_STATE=/state
+      - KG_HUB_REFINERY_INTERVAL_SEC=90
+      - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=15
+      - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
+    volumes:
+      - /volume1/docker/kg-hub-data/claude-mem:/data/claude-mem:ro
+      - /volume1/docker/kg-hub-data/refinery-state:/state
+    command: ["sh", "-c", "sleep 40; python -m kg_refinery"]

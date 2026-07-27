@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import re
 
-KINDS = ("方法论", "手册", "决策", "事故", "项目事实", "生命周期事件", "素材", "公开故事", "unclassified")
+# registry:目录/注册表/清单类(2026-07-28 预拆 catalog 门引入)——仅存全文可搜,
+# 不进 graphiti 语义抽取。加入白名单使人工打标/看板分桶合法。
+KINDS = ("方法论", "手册", "决策", "事故", "项目事实", "生命周期事件", "素材", "公开故事", "registry", "unclassified")
 DURABILITY = ("evergreen", "time-bound")
 
 _PROJECT_RE = re.compile(r"project=(\S+)")

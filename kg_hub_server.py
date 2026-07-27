@@ -62,6 +62,9 @@ from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
+from utils.predigest import (  # noqa: E402
+    predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
+)
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -184,18 +187,28 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         "       collect({sd:sd, sid:sid, uuid:uuid}) AS removed",
         threshold=threshold,
     )
-    if rows:
-        cleaned = rows[0].get("cleaned", 0)
-        if cleaned:
-            removed = rows[0].get("removed", [])
-            logger.warning(
-                "[ingest:cleanup] removed %d stuck pending keys (older than %d min): %s",
-                cleaned,
-                STUCK_THRESHOLD_MIN,
-                removed,
-            )
-        return int(cleaned)
-    return 0
+    cleaned = int(rows[0].get("cleaned", 0)) if rows else 0
+    if cleaned:
+        logger.warning(
+            "[ingest:cleanup] removed %d stuck pending keys (older than %d min): %s",
+            cleaned, STUCK_THRESHOLD_MIN, rows[0].get("removed", []),
+        )
+    # error 键 24h 后自动清理(REFINERY-DESIGN Phase C 项,2026-07-28 提前):
+    # 此前 error 键永驻 → 重推方永远撞 409 → 瞬时抽取失败(LLM限频/图抖动)被
+    # 永久化。清掉后下一次重推可正常重试;24h 窗口内 409 仍挡住无脑快速重试。
+    err_threshold = (datetime.now(tz=timezone.utc) - timedelta(hours=24)).isoformat()
+    erows, _, _ = await graphiti.driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status = 'error' AND k.created_at < $t "
+        "WITH k, k.source_description AS sd, k.source_obs_id AS sid DELETE k "
+        "RETURN count(*) AS c, collect({sd:sd, sid:sid}) AS removed",
+        t=err_threshold,
+    )
+    ecleaned = int(erows[0].get("c", 0)) if erows else 0
+    if ecleaned:
+        logger.warning("[ingest:cleanup] removed %d error keys (>24h, 允许重试): %s",
+                       ecleaned, erows[0].get("removed", []))
+    return cleaned + ecleaned
 
 
 async def merge_or_get_ingested_key(
@@ -346,6 +359,171 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
 INGEST_LOCK_TIMEOUT_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_TIMEOUT_SEC", "180.0"))
 INGEST_LOCK_RETRIES = int(os.environ.get("KG_HUB_INGEST_LOCK_RETRIES", "5"))
 INGEST_LOCK_BACKOFF_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_BACKOFF_SEC", "5.0"))
+# Phase B' 长文档预拆开关(REFINERY-DESIGN §3')。默认关,灰度经 compose env 打开。
+PREDIGEST_ENABLED = os.environ.get("KG_HUB_PREDIGEST", "0").lower() in ("1", "true", "yes")
+
+
+async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
+                             kind: str | None = None, prov: str | None = None,
+                             predigested: bool = False) -> str:
+    """仅存 Episodic 节点,**不走 graphiti 抽取**(不产 fact/实体)。
+    正文进 fulltext 索引 → episode_search 全文可搜(中文洞察承重路径)。
+    用于:catalog 类文档、预拆后的父文档(fact 由子 observation 供给)。"""
+    u = str(uuidlib.uuid4())
+    now = datetime.now(tz=timezone.utc).isoformat()
+    # entity_edges: [] 不可省——bare 节点带 source='text'+valid_at 会进 graphiti
+    # retrieve_episodes 的"最近10条"抽取上下文,缺该字段 EpisodicNode 校验直接抛
+    # ValidationError,毒化**所有后续** add_episode(2026-07-28 审查 F1,venv 实测)。
+    cy = ("CREATE (e:Episodic {uuid: $u, name: $n, content: $c, "
+          "source_description: $sd, source: 'text', group_id: $g, "
+          "created_at: $now, valid_at: $vt, entity_edges: []")
+    if kind:
+        cy += ", kind: $k, kind_confidence: 1.0"
+    if prov:
+        cy += ", provenance: $prov"
+        if prov.startswith("external"):
+            cy += ", verified: false"
+    if predigested:
+        cy += ", predigested: true"
+    cy += "})"
+    await graphiti.driver.execute_query(
+        cy, u=u, n=body.name, c=body.episode_body, sd=body.source_description,
+        g=GROUP_ID, now=now, vt=ref_time.isoformat(), k=kind, prov=prov)
+    return u
+
+
+async def _locked_add_episode(graphiti, name: str, episode_body: str,
+                              sd: str, ref_time: datetime):
+    """单条 episode 的 加锁→抽取,锁竞争重试策略与整篇路径一致。耗尽则 raise。"""
+    attempt = 0
+    while True:
+        try:
+            async with async_writer_lock(
+                owner=f"api_ingest_predigest({name})",
+                timeout_seconds=INGEST_LOCK_TIMEOUT_SEC,
+            ):
+                return await graphiti.add_episode(
+                    name=name, episode_body=episode_body, source=EpisodeType.text,
+                    source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
+                    entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                    edge_type_map=EDGE_TYPE_MAP)
+        except WriterLockBusy:
+            attempt += 1
+            if attempt > INGEST_LOCK_RETRIES:
+                raise
+            await asyncio.sleep(INGEST_LOCK_BACKOFF_SEC * attempt)
+
+
+async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
+                             route: str, started: datetime) -> bool:
+    """Phase B' 预拆路径(REFINERY-DESIGN §3')。返回 True=已完整处理(含状态回写);
+    返回 False=调用方落回整篇路径(**任何失败都不丢数据**)。
+
+    catalog → 仅存节点(kind=registry,不抽取,全文可搜)。
+    split   → LLM 拆原子 observation(锁外,慢操作不占写锁)→ 父文档仅存节点 +
+              子 observation 逐条进 graphiti(好 fact 从这来,粒度对齐 claude-mem)。"""
+    sd, sid = body.source_description, body.source_obs_id
+    prov = body.provenance or classify_provenance(body.episode_body)
+    if route == "catalog":
+        try:
+            u = await _bare_episode_node(graphiti, body, ref_time,
+                                         kind="registry", prov=prov)
+        except Exception:  # noqa: BLE001 — 节点没建成,回退整篇是干净的
+            logger.exception("[ingest:catalog_failed] name=%s → 回退整篇", body.name)
+            return False
+        # 节点已建成后**绝不 return False**(回退会双写);状态回写失败单独兜底。
+        try:
+            await update_ingested_key_status(graphiti, sd, sid, "ok",
+                                             episode_uuid=u, nodes=1, edges=0)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ingest:catalog_status_failed] name=%s(节点已建,键留pending由清理器接管)", body.name)
+        logger.info("[ingest:catalog] name=%s → 仅存不抽取(kind=registry)", body.name)
+        return True
+
+    # split:LLM 拆分在写锁外做
+    try:
+        prompt = PREDIGEST_PROMPT.format(max_obs=MAX_OBS, body=body.episode_body[:16000])
+        raw = await _llm_complete(prompt, max_tokens=3200)
+        obs_list = parse_observations(raw)
+    except Exception:  # noqa: BLE001
+        logger.exception("[ingest:predigest_llm_failed] name=%s → 回退整篇", body.name)
+        return False
+    if not obs_list:
+        logger.warning("[ingest:predigest_empty] name=%s LLM 拆不出 → 回退整篇", body.name)
+        return False
+
+    try:
+        parent_uuid = await _bare_episode_node(graphiti, body, ref_time,
+                                               prov=prov, predigested=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("[ingest:predigest_parent_failed] name=%s → 回退整篇", body.name)
+        return False
+    try:
+        await _tag_schema_fields(graphiti, parent_uuid, body)
+    except Exception:  # noqa: BLE001
+        logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", parent_uuid)
+
+    total_nodes, total_edges, ok_children = 1, 0, 0
+    for i, obs in enumerate(obs_list, 1):
+        child_name = f"{body.name}--obs-{i:02d}"
+        try:
+            # 幂等:重放(stuck 清理后重推)时按名跳过已入图的子片段,防重复
+            drows, _, _ = await graphiti.driver.execute_query(
+                "MATCH (e:Episodic {name: $n}) RETURN count(e) AS c", n=child_name)
+            if drows and int(drows[0].get("c") or 0):
+                ok_children += 1
+                logger.info("[ingest:predigest_child_dup] %s 已在图,跳过", child_name)
+                continue
+        except Exception:  # noqa: BLE001 — 查重失败不阻塞,最坏重复一条
+            pass
+        try:
+            result = await _locked_add_episode(
+                graphiti, child_name, obs_to_episode_body(obs, body.name),
+                f"{sd} · predigest type={obs['type']}", ref_time)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
+            continue
+        ok_children += 1
+        # 键保活:预拆串行跑 N 个片段可超 30min stuck 阈值,刷 created_at 防清理器
+        # 在半路删键(删了→轮询方 not_found→重推→双份)。
+        try:
+            await graphiti.driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "SET k.created_at = $now",
+                sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
+        except Exception:  # noqa: BLE001
+            pass
+        total_nodes += len(result.nodes)
+        total_edges += len(result.edges)
+        try:
+            cu = str(result.episode.uuid)  # type: ignore[attr-defined]
+            cy = ("MATCH (e:Episodic {uuid: $u}) SET e.derived_from = $p, "
+                  "e.predigest = true, e.provenance = $prov")
+            if prov.startswith("external"):
+                cy += ", e.verified = coalesce(e.verified, false)"
+            await graphiti.driver.execute_query(cy, u=cu, p=body.name, prov=prov)
+        except Exception:  # noqa: BLE001
+            logger.exception("[ingest:predigest_child_tag_failed] %s (non-fatal)", child_name)
+
+    # 父节点+子片段已写入,此后**绝不 return False / 绝不外抛**(do_extract 的
+    # never-raise 契约;抛出→键卡pending→清理器删键→重推双份。2026-07-28 审查 F2)。
+    try:
+        await update_ingested_key_status(graphiti, sd, sid, "ok",
+                                         episode_uuid=parent_uuid,
+                                         nodes=total_nodes, edges=total_edges)
+        # 降级可观测:子片段成功率写上键,精炼层看板/排障可见(审查 F5)
+        await graphiti.driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "SET k.predigest_children = $pc",
+            sd=sd, sid=sid, pc=f"{ok_children}/{len(obs_list)}")
+    except Exception:  # noqa: BLE001
+        logger.exception("[ingest:predigest_status_failed] name=%s(内容已入图,键留pending)", body.name)
+    elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
+    logger.info("[ingest:predigest_done] name=%s children=%d/%d elapsed=%.1fs "
+                "nodes=%d edges=%d%s",
+                body.name, ok_children, len(obs_list), elapsed, total_nodes, total_edges,
+                "" if ok_children else " ⚠ 全部子片段失败,仅父文档可搜(降级)")
+    return True
 
 
 async def do_extract(
@@ -372,6 +550,25 @@ async def do_extract(
         "[ingest:start] source=%s sobsid=%s body_len=%d",
         sd, sid, len(body.episode_body),
     )
+    # —— Phase B' 分流(REFINERY-DESIGN §3',fact 层粒度治理):长文档预拆 /
+    # catalog 仅存。预拆路径内部任何失败都返回 False 落回下方整篇路径,不丢数据;
+    # 外层再兜一道 never-raise(与 do_extract 契约一致,审查 F2):意外异常时
+    # 把键置 error(可重试),**不**落整篇路径——预拆可能已写入部分内容,回退会双写。
+    if PREDIGEST_ENABLED:
+        route = predigest_route(body.name, body.episode_body)
+        if route:
+            try:
+                if await _predigest_extract(graphiti, body, ref_time, route, started):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[ingest:predigest_unexpected] sd=%s sid=%s", sd, sid)
+                try:
+                    await update_ingested_key_status(
+                        graphiti, sd, sid, "error",
+                        error_message=f"predigest: {type(exc).__name__}: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
     try:
         result = None
         attempt = 0
@@ -1564,6 +1761,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/tools", "icon": "🛠", "ready": True},
     {"name": "案例整理台", "desc": "给知识打标签(内部/方法/可公开)+验证,一键操作",
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
+    {"name": "精炼层", "desc": "统一摄入 refinery:claude-mem 复活线吞吐/积压烧进度 + fact 层质量指标",
+     "url": "/dashboard/refinery", "icon": "⚗️", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
      "url": "/dashboard/feedback", "icon": "📣", "ready": True},
     {"name": "反馈待办", "desc": "自动列出需你拍板的:待分层(AI已建议)+待补运营数据",
@@ -3066,6 +3265,86 @@ async def dashboard_inbox(request: Request) -> HTMLResponse:
     return HTMLResponse(_DASH_INBOX_HTML.replace("__DATA__", data_json))
 
 
+_DASH_REFINERY_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=60>
+<title>kg-hub 精炼层</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}h2{font-size:15px;font-weight:500;margin:1.2rem 0 .4rem}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}.mc .s{font-size:12px;color:GrayText}
+.ts{color:GrayText;font-size:12px}.warn{color:#C0392B}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>⚗️ 精炼层(refinery)</h1>
+<div class=ts id=hb></div>
+<h2>Level-1:claude-mem 复活线</h2><div class=cards id=l1></div>
+<h2>fact 层质量(Phase B' 预拆的疗效指标)</h2><div class=cards id=fq></div>
+<div class=ts>基线 2026-07-28:文献元数据型 fact 611 条(4.4%)· 中文洞察查询命中 0/10 · 预拆前每篇长文档洞察 fact≈0。指标向好 = 预拆在起作用。</div>
+<script>var D=__DATA__;
+document.getElementById('hb').textContent=(D.status_ts?('refinery 最后心跳: '+D.status_ts+' UTC'+(D.stale?' ⚠ 超过10分钟,容器可能没在跑':'')):'⚠ 尚无 status.json——refinery 容器未启动或共享卷未挂')+(D.last_error?(' · ⚠ 最近错误: '+D.last_error):'');
+var s=D.l1;document.getElementById('l1').innerHTML='<div class=mc><div class=l>积压剩余</div><div class=v>'+s.backlog_remaining+'</div><div class=s>夜间窗口'+(s.window_open?'开':'关')+' · 每轮'+s.per_cycle+'条</div></div><div class=mc><div class=l>已入图(水印)</div><div class=v>'+s.ingested+'</div><div class=s>拒绝 '+s.rejected+' · 失败 '+s.failed+'</div></div><div class=mc><div class=l>IngestedKey</div><div class=v>'+D.keys.ok+'</div><div class=s>pending '+D.keys.pending+' · error '+D.keys.error+'</div></div>';
+var f=D.fq;document.getElementById('fq').innerHTML='<div class=mc><div class=l>fact 总数</div><div class=v>'+f.total+'</div></div><div class=mc><div class=l>文献元数据型占比</div><div class="v'+(f.meta_pct>4.4?' warn':'')+'">'+f.meta_pct+'%</div><div class=s>'+f.meta+' 条 · 目标:随预拆下降</div></div><div class=mc><div class=l>预拆产物</div><div class=v>'+f.predigest_children+'</div><div class=s>子observation · registry标记 '+f.registry+'</div></div>';
+</script></body></html>"""
+
+
+async def dashboard_refinery(request: Request) -> HTMLResponse:
+    """精炼层看板:refinery status.json(共享卷 ro)+ 图内 fact 层质量指标。"""
+    driver = get_status_driver()
+
+    async def cnt(cy, **p):
+        rows, _, _ = await driver.execute_query(cy, **p)
+        return int(rows[0].get("c") or 0) if rows else 0
+
+    status, status_ts, stale = {}, "", False
+    try:
+        sp = Path(os.environ.get("KG_HUB_REFINERY_STATUS", "/refinery-state/status.json"))
+        if sp.exists():
+            status = json.loads(sp.read_text())
+            status_ts = (status.get("ts") or "")[:19]
+            try:
+                age = (datetime.now(tz=timezone.utc)
+                       - datetime.fromisoformat(status["ts"])).total_seconds()
+                stale = age > 600
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        logger.exception("[dashboard_refinery] status.json read failed")
+
+    try:
+        total = await cnt("MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS c")
+        meta = await cnt(
+            "MATCH ()-[e:RELATES_TO]->() WHERE e.fact CONTAINS 'documents that' "
+            "OR e.fact CONTAINS 'was extracted from' OR e.fact CONTAINS 'belongs to the' "
+            "OR e.fact CONTAINS 'references the' RETURN count(e) AS c")
+        children = await cnt(
+            "MATCH (n:Episodic) WHERE n.predigest = true RETURN count(n) AS c")
+        registry = await cnt(
+            "MATCH (n:Episodic) WHERE n.kind = 'registry' RETURN count(n) AS c")
+        k_ok = await cnt("MATCH (k:IngestedKey) WHERE k.status='ok' RETURN count(k) AS c")
+        k_pend = await cnt("MATCH (k:IngestedKey) WHERE k.status='pending' RETURN count(k) AS c")
+        k_err = await cnt("MATCH (k:IngestedKey) WHERE k.status='error' RETURN count(k) AS c")
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>精炼层取数失败: {exc}</p>", status_code=503)
+
+    wmk = status.get("watermark") or {}
+    data = {
+        "status_ts": status_ts, "stale": stale,
+        "last_error": str(status.get("last_error") or "")[:160],
+        "l1": {"backlog_remaining": status.get("backlog_remaining", "—"),
+               "window_open": bool(status.get("backlog_window_open")),
+               "per_cycle": status.get("per_cycle", 15),
+               "ingested": wmk.get("ingested", "—"),
+               "rejected": wmk.get("rejected", "—"),
+               "failed": wmk.get("failed", "—")},
+        "keys": {"ok": k_ok, "pending": k_pend, "error": k_err},
+        "fq": {"total": total, "meta": meta,
+               "meta_pct": round(100 * meta / max(total, 1), 1),
+               "predigest_children": children, "registry": registry},
+    }
+    data_json = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_REFINERY_HTML.replace("__DATA__", data_json))
+
+
 _TRANSLATE_PROMPT = """把下面内容翻译成**简体中文**。代码、命令、路径、标识符、URL、
 专有名词保持原样不译。已是中文的部分原样保留。只输出译文，不要任何解释或前缀。
 
@@ -3103,6 +3382,7 @@ app = Starlette(
         Route("/dashboard/utilization", dashboard_utilization, methods=["GET"]),
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
+        Route("/dashboard/refinery", dashboard_refinery, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
         Route("/dashboard/archive_episode", archive_episode, methods=["POST"]),
