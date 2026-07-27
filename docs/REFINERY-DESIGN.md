@@ -108,6 +108,79 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 3. 质量闸误杀(historic 18% 接纳率):决策日志留全量,shadow 指标进精炼层看板,阈值 bind-mount 可调
 4. OpenClaw tailer 读 sessions.json/jsonl 含敏感内容:提炼后原文不出 VPS 之外只进 refinery 缓冲,缓冲文件 0600 + 提炼完成即清
 
+---
+
+# 评审反馈(使用侧会话,2026-07-27)
+
+> 触发:一次真实 kg-use 查询「公众号运营策略」质量极差。诊断结论**推翻了"知识不足"**——
+> 知识在图里且很好,是**fact 层语义倒挂**导致不可达。本节是把该 case 的实测证据交给本方案。
+
+## 一、本 case 的实测证据(P3 的真正靶心)
+
+同一个查询,两类内容抽出的 fact 完全反向:
+
+| 输入 | 抽出的 fact | 数量 |
+|---|---|---|
+| 《公众号阅读量断崖衰减——48h是流量生死线》(有洞察+数据表) | `CAPSULE-X documents that the article 'Y' received 65 reads` ×4(**纯文献元数据,英文**) | **4** |
+| `cron-task-registry`(纯任务枚举,无洞察) | `OpenClaw 版本检查 belongs to the OpenClaw project` ×55 | **55** |
+
+后果:核心洞察("48小时内完成80%累积""早期互动是关键信号")**抽成 0 条 fact**;而 `/api/search`
+只搜 fact ⇒ 该胶囊放宽到 top30 都不出现,top30 里 22 条来自 `openclaw-kb-*`、19 条是注册表。
+查询者最终**SSH 到 VPS 读原文**才拿到答案——此刻 kg-hub 对中文分析型知识的实际角色是"文件仓库"。
+
+**规律(重要,决定解法)**:fact 层质量**由输入粒度决定**,不由内容价值决定——
+- claude-mem obs(原子、预结构化、含显式 facts 字段)→ fact 良好(`kg-hub uses Tailscale for networking`)
+- OpenClaw 胶囊/kb 文档(数千字中文 markdown+表格,洞察藏在散文里)→ fact 退化为文献元数据
+- 目录/注册表类(枚举)→ 海量 trivial fact,**靠数量扫席召回**
+
+## 二、对本方案的三点反馈
+
+**① 最大 gap:方案没有 fact 层的 owner。** Level-0/Level-1 都在解决"**更多**内容进来"和
+"episode 级元数据(kind/provenance)",治理引擎的"归纳"也是 episode 级分类;而 `/api/ingest`
+内部的 graphiti 抽取(fact 生成)**全程未被触碰**,且「明确不做」写了"不新建第二套 prompt"。
+结果:本 case 的根因在本方案里无人认领。
+
+**建议(顺着你们的架构,不另起炉灶)**:方案已有的 Level-0 能力——「LLM 把原始输入提炼成
+observation 六字段(type/title/facts/narrative/concepts)」——**正是解药,但只用在了新来源上**。
+把它同样用在**长文档线**:OpenClaw 胶囊/kb 文档不再整篇 4000 字丢给 `/api/ingest`,而先
+**预拆成 N 条原子 observation(带显式 facts)**再入图。这样输入粒度对齐 claude-mem,fact 层
+自然回正,且完全复用你们已定的 prompt/质量闸/唯一写入通道。可作 **Phase B'**(在 B 的提炼器
+落地后顺手扩用,增量很小)。
+
+**② Phase A 有放大风险,建议加前置度量。** 回填 ~800 条走的是**未改的抽取**;夜间胶囊合成
+产物同样再过一遍抽取。若 fact 倒挂不先解决,Phase A 的"成功"(episodes +800)可能与**召回变差**
+同时发生——这正是用户已经吃过的教训(KPI 报告 5 天纹丝不动)。建议:
+- 精炼层看板加两个 fact 层指标:**每 episode 的 fact 数分布**、**fact 中"文献元数据型"占比**
+  (可用轻量规则:fact 含 `documents that|references|belongs to` 且主语是文档名);
+- Phase A 前后各跑一次 `eval_recall` + 一条固定中文洞察查询做基线对照,写进 Phase A 验证项。
+
+**③ 目录/注册表类文档不该进语义索引(便宜且立竿见影)。** `923a705` 的 KNOWLEDGE_DIRS 扩张把
+`resources/cron-registry`、`cron-task-registry`、`*-audit-*` 这类**目录/索引/审计**文档收进来了
+——它们是"目录"不是"知识",天然产生几十条 trivial fact 扫席。两个改法,建议都做:
+- 摄入侧:push 端按文件名/内容特征(标题含 registry/registry/索引/清单/审计,或正文表格行数 > N
+  且无"一句话/结论"段)判为 catalog → 不入图,或入图但标 `kind=registry`;
+- 检索侧(防御性,治未来的类似输入):`/api/search` top-N **同源 episode 限席**(如同一 episode
+  最多占 2 席)。这条我可以做,但它在你们的 search 排序地盘上,等你们点头。
+
+## 三、已就位、可依赖的两个前提(本会话 2026-07-26/27 已上线)
+
+- **`episode_search` 中文回退已修**(commit `221f050`):FalkorDB fulltext **无 CJK 分词**,
+  中文查询"成功但 0 行"不抛异常,原代码只在 `except` 回退 ⇒ 中文正文此前完全搜不到。现改为
+  `if not rows` 回退(与 `dashboard_knowledge` 既有写法一致)。修完中文立刻命中
+  《公众号定位与自动运营边界》《阅读量断崖衰减》。
+  ⚠ **承重依赖**:在 fact 层修好之前,`episode_search`(搜正文)是中文洞察的**唯一可达路径**,
+  kg-use 已强制"top 命中离题必须补搜 episode_search 才能下结论"。**别把它优化掉。**
+- **检索质量反馈已进反馈环**(同 commit):verdict 增 `irrelevant`/`missed`,主语是本次查询而非
+  知识,故 `status='diagnostic'`——**不进拍板队列**(不再造烂尾队列),只做度量:待办⑥底部只读
+  列表 + 每日日报一行。P3 实施时可直接把它当**回归探针**:改抽取前后,看 `missed` 是否下降。
+
+## 四、结论与分工
+
+本方案的摄入统一/复活 claude-mem/夜间治理调度**方向正确、复用纪律好**,我不另提竞品方案。
+唯一实质缺口是 **fact 层语义质量无人认领**,而它恰是"知识库像素材堆、查不到洞察"的直接原因。
+建议把上述 ①(长文档预拆成原子 observation)提为与 Phase A 并列的优先项,②③ 作为配套度量与止血。
+P3 由本方案会话专职实施;使用侧会话负责 kg-use / 反馈环 / 检索质量探针,并按需提供 case 证据。
+
 ## 验证方式(实施时)
 - Phase A:积压烧完后 `quality_audit` 对比(episodes 应 +~800);`/api/queue_stats` 无 stuck;门户卡吞吐曲线;kg-use 搜一条 6 月的 muxcp 知识应命中
 - Phase B:OpenClaw 里跑一个真实会话→结束后 ≤5min 图里可搜到该会话 observation;kb-001 次日胶囊不再含会话源
