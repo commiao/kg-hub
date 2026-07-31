@@ -44,12 +44,28 @@ def main() -> int:
 
     from falkordb import FalkorDB
 
-    db = FalkorDB(
-        host=os.environ.get("KG_HUB_FALKORDB_HOST", "127.0.0.1"),
-        port=int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379")),
-        password=os.environ.get("KG_HUB_FALKORDB_PASSWORD") or None,
-    )
-    g = db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
+    # Mac→NAS 链路会假超时(tailscale 抖动/NAS 冷启动)——递进重试,仍连不上按
+    # 瞬时跳过退 0:日报缺一天不是故障,别让 launchd 记 errored(2026-07-31 实发,
+    # 同 capsule_watch 的教训)。
+    import time as _time
+    g = None
+    for _i in range(3):
+        try:
+            db = FalkorDB(
+                host=os.environ.get("KG_HUB_FALKORDB_HOST", "127.0.0.1"),
+                port=int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379")),
+                password=os.environ.get("KG_HUB_FALKORDB_PASSWORD") or None,
+            )
+            g = db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
+            g.ro_query("RETURN 1")
+            break
+        except Exception as exc:  # noqa: BLE001
+            if _i < 2:
+                _time.sleep(10)
+                continue
+            print(f"[digest] NAS 不可达(瞬时,本次跳过): {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return 0
     cut = (datetime.now(tz=timezone.utc) - timedelta(hours=24)).isoformat()
 
     handled = g.query(
