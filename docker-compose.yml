@@ -6,8 +6,8 @@
 #
 # Layout on NAS:
 #   /volume1/docker/kg-hub-src/        <- this repo (Project folder = build context)
-#   /volume1/docker/kg-hub-data/falkordb  <- FalkorDB RDB+AOF (rsynced from Mac)
-#   /volume1/docker/kg-hub-data/models    <- fastembed bge-small cache
+#   /volume2/4T/kg-hub-data/falkordb  <- FalkorDB RDB+AOF (rsynced from Mac)
+#   /volume2/4T/kg-hub-data/models    <- fastembed bge-small cache
 #
 # Secrets come from .env in this same folder (see deploy/nas/.env.example).
 
@@ -25,7 +25,7 @@ services:
       - "127.0.0.1:6379:6379"   # NAS-local only — never exposed on the network
       - "127.0.0.1:3001:3000"   # FalkorDB browser UI, NAS-local only
     volumes:
-      - /volume1/docker/kg-hub-data/falkordb:/var/lib/falkordb/data
+      - /volume2/4T/kg-hub-data/falkordb:/var/lib/falkordb/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$FALKORDB_PASSWORD\" --no-auth-warning PING | grep -q PONG"]
       interval: 10s
@@ -69,9 +69,9 @@ services:
       # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
       - KG_HUB_REFINERY_STATUS=/refinery-state/status.json
     volumes:
-      - /volume1/docker/kg-hub-data/models:/models
-      - /volume1/docker/kg-hub-data/ingest-backup:/backup
-      - /volume1/docker/kg-hub-data/refinery-state:/refinery-state:ro
+      - /volume2/4T/kg-hub-data/models:/models
+      - /volume2/4T/kg-hub-data/ingest-backup:/backup
+      - /volume2/4T/kg-hub-data/refinery-state:/refinery-state:ro
     ports:
       # Host port 17171 (off the common 8080) -> container 8080. Bind to loopback
       # only: closes LAN exposure. Tailscale userspace networking auto-forwards
@@ -99,8 +99,8 @@ services:
       - KG_HUB_FALKORDB_SLOW_SEC=8
       - KG_HUB_BACKLOG_THRESHOLD=20
     volumes:
-      - /volume1/docker/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
-      - /volume1/docker/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
+      - /volume2/4T/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
+      - /volume2/4T/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
     command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
 
   # Ongoing ingest worker (runs ON the NAS, always-on). The one-time claude-mem
@@ -137,9 +137,9 @@ services:
       - SEMAPHORE_LIMIT=1
       - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
     volumes:
-      - /volume1/docker/kg-hub-data/models:/models
-      - /volume1/docker/kg-hub-data/ingest-state:/app/data
-      - /volume1/docker/kg-hub-data/openclaw-src:/openclaw-src:ro
+      - /volume2/4T/kg-hub-data/models:/models
+      - /volume2/4T/kg-hub-data/ingest-state:/app/data
+      - /volume2/4T/kg-hub-data/openclaw-src:/openclaw-src:ro
     # canonical docs only. openclaw capsules 已改走 VPS 直推 /api/ingest
     # (2026-07-23,见 docs/KNOWLEDGE-GOVERNANCE.md)——此前这里和 Mac launchd
     # 各跑一条摄入线,双写重复入图;两条旧线同日退役,勿恢复。
@@ -167,7 +167,11 @@ services:
       - KG_HUB_REFINERY_INTERVAL_SEC=90
       - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=15
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
+      # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
+      - KG_HUB_REFINERY_MAX_DISK_TEMP=52
     volumes:
-      - /volume1/docker/kg-hub-data/claude-mem:/data/claude-mem:ro
-      - /volume1/docker/kg-hub-data/refinery-state:/state
+      # 群晖盘温直读(免sudo),温度门控数据源
+      - /run/synostorage/disks:/disktemp:ro
+      - /volume2/4T/kg-hub-data/claude-mem:/data/claude-mem:ro
+      - /volume2/4T/kg-hub-data/refinery-state:/state
     command: ["sh", "-c", "sleep 40; python -m kg_refinery"]

@@ -4,7 +4,7 @@
 # 仅在 db 变化时传;Mac↔NAS 抖动时重试,失败则跳过(下个周期再来)。
 SRC="/Users/mac/.claude-mem/claude-mem.db"
 NAS="commiao@100.123.208.32"
-DST="/volume1/docker/kg-hub-data/claude-mem/claude-mem.db"
+DST="/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
 STATE="/Users/mac/.kg-hub/state"
 STAMP="$STATE/claude-mem-synced.sha"
 mkdir -p "$STATE"

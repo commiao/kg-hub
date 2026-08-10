@@ -67,6 +67,25 @@ WATERMARK = STATE_DIR / "watermark.json"
 STATUS = STATE_DIR / "status.json"
 DECISIONS_LOG = STATE_DIR / "ingest_decisions.jsonl"
 CST = timezone(timedelta(hours=8))  # Asia/Shanghai,夜间窗口按此判
+# 温度门控(2026-08 过热事件:空闲盘温 58/59°C,DSM 强制关机线 ~61°C,余量仅
+# 2-3°C——持续写盘曾连续两周把 NAS 压关机)。群晖盘温免 sudo 直读
+# /run/synostorage/disks/sata*/temperature,compose 把该目录挂到 /disktemp(ro)。
+DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
+MAX_DISK_TEMP = int(os.environ.get("KG_HUB_REFINERY_MAX_DISK_TEMP", "52"))
+
+
+def max_disk_temp() -> int | None:
+    """全部盘温取最大。读不到(非群晖/未挂载)返回 None = 不拦,但会记进 status。"""
+    temps = []
+    try:
+        for f in DISKTEMP_DIR.glob("*/temperature"):
+            try:
+                temps.append(int(f.read_text().strip()))
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return max(temps) if temps else None
 
 
 # ---------- 水印 ----------
@@ -371,6 +390,13 @@ async def main() -> int:
                 quotas = QuotaTracker()
                 quota_day = datetime.now(tz=CST).date()
                 decided.clear()
+            # —— 温度门控:盘温超阈值本轮完全歇工(只写状态心跳),保硬件 ——
+            dtemp = max_disk_temp()
+            if dtemp is not None and dtemp >= MAX_DISK_TEMP:
+                log.warning("[thermal] 盘温 %d°C ≥ 阈值 %d°C,本轮歇工", dtemp, MAX_DISK_TEMP)
+                write_status(disk_temp=dtemp, thermal_hold=True, last_error=None)
+                await asyncio.sleep(INTERVAL)
+                continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
             boundary = wm["boundary_id"]
 
@@ -408,6 +434,7 @@ async def main() -> int:
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
 
             write_status(
+                disk_temp=dtemp, thermal_hold=False,
                 boundary_id=boundary, live_cursor=wm.get("live_cursor"),
                 live_processed=s_live, backlog_processed=s_back,
                 backlog_remaining=backlog_remaining,
