@@ -55,6 +55,9 @@ STATE_DIR = Path(os.environ.get("KG_HUB_REFINERY_STATE", "/state"))
 INTERVAL = int(os.environ.get("KG_HUB_REFINERY_INTERVAL_SEC", "90"))
 BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "15"))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
+# 夜间回填窗口(CST 小时,含头不含尾;跨午夜写成 start>end)。2026-08-13 用户定 22-5。
+BACKLOG_START = int(os.environ.get("KG_HUB_REFINERY_WINDOW_START", "22"))
+BACKLOG_END = int(os.environ.get("KG_HUB_REFINERY_WINDOW_END", "5"))
 # 旧直连线水印(526 ingested + 2471 rejected)。repo 的 data/ 被 .dockerignore 排除,
 # 容器里拿不到 → 部署时必须把该 json 预置到 refinery-state 卷(见 REFINERY-DESIGN
 # 部署步骤);这里两个位置都找:先 STATE 卷(生产),再 repo(Mac 本地调试)。
@@ -312,8 +315,15 @@ def write_status(**kw) -> None:
 
 
 def in_backlog_window() -> bool:
+    """工作窗口:refinery 的全部摄入(新 obs + 积压回填)只在此窗口内跑,窗口外
+    完全静默(白天不与真实使用抢 LLM/IO,也避开室温峰值)。默认 22:00-05:00 CST,
+    可经 env 调(跨午夜按 start>end 处理)。"""
     h = datetime.now(tz=CST).hour
-    return h >= 23 or h < 7
+    if BACKLOG_START == BACKLOG_END:
+        return False
+    if BACKLOG_START < BACKLOG_END:          # 同日窗口,如 1-5
+        return BACKLOG_START <= h < BACKLOG_END
+    return h >= BACKLOG_START or h < BACKLOG_END   # 跨午夜,如 22-5
 
 
 # ---------- 主循环 ----------
@@ -394,7 +404,16 @@ async def main() -> int:
             dtemp = max_disk_temp()
             if dtemp is not None and dtemp >= MAX_DISK_TEMP:
                 log.warning("[thermal] 盘温 %d°C ≥ 阈值 %d°C,本轮歇工", dtemp, MAX_DISK_TEMP)
-                write_status(disk_temp=dtemp, thermal_hold=True, last_error=None)
+                write_status(disk_temp=dtemp, thermal_hold=True,
+                             backlog_window_open=in_backlog_window(), last_error=None)
+                await asyncio.sleep(INTERVAL)
+                continue
+            # —— 工作窗口门控(用户 2026-08-13 定 22:00-05:00):窗口外新 obs 与
+            # 积压一律不动,只留心跳。数据在 db/水印里等着,窗口一开自动追平。
+            if not in_backlog_window():
+                write_status(disk_temp=dtemp, thermal_hold=False,
+                             backlog_window_open=False, idle_outside_window=True,
+                             last_error=None)
                 await asyncio.sleep(INTERVAL)
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
@@ -434,7 +453,7 @@ async def main() -> int:
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
 
             write_status(
-                disk_temp=dtemp, thermal_hold=False,
+                disk_temp=dtemp, thermal_hold=False, idle_outside_window=False,
                 boundary_id=boundary, live_cursor=wm.get("live_cursor"),
                 live_processed=s_live, backlog_processed=s_back,
                 backlog_remaining=backlog_remaining,

@@ -167,8 +167,11 @@ services:
       - KG_HUB_REFINERY_INTERVAL_SEC=90
       - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=15
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
+      # 回填窗口 22:00-05:00 CST(用户 2026-08-13 指定),其他时间静默
+      - KG_HUB_REFINERY_WINDOW_START=22
+      - KG_HUB_REFINERY_WINDOW_END=5
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
-      - KG_HUB_REFINERY_MAX_DISK_TEMP=52
+      - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-52}
     volumes:
       # 群晖盘温直读(免sudo),温度门控数据源
       - /run/synostorage/disks:/disktemp:ro
