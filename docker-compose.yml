@@ -61,9 +61,10 @@ services:
       - HF_HUB_OFFLINE=1
       # Durable backup of every /api/ingest episode body (survives graph loss).
       - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
-      # Keep the NAS gentle: fully-serial LLM calls + rate cap (same as Mac).
-      - SEMAPHORE_LIMIT=1
-      - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
+      # LLM 并发/限速。默认全串行(对 NAS 温柔);经 .env 可调——2026-08-14 实测
+      # 单条入图 80s 全卡在这里(温度只占 20% 暂停),提产能的唯一开关就是这两个。
+      - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-1}
+      - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-4.0}
       # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
       - KG_HUB_PREDIGEST=${KG_HUB_PREDIGEST:-0}
       # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
