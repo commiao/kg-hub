@@ -163,6 +163,30 @@ def emit_alert(severity: str, kind: str, message: str) -> None:
     print(f"{title} | {message} (via {sent_via})")
 
 
+DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
+DISK_TEMP_WARN = int(os.environ.get("KG_HUB_DISK_TEMP_WARN", "59"))
+
+
+def check_disk_temp() -> tuple[int | None, str]:
+    """群晖盘温预警(2026-08 过热事件后加)。DSM 到 61°C 直接强制关机、且**没有任何
+    通知**——8/16 就这样停了 24 小时无人知。这里在触线前一步喊人,让"开机"这个
+    唯一的人工动作能及时发生。读 /run/synostorage/disks/*/temperature(免 sudo)。"""
+    temps: dict[str, int] = {}
+    try:
+        for f in DISKTEMP_DIR.glob("*/temperature"):
+            try:
+                temps[f.parent.name] = int(f.read_text().strip())
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        return None, "disk temp unreadable"
+    if not temps:
+        return None, "no disk temp source"
+    hottest = max(temps.values())
+    detail = " ".join(f"{k}={v}°C" for k, v in sorted(temps.items()))
+    return hottest, f"{detail}(阈值 {DISK_TEMP_WARN}°C,DSM 61°C 强制关机)"
+
+
 def check_health() -> tuple[bool, str]:
     """Returns (alive, message)."""
     try:
@@ -258,8 +282,15 @@ def main() -> int:
         "recent_errors": False,
         "falkordb_unreachable": False,
         "falkordb_slow": False,
+        "disk_temp_high": False,
     }
     details: dict[str, str] = {}
+
+    # 0. 盘温(优先级最高:硬件保护,且与 server 存活无关)
+    hottest, temp_msg = check_disk_temp()
+    if hottest is not None and hottest >= DISK_TEMP_WARN:
+        new_anomalies["disk_temp_high"] = True
+        details["disk_temp_high"] = f"⚠️ 硬盘温度 {hottest}°C 逼近强制关机线 · {temp_msg}"
 
     # 1. health probe
     alive, health_msg = check_health()

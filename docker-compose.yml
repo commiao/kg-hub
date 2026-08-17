@@ -99,7 +99,11 @@ services:
       - KG_HUB_FEISHU_WEBHOOK=${KG_HUB_FEISHU_WEBHOOK}
       - KG_HUB_FALKORDB_SLOW_SEC=8
       - KG_HUB_BACKLOG_THRESHOLD=20
+      # 盘温预警:DSM 61°C 强制关机且无任何通知(8/16 因此停机 24h 无人知)。
+      # 59°C 就喊人,给"及时开机/加风扇"留反应时间。
+      - KG_HUB_DISK_TEMP_WARN=${KG_HUB_DISK_TEMP_WARN:-59}
     volumes:
+      - /run/synostorage/disks:/disktemp:ro   # 盘温直读(免 sudo)
       - /volume2/4T/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
       - /volume2/4T/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
     command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
