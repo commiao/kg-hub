@@ -168,9 +168,11 @@ services:
       - KG_HUB_REFINERY_INTERVAL_SEC=90
       - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=${KG_HUB_REFINERY_PER_CYCLE:-15}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
-      # 回填窗口 22:00-05:00 CST(用户 2026-08-13 指定),其他时间静默
-      - KG_HUB_REFINERY_WINDOW_START=22
-      - KG_HUB_REFINERY_WINDOW_END=5
+      # 工作窗口(CST)。2026-08-18 按 857 条温度采样重定为 01:00-08:00:
+      # 实测 22-23 点是全天最热(盘温<60 的可开工比例仅 25%/40%),01-08 才是凉窗
+      # (80-100%)。原 22-05 有近一半时间被温度门控空转。
+      - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-1}
+      - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
       - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-52}
     volumes:
