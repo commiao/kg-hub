@@ -36,6 +36,13 @@
 | 通知与监控体系 | [`docs/notification-system.md`](docs/notification-system.md) |
 | NAS 部署 / 迁移 | [`deploy/nas/MIGRATION.md`](deploy/nas/MIGRATION.md) |
 
+**Agent meta 规则**（`scope: global` canonical，经 PUSH hook 注入所有工具的新会话；内容与 kg-hub 内部架构无关，是通用 agent 行为准则）
+
+| 规则 | 文件 | 一句话 |
+|---|---|---|
+| 能力发现 | [`docs/AGENT-TOOL-DISCOVERY.md`](docs/AGENT-TOOL-DISCOVERY.md) | 声明"没有 X 能力"前，MCP 空间和 Skill 空间**都要扫** |
+| 证据自检 | [`docs/INVESTIGATION-RULES.md`](docs/INVESTIGATION-RULES.md) | 用分布下结论前，先验采集通道是否健康；看 MAX 不看 COUNT |
+
 **飞书文档收录**（长文存档，与上方 repo 文档一一对应）:通知与监控体系 · 事件复盘 + 最终架构 · 切流量后链路体检与修复 · 能耗复发 + 记忆断流排查 · 跨平台 / 跨工具对接手册。
 
 ## 为什么独立成项目

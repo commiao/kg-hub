@@ -96,6 +96,12 @@ CANONICAL_DOCS = [
         "desc": "kg-hub-canonical: AGENT-TOOL-DISCOVERY.md — meta rule for agent self-awareness, MCP vs Skill 双轨 (2026-06-14 lesson)",
         "scope": "global",
     },
+    {
+        "path": "docs/INVESTIGATION-RULES.md",
+        "name": "kg-hub-canonical-INVESTIGATION-RULES",
+        "desc": "kg-hub-canonical: INVESTIGATION-RULES.md — meta rule for evidence self-check: MAX not COUNT / 分布≠真相 / 分层验证 / 配置在+数据断=静默失效 (2026-08-20 lesson)",
+        "scope": "global",
+    },
 ]
 
 
