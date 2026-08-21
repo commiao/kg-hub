@@ -75,19 +75,20 @@ async def topology_report(request: Request) -> JSONResponse:
                          "nodes": len(nodes)})
 
 
-async def dashboard_topology(request: Request) -> HTMLResponse:
-    """GET /dashboard/topology — 渲染拓扑图。"""
+async def _load_snapshots() -> list[dict]:
+    """读出各设备最新快照，补上 _host/_recv/_age_s/_stale。
+
+    面板(HTML)和 /api/topology/latest(JSON) 共用 —— 告警必须看**和人眼完全同一份**
+    数据，否则会出现"面板红着但没告警"或反过来的裂缝。
+    """
     from kg_hub_server import get_status_driver
 
-    try:
-        driver = get_status_driver()
-        rows, _, _ = await driver.execute_query(
-            "MATCH (t:TopologySnapshot) "
-            "RETURN t.host AS host, t.payload AS payload, "
-            "       t.generated_at AS gen, t.received_at AS recv "
-            "ORDER BY t.received_at DESC")
-    except Exception as exc:  # noqa: BLE001
-        return HTMLResponse(f"<p>拓扑取数失败: {exc}</p>", status_code=503)
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (t:TopologySnapshot) "
+        "RETURN t.host AS host, t.payload AS payload, "
+        "       t.generated_at AS gen, t.received_at AS recv "
+        "ORDER BY t.received_at DESC")
 
     snaps = []
     now = datetime.now(tz=timezone.utc)
@@ -108,9 +109,27 @@ async def dashboard_topology(request: Request) -> HTMLResponse:
         # 探针自己失联也要能看出来：快照过期就整体降级
         snap["_stale"] = bool(age is not None and age > STALE_AFTER_S)
         snaps.append(snap)
+    return snaps
 
+
+async def dashboard_topology(request: Request) -> HTMLResponse:
+    """GET /dashboard/topology — 渲染拓扑图。"""
+    try:
+        snaps = await _load_snapshots()
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"<p>拓扑取数失败: {exc}</p>", status_code=503)
     data = {"snapshots": snaps, "layers": LAYERS, "stale_after_s": STALE_AFTER_S}
     return HTMLResponse(_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
+
+
+async def topology_latest(request: Request) -> JSONResponse:
+    """GET /api/topology/latest — 快照 JSON，给 watchdog 告警用。"""
+    try:
+        snaps = await _load_snapshots()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+    return JSONResponse({"ok": True, "stale_after_s": STALE_AFTER_S,
+                         "snapshots": snaps})
 
 
 _HTML = r"""<!doctype html>
@@ -360,7 +379,13 @@ function renderHost(s, hi){
     const y2 = b.y + BH*(ii+1)/(iN+1);          // ① 入端口
     const x1 = a.x + BW, x2 = b.x;
     let d;
-    if (b.ci - a.ci > 1) {
+    // 跨列但**同高**且中间列在这个高度没有节点挡路 → 直接一条水平直线。
+    // 上一版只按"列距 > 1"就无条件送去底部绕行，于是 OpenClaw(工具) → OpenClaw(传输)
+    // 这种同一行的边也绕到图底再拐回来，白跑一大圈。
+    const clearStraight = (b.ci - a.ci > 1) && Math.abs(y1-y2) < 1.5 && !cols.some((c,cc)=>
+      cc > a.ci && cc < b.ci && c.nodes.some(n=>{
+        const q = pos[n.id]; return y1 > q.y - 4 && y1 < q.y + BH + 4; }));
+    if (b.ci - a.ci > 1 && !clearStraight) {
       // ④ 跨列 → 下行/上行各走自己的通道，底部横穿一条独占的 y
       const xd = laneX(e,'down'), xu = laneX(e,'up');
       const yb = PADT + rowTop[nRows] + 8 + crossEdges.indexOf(e)*7;
@@ -381,6 +406,27 @@ function renderHost(s, hi){
     const faint = e.from.startsWith('dev:') ? ' faint' : (b.ci-a.ci>1 ? ' bypass' : '');
     const mk = faint ? "" : ` marker-end="url(#${({green:"ag",amber:"aa",red:"ar"})[e.state]||"ax"})"`;
     return `<path class="edge ${esc(e.state)}${faint}" d="${d}"${mk}/>`;
+  }).join('');
+
+  // 设备 → 本带工具：带内树形托架（一条竖脊 + 每个工具一根短横杆）
+  //
+  // 为什么托架不会重新制造上一版那种线团：**各带在垂直方向互不重叠**，
+  // 所以所有带的竖脊可以共用同一个 x，一条通道就够，不像原来 9 条线各要一条。
+  // 单工具的带退化成一条直线。
+  const SPINE = 16;
+  const bracket = bands.filter(b=>b.dev && b.tools.length && pos[b.dev.id]).map(b=>{
+    const dp = pos[b.dev.id];
+    const xs = dp.x + BW + SPINE;
+    const tp = b.tools.map(t=>pos[t.id]).filter(Boolean);
+    if (!tp.length) return '';
+    const st = (s.nodes||[]).find(n=>n.id===b.dev.id) || {};
+    const cls = `edge ${esc(st.state||'grey')} faint`;
+    if (tp.length === 1)
+      return `<path class="${cls}" d="M${dp.x+BW} ${dp.cy} L${tp[0].x} ${tp[0].cy}"/>`;
+    const ys = tp.map(q=>q.cy);
+    return `<path class="${cls}" d="M${dp.x+BW} ${dp.cy} L${xs} ${dp.cy}"/>`
+      + `<path class="${cls}" d="M${xs} ${Math.min(...ys)} L${xs} ${Math.max(...ys)}"/>`
+      + tp.map(q=>`<path class="${cls}" d="M${xs} ${q.cy} L${q.x} ${q.cy}"/>`).join('');
   }).join('');
 
   // band 底色 + 分隔线：先画，垫在连线和节点下面
@@ -422,7 +468,7 @@ function renderHost(s, hi){
     <div class=hh><b>${esc(s._host)}</b>
       <span class="pill ${esc(s.overall)}">${esc(s.overall)}</span>${age}${stale}</div>
     <div class=wrap><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
-      ${bandSvg}${heads}${edges}${boxes}
+      ${bandSvg}${heads}${bracket}${edges}${boxes}
     </svg></div>
     ${blockers}${dets.join('')}
   </div>`;

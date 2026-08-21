@@ -241,6 +241,62 @@ def check_search_probe() -> tuple[str, float, str]:
         return "error", 0.0, f"{type(exc).__name__}: {exc}"
 
 
+def check_capture_chain(cfg: dict) -> tuple[list[str], list[str]]:
+    """采集链路健康：读 kg-hub 的拓扑快照，判断"该喊人"的两件事。
+
+    返回 (blocked_msgs, stale_msgs)。
+
+    ## 为什么只对 red 和"探针失联"告警，黄灯一概不报
+
+    黄灯（Cursor 三天没动、Mac→NAS 落后几十条）是**被观测的常态**，不是故障。
+    对黄灯告警等于每天几十条噪音，一周内人就把这个群静音了 —— 那时真的红灯
+    来了也没人看。这与探针 --exit-zero 是同一个判断。
+
+    ## 探针失联比链路阻塞更值得告警
+
+    链路阻塞时面板是红的，人一看就知道。但**探针自己死了**的时候，面板显示的
+    是最后一次成功上报的旧数据 —— 看上去一切正常。这正是 T-0021 里 codex 采集
+    静默停摆 5 周没人发现的同一个失效模式：**配置在、进程没了、数据停了、没人报警**。
+    所以"没有新快照"必须是一条独立告警，而不是靠链路灯色间接反映。
+    """
+    if not KG_HUB_URL:
+        return [], []
+    try:
+        r = httpx.get(f"{KG_HUB_URL.rstrip('/')}/api/topology/latest",
+                      headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"} if KG_HUB_TOKEN else {},
+                      timeout=10.0)
+        if r.status_code >= 400:
+            return [], [f"拓扑快照接口 HTTP {r.status_code}"]
+        snaps = (r.json() or {}).get("snapshots") or []
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"拓扑快照取数失败: {type(exc).__name__}: {exc}"]
+
+    return judge_snapshots(snaps, cfg)
+
+
+def judge_snapshots(snaps: list[dict], cfg: dict) -> tuple[list[str], list[str]]:
+    """纯判定：快照 → (阻塞消息, 失联消息)。与取数分开，好写测试。
+
+    见 check_capture_chain 的说明：只对 red blockers 和探针失联告警，黄灯不报。
+    """
+    if not snaps:
+        return [], ["从未收到任何设备的采集链路快照 —— 探针没在跑？"]
+
+    stale_after = int(cfg.get("capture_stale_after_min", 0)) * 60 or None
+    blocked, stale = [], []
+    for sn in snaps:
+        host = sn.get("_host") or "?"
+        age = sn.get("_age_s")
+        is_stale = bool(sn.get("_stale")) if stale_after is None else (
+            isinstance(age, (int, float)) and age > stale_after)
+        if is_stale:
+            stale.append(f"{host} 探针失联 {int(age or 0) // 60} 分钟未上报")
+            continue          # 数据本身已过期，其灯色不再可信，不重复报 blocked
+        for b in (sn.get("blockers") or []):
+            blocked.append(f"{host} · {b.get('label', '?')}: {b.get('detail', '')}")
+    return blocked, stale
+
+
 def main() -> int:
     # Hot-read notification config (file on a mounted volume) — overrides env-derived
     # defaults each cycle, so rules change without a rebuild/recreate.
@@ -283,6 +339,8 @@ def main() -> int:
         "falkordb_unreachable": False,
         "falkordb_slow": False,
         "disk_temp_high": False,
+        "capture_blocked": False,
+        "capture_probe_stale": False,
     }
     details: dict[str, str] = {}
 
@@ -356,6 +414,22 @@ def main() -> int:
         elif pstatus == "slow":
             new_anomalies["falkordb_slow"] = True
             details["falkordb_slow"] = pmsg
+
+    # 2c. 采集链路（各设备/工具 → claude-mem → SQLite → NAS → kg-hub）
+    if alive and cfg.get("capture_chain_enabled", True):
+        cap_blocked, cap_stale = check_capture_chain(cfg)
+        if cap_blocked:
+            new_anomalies["capture_blocked"] = True
+            details["capture_blocked"] = (
+                "采集链路有阻塞点:\n  " + "\n  ".join(cap_blocked[:6])
+                + "\n看 /dashboard/topology")
+        if cap_stale:
+            new_anomalies["capture_probe_stale"] = True
+            details["capture_probe_stale"] = (
+                "采集探针没在上报(面板显示的是旧数据,看着正常但其实是盲的):\n  "
+                + "\n  ".join(cap_stale[:6])
+                + "\n查该机 launchctl print gui/$UID/com.kg-hub.capture-probe"
+                  " 与 ~/.kg-hub/logs/capture-probe.err.log")
 
     # 3. edge-triggered alerts (only on state transitions)
     for kind, is_bad_now in new_anomalies.items():

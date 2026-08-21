@@ -59,7 +59,7 @@ from graphiti_client import (  # noqa: E402
     build_graphiti,
 )
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
-from topology import dashboard_topology, topology_report  # noqa: E402
+from topology import dashboard_topology, topology_report, topology_latest  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
@@ -3400,6 +3400,7 @@ app = Starlette(
         Route("/dashboard/usage_feedback_undo", usage_feedback_undo, methods=["POST"]),
         Route("/dashboard/topology", dashboard_topology, methods=["GET"]),
         Route("/api/topology/report", topology_report, methods=["POST"]),
+        Route("/api/topology/latest", topology_latest, methods=["GET"]),
         Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
