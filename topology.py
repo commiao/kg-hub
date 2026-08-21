@@ -150,7 +150,9 @@ svg{display:block;width:100%;height:auto;max-width:1180px}
 .box.red{stroke:var(--red);stroke-width:2} .box.grey{stroke:var(--grey)}
 .dot.green{fill:var(--green)} .dot.amber{fill:var(--amber)}
 .dot.red{fill:var(--red)} .dot.grey{fill:var(--grey)}
-.edge{stroke:var(--grey);stroke-width:1.5;fill:none;opacity:.5}
+.edge{stroke:var(--grey);stroke-width:1.5;fill:none;opacity:.5;stroke-linejoin:round}
+.edge.faint{opacity:.2;stroke-width:1}
+.edge.bypass{stroke-dasharray:2 4;opacity:.55}
 .edge.green{stroke:var(--green);opacity:.75}
 .edge.amber{stroke:var(--amber);opacity:.9;stroke-dasharray:5 3}
 .edge.red{stroke:var(--red);opacity:1;stroke-width:2.5;stroke-dasharray:4 3}
@@ -173,12 +175,23 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
   <span><i style="background:var(--red)"></i>阻塞或故障</span>
   <span><i style="background:var(--grey)"></i>未配置</span>
   <span>虚线 = 该跳有滞后或中断</span>
+  <span>底部点线 = 跨层直连（如 OpenClaw 不走 claude-mem）</span>
 </div>
+<svg width=0 height=0 style="position:absolute"><defs>
+<marker id=ag viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
+  <path d="M0 1 L6 4 L0 7" fill=none stroke="var(--green)" stroke-width=1.4/></marker>
+<marker id=aa viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
+  <path d="M0 1 L6 4 L0 7" fill=none stroke="var(--amber)" stroke-width=1.4/></marker>
+<marker id=ar viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
+  <path d="M0 1 L6 4 L0 7" fill=none stroke="var(--red)" stroke-width=1.6/></marker>
+<marker id=ax viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
+  <path d="M0 1 L6 4 L0 7" fill=none stroke="var(--grey)" stroke-width=1.2/></marker>
+</defs></svg>
 <div id=root></div>
 <script>
 const D = __DATA__;
 // LW=列间距 LH=行距 BW/BH=节点框。BW 要容得下最长标签（"claude-mem worker"）
-const LW = 140, LH = 60, PADT = 34, BW = 124, BH = 42;
+const LW = 150, LH = 60, PADT = 34, BW = 104, BH = 42;
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
@@ -204,20 +217,57 @@ function renderHost(s, hi){
     key, label, nodes:(s.nodes||[]).filter(n=>n.layer===key)
   })).filter(c=>c.nodes.length);
   const maxRows = Math.max(...cols.map(c=>c.nodes.length), 1);
-  // 宽度只由内容决定（不再撑到 900），配合 svg{width:100%} 自适应缩放
   const W = cols.length*LW + 24;
-  const H = PADT + maxRows*LH + 16;
+  const BUS = 26;                       // 底部绕行通道高度，给跨列边走
+  const H = PADT + maxRows*LH + BUS;
 
-  // 记录每个节点中心点，画边用
   const pos = {};
   cols.forEach((c,ci)=>c.nodes.forEach((n,ri)=>{
-    pos[n.id] = {x: 20+ci*LW, y: PADT+ri*LH, cx: 20+ci*LW+BW/2, cy: PADT+ri*LH+BH/2};
+    pos[n.id] = {ci, ri, x: 20+ci*LW, y: PADT+ri*LH,
+                 cx: 20+ci*LW+BW/2, cy: PADT+ri*LH+BH/2};
   }));
 
-  const edges = (s.edges||[]).filter(e=>pos[e.from]&&pos[e.to]).map(e=>{
-    const a=pos[e.from], b=pos[e.to];
-    const x1=a.x+BW, y1=a.cy, x2=b.x, y2=b.cy, mx=(x1+x2)/2;
-    return `<path class="edge ${esc(e.state)}" d="M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2} ${y2}"/>`;
+  // ---- 正交路由：避免交叉与重叠的三个手段 ----
+  // ① 端口分散：一个节点的多条边在边缘上均匀分点，不再挤同一点
+  // ② 按对端 y 排序后再分配端口：同一束线保持相对顺序 → 不交叉（平面图技巧）
+  // ③ 汇流轴按边序错开 + 跨列边走底部通道 → 垂直段不重叠、不穿节点
+  const el = (s.edges||[]).filter(e=>pos[e.from]&&pos[e.to]);
+  const outs = {}, ins = {};
+  el.forEach(e=>{ (outs[e.from] = outs[e.from]||[]).push(e);
+                  (ins[e.to]   = ins[e.to]  ||[]).push(e); });
+  Object.values(outs).forEach(a=>a.sort((p,q)=>pos[p.to].cy - pos[q.to].cy));
+  Object.values(ins ).forEach(a=>a.sort((p,q)=>pos[p.from].cy - pos[q.from].cy));
+
+  const R = 5;   // 折角圆角
+  const edges = el.map((e,ei)=>{
+    const a = pos[e.from], b = pos[e.to];
+    const oi = outs[e.from].indexOf(e), on = outs[e.from].length;
+    const ii = ins[e.to].indexOf(e),   iN = ins[e.to].length;
+    const y1 = a.y + BH*(oi+1)/(on+1);          // ① 出端口
+    const y2 = b.y + BH*(ii+1)/(iN+1);          // ① 入端口
+    const x1 = a.x + BW, x2 = b.x;
+    let d;
+    if (b.ci - a.ci > 1) {
+      // ③ 跨列 → 走底部通道，绝不斜穿中间列的节点
+      const yb = PADT + maxRows*LH + 8 + (ei % 2) * 8;
+      d = `M${x1} ${y1} L${x1+10} ${y1} L${x1+10} ${yb-R} Q${x1+10} ${yb} ${x1+10+R} ${yb}`
+        + ` L${x2-16-R} ${yb} Q${x2-16} ${yb} ${x2-16} ${yb-R} L${x2-16} ${y2+R}`
+        + ` Q${x2-16} ${y2} ${x2-16+R} ${y2} L${x2} ${y2}`;
+    } else if (Math.abs(y1-y2) < 1.5) {
+      d = `M${x1} ${y1} L${x2} ${y2}`;                       // 同高 → 直线
+    } else {
+      // ③ 汇流轴错开：多对一汇聚时按**入边序**错开（多条边共用一个目标，
+      //    各自 on=1 用出边序会全部重合），一对多时按出边序错开。
+      const spread = iN > 1 ? ii/(iN-1) : (on > 1 ? oi/(on-1) : 0.5);
+      const mx = x1 + (x2-x1)*(0.28 + 0.44*spread);
+      const s2 = y2 > y1 ? 1 : -1;
+      d = `M${x1} ${y1} L${mx-R} ${y1} Q${mx} ${y1} ${mx} ${y1+R*s2}`
+        + ` L${mx} ${y2-R*s2} Q${mx} ${y2} ${mx+R} ${y2} L${x2} ${y2}`;
+    }
+    // 设备→工具的边信息量低（只表达"装在这台机上"），画淡避免抢视线
+    const faint = e.from.startsWith('dev:') ? ' faint' : (b.ci-a.ci>1 ? ' bypass' : '');
+    const mk = faint ? "" : ` marker-end="url(#${({green:"ag",amber:"aa",red:"ar"})[e.state]||"ax"})"`;
+    return `<path class="edge ${esc(e.state)}${faint}" d="${d}"${mk}/>`;
   }).join('');
 
   const heads = cols.map((c,ci)=>

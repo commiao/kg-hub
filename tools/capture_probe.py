@@ -248,7 +248,7 @@ def probe_openclaw() -> list[dict]:
                       else "本机无 openclaw-sync 日志")),
     })
     nodes.append({
-        "id": "sync:openclaw", "layer": "transport", "label": "OpenClaw 拉取",
+        "id": "sync:openclaw", "layer": "transport", "label": "OpenClaw",
         "state": GREY if log_idle is None else (GREEN if log_idle < 3 * 3600 else AMBER),
         "idle_human": human_idle(log_idle) if log_idle is not None else "—",
         "idle_seconds": None if log_idle is None else int(log_idle),
@@ -289,7 +289,8 @@ def probe_devices() -> list[dict]:
             live = "active" if "active" in rest else "idle"
             state, badge = GREEN, short or "在线"
             detail = f"{os_name}｜在线（{live}）"
-        nodes.append({"id": f"dev:{host}", "layer": "device", "label": host,
+        short_host = host.replace("-aliyun-us","").replace("-syno","")
+        nodes.append({"id": f"dev:{host}", "layer": "device", "label": short_host,
                       "state": state, "idle_human": badge,
                       "metrics": {"ip": ip},
                       "detail": f"{detail}｜角色：{full}"
@@ -321,7 +322,7 @@ def probe_hooks(tool_seen: dict) -> list[dict]:
             cc_detail = ("settings.json 无 claude-mem，但有数据流入"
                          "（可能经 --plugin-dir 注入）" if has_data
                          else "settings.json 无 claude-mem 且无数据")
-    nodes.append({"id": "hook:claude", "layer": "hook", "label": "Claude Code hooks",
+    nodes.append({"id": "hook:claude", "layer": "hook", "label": "Claude Code",
                   "state": cc_state, "detail": cc_detail})
 
     # --- Codex：trusted_hash 集合 vs 磁盘 hook 集合 ---
@@ -358,13 +359,13 @@ def probe_hooks(tool_seen: dict) -> list[dict]:
                 cx_detail = f"{len(on_disk)} 个 hook 全部已 approve"
                 if stale:
                     cx_detail += f"；另有 {len(stale)} 条旧残留（无害）"
-    nodes.append({"id": "hook:codex", "layer": "hook", "label": "Codex hooks",
+    nodes.append({"id": "hook:codex", "layer": "hook", "label": "Codex",
                   "state": cx_state, "detail": cx_detail})
 
     # --- Cursor / Qoder：有 hooks 配置文件即算配置在，真相看数据 ---
     for src, label, globs in (
-        ("cursor", "Cursor hooks", [".cursor/hooks.json", ".cursor/settings.json"]),
-        ("qoder", "Qoder hooks", [".qoder/settings.json", ".qoder/hooks.json"]),
+        ("cursor", "Cursor", [".cursor/hooks.json", ".cursor/settings.json"]),
+        ("qoder", "Qoder", [".qoder/settings.json", ".qoder/hooks.json"]),
     ):
         found = [g for g in globs if (HOME / g).exists()
                  and "claude-mem" in (HOME / g).read_text(errors="replace")]
@@ -383,10 +384,10 @@ def probe_worker() -> dict:
     """claude-mem worker：唯一真正的"服务不可达就是红"的节点。"""
     data, err = http_json(CM_HEALTH, timeout=4)
     if err or not data:
-        return {"id": "worker", "layer": "worker", "label": "claude-mem worker",
+        return {"id": "worker", "layer": "worker", "label": "claude-mem",
                 "state": RED, "detail": f"health 不可达（{err or 'empty'}）@ :37701"}
     up = int(data.get("uptime") or 0)
-    return {"id": "worker", "layer": "worker", "label": "claude-mem worker",
+    return {"id": "worker", "layer": "worker", "label": "claude-mem",
             "state": GREEN if data.get("status") == "ok" else RED,
             "metrics": {"pid": data.get("pid"), "uptime_s": up},
             "detail": (f"v{data.get('version')} pid={data.get('pid')} "
@@ -420,7 +421,7 @@ def probe_sqlite() -> tuple[dict, int | None]:
               f"主库 mtime {human_idle(main_idle)}前")
     if mode == "wal" and wal_idle is not None and main_idle - wal_idle > 3600:
         detail += "  ⚠️ 主库 mtime 明显滞后于 WAL —— 任何用主库 mtime/sha 判变化的逻辑都会失效"
-    return ({"id": "sqlite", "layer": "storage", "label": "SQLite (+WAL)",
+    return ({"id": "sqlite", "layer": "storage", "label": "SQLite",
              "state": state, "idle_seconds": int(eff_idle), "idle_human": human_idle(eff_idle),
              "metrics": {"max_obs_id": max_id, "wal_mb": round(wal_mb, 1), "journal_mode": mode},
              "detail": detail}, max_id)
@@ -447,7 +448,7 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         if out.strip().isdigit():
             nas_max = int(out.strip())
 
-    node = {"id": "sync", "layer": "transport", "label": "Mac→NAS 同步",
+    node = {"id": "sync", "layer": "transport", "label": "Mac→NAS",
             "metrics": {"local_max_obs_id": local_max, "nas_max_obs_id": nas_max}}
     if nas_max is None:
         node["state"] = AMBER
@@ -479,19 +480,19 @@ def probe_kghub(url: str | None, token: str | None) -> list[dict]:
     nodes = []
     h, err = http_json(f"{url}/health", timeout=6)
     ok = bool(h) and h.get("status") == "ok"
-    nodes.append({"id": "kghub", "layer": "kghub", "label": "kg-hub server",
+    nodes.append({"id": "kghub", "layer": "kghub", "label": "kg-hub",
                   "state": GREEN if ok else RED,
                   "detail": (f"{url} 健康" if ok else f"{url} 不可达（{err or 'bad status'}）")})
     if ok:
         st, _ = http_json(f"{url}/api/stats", timeout=8, token=token)
         if isinstance(st, dict) and st:
             ent = st.get("entities") or st.get("nodes")
-            nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB 图谱",
+            nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB",
                           "state": GREEN,
                           "metrics": {k: v for k, v in st.items() if isinstance(v, int)},
                           "detail": f"entities={ent} edges={st.get('edges')} episodes={st.get('episodes')}"})
         else:
-            nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB 图谱",
+            nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB",
                           "state": AMBER, "detail": "/api/stats 取数失败（可能需要 token）"})
     return nodes
 
