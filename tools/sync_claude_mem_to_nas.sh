@@ -35,8 +35,14 @@ LOCK="$STATE/sync.lock"
 if [ -f "$LOCK" ]; then
   lpid=$(cat "$LOCK" 2>/dev/null)
   if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
-    age=$(ps -o etimes= -p "$lpid" 2>/dev/null | tr -d ' ')
-    [ -n "$age" ] || age=0
+    # 跑了多久 = 现在 - 锁文件 mtime。锁是开工那一刻写的,所以它的 mtime
+    # 就是本轮起点。不用 `ps -o etimes=` —— 那是 GNU/procps 的关键字,
+    # macOS 的 BSD ps 不认,会把整份关键字清单打印出来当成 $age,于是
+    # `[ "$age" -gt 600 ]` 直接报错、永远落到 else 分支 ——
+    # **卡死接管逻辑等于从没生效过**。(2026-08-21 实测踩到)
+    lmt=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null)
+    now=$(date +%s)
+    if [ -n "$lmt" ]; then age=$((now - lmt)); else age=0; fi
     if [ "$age" -gt 600 ]; then
       echo "$(ts) 上一轮 pid=$lpid 已卡 ${age}s,杀掉重来"
       pkill -9 -P "$lpid" 2>/dev/null
