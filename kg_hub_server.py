@@ -1768,6 +1768,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/feedback", "icon": "📣", "ready": True},
     {"name": "反馈待办", "desc": "自动列出需你拍板的:待分层(AI已建议)+待补运营数据",
      "url": "/dashboard/inbox", "icon": "📥", "ready": True},
+    {"name": "采集链路拓扑", "desc": "各设备/工具 → hook → claude-mem → SQLite → 传输 → kg-hub 全链路灯色 + 空闲时长 + 阻塞点",
+     "url": "/dashboard/topology", "icon": "🕸", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>

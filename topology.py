@@ -166,7 +166,11 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
 .empty{color:var(--mut);padding:30px;text-align:center;border:1px dashed var(--line);
   border-radius:10px}
+.back{display:inline-block;margin:0 0 .5rem;font-size:13px;color:var(--mut);
+  text-decoration:none}
+.back:hover{text-decoration:underline}
 </style>
+<a class=back href="/portal">← 报表门户</a>
 <h1>采集链路拓扑</h1>
 <div class=sub>工具 → hook → claude-mem → SQLite → 传输 → kg-hub ｜ 每 60s 自动刷新 ｜ 点节点看详情</div>
 <div class=legend>
@@ -190,8 +194,12 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
 <div id=root></div>
 <script>
 const D = __DATA__;
-// LW=列间距 LH=行距 BW/BH=节点框。BW 要容得下最长标签（"claude-mem worker"）
-const LW = 150, LH = 60, PADT = 34, BW = 104, BH = 42;
+// LH=行距 BW/BH=节点框（BW 要容得下最长标签 "claude-mem worker"）。
+// 列间距**不再是常量** —— 见 renderHost 里的 gapW：按实际穿过的连线数算。
+// 等宽间隙是上一版的病根：设备→工具要过 9 条线、worker→存储只过 1 条，
+// 给同样的 46px，前者被压成每条 5px 的一团麻。
+const LH = 74, PADT = 34, BW = 104, BH = 42;
+const GAP_BASE = 40, GAP_LANE = 15;   // 间隙宽 = BASE + 过线数 * LANE
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
@@ -217,29 +225,68 @@ function renderHost(s, hi){
     key, label, nodes:(s.nodes||[]).filter(n=>n.layer===key)
   })).filter(c=>c.nodes.length);
   const maxRows = Math.max(...cols.map(c=>c.nodes.length), 1);
-  const W = cols.length*LW + 24;
-  const BUS = 26;                       // 底部绕行通道高度，给跨列边走
+
+  // 列/行序（不依赖 x，先算出来给通道统计用）
+  const ci_ = {};
+  cols.forEach((c,ci)=>c.nodes.forEach((n,ri)=>{ ci_[n.id] = {ci, ri}; }));
+  const el = (s.edges||[]).filter(e=>ci_[e.from]&&ci_[e.to]);
+
+  // ---- 正交路由：避免交叉与重叠的四个手段 ----
+  // ① 端口分散：一个节点的多条边在边缘均匀分点，不挤同一点
+  // ② 按对端 y 排序后分配端口：同一束线保持相对顺序 → 不交叉（平面图技巧）
+  // ③ 间隙按需定宽 + 全局通道分配：每条线在它穿过的间隙里独占一条垂直通道
+  // ④ 跨列边走底部通道，逐条错开 y → 不斜穿中间列、不互相压
+
+  // ③-a 统计每个列间隙要过多少条线
+  const nGap = Math.max(cols.length - 1, 0);
+  const slots = Array.from({length: nGap}, ()=>[]);
+  el.forEach(e=>{
+    const a = ci_[e.from], b = ci_[e.to];
+    if (b.ci - a.ci > 1) {           // 跨列：下行占 a 右侧间隙，上行占 b 左侧间隙
+      if (slots[a.ci])   slots[a.ci].push({e, kind:'down'});
+      if (slots[b.ci-1]) slots[b.ci-1].push({e, kind:'up'});
+    } else if (b.ci - a.ci === 1) {
+      slots[a.ci].push({e, kind:'mid'});
+    }
+  });
+  // ③-b 同间隙内按「源行→目标行」排序再发通道号 → 同束线不互相穿越
+  slots.forEach(g=>g.sort((p,q)=>
+    (ci_[p.e.from].ri - ci_[q.e.from].ri) || (ci_[p.e.to].ri - ci_[q.e.to].ri)));
+  const gapW = slots.map(g=>GAP_BASE + g.length*GAP_LANE);
+  const lane = {};
+  const lkey = (e,k)=>e.from+'>'+e.to+'|'+k;
+  slots.forEach((g,gi)=>g.forEach((it,i)=>{ lane[lkey(it.e,it.kind)] = {i, n:g.length, gi}; }));
+
+  // 列 x 由累积间隙决定（不再是 ci*LW）
+  const colX = []; let ax = 20;
+  cols.forEach((c,ci)=>{ colX[ci] = ax; ax += BW + (gapW[ci]||0); });
+
+  const crossEdges = el.filter(e=>ci_[e.to].ci - ci_[e.from].ci > 1);
+  const BUS = 14 + crossEdges.length*7;     // 底部绕行通道，每条跨列边一层
+  const W = ax + 4;
   const H = PADT + maxRows*LH + BUS;
 
   const pos = {};
   cols.forEach((c,ci)=>c.nodes.forEach((n,ri)=>{
-    pos[n.id] = {ci, ri, x: 20+ci*LW, y: PADT+ri*LH,
-                 cx: 20+ci*LW+BW/2, cy: PADT+ri*LH+BH/2};
+    pos[n.id] = {ci, ri, x: colX[ci], y: PADT+ri*LH,
+                 cx: colX[ci]+BW/2, cy: PADT+ri*LH+BH/2};
   }));
 
-  // ---- 正交路由：避免交叉与重叠的三个手段 ----
-  // ① 端口分散：一个节点的多条边在边缘上均匀分点，不再挤同一点
-  // ② 按对端 y 排序后再分配端口：同一束线保持相对顺序 → 不交叉（平面图技巧）
-  // ③ 汇流轴按边序错开 + 跨列边走底部通道 → 垂直段不重叠、不穿节点
-  const el = (s.edges||[]).filter(e=>pos[e.from]&&pos[e.to]);
   const outs = {}, ins = {};
   el.forEach(e=>{ (outs[e.from] = outs[e.from]||[]).push(e);
                   (ins[e.to]   = ins[e.to]  ||[]).push(e); });
   Object.values(outs).forEach(a=>a.sort((p,q)=>pos[p.to].cy - pos[q.to].cy));
   Object.values(ins ).forEach(a=>a.sort((p,q)=>pos[p.from].cy - pos[q.from].cy));
 
+  // 通道号 → 真实 x：在该间隙里均匀分布
+  const laneX = (e,k)=>{
+    const L = lane[lkey(e,k)];
+    if (!L) return pos[e.from].x + BW + 20;
+    return colX[L.gi] + BW + gapW[L.gi]*(L.i+1)/(L.n+1);
+  };
+
   const R = 5;   // 折角圆角
-  const edges = el.map((e,ei)=>{
+  const edges = el.map(e=>{
     const a = pos[e.from], b = pos[e.to];
     const oi = outs[e.from].indexOf(e), on = outs[e.from].length;
     const ii = ins[e.to].indexOf(e),   iN = ins[e.to].length;
@@ -248,18 +295,18 @@ function renderHost(s, hi){
     const x1 = a.x + BW, x2 = b.x;
     let d;
     if (b.ci - a.ci > 1) {
-      // ③ 跨列 → 走底部通道，绝不斜穿中间列的节点
-      const yb = PADT + maxRows*LH + 8 + (ei % 2) * 8;
-      d = `M${x1} ${y1} L${x1+10} ${y1} L${x1+10} ${yb-R} Q${x1+10} ${yb} ${x1+10+R} ${yb}`
-        + ` L${x2-16-R} ${yb} Q${x2-16} ${yb} ${x2-16} ${yb-R} L${x2-16} ${y2+R}`
-        + ` Q${x2-16} ${y2} ${x2-16+R} ${y2} L${x2} ${y2}`;
+      // ④ 跨列 → 下行/上行各走自己的通道，底部横穿一条独占的 y
+      const xd = laneX(e,'down'), xu = laneX(e,'up');
+      const yb = PADT + maxRows*LH + 8 + crossEdges.indexOf(e)*7;
+      d = `M${x1} ${y1} L${xd-R} ${y1} Q${xd} ${y1} ${xd} ${y1+R}`
+        + ` L${xd} ${yb-R} Q${xd} ${yb} ${xd+R} ${yb}`
+        + ` L${xu-R} ${yb} Q${xu} ${yb} ${xu} ${yb-R}`
+        + ` L${xu} ${y2+R} Q${xu} ${y2} ${xu+R} ${y2} L${x2} ${y2}`;
     } else if (Math.abs(y1-y2) < 1.5) {
       d = `M${x1} ${y1} L${x2} ${y2}`;                       // 同高 → 直线
     } else {
-      // ③ 汇流轴错开：多对一汇聚时按**入边序**错开（多条边共用一个目标，
-      //    各自 on=1 用出边序会全部重合），一对多时按出边序错开。
-      const spread = iN > 1 ? ii/(iN-1) : (on > 1 ? oi/(on-1) : 0.5);
-      const mx = x1 + (x2-x1)*(0.28 + 0.44*spread);
+      // ③ 每条线在本间隙独占一条垂直通道，互不重合
+      const mx = laneX(e,'mid');
       const s2 = y2 > y1 ? 1 : -1;
       d = `M${x1} ${y1} L${mx-R} ${y1} Q${mx} ${y1} ${mx} ${y1+R*s2}`
         + ` L${mx} ${y2-R*s2} Q${mx} ${y2} ${mx+R} ${y2} L${x2} ${y2}`;
@@ -271,7 +318,7 @@ function renderHost(s, hi){
   }).join('');
 
   const heads = cols.map((c,ci)=>
-    `<text class=lname x="${20+ci*LW}" y="18">${esc(c.label)}</text>`).join('');
+    `<text class=lname x="${colX[ci]}" y="18">${esc(c.label)}</text>`).join('');
 
   let dets = [];
   const boxes = cols.map(c=>c.nodes.map(n=>{
