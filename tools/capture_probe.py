@@ -621,6 +621,9 @@ def main() -> int:
     ap.add_argument("--report", action="store_true", help="POST 到 kg-hub /api/topology/report")
     ap.add_argument("--pretty", action="store_true", help="人眼可读输出")
     ap.add_argument("--out", type=str, default=None, help="同时写入该文件")
+    ap.add_argument("--html", type=str, default=None,
+                    help="渲染成独立 HTML 文件（本机直接用浏览器打开，"
+                         "不依赖 kg-hub 部署 —— 面板上线前的临时通道）")
     args = ap.parse_args()
 
     snap = collect()
@@ -630,6 +633,24 @@ def main() -> int:
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(snap, ensure_ascii=False, indent=2))
+
+    if args.html:
+        # 复用面板的同一套模板渲染，保证本机预览与 kg-hub 上线后长得一样
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        try:
+            import topology  # noqa: PLC0415
+            view = dict(snap)
+            view.update({"_host": snap["host"], "_recv": snap["generated_at"],
+                         "_age_s": 0, "_stale": False})
+            html = topology._HTML.replace("__DATA__", json.dumps(
+                {"snapshots": [view], "layers": topology.LAYERS,
+                 "stale_after_s": topology.STALE_AFTER_S}, ensure_ascii=False))
+            p = Path(args.html)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(html)
+            print(f"[html] {p}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"[html] 渲染失败: {type(e).__name__}: {e}", file=sys.stderr)
 
     if args.report:
         env = read_env(CM_ENV)
