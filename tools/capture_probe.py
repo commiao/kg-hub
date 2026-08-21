@@ -621,6 +621,10 @@ def main() -> int:
     ap.add_argument("--report", action="store_true", help="POST 到 kg-hub /api/topology/report")
     ap.add_argument("--pretty", action="store_true", help="人眼可读输出")
     ap.add_argument("--out", type=str, default=None, help="同时写入该文件")
+    ap.add_argument("--exit-zero", action="store_true",
+                    help="总是返回 0。给 launchd/cron 用 —— 黄灯是被观测的常态而非"
+                         "装置故障，让退出码携带健康度会把定时任务标成 errored，"
+                         "淹掉真正的装置异常。健康度请从面板 / --out 的 JSON 读。")
     ap.add_argument("--html", type=str, default=None,
                     help="渲染成独立 HTML 文件（本机直接用浏览器打开，"
                          "不依赖 kg-hub 部署 —— 面板上线前的临时通道）")
@@ -662,7 +666,10 @@ def main() -> int:
                            token=env.get("KG_HUB_API_TOKEN"), method="POST", payload=snap)
         print(f"[report] {'失败: ' + err if err else 'ok'}", file=sys.stderr)
 
-    # 退出码：红=2，黄=1，绿=0 —— 方便被 shell / 监控直接消费
+    # 退出码：红=2，黄=1，绿=0 —— 方便被 shell / 监控直接消费。
+    # 但定时任务要用 --exit-zero：见该参数的 help。
+    if args.exit_zero:
+        return 0
     return {RED: 2, AMBER: 1}.get(snap["overall"], 0)
 
 
