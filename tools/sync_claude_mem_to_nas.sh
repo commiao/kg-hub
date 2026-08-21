@@ -26,6 +26,32 @@ mkdir -p "$STATE"
 ts() { date '+%F %T'; }
 [ -f "$SRC" ] || { echo "$(ts) no source db"; exit 0; }
 
+# ── 并发锁 ─────────────────────────────────────────────────────────────
+# launchd 的 StartInterval **不会**在上一轮还活着时另起一轮。所以一次卡死的
+# 传输会让同步无限期冻结 —— 2026-08-21 就是这么停了 40 分钟:一个 cat|ssh
+# 在 79MB 传到 21% 时僵住,STAT=S 挂了 23 分钟,期间 900s 的定时一次都没触发。
+# 这里自己判定并杀掉卡死的上一轮,不把活性交给 launchd。
+LOCK="$STATE/sync.lock"
+if [ -f "$LOCK" ]; then
+  lpid=$(cat "$LOCK" 2>/dev/null)
+  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
+    age=$(ps -o etimes= -p "$lpid" 2>/dev/null | tr -d ' ')
+    [ -n "$age" ] || age=0
+    if [ "$age" -gt 600 ]; then
+      echo "$(ts) 上一轮 pid=$lpid 已卡 ${age}s,杀掉重来"
+      pkill -9 -P "$lpid" 2>/dev/null
+      kill -9 "$lpid" 2>/dev/null
+    else
+      echo "$(ts) 上一轮 pid=$lpid 仍在跑 (${age}s),本轮跳过"
+      exit 0
+    fi
+  fi
+fi
+echo $$ > "$LOCK"
+
+# 被 SIGKILL 打断时 trap 不会跑,79MB 的快照会留在 /tmp。开工先扫。
+find /tmp -maxdepth 1 -name 'cm-snap.*' -type f -mmin +30 -delete 2>/dev/null
+
 # ── 判据 ───────────────────────────────────────────────────────────────
 cur=$(sqlite3 -readonly "$SRC" 'SELECT MAX(id) FROM observations;' 2>/dev/null)
 case "$cur" in
@@ -40,7 +66,7 @@ prev=$(cat "$STAMP" 2>/dev/null)
 
 # ── 快照 ───────────────────────────────────────────────────────────────
 TMP=$(mktemp /tmp/cm-snap.XXXXXX) && rm -f "$TMP" && TMP="$TMP.db"
-trap 'rm -f "$TMP" "$TMP-wal" "$TMP-shm"' EXIT INT TERM
+trap 'rm -f "$TMP" "$TMP-wal" "$TMP-shm" "$LOCK"' EXIT INT TERM
 if ! sqlite3 -readonly "$SRC" "VACUUM INTO '$TMP'" 2>/dev/null; then
   echo "$(ts) ERROR VACUUM INTO 失败,本轮不同步"; exit 1
 fi
@@ -61,9 +87,32 @@ fi
 # 换完主库要顺手删掉 NAS 上的 -wal/-shm:VACUUM INTO 的产物是自包含的(已
 # checkpoint),所以那边任何 -wal 都必然是**上一个版本主库**留下的陈旧文件。
 # 留着的话 SQLite 会拿旧 WAL 去回放新主库 —— 轻则读到错数据,重则判定损坏。
+SIZE=$(wc -c < "$TMP" | tr -d ' ')
+
+# 远端在 mv 之前必须自己验一遍:字节数 + integrity_check + watermark 三样都对。
+#
+# 为什么非得在**远端**验:原来的 `cat > tmp && mv` 挡不住流被截断。ssh 连接
+# 一断,远端 cat 收到的是干净的 EOF,于是 **exit 0**,`&&` 成立,mv 把半截库
+# 装上去。2026-08-21 实测踩到:79MB 传了 17MB 链路僵住,最后 NAS 上的
+# claude-mem.db 变成 17301504 字节、integrity 报 "database disk image is
+# malformed",而日志和退出码都看不出任何异常。
+# 原子 mv 防的是"读到写一半的文件",防不住"写完的是个短文件"。
+REMOTE="gunzip -c > '$DST.tmp' \
+ && [ \"\$(wc -c < '$DST.tmp' | tr -d ' ')\" = '$SIZE' ] \
+ && [ \"\$(sqlite3 -readonly '$DST.tmp' 'PRAGMA integrity_check;' 2>/dev/null | head -1)\" = 'ok' ] \
+ && [ \"\$(sqlite3 -readonly '$DST.tmp' 'SELECT MAX(id) FROM observations;' 2>/dev/null)\" = '$cur' ] \
+ && mv -f '$DST.tmp' '$DST' && rm -f '$DST-wal' '$DST-shm' \
+ || { rm -f '$DST.tmp'; exit 9; }"
+
 for i in 1 2 3; do
-  if cat "$TMP" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$NAS" \
-       "cat > '$DST.tmp' && mv -f '$DST.tmp' '$DST' && rm -f '$DST-wal' '$DST-shm'" \
+  # ServerAliveInterval/CountMax:ConnectTimeout 只管建连,管不了**传输中途**
+  # 卡住。Mac↔NAS 走 tailscale 本来就会抖(见 kg-hub-mac-nas-tailscale-flaky),
+  # 没有 keepalive 的 ssh 会无限期挂着。15s×4 → 约 60s 判死。
+  # 压着传:实测链路只有 ~327 KB/s(direct,67ms,但吞吐就这样),79MB 裸传要 ~246s,
+  # 占掉 900s 周期的 1/4,中途一抖就僵。gzip 后 79MB→26.9MB(2.9x),降到 ~85s,
+  # 卡死暴露面小得多。顺带:gunzip 遇到截断输入会返回非 0,多一层防截断。
+  if gzip -c "$TMP" | ssh -o BatchMode=yes -o ConnectTimeout=10 \
+       -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$NAS" "$REMOTE" \
        >/dev/null 2>&1; then
     echo "$cur" > "$STAMP"
     echo "$(ts) synced (obs MAX id=$cur, 上轮=${prev:-无})"
@@ -71,5 +120,5 @@ for i in 1 2 3; do
   fi
   sleep 10
 done
-echo "$(ts) sync failed (NAS unreachable via Mac), retry next interval"
+echo "$(ts) sync failed (NAS 不可达或远端校验未过), retry next interval"
 exit 0

@@ -444,16 +444,41 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         stamp_age = time.time() - SYNC_STAMP.stat().st_mtime
 
     nas_max: int | None = None
+    nas_integrity: str | None = None
     nas_err = None
     if nas_host:
-        out, nas_err = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", nas_host,
-                           f"sqlite3 '{NAS_DB}' 'SELECT MAX(id) FROM observations;'"], timeout=20)
-        if out.strip().isdigit():
-            nas_max = int(out.strip())
+        # 一次往返同时取完整性和 watermark。**必须查 integrity_check**：
+        # 传输被截断时 NAS 上会落一个短文件，SELECT MAX(id) 直接报
+        # "database disk image is malformed"、取不到数 —— 如果只看 MAX(id)
+        # 拿不到就判 amber「读不到」，那么**库损坏这件事就是静默的**
+        # （amber 按设计不告警）。这正是本项目要抓的失效类型，2026-08-21
+        # 在探针自己身上复现了一次。
+        out, nas_err = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                           "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3", nas_host,
+                           f"sqlite3 -readonly '{NAS_DB}' 'PRAGMA integrity_check;' 2>&1 | head -1; "
+                           f"echo '@@'; "
+                           f"sqlite3 -readonly '{NAS_DB}' 'SELECT MAX(id) FROM observations;' 2>&1"],
+                          timeout=25)
+        if "@@" in out:
+            integ_raw, max_raw = out.split("@@", 1)
+            nas_integrity = integ_raw.strip()
+            if max_raw.strip().isdigit():
+                nas_max = int(max_raw.strip())
 
     node = {"id": "sync", "layer": "transport", "label": "Mac→NAS",
-            "metrics": {"local_max_obs_id": local_max, "nas_max_obs_id": nas_max}}
+            "metrics": {"local_max_obs_id": local_max, "nas_max_obs_id": nas_max,
+                        "nas_integrity": nas_integrity}}
+
+    # 库损坏 = RED。它和"NAS 连不上"是两件完全不同的事：前者是数据已经坏了、
+    # ingester 正在读一个坏库；后者多半是 tailscale 抖一下，下轮就好。
+    if nas_integrity and nas_integrity != "ok":
+        node["state"] = RED
+        node["detail"] = (f"⚠️ NAS 侧 db 已损坏：{nas_integrity[:80]}"
+                          f"｜ingester 正在读一个坏库，需重传全量（见 T-0033）")
+        return node
+
     if nas_max is None:
+        # 走到这里说明 ssh 本身没通（或输出格式不对）—— 传输层抖动，暂态。
         node["state"] = AMBER
         node["detail"] = f"读不到 NAS 侧 db（{nas_err or 'no host'}）｜最后日志：{last_line[-60:]}"
         return node
