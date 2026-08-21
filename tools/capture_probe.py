@@ -205,9 +205,12 @@ def probe_tools() -> tuple[list[dict], dict]:
         nodes.append(node)
         seen[key] = node
 
-    # 排序：有数据的按新鲜度在前，无数据的（grey）沉底
+    # 排序：无数据的（grey）沉底，其余按 KNOWN_TOOLS 声明序 —— **不能按新鲜度排**。
+    # 按新鲜度排会让每次 60s 刷新时节点上下互换位置，看板上找一个工具就得重新扫一遍，
+    # 空间记忆全废。监控面板的位置稳定性 > 让最活跃的排最前。
+    decl = {k: i for i, (k, *_ ) in enumerate(KNOWN_TOOLS)}
     nodes.sort(key=lambda n: (n["state"] == GREY,
-                              n.get("idle_seconds") if n.get("idle_seconds") is not None else 1 << 60))
+                              decl.get(n["id"].split(":", 1)[-1], 1 << 20)))
     return nodes, seen
 
 

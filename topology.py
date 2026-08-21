@@ -120,10 +120,12 @@ _HTML = r"""<!doctype html>
 :root{
   --bg:#faf9f7; --fg:#1a1a19; --mut:#6b6a66; --line:#dedcd6; --card:#fff;
   --green:#2e9b5b; --amber:#d29922; --red:#e5534b; --grey:#a3a19b;
+  --band:#efece6;
 }
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){
   --bg:#16171a; --fg:#e8e6e1; --mut:#9a9892; --line:#2c2e33; --card:#1d1f23;
   --green:#3fb950; --amber:#d29922; --red:#f85149; --grey:#6e7681;
+  --band:#23262c;
 }}
 *{box-sizing:border-box}
 body{margin:0;padding:20px;background:var(--bg);color:var(--fg);
@@ -164,6 +166,9 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
   padding-top:10px;display:none;white-space:pre-wrap}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--mut);margin-top:6px}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
+.band{fill:var(--band)}
+.bandsep{stroke:var(--line);stroke-width:1.2;opacity:1}
+.bandtag{fill:var(--mut);font-size:10px;letter-spacing:.4px}
 .empty{color:var(--mut);padding:30px;text-align:center;border:1px dashed var(--line);
   border-radius:10px}
 .back{display:inline-block;margin:0 0 .5rem;font-size:13px;color:var(--mut);
@@ -198,8 +203,8 @@ const D = __DATA__;
 // 列间距**不再是常量** —— 见 renderHost 里的 gapW：按实际穿过的连线数算。
 // 等宽间隙是上一版的病根：设备→工具要过 9 条线、worker→存储只过 1 条，
 // 给同样的 46px，前者被压成每条 5px 的一团麻。
-const LH = 74, PADT = 34, BW = 104, BH = 42;
-const GAP_BASE = 40, GAP_LANE = 15;   // 间隙宽 = BASE + 过线数 * LANE
+const LH = 86, LH_C = 60, PADT = 34, BW = 104, BH = 42;   // LH_C: 无工具的行
+const GAP_BASE = 52, GAP_LANE = 17;   // 间隙宽 = BASE + 过线数 * LANE
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
@@ -224,12 +229,73 @@ function renderHost(s, hi){
   const cols = D.layers.map(([key,label])=>({
     key, label, nodes:(s.nodes||[]).filter(n=>n.layer===key)
   })).filter(c=>c.nodes.length);
-  const maxRows = Math.max(...cols.map(c=>c.nodes.length), 1);
+  const nodeById = {}; (s.nodes||[]).forEach(n=>nodeById[n.id]=n);
+  const ciOf = {}; cols.forEach((c,i)=>ciOf[c.key]=i);
+  const devCol = cols.find(c=>c.key==='device'), toolCol = cols.find(c=>c.key==='tool');
 
-  // 列/行序（不依赖 x，先算出来给通道统计用）
+  // ---- 按设备分组成横向 band ----
+  // 工具按所属设备聚簇，band 内相邻 == 装在同一台机器上。
+  // 归属关系一旦由「相邻 + 底色分带」表达，设备→工具那 8 条连线就**不用画了**
+  // —— 这比把它们摊开更彻底：设备→工具间隙从 9 条降到 1 条。
+  const owner = {};
+  (s.edges||[]).forEach(e=>{
+    if (e.from.startsWith('dev:') && nodeById[e.to] && nodeById[e.to].layer==='tool')
+      owner[e.to] = e.from;
+  });
+  const bands = [];
+  let rcur = 0;
+  if (devCol && toolCol) {
+    // 有工具的设备排前面 → 工具列连续成块，没有采集工具的设备（NAS/手机/离线机）
+    // 收在底部，它们的空带不会把工具列切断
+    const ordered = devCol.nodes.slice().sort((a,b)=>
+      (toolCol.nodes.some(t=>owner[t.id]===a.id) ? 0 : 1)
+      - (toolCol.nodes.some(t=>owner[t.id]===b.id) ? 0 : 1));
+    ordered.forEach(dn=>{
+      const tools = toolCol.nodes.filter(t=>owner[t.id]===dn.id);
+      const rows = Math.max(tools.length, 1);
+      bands.push({dev:dn, tools, r0:rcur, rows});
+      rcur += rows;
+    });
+    const orphans = toolCol.nodes.filter(t=>!owner[t.id]);
+    if (orphans.length){ bands.push({dev:null, tools:orphans, r0:rcur, rows:orphans.length});
+                         rcur += orphans.length; }
+  }
+
+  // ---- 行号分配 ----
+  const row = {};
+  bands.forEach(b=>{
+    if (b.dev) row[b.dev.id] = b.r0;                       // 设备框对齐它这一带的首行
+    b.tools.forEach((t,k)=>{ row[t.id] = b.r0 + k; });
+  });
+  // 工具之后各列：行 = 前驱行的均值 → 节点贴近来源，连线更短更直，
+  // hook 自然落在对应工具同一行（tool→hook 变成一条水平直线）
+  const preds = {};
+  (s.edges||[]).forEach(e=>{ (preds[e.to] = preds[e.to]||[]).push(e.from); });
+  cols.forEach(c=>{
+    if (c.key==='device' || c.key==='tool') return;
+    const want = c.nodes.map(n=>{
+      const ps = (preds[n.id]||[]).filter(x=>row[x]!=null);
+      return {n, r: ps.length ? ps.reduce((a,x)=>a+row[x],0)/ps.length : 0};
+    }).sort((a,b)=>a.r-b.r);
+    let last = -Infinity;                                  // 同列去重叠：至少隔 1 行
+    want.forEach(w=>{ const r = Math.max(w.r, last+1); row[w.n.id] = r; last = r; });
+  });
+  cols.forEach(c=>c.nodes.forEach((n,ri)=>{ if(row[n.id]==null) row[n.id] = ri; }));
+  const nRows = Math.ceil(Math.max(...Object.values(row))) + 1;
+  const toolRows = new Set();
+  bands.forEach(b=>b.tools.forEach((t,k)=>toolRows.add(b.r0+k)));
+  const rowH = Array.from({length:nRows}, (_,r)=>toolRows.has(r) ? LH : LH_C);
+  const rowTop = [0];
+  for (let r=0; r<nRows; r++) rowTop[r+1] = rowTop[r] + rowH[r];
+  const yOf = r=>{ const f = Math.max(0, Math.min(nRows-1, Math.floor(r)));
+                   return PADT + rowTop[f] + (r-f)*rowH[f]; };
+  const maxRows = nRows;
+
   const ci_ = {};
-  cols.forEach((c,ci)=>c.nodes.forEach((n,ri)=>{ ci_[n.id] = {ci, ri}; }));
-  const el = (s.edges||[]).filter(e=>ci_[e.from]&&ci_[e.to]);
+  cols.forEach((c,ci)=>c.nodes.forEach(n=>{ ci_[n.id] = {ci, ri: row[n.id]}; }));
+  // 设备→工具的边不再画（归属已由分带表达）
+  const el = (s.edges||[]).filter(e=>ci_[e.from]&&ci_[e.to])
+    .filter(e=>!(e.from.startsWith('dev:') && nodeById[e.to] && nodeById[e.to].layer==='tool'));
 
   // ---- 正交路由：避免交叉与重叠的四个手段 ----
   // ① 端口分散：一个节点的多条边在边缘均匀分点，不挤同一点
@@ -264,12 +330,12 @@ function renderHost(s, hi){
   const crossEdges = el.filter(e=>ci_[e.to].ci - ci_[e.from].ci > 1);
   const BUS = 14 + crossEdges.length*7;     // 底部绕行通道，每条跨列边一层
   const W = ax + 4;
-  const H = PADT + maxRows*LH + BUS;
+  const H = PADT + rowTop[nRows] + BUS;
 
   const pos = {};
-  cols.forEach((c,ci)=>c.nodes.forEach((n,ri)=>{
-    pos[n.id] = {ci, ri, x: colX[ci], y: PADT+ri*LH,
-                 cx: colX[ci]+BW/2, cy: PADT+ri*LH+BH/2};
+  cols.forEach((c,ci)=>c.nodes.forEach(n=>{
+    const ri = row[n.id], y = yOf(ri);
+    pos[n.id] = {ci, ri, x: colX[ci], y, cx: colX[ci]+BW/2, cy: y+BH/2};
   }));
 
   const outs = {}, ins = {};
@@ -297,7 +363,7 @@ function renderHost(s, hi){
     if (b.ci - a.ci > 1) {
       // ④ 跨列 → 下行/上行各走自己的通道，底部横穿一条独占的 y
       const xd = laneX(e,'down'), xu = laneX(e,'up');
-      const yb = PADT + maxRows*LH + 8 + crossEdges.indexOf(e)*7;
+      const yb = PADT + rowTop[nRows] + 8 + crossEdges.indexOf(e)*7;
       d = `M${x1} ${y1} L${xd-R} ${y1} Q${xd} ${y1} ${xd} ${y1+R}`
         + ` L${xd} ${yb-R} Q${xd} ${yb} ${xd+R} ${yb}`
         + ` L${xu-R} ${yb} Q${xu} ${yb} ${xu} ${yb-R}`
@@ -315,6 +381,15 @@ function renderHost(s, hi){
     const faint = e.from.startsWith('dev:') ? ' faint' : (b.ci-a.ci>1 ? ' bypass' : '');
     const mk = faint ? "" : ` marker-end="url(#${({green:"ag",amber:"aa",red:"ar"})[e.state]||"ax"})"`;
     return `<path class="edge ${esc(e.state)}${faint}" d="${d}"${mk}/>`;
+  }).join('');
+
+  // band 底色 + 分隔线：先画，垫在连线和节点下面
+  const bandSvg = bands.map((b,k)=>{
+    const y0 = PADT + rowTop[b.r0] - (rowH[b.r0]-BH)/2;
+    const h  = rowTop[Math.min(b.r0+b.rows, nRows)] - rowTop[b.r0];
+    const fill = (k % 2) ? `<rect class=band x="6" y="${y0}" width="${W-12}" height="${h}" rx="6"/>` : '';
+    const sep  = k ? `<line class=bandsep x1="6" y1="${y0}" x2="${W-6}" y2="${y0}"/>` : '';
+    return fill + sep;
   }).join('');
 
   const heads = cols.map((c,ci)=>
@@ -347,7 +422,7 @@ function renderHost(s, hi){
     <div class=hh><b>${esc(s._host)}</b>
       <span class="pill ${esc(s.overall)}">${esc(s.overall)}</span>${age}${stale}</div>
     <div class=wrap><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
-      ${heads}${edges}${boxes}
+      ${bandSvg}${heads}${edges}${boxes}
     </svg></div>
     ${blockers}${dets.join('')}
   </div>`;
