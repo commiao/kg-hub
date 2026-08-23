@@ -43,7 +43,7 @@ HOME = Path.home()
 CM_DB = HOME / ".claude-mem" / "claude-mem.db"
 CM_ENV = HOME / ".claude-mem" / ".env"
 CM_HEALTH = "http://localhost:37701/api/health"
-SYNC_STAMP = HOME / ".kg-hub" / "state" / "claude-mem-synced.sha"
+SYNC_STAMP = HOME / ".kg-hub" / "state" / "claude-mem-synced.obsid"
 SYNC_LOG = HOME / ".kg-hub" / "logs" / "claude-mem-sync.out.log"
 NAS_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
 
@@ -53,9 +53,20 @@ GREEN, AMBER, RED, GREY = "green", "amber", "red", "grey"
 # 工具层阈值：工具"没在用"不是故障，所以只有 green/amber，never red
 TOOL_FRESH_S = 4 * 3600          # 4h 内有产出 = 活跃
 # sync 跳阈值：这一跳是 T-0028 的现场，判据要严
-SYNC_LAG_ROWS_RED = 50           # NAS 落后超过这么多条 = 故障
-SYNC_LAG_SECONDS_RED = 2 * 3600  # 或者落后超过 2h = 故障
-SYNC_LAG_ROWS_AMBER = 5
+# 同步健康的判据是**距上次成功同步多久**，不是落后多少条。
+#
+# 原来用 SYNC_LAG_ROWS_RED=50 条判故障 —— 错得很实在:实测正常单个 15 分钟
+# 周期就经常新增 49/52/55/56 条，阈值直接落在正常范围里面。探针每 10 分钟
+# 跑一次、与 15 分钟的同步周期错开，于是随便赶上一个活跃周期就报 red。
+# 2026-08-23 真的这么误报了一次(落差 69，实际上 14 分钟前刚同步成功)。
+# 条数随活跃度浮动，是**工作量**不是**健康度**；时间才是。
+#
+# stamp 的 mtime 只在同步**成功**时更新，所以它就是"上次成功同步"的时刻。
+# 空闲期(没有新 obs，脚本报 skip)stamp 也不动，因此所有判据都加 lag>0 前置：
+# 落差为 0 就是健康，跟多久没同步无关(比如笔记本睡了一夜)。
+SYNC_STALL_RED_S = 45 * 60       # 连续 3 个周期没能成功同步 = 故障
+SYNC_STALL_AMBER_S = 25 * 60     # 跳过 1 个周期 = 留意
+SYNC_LAG_ROWS_HUGE = 500         # 落差大到不像单周期的量，单独提示积压
 
 # 已知工具全集 —— **无数据也要列出来**（灰色"未接入"），否则"某工具从未接入"
 # 这件事本身在图上不可见，正是 T-0021 那类问题的温床。
@@ -484,19 +495,28 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         return node
 
     lag = (local_max or 0) - nas_max
+    age = stamp_age or 0
     node["metrics"]["lag_rows"] = lag
-    if lag >= SYNC_LAG_ROWS_RED or (stamp_age or 0) > SYNC_LAG_SECONDS_RED and lag > 0:
+    node["metrics"]["since_last_sync_s"] = int(age) if stamp_age else None
+
+    if lag <= 0:
+        node["state"] = GREEN          # 追平了就是健康，无关多久没同步
+    elif age > SYNC_STALL_RED_S:
         node["state"] = RED
-    elif lag > SYNC_LAG_ROWS_AMBER:
+    elif age > SYNC_STALL_AMBER_S:
         node["state"] = AMBER
     else:
-        node["state"] = GREEN
-    node["idle_seconds"] = int(stamp_age) if stamp_age else None
+        node["state"] = GREEN          # 刚同步过，落差只是本周期的正常累积
+
+    node["idle_seconds"] = int(age) if stamp_age else None
     node["idle_human"] = human_idle(stamp_age)
     node["detail"] = (f"落差 {lag} 条（本机 {local_max} / NAS {nas_max}）｜"
-                      f"上次实际 synced {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
-    if lag >= SYNC_LAG_ROWS_RED:
-        node["detail"] += "  ⚠️ NAS 侧数据已冻结，kg-hub 拿不到新观察（参见 T-0028）"
+                      f"上次成功同步 {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
+    if node["state"] == RED:
+        node["detail"] += (f"  ⚠️ 已 {human_idle(age)}没能成功同步且仍有 {lag} 条未过去，"
+                           f"kg-hub 拿不到新观察")
+    elif lag >= SYNC_LAG_ROWS_HUGE:
+        node["detail"] += f"  ｜积压 {lag} 条偏大，留意是否在追赶"
     return node
 
 
