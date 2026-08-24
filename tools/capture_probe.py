@@ -64,6 +64,17 @@ TOOL_FRESH_S = 4 * 3600          # 4h 内有产出 = 活跃
 # stamp 的 mtime 只在同步**成功**时更新，所以它就是"上次成功同步"的时刻。
 # 空闲期(没有新 obs，脚本报 skip)stamp 也不动，因此所有判据都加 lag>0 前置：
 # 落差为 0 就是健康，跟多久没同步无关(比如笔记本睡了一夜)。
+#
+# ── 2026-08-24 第三轮修正:连"距上次成功同步"也是错的代理量 ──────────────
+# 又误报了一次:8/23 23:42 之后整夜零 obs(人在睡)，stamp 因此 11 小时没动;
+# 11:16 新 obs 一落地，lag 变 20，判据立刻撞上 age(11h) > 45min → RED，
+# 而这 20 条**只等了 4 分钟**，且 11:20 就正常同步走了。
+# 空闲越久 → 误报越狠，正好在最不该报警的时候报警。
+#
+# 正解:判"**这批未同步的 obs 等了多久**" = now - MIN(created_at) where
+# id > nas_max。它直接就是"数据被卡了多久"这个要测的量本身，不受空闲期影响:
+# 空闲期没有未同步行，无从计算，自然不报。
+# 同一个坑的第三种壳:条数(工作量)→距上次同步(被空闲污染)→积压行等待时长(真量)。
 SYNC_STALL_RED_S = 45 * 60       # 连续 3 个周期没能成功同步 = 故障
 SYNC_STALL_AMBER_S = 25 * 60     # 跳过 1 个周期 = 留意
 SYNC_LAG_ROWS_HUGE = 500         # 落差大到不像单周期的量，单独提示积压
@@ -495,25 +506,53 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         return node
 
     lag = (local_max or 0) - nas_max
-    age = stamp_age or 0
     node["metrics"]["lag_rows"] = lag
-    node["metrics"]["since_last_sync_s"] = int(age) if stamp_age else None
+    node["metrics"]["since_last_sync_s"] = int(stamp_age) if stamp_age else None
+
+    # 积压行等了多久 = now - 最老未同步行的 created_at。这才是"数据被卡多久"
+    # 本身;stamp_age 会被空闲期污染(见顶部第三轮注释)。
+    backlog_age = None
+    if lag > 0:
+        try:
+            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            row = con.execute(
+                "SELECT MIN(created_at_epoch) FROM observations WHERE id > ?;",
+                (nas_max,)).fetchone()
+            con.close()
+            if row and row[0]:
+                # created_at_epoch 是**毫秒**(claude-mem 用 JS 时间戳)。按秒算会
+                # 得到 -1.78e12 这种负数，被 max(0,..) 夹成 0 → 看起来"刚积压"，
+                # 永远绿灯 —— 又一个"命令成功但语义错"的静默失效。
+                ep = float(row[0])
+                if ep > 1e11:
+                    ep /= 1000.0
+                backlog_age = max(0.0, time.time() - ep)
+        except Exception:  # noqa: BLE001
+            backlog_age = None
+        # 注意:算不到时**不要**退回 stamp_age —— 那正是本轮要消除的假红来源
+        # (空闲越久 stamp_age 越大)。算不出就判 amber(留意、不告警)，别猜。
+    # 用 is not None:0.0 是合法值(刚产生的积压)，别被当成"算不出"
+    node["metrics"]["backlog_age_s"] = (
+        int(backlog_age) if backlog_age is not None else None)
 
     if lag <= 0:
         node["state"] = GREEN          # 追平了就是健康，无关多久没同步
-    elif age > SYNC_STALL_RED_S:
+    elif backlog_age is None:
+        node["state"] = AMBER          # 有落差但算不出等待时长，留意不报警
+    elif backlog_age > SYNC_STALL_RED_S:
         node["state"] = RED
-    elif age > SYNC_STALL_AMBER_S:
+    elif backlog_age > SYNC_STALL_AMBER_S:
         node["state"] = AMBER
     else:
-        node["state"] = GREEN          # 刚同步过，落差只是本周期的正常累积
+        node["state"] = GREEN          # 积压刚产生，属本周期正常累积
 
-    node["idle_seconds"] = int(age) if stamp_age else None
+    node["idle_seconds"] = int(stamp_age) if stamp_age else None
     node["idle_human"] = human_idle(stamp_age)
     node["detail"] = (f"落差 {lag} 条（本机 {local_max} / NAS {nas_max}）｜"
-                      f"上次成功同步 {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
+                      + (f"积压最久 {human_idle(backlog_age)}｜" if backlog_age else "")
+                      + f"上次成功同步 {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
     if node["state"] == RED:
-        node["detail"] += (f"  ⚠️ 已 {human_idle(age)}没能成功同步且仍有 {lag} 条未过去，"
+        node["detail"] += (f"  ⚠️ 最老未同步 obs 已等 {human_idle(backlog_age)}（{lag} 条），"
                            f"kg-hub 拿不到新观察")
     elif lag >= SYNC_LAG_ROWS_HUGE:
         node["detail"] += f"  ｜积压 {lag} 条偏大，留意是否在追赶"
