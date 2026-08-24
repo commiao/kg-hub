@@ -28,6 +28,8 @@ LAYERS = [
     ("worker", "worker"),
     ("storage", "存储"),
     ("transport", "传输"),
+    ("nasdb", "NAS 副本"),
+    ("consumer", "消费容器"),
     ("kghub", "kg-hub"),
     ("graph", "图谱"),
 ]
@@ -196,7 +198,7 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
 </style>
 <a class=back href="/portal">← 报表门户</a>
 <h1>采集链路拓扑</h1>
-<div class=sub>工具 → hook → claude-mem → SQLite → 传输 → kg-hub ｜ 每 60s 自动刷新 ｜ 点节点看详情</div>
+<div class=sub>工具 → hook → claude-mem → SQLite → 传输 → NAS 副本 → refinery → kg-hub → FalkorDB ｜ 每 60s 自动刷新 ｜ 点节点看详情</div>
 <div class=legend>
   <span><i style="background:var(--green)"></i>正常</span>
   <span><i style="background:var(--amber)"></i>空闲/滞后（非故障）</span>
@@ -288,16 +290,33 @@ function renderHost(s, hi){
   });
   // 工具之后各列：行 = 前驱行的均值 → 节点贴近来源，连线更短更直，
   // hook 自然落在对应工具同一行（tool→hook 变成一条水平直线）
-  const preds = {};
-  (s.edges||[]).forEach(e=>{ (preds[e.to] = preds[e.to]||[]).push(e.from); });
+  const orphan = [];
+  const preds = {}, succs = {};
+  (s.edges||[]).forEach(e=>{ (preds[e.to] = preds[e.to]||[]).push(e.from);
+                             (succs[e.from] = succs[e.from]||[]).push(e.to); });
   cols.forEach(c=>{
     if (c.key==='device' || c.key==='tool') return;
     const want = c.nodes.map(n=>{
       const ps = (preds[n.id]||[]).filter(x=>row[x]!=null);
-      return {n, r: ps.length ? ps.reduce((a,x)=>a+row[x],0)/ps.length : 0};
+      if (ps.length) return {n, r: ps.reduce((a,x)=>a+row[x],0)/ps.length};
+      orphan.push({n, col:c});     // 没有前驱 → 留到补算 pass（见下）
+      return {n, r: 0};
     }).sort((a,b)=>a.r-b.r);
     let last = -Infinity;                                  // 同列去重叠：至少隔 1 行
     want.forEach(w=>{ const r = Math.max(w.r, last+1); row[w.n.id] = r; last = r; });
+  });
+
+  // 补算 pass：没有前驱的节点（如 ingester —— 它是独立的 canonical 文档线，
+  // 不读 claude-mem）改用**后继**行定位。必须放在主循环之后：它的后继
+  // (kg-hub) 在更右边的列，主循环按列从左往右走时那一行还没算出来，
+  // 于是只能退回 0，节点被甩到图顶孤零零飘着。
+  orphan.forEach(({n, col})=>{
+    const ss = (succs[n.id]||[]).filter(x=>row[x]!=null);
+    if (!ss.length) return;
+    let r = ss.reduce((a,x)=>a+row[x],0)/ss.length;
+    const taken = col.nodes.filter(m=>m.id!==n.id).map(m=>row[m.id]).sort((a,b)=>a-b);
+    while (taken.some(t=>Math.abs(t-r) < 1)) r += 1;       // 躲开同列已占的行
+    row[n.id] = r;
   });
   cols.forEach(c=>c.nodes.forEach((n,ri)=>{ if(row[n.id]==null) row[n.id] = ri; }));
   const nRows = Math.ceil(Math.max(...Object.values(row))) + 1;

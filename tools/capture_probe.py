@@ -604,6 +604,142 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
     return node
 
 
+NAS_REFINERY_STATUS = "/volume2/4T/kg-hub-data/refinery-state/status.json"
+REFINERY_STALE_S = 15 * 60       # status.json 超过这么久没更新 = refinery 可能死了
+
+
+def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
+    """NAS 侧的消费链路：副本库 → refinery / ingester 容器 → kg-hub。
+
+    这段以前完全没在拓扑上 —— 图止于「传输 → kg-hub」，中间三跳是黑的。
+    可是数据卡住最常见的位置恰恰在这里（副本损坏、refinery 被温度门控歇工、
+    容器挂了），看板却什么都不显示。
+
+    一次 ssh 取三样：副本自身状态、refinery 的 status.json、容器存活。
+    """
+    out = [
+        {"id": "nasdb", "layer": "nasdb", "label": "claude-mem 副本",
+         "state": GREY, "detail": "未探测"},
+        {"id": "refinery", "layer": "consumer", "label": "refinery",
+         "state": GREY, "detail": "未探测"},
+        {"id": "ingester", "layer": "consumer", "label": "ingester",
+         "state": GREY, "detail": "未探测"},
+    ]
+    if not nas_host:
+        return out
+
+    dk = "sudo -n /var/packages/ContainerManager/target/usr/bin/docker"
+    cmd = (
+        f"echo \"size=$(wc -c < '{NAS_DB}' 2>/dev/null)\"; "
+        f"echo \"integ=$(sqlite3 -readonly '{NAS_DB}' 'PRAGMA integrity_check;' 2>/dev/null | head -1)\"; "
+        f"echo \"max=$(sqlite3 -readonly '{NAS_DB}' 'SELECT MAX(id) FROM observations;' 2>/dev/null)\"; "
+        f"echo \"mtime=$(date -r '{NAS_DB}' +%s 2>/dev/null)\"; "
+        f"echo 'status_begin'; cat '{NAS_REFINERY_STATUS}' 2>/dev/null; echo; echo 'status_end'; "
+        f"{dk} ps --format '{{{{.Names}}}}|{{{{.Status}}}}' 2>/dev/null"
+    )
+    raw, err = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                   "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+                   nas_host, cmd], timeout=30)
+    if err and not raw:
+        for n in out:
+            n["state"] = AMBER
+            n["detail"] = f"NAS 探测失败（{err}）"
+        return out
+
+    def field(k):
+        m = re.search(rf"^{k}=(.*)$", raw, re.M)
+        return (m.group(1).strip() if m else "")
+
+    # —— 副本库 ——
+    integ, size, nmax, mtime = field("integ"), field("size"), field("max"), field("mtime")
+    db = out[0]
+    db["metrics"] = {"size_bytes": int(size) if size.isdigit() else None,
+                     "max_obs_id": int(nmax) if nmax.isdigit() else None}
+    if not size or not size.isdigit():
+        db["state"] = RED
+        db["detail"] = "副本文件不存在"
+    elif integ != "ok":
+        # 库损坏 ≠ 连不上。前者是数据已经坏了、refinery 正在读坏库。
+        db["state"] = RED
+        db["detail"] = f"⚠️ 副本损坏：{integ[:60]}"
+    else:
+        age = None
+        if mtime.isdigit():
+            age = int(time.time()) - int(mtime)
+            db["idle_seconds"] = age
+            db["idle_human"] = human_idle(age)
+        lag = (local_max or 0) - int(nmax) if nmax.isdigit() else None
+        db["state"] = GREEN
+        db["detail"] = (f"{int(size)/1048576:.1f} MB · MAX(id)={nmax}"
+                        + (f" · 落后本机 {lag} 条" if lag else " · 与本机一致")
+                        + " · 剥离版(仅 observations+sdk_sessions)")
+
+    # —— 容器存活 ——
+    ps = dict(l.split("|", 1) for l in raw.splitlines() if "|" in l and not l.startswith("#"))
+    def container(name):
+        for k, v in ps.items():
+            if k.strip() == name:
+                return v.strip()
+        return None
+
+    # —— refinery ——
+    rf = out[1]
+    st_txt = ""
+    m = re.search(r"status_begin\n(.*?)\nstatus_end", raw, re.S)
+    if m:
+        st_txt = m.group(1).strip()
+    cs = container("kg-hub-refinery")
+    try:
+        js = json.loads(st_txt) if st_txt else {}
+    except Exception:  # noqa: BLE001
+        js = {}
+    if cs is None:
+        rf["state"] = RED
+        rf["detail"] = "容器 kg-hub-refinery 不在运行"
+    elif not js:
+        rf["state"] = AMBER
+        rf["detail"] = f"容器 {cs}，但读不到 status.json"
+    else:
+        age = None
+        try:
+            age = int(time.time() - datetime.fromisoformat(js["ts"]).timestamp())
+        except Exception:  # noqa: BLE001
+            pass
+        rf["idle_seconds"] = age
+        rf["idle_human"] = human_idle(age)
+        rf["metrics"] = {k: js.get(k) for k in
+                         ("live_cursor", "backlog_remaining", "disk_temp", "per_cycle")}
+        bl, dt = js.get("backlog_remaining"), js.get("disk_temp")
+        base = (f"游标 {js.get('live_cursor')} · 积压 {bl} · 盘温 {dt}°C")
+        if js.get("last_error"):
+            rf["state"] = RED
+            rf["detail"] = f"last_error: {str(js['last_error'])[:60]} · {base}"
+        elif age is not None and age > REFINERY_STALE_S:
+            # 心跳停了才是故障 —— 下面两种"歇工"是它自己选择的，不是坏了。
+            rf["state"] = RED
+            rf["detail"] = f"⚠️ status.json {human_idle(age)}没更新，refinery 可能已死 · {base}"
+        elif js.get("thermal_hold"):
+            rf["state"] = AMBER
+            rf["detail"] = f"温度门控歇工（盘温 {dt}°C 超阈）· {base}"
+        elif js.get("idle_outside_window"):
+            rf["state"] = AMBER
+            rf["detail"] = f"工作窗口外待命（凉窗 01:00-08:00 才开工）· {base}"
+        else:
+            rf["state"] = GREEN
+            rf["detail"] = f"处理中 · {base}"
+
+    # —— ingester（canonical docs 线，与 claude-mem 无关，并入 kg-hub）——
+    ig = out[2]
+    cs = container("kg-hub-ingester")
+    if cs is None:
+        ig["state"] = RED
+        ig["detail"] = "容器 kg-hub-ingester 不在运行"
+    else:
+        ig["state"] = GREEN
+        ig["detail"] = f"{cs} · canonical 文档线，每 600s 一轮（不读 claude-mem）"
+    return out
+
+
 def probe_kghub(url: str | None, token: str | None) -> list[dict]:
     """kg-hub 服务 + 图谱规模。"""
     if not url:
@@ -670,6 +806,18 @@ def build_edges(tool_seen: dict, nodes_by_id: dict) -> list[dict]:
             edges.append({"from": "sync:openclaw", "to": "kghub",
                           "state": st("sync:openclaw") if st("sync:openclaw") != GREEN
                           else st("kghub")})
+    # NAS 侧消费链:传输 → 副本库 → refinery → kg-hub；ingester 是独立的
+    # canonical 文档线(不读 claude-mem),直接进 kg-hub。
+    if "nasdb" in nodes_by_id:
+        edges.append({"from": "sync", "to": "nasdb", "state": st("nasdb")})
+        if "refinery" in nodes_by_id:
+            edges.append({"from": "nasdb", "to": "refinery", "state": st("refinery")})
+            edges.append({"from": "refinery", "to": "kghub",
+                          "state": st("refinery") if st("refinery") != GREEN else st("kghub")})
+    if "ingester" in nodes_by_id:
+        edges.append({"from": "ingester", "to": "kghub",
+                      "state": st("ingester") if st("ingester") != GREEN else st("kghub")})
+
     # NAS 设备 → kg-hub
     nas_dev = next((n["id"] for n in nodes_by_id.values()
                     if n["layer"] == "device" and "nas" in n["label"].lower()), None)
@@ -683,6 +831,19 @@ def build_edges(tool_seen: dict, nodes_by_id: dict) -> list[dict]:
         {"from": "kghub", "to": "falkordb", "state": st("falkordb")},
     ]
     return [e for e in edges if e["from"] in nodes_by_id and e["to"] in nodes_by_id]
+
+
+def _layer_defs():
+    """层定义的唯一真源:topology.LAYERS。取不到时退回一份等价副本。"""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import topology  # noqa: PLC0415
+        return topology.LAYERS
+    except Exception:  # noqa: BLE001
+        return [("device", "设备"), ("tool", "工具"), ("hook", "hook"),
+                ("worker", "worker"), ("storage", "存储"), ("transport", "传输"),
+                ("nasdb", "NAS 副本"), ("consumer", "消费容器"),
+                ("kghub", "kg-hub"), ("graph", "图谱")]
 
 
 def collect() -> dict:
@@ -705,10 +866,11 @@ def collect() -> dict:
     worker = probe_worker()
     sqlite_node, local_max = probe_sqlite()
     sync_node = probe_sync(local_max, nas_host)
+    nas_nodes = probe_nas_chain(nas_host, local_max)
     kg_nodes = probe_kghub(url, token)
 
     nodes = (device_nodes + tool_nodes + hook_nodes + [worker, sqlite_node, sync_node]
-             + [n for n in oc_nodes if n["layer"] == "transport"] + kg_nodes)
+             + [n for n in oc_nodes if n["layer"] == "transport"] + nas_nodes + kg_nodes)
     by_id = {n["id"]: n for n in nodes}
     edges = build_edges(tool_seen, by_id)
 
@@ -722,8 +884,9 @@ def collect() -> dict:
         "host": os.uname().nodename.split(".")[0],
         "overall": worst,
         "blockers": blockers,
-        "layers": ["device", "tool", "hook", "worker", "storage", "transport",
-                   "kghub", "graph"],
+        # 唯一真源是 topology.LAYERS。这里曾经手抄一份,结果加了新层却漏改这里,
+        # 节点探到了却整层不显示(device/graph 踩过一次,nasdb/consumer 又踩一次)。
+        "layers": [k for k, _ in _layer_defs()],
         "nodes": nodes,
         "edges": edges,
     }
