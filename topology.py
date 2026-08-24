@@ -332,8 +332,14 @@ function renderHost(s, hi){
   const ci_ = {};
   cols.forEach((c,ci)=>c.nodes.forEach(n=>{ ci_[n.id] = {ci, ri: row[n.id]}; }));
   // 设备→工具的边不再画（归属已由分带表达）
+  // 设备边一律不画。它表达的是「这东西跑在哪台机器上」——归属，不是数据流。
+  // 工具的归属由分带的相邻性表达；NAS 侧那些(副本/refinery/ingester/kg-hub/
+  // FalkorDB)则写进各自节点的详情里。
+  //
+  // 之前只滤掉了 dev→工具，留下的 dev:home-nas→kg-hub 从设备列一路拉到
+  // 最右边,实测单条横段 1454px,几乎横贯整张图,而它只说了"kg-hub 在 NAS 上"。
   const el = (s.edges||[]).filter(e=>ci_[e.from]&&ci_[e.to])
-    .filter(e=>!(e.from.startsWith('dev:') && nodeById[e.to] && nodeById[e.to].layer==='tool'));
+    .filter(e=>!e.from.startsWith('dev:'));
 
   // ---- 正交路由：避免交叉与重叠的四个手段 ----
   // ① 端口分散：一个节点的多条边在边缘均匀分点，不挤同一点
@@ -393,8 +399,13 @@ function renderHost(s, hi){
     const order = chan.map((y,i)=>({y,i})).sort((p,q)=>Math.abs(p.y-mid)-Math.abs(q.y-mid));
     for (const c of order) {
       if (chanUsed[c.i]) continue;
-      const blocked = cols.some((col,cc)=> cc > aci && cc < bci && col.nodes.some(n=>{
-        const q = pos[n.id]; return c.y > q.y - 8 && c.y < q.y + BH + 8; }));
+      // 挡路判定看**所有列**而不只是中间列:通道横穿时会从各列旁边掠过,
+      // 贴着任一节点的高度走都容易和该节点的端口短桩挤在一起。
+      // (注:这条并没有消掉最后那 2 处 4-7px 的接近 —— 那是两条边**汇聚到
+      //  同一节点**时各自入口短桩的间距,属节点-连线图的固有现象,
+      //  与通道选取无关。留着这条是因为"通道别贴着节点走"本身是对的。)
+      const blocked = cols.some(col=> col.nodes.some(n=>{
+        const q = pos[n.id]; return c.y > q.y - 9 && c.y < q.y + BH + 9; }));
       if (!blocked) { chanUsed[c.i] = 1; return c.y; }
     }
     return chan[chan.length-1];                // 全被占满 → 退回图底

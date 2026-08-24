@@ -670,7 +670,7 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
             db["idle_human"] = human_idle(age)
         lag = (local_max or 0) - int(nmax) if nmax.isdigit() else None
         db["state"] = GREEN
-        db["detail"] = (f"{int(size)/1048576:.1f} MB · MAX(id)={nmax}"
+        db["detail"] = (f"[home-nas] {int(size)/1048576:.1f} MB · MAX(id)={nmax}"
                         + (f" · 落后本机 {lag} 条" if lag else " · 与本机一致")
                         + " · 剥离版(仅 observations+sdk_sessions)")
 
@@ -726,7 +726,7 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
             rf["detail"] = f"工作窗口外待命（凉窗 01:00-08:00 才开工）· {base}"
         else:
             rf["state"] = GREEN
-            rf["detail"] = f"处理中 · {base}"
+            rf["detail"] = f"[home-nas] 处理中 · {base}"
 
     # —— ingester（canonical docs 线，与 claude-mem 无关，并入 kg-hub）——
     ig = out[2]
@@ -736,7 +736,7 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
         ig["detail"] = "容器 kg-hub-ingester 不在运行"
     else:
         ig["state"] = GREEN
-        ig["detail"] = f"{cs} · canonical 文档线，每 600s 一轮（不读 claude-mem）"
+        ig["detail"] = f"[home-nas] {cs} · canonical 文档线，每 600s 一轮（不读 claude-mem）"
     return out
 
 
@@ -750,7 +750,8 @@ def probe_kghub(url: str | None, token: str | None) -> list[dict]:
     ok = bool(h) and h.get("status") == "ok"
     nodes.append({"id": "kghub", "layer": "kghub", "label": "kg-hub",
                   "state": GREEN if ok else RED,
-                  "detail": (f"{url} 健康" if ok else f"{url} 不可达（{err or 'bad status'}）")})
+                  "detail": (f"[home-nas] {url} 健康" if ok
+                             else f"[home-nas] {url} 不可达（{err or 'bad status'}）")})
     if ok:
         st, _ = http_json(f"{url}/api/stats", timeout=8, token=token)
         if isinstance(st, dict) and st:
@@ -758,7 +759,7 @@ def probe_kghub(url: str | None, token: str | None) -> list[dict]:
             nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB",
                           "state": GREEN,
                           "metrics": {k: v for k, v in st.items() if isinstance(v, int)},
-                          "detail": f"entities={ent} edges={st.get('edges')} episodes={st.get('episodes')}"})
+                          "detail": f"[home-nas] entities={ent} edges={st.get('edges')} episodes={st.get('episodes')}"})
         else:
             nodes.append({"id": "falkordb", "layer": "graph", "label": "FalkorDB",
                           "state": AMBER, "detail": "/api/stats 取数失败（可能需要 token）"})
