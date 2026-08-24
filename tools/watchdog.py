@@ -367,20 +367,28 @@ def main() -> int:
             if pending > BACKLOG_THRESHOLD:
                 new_anomalies["queue_backlog"] = True
                 details["queue_backlog"] = f"pending={pending} > threshold {BACKLOG_THRESHOLD}"
-            # OpenClaw 直推链路新鲜度:kb-001 每日 04:00 产胶囊,VPS 直推
-            # 每 30 分钟一轮;账龄超阈(默认 30h)= 产出或直推断了。
-            # notify config 里 capsule_stale_hours<=0 可关闭。
+            # ── OpenClaw 直推链路:只报「卡住」,不报「没产出」 ─────────────────
+            # 2026-08-24 校准:原判据是纯账龄(阈值 76h)。但实测 kb-001 的产出
+            # 间隔是 2 天 / 16 天 / 9 天(7-24、7-26、8-11、8-20)——**阈值落在
+            # 正常范围里面**,于是"OpenClaw 这几天没写新胶囊"这件正常事天天报警。
+            # 而"没写"是内容依赖的,不是故障;kb-001 每天 04:00 都跑且返回 ok。
+            #
+            # 三个信号分开(混在一起就没法行动):
+            #   装置存活 → 探针 sync:openclaw 读 VPS push.log 心跳(静默6h判红)
+            #   内容产出 → 不告警(不规律是常态)
+            #   管线卡住 → 本项:产出了但进不去图 = 隔离区积压 / 错误键 ← 可行动
+            #
+            # 故账龄只作**必要条件**,还须有真卡住的证据才报。
             stale_h = float(cfg.get("capsule_stale_hours", 30))
             cap_age = stats.get("openclaw_capsule_age_hours")
             if stale_h > 0:
                 if isinstance(cap_age, (int, float)):
-                    if cap_age > stale_h:
+                    nq = int(stats.get("quarantined_capsules") or 0)
+                    if cap_age > stale_h and nq > 0:
                         new_anomalies["capsule_stale"] = True
-                        nq = stats.get("quarantined_capsules") or 0
                         details["capsule_stale"] = (
-                            f"最新 OpenClaw 知识胶囊已 {cap_age}h 未入图 (阈值 {stale_h}h)。"
-                            + (f"隔离区积压 {nq} 条 → 先看 /dashboard/inbox ③格式异常;" if nq else "")
-                            + "再查 VPS kb-001 cron 与直推日志 ~/.kg-hub-push/push.log"
+                            f"OpenClaw 胶囊卡在门口:隔离区积压 {nq} 条,最新入图已 {cap_age}h。"
+                            f"→ /dashboard/inbox ③格式异常(补来源标或丢弃)"
                         )
                 else:
                     # 取数暂态失败(字段缺失/null):沿用上一轮判定,避免 30h+ 长异常

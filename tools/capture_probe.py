@@ -236,13 +236,26 @@ def probe_tools() -> tuple[list[dict], dict]:
     return nodes, seen
 
 
-def probe_openclaw() -> list[dict]:
+OPENCLAW_VPS = os.environ.get("KG_HUB_OPENCLAW_VPS", "admin@100.79.177.102")
+
+
+def probe_openclaw(vps_host: str | None = OPENCLAW_VPS) -> list[dict]:
     """OpenClaw 支线：它在 oc-vps 上产 markdown 胶囊，不走 claude-mem。
 
-    Mac 侧只能看到 sync 这一段（launchd 跑的 openclaw-sync）；VPS 内部
-    状态要等那台机也装探针。清单完整性优先——即使只能看一段也要画出来。
+    2026-08-24 起判据全部取自 **VPS 侧实况**（ssh 只读）：直推 push.log 心跳 +
+    会话目录 mtime。此前读 Mac 本地 openclaw-sync.out.log —— 那条中转线 7/23
+    就退役了，日志从此不动，于是面板长期误报"OpenClaw 29 天没动"。
     """
     nodes = []
+    # VPS 会话活性（工具层用）：会话文件 mtime，与胶囊产出无关
+    oc_sess_idle = None
+    if vps_host:
+        out, _e = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", vps_host,
+                      "date +%s; stat -c %Y $(ls -t ~/.openclaw/agents/main/sessions/*.jsonl "
+                      "2>/dev/null | head -1) 2>/dev/null"], timeout=20)
+        pr = out.strip().splitlines()
+        if len(pr) >= 2 and pr[0].strip().isdigit() and pr[1].strip().isdigit():
+            oc_sess_idle = max(0.0, int(pr[0]) - int(pr[1]))
     log_idle, last_line = None, ""
     if OPENCLAW_SYNC_LOG.exists():
         log_idle = time.time() - OPENCLAW_SYNC_LOG.stat().st_mtime
@@ -265,20 +278,52 @@ def probe_openclaw() -> list[dict]:
 
     nodes.append({
         "id": "tool:openclaw", "layer": "tool", "label": "OpenClaw",
-        "state": GREY if log_idle is None else (GREEN if log_idle < 3 * 3600 else AMBER),
-        "idle_human": human_idle(log_idle) if log_idle is not None else "无数据",
-        "idle_seconds": None if log_idle is None else int(log_idle),
+        # 活性看 VPS 会话文件,不看那个 7/23 退役的 Mac 中转日志(见下方注释)
+        "state": GREY if oc_sess_idle is None else (
+            GREEN if oc_sess_idle < TOOL_FRESH_S else AMBER),
+        "idle_human": human_idle(oc_sess_idle) if oc_sess_idle is not None else "无数据",
+        "idle_seconds": None if oc_sess_idle is None else int(oc_sess_idle),
         "detail": ("在 oc-vps 上产 markdown 胶囊，不走 claude-mem hook｜"
-                   + (f"sync 日志 {human_idle(log_idle)}前更新" if log_idle is not None
-                      else "本机无 openclaw-sync 日志")),
+                   + (f"最近会话 {human_idle(oc_sess_idle)}前" if oc_sess_idle is not None
+                      else "读不到 VPS 会话目录")),
     })
+    # ── 直推链路存活:判据必须读 **VPS 侧** push.log ───────────────────────
+    # 2026-08-24 修:本节点原先读 Mac 的 ~/.kg-hub/logs/openclaw-sync.out.log,
+    # 那是 **7/23 就退役** 的 Mac 中转线日志(当天改成 VPS 直推)。于是面板长期
+    # 显示"OpenClaw 29 天没动" —— 实际是**探针看错了文件**,直推每 30 分钟都在跑。
+    # 这是「判据陷阱」的又一例:装置换了实现,监控还盯着旧痕迹。
+    #
+    # 分工(三个信号别混):
+    #   装置存活 = push.log 心跳(每 30min 必写一行,与有没有新胶囊无关)← 本节点
+    #   内容产出 = kb-001 写不写胶囊(不规律,2~16 天,**不是故障**)
+    #   管线卡住 = 隔离区/错误键(watchdog capsule_stale 负责)
+    push_idle = None
+    push_last = ""
+    if vps_host:
+        out, _e = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", vps_host,
+                      "date +%s; stat -c %Y ~/.kg-hub-push/push.log 2>/dev/null; "
+                      "tail -1 ~/.kg-hub-push/push.log 2>/dev/null"], timeout=20)
+        parts = out.strip().splitlines()
+        if len(parts) >= 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+            push_idle = max(0.0, int(parts[0]) - int(parts[1]))
+        if len(parts) >= 3:
+            push_last = parts[2].strip()
+    # 每 30 分钟一轮 → 静默 6h = 连丢 12 轮 = 装置死了,这才该红
+    if push_idle is None:
+        oc_state, oc_note = GREY, "读不到 VPS push.log（ssh 不通或路径变了）"
+    elif push_idle > 6 * 3600:
+        oc_state, oc_note = RED, f"直推日志静默 {human_idle(push_idle)}（每 30min 应写一行）= 装置已停"
+    elif push_idle > 2 * 3600:
+        oc_state, oc_note = AMBER, f"直推日志 {human_idle(push_idle)}前更新，慢于 30min 周期"
+    else:
+        oc_state, oc_note = GREEN, f"直推日志 {human_idle(push_idle)}前更新"
     nodes.append({
         "id": "sync:openclaw", "layer": "transport", "label": "OpenClaw",
-        "state": GREY if log_idle is None else (GREEN if log_idle < 3 * 3600 else AMBER),
-        "idle_human": human_idle(log_idle) if log_idle is not None else "—",
-        "idle_seconds": None if log_idle is None else int(log_idle),
-        "detail": (f"胶囊快照最后更新 {human_idle(snap_idle)}前｜"
-                   f"最后日志：{last_line[-48:] or '—'}"),
+        "state": oc_state,
+        "idle_human": human_idle(push_idle) if push_idle is not None else "—",
+        "idle_seconds": None if push_idle is None else int(push_idle),
+        "metrics": {"push_log_idle_s": None if push_idle is None else int(push_idle)},
+        "detail": f"{oc_note}｜最后日志：{push_last[-56:] or '—'}",
     })
     return nodes
 

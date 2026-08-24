@@ -32,7 +32,10 @@ import math
 import os
 import re
 import sys
+import time
+import unicodedata
 import uuid as uuidlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,6 +54,7 @@ from starlette.routing import Route
 
 from graphiti_core.driver.falkordb_driver import FalkorDriver  # type: ignore
 from graphiti_core.nodes import EpisodeType  # type: ignore
+from falkordb import FalkorDB as SyncFalkorDB  # type: ignore
 
 from graphiti_client import (  # noqa: E402
     FALKORDB_DATABASE,
@@ -60,12 +64,15 @@ from graphiti_client import (  # noqa: E402
 )
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from topology import dashboard_topology, topology_report, topology_latest  # noqa: E402
+from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
 from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
 )
+from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
+from tools.retrieval_aliases import query_aliases  # noqa: E402
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -96,6 +103,9 @@ INGEST_BACKUP_PATH = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
 # observed (rich-content add_episode ~196s + lock wait ~180s + 429 retries ~150s
 # ≈ 9 min worst). Configurable for tuning.
 STUCK_THRESHOLD_MIN = int(os.environ.get("KG_HUB_STUCK_THRESHOLD_MIN", "30"))
+QUALITY_SUMMARY_TTL_SECONDS = max(
+    30, int(os.environ.get("KG_HUB_QUALITY_SUMMARY_TTL_SECONDS", "300"))
+)
 
 # logger for ingest lifecycle events ([ingest:start] / [ingest:done] / [ingest:error])
 logger = logging.getLogger("kg_hub.server")
@@ -109,6 +119,8 @@ logging.basicConfig(
 _graphiti = None
 _init_lock = asyncio.Lock()
 _status_driver = None
+_quality_summary_lock = asyncio.Lock()
+_quality_summary_cache: dict[str, object] = {}
 
 
 async def get_graphiti():
@@ -283,6 +295,19 @@ async def update_ingested_key_status(
         edges=int(edges),
         error_message=error_message,
     )
+    # 入图成功 → 顺手清掉同 source_obs_id 的隔离记录。
+    # 2026-08-24:格式门在 09:06 拦下 5 条 taskhub 胶囊,补标后 13:05 已成功入图,
+    # 但 QuarantinedCapsule 节点没人删 → 隔离区计数长期虚高 5 条 →
+    # watchdog capsule_stale 一直报"胶囊卡在门口",而它们早就在图里了。
+    # 三条入图路径(整篇/预拆/catalog)都经过本函数,所以清理放这里一处覆盖全部;
+    # requeue/discard 各自的删除保留不动(它们是人工路径,可能没走到 extract)。
+    if status == "ok":
+        try:
+            await graphiti.driver.execute_query(
+                "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q",
+                sid=source_obs_id)
+        except Exception:  # noqa: BLE001 — 清不掉不影响入图本身
+            logger.warning("[ingest] 隔离记录清理失败 sid=%s(非致命)", source_obs_id)
 
 
 async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
@@ -326,6 +351,86 @@ class IngestBody(BaseModel):
 # ---------- Route handlers ----------
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "kg_hub_server"})
+
+
+def bounded_search_episode_uuids(candidate: dict, limit: int = 8) -> list[str]:
+    """Expose only validated, bounded story-boundary identifiers from search internals."""
+    values: set[str] = set()
+    for raw in candidate.get("_eps_live") or []:
+        try:
+            values.add(str(uuidlib.UUID(str(raw))))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return sorted(values)[:max(0, min(int(limit), 8))]
+
+
+def quality_summary_payload(metrics: dict, generated_at: str, cache_age_seconds: int) -> dict:
+    """Return the bounded, read-only quality contract consumed by operator UIs."""
+    return {
+        "status": "ok",
+        "mode": "read_only",
+        "generated_at": generated_at,
+        "cache_age_seconds": max(0, int(cache_age_seconds)),
+        "cache_ttl_seconds": QUALITY_SUMMARY_TTL_SECONDS,
+        "metrics": metrics,
+        "interpretation": {
+            "injected_ever_rate_pct": "只表示曾进入 canonical_context，不等同于完整使用率。",
+            "dup_clusters_approx": "按项目和标题的近重复代理指标，只用于趋势观察。",
+            "ops_noise": "运维自指内容的数量与占比，优先通过入口过滤和显式归档治理。",
+        },
+    }
+
+
+async def quality_summary(request: Request) -> JSONResponse:
+    """GET /api/quality-summary — cached graph hygiene metrics, never writes graph data."""
+    del request
+    now = time.monotonic()
+    cached_at = float(_quality_summary_cache.get("monotonic_at") or 0)
+    cached_metrics = _quality_summary_cache.get("metrics")
+    if isinstance(cached_metrics, dict) and now - cached_at < QUALITY_SUMMARY_TTL_SECONDS:
+        return JSONResponse(
+            quality_summary_payload(
+                cached_metrics,
+                str(_quality_summary_cache.get("generated_at") or ""),
+                int(now - cached_at),
+            )
+        )
+
+    async with _quality_summary_lock:
+        now = time.monotonic()
+        cached_at = float(_quality_summary_cache.get("monotonic_at") or 0)
+        cached_metrics = _quality_summary_cache.get("metrics")
+        if isinstance(cached_metrics, dict) and now - cached_at < QUALITY_SUMMARY_TTL_SECONDS:
+            return JSONResponse(
+                quality_summary_payload(
+                    cached_metrics,
+                    str(_quality_summary_cache.get("generated_at") or ""),
+                    int(now - cached_at),
+                )
+            )
+        try:
+            from tools.health_check import collect as collect_health_metrics
+
+            metrics = await collect_health_metrics()
+        except Exception as exc:  # noqa: BLE001 - status endpoint must not hide a failed audit
+            logger.exception("[quality-summary] collection failed")
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "mode": "read_only",
+                    "message": f"quality summary unavailable: {type(exc).__name__}",
+                },
+                status_code=503,
+            )
+        generated_at = datetime.now(tz=timezone.utc).isoformat()
+        _quality_summary_cache.update(
+            {
+                "monotonic_at": now,
+                "generated_at": generated_at,
+                "metrics": metrics,
+            }
+        )
+        return JSONResponse(quality_summary_payload(metrics, generated_at, 0))
 
 
 def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
@@ -1020,6 +1125,10 @@ async def search(request: Request) -> JSONResponse:
     f_project = (request.query_params.get("project") or "").strip()
     f_kind = (request.query_params.get("kind") or "").strip()
     f_durability = (request.query_params.get("durability") or "").strip()
+    include_boundaries = (
+        (request.query_params.get("boundaries") or "").strip().lower()
+        in ("1", "true", "yes")
+    )
 
     driver = get_status_driver()
     pool = min(num_results * 4, 60)
@@ -1050,13 +1159,40 @@ async def search(request: Request) -> JSONResponse:
         logger.exception("[search] semantic leg failed for q=%r; falling back to substring", query)
 
     # —— 子串腿:精确关键词命中(高精度),给已有候选提权 / 补入新候选。
+    # CJK fulltext 不分词：短的多词查询在完整短语无命中时，改为所有词均命中。
+    # 只允许最多 4 个受限词项，不能扩大成任意词的宽松 OR 检索。
+    exact_rows = []
+    applied_aliases: list[str] = []
     try:
-        rows, _, _ = await driver.execute_query(
+        exact_rows, _, _ = await driver.execute_query(
             "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $q "
             "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
             "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
             q=query.lower(), lim=pool)
-        for r in rows:
+        if not exact_rows:
+            terms = bounded_terms(query)
+            if terms:
+                clause, term_params = all_terms_clause(terms, ("e.fact",))
+                exact_rows, _, _ = await driver.execute_query(
+                    "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
+                    "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+                    "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
+                    lim=pool, **term_params,
+                )
+        if not exact_rows:
+            for alias in query_aliases(query):
+                clause, term_params = all_terms_clause(alias.expand_terms, ("e.fact",))
+                alias_rows, _, _ = await driver.execute_query(
+                    "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
+                    "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+                    "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
+                    lim=pool,
+                    **term_params,
+                )
+                if alias_rows:
+                    exact_rows.extend(alias_rows)
+                    applied_aliases.append(alias.rule_id)
+        for r in exact_rows:
             fact = r.get("fact")
             if fact in cand:
                 cand[fact]["exact"] = True
@@ -1073,7 +1209,8 @@ async def search(request: Request) -> JSONResponse:
 
     if not cand:
         return JSONResponse({"status": "ok", "query": query,
-                             "mode": "hybrid" if sem_ok else "substring_fallback", "results": []})
+                             "mode": "hybrid" if sem_ok else "substring_fallback",
+                             "query_expansions": applied_aliases, "results": []})
 
     # —— 按 fact 批量补 episodes(语义腿候选没带,统一补齐才好排序/facet)——
     try:
@@ -1189,6 +1326,8 @@ async def search(request: Request) -> JSONResponse:
     # verbose=1:附带背书 episode 元数据(kg-use skill 的使用报告要 name/verified 等)
     verbose = (request.query_params.get("verbose", "") or "").lower() in ("1", "true", "yes")
     for c in top:
+        if include_boundaries:
+            c["episode_uuids"] = bounded_search_episode_uuids(c)
         if verbose:
             c["backing"] = [{"name": attr[u]["nm"], "kind": attr[u]["kind"],
                              "durability": attr[u]["dur"], "verified": attr[u]["ver"],
@@ -1197,7 +1336,7 @@ async def search(request: Request) -> JSONResponse:
         c.pop("_eps_live", None)
     return JSONResponse({"status": "ok", "query": query,
                          "mode": "hybrid" if sem_ok else "substring_fallback",
-                         "results": top})
+                         "query_expansions": applied_aliases, "results": top})
 
 
 # ---------------------------------------------------------------------------
@@ -1573,6 +1712,7 @@ async def episode_search(request: Request) -> JSONResponse:
     # disabled 时 pool=lim（查询与今日字节一致，避免平局下返回不同子集）；enabled 时放大供重排
     pool = min(lim * 3, 45) if _DELIVERY.get("enabled") else lim
     rows = []
+    applied_aliases: list[str] = []
     try:
         rows, _, _ = await driver.execute_query(
             "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
@@ -1596,6 +1736,28 @@ async def episode_search(request: Request) -> JSONResponse:
             f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
             q=q,
         )
+    if not rows:
+        terms = bounded_terms(q)
+        if terms:
+            clause, term_params = all_terms_clause(terms, ("n.name", "n.content"))
+            rows, _, _ = await driver.execute_query(
+                "MATCH (n:Episodic) WHERE NOT coalesce(n.archived, false) AND " + clause + " "
+                "RETURN n.name AS name, n.content AS content, "
+                f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
+                **term_params,
+            )
+    if not rows:
+        for alias in query_aliases(q):
+            clause, term_params = all_terms_clause(alias.expand_terms, ("n.name", "n.content"))
+            alias_rows, _, _ = await driver.execute_query(
+                "MATCH (n:Episodic) WHERE NOT coalesce(n.archived, false) AND " + clause + " "
+                "RETURN n.name AS name, n.content AS content, "
+                f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
+                **term_params,
+            )
+            if alias_rows:
+                rows.extend(alias_rows)
+                applied_aliases.append(alias.rule_id)
     items = [{"name": r.get("name"), "source": r.get("source"),
               "score": r.get("score"), "content": r.get("content")} for r in rows]
     items = _tiered_rerank(items, lim)          # G5：type-weighted（enabled=false 时等价原样）
@@ -1619,7 +1781,394 @@ async def episode_search(request: Request) -> JSONResponse:
         "score": it.get("score"),
         "body_preview": (it.get("content") or "")[:600],
     } for it in items]
-    return JSONResponse({"status": "ok", "results": results})
+    return JSONResponse({"status": "ok", "query_expansions": applied_aliases, "results": results})
+
+
+_EPISODE_EXACT_MATCH_METHOD = "normalized_exact_substring"
+_EPISODE_EXACT_MATCH_MIN = 48
+_EPISODE_EXACT_MATCH_MAX = 240
+_EPISODE_EXACT_MATCH_MAX_RESULTS = 2
+_EPISODE_EXACT_MATCH_SCAN_LIMIT = _EPISODE_EXACT_MATCH_MAX_RESULTS + 1
+_EPISODE_EXACT_MATCH_MAX_BODY_BYTES = 4096
+_EPISODE_EXACT_MATCH_MAX_ACTIVE_EPISODES = 10_000
+_EPISODE_EXACT_MATCH_MAX_TOTAL_CONTENT_CHARS = 64 * 1024 * 1024
+_EPISODE_EXACT_MATCH_MAX_SINGLE_CONTENT_CHARS = 256 * 1024
+_EPISODE_EXACT_MATCH_QUERY_TIMEOUT_SECONDS = 5.0
+_EPISODE_EXACT_MATCH_BODY_TIMEOUT_SECONDS = 1.0
+_EPISODE_EXACT_MATCH_TOTAL_TIMEOUT_SECONDS = 6.0
+_EPISODE_EXACT_MATCH_CONCURRENCY = 2
+_episode_exact_match_semaphore = asyncio.Semaphore(_EPISODE_EXACT_MATCH_CONCURRENCY)
+_episode_exact_match_executor = ThreadPoolExecutor(
+    max_workers=_EPISODE_EXACT_MATCH_CONCURRENCY,
+    thread_name_prefix="episode-exact-match",
+)
+
+
+class _EpisodeExactMatchDeadlineExceeded(Exception):
+    pass
+
+
+class _EpisodeExactMatchScanLimitExceeded(Exception):
+    pass
+
+
+class _EpisodeExactMatchIncompleteScan(Exception):
+    pass
+
+
+def _normalize_exact_match_text(value: str) -> str:
+    """Apply deterministic Unicode/newline normalization without fuzzy matching."""
+    return (
+        unicodedata.normalize("NFKC", value)
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+
+def _episode_exact_match_error(code: str, message: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        {"status": "error", "code": code, "message": message},
+        status_code=status_code,
+    )
+
+
+def _episode_exact_match_query_timeout_ms(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _EpisodeExactMatchDeadlineExceeded
+    return max(
+        1,
+        min(int(_EPISODE_EXACT_MATCH_QUERY_TIMEOUT_SECONDS * 1000), int(remaining * 1000)),
+    )
+
+
+def _episode_exact_match_result_records(result) -> list[dict[str, object]]:
+    header = [str(item[1]) for item in result.header]
+    return [
+        {
+            field_name: row[index] if index < len(row) else None
+            for index, field_name in enumerate(header)
+        }
+        for row in result.result_set
+    ]
+
+
+def _episode_exact_match_fetch_snapshot_with_query_sync(query_fn, deadline: float):
+    stats_query = (
+        "MATCH (n:Episodic) "
+        "WHERE NOT coalesce(n.archived, false) "
+        "AND n.uuid IS NOT NULL AND n.content IS NOT NULL "
+        f"WITH n LIMIT {_EPISODE_EXACT_MATCH_MAX_ACTIVE_EPISODES + 1} "
+        "RETURN count(n) AS active_count, "
+        "       coalesce(sum(size(n.content)), 0) AS total_content_chars, "
+        "       coalesce(max(size(n.content)), 0) AS max_content_chars"
+    )
+    stats_rows = query_fn(
+        stats_query,
+        _episode_exact_match_query_timeout_ms(deadline),
+    )
+    if len(stats_rows) != 1:
+        raise _EpisodeExactMatchIncompleteScan
+    stats = stats_rows[0]
+    active_count = int(stats.get("active_count") or 0)
+    total_content_chars = int(stats.get("total_content_chars") or 0)
+    max_content_chars = int(stats.get("max_content_chars") or 0)
+    if active_count < 0 or total_content_chars < 0 or max_content_chars < 0:
+        raise _EpisodeExactMatchIncompleteScan
+    if (
+        active_count > _EPISODE_EXACT_MATCH_MAX_ACTIVE_EPISODES
+        or total_content_chars > _EPISODE_EXACT_MATCH_MAX_TOTAL_CONTENT_CHARS
+        or max_content_chars > _EPISODE_EXACT_MATCH_MAX_SINGLE_CONTENT_CHARS
+    ):
+        logger.warning(
+            "[episode_exact_match] scan_limit_exceeded episodes=%d total_chars=%d max_chars=%d",
+            active_count,
+            total_content_chars,
+            max_content_chars,
+        )
+        raise _EpisodeExactMatchScanLimitExceeded
+
+    rows_query = (
+        "MATCH (n:Episodic) "
+        "WHERE NOT coalesce(n.archived, false) "
+        "AND n.uuid IS NOT NULL AND n.content IS NOT NULL "
+        "RETURN n.uuid AS episode_uuid, n.content AS content "
+        f"ORDER BY episode_uuid LIMIT {_EPISODE_EXACT_MATCH_MAX_ACTIVE_EPISODES + 1}"
+    )
+    rows = query_fn(
+        rows_query,
+        _episode_exact_match_query_timeout_ms(deadline),
+    )
+    if time.monotonic() >= deadline:
+        raise _EpisodeExactMatchDeadlineExceeded
+    return active_count, total_content_chars, rows
+
+
+def _episode_exact_match_fetch_snapshot_sync(deadline: float):
+    """Run blocking FalkorDB reads in a worker thread with server-side timeouts."""
+    client = SyncFalkorDB(
+        host=FALKORDB_HOST,
+        port=FALKORDB_PORT,
+        password=os.environ.get("KG_HUB_FALKORDB_PASSWORD") or None,
+        socket_connect_timeout=_EPISODE_EXACT_MATCH_QUERY_TIMEOUT_SECONDS,
+        socket_timeout=_EPISODE_EXACT_MATCH_QUERY_TIMEOUT_SECONDS + 1.0,
+    )
+    try:
+        graph = client.select_graph(FALKORDB_DATABASE)
+        return _episode_exact_match_fetch_snapshot_with_query_sync(
+            lambda query, timeout_ms: _episode_exact_match_result_records(
+                graph.ro_query(query, timeout=timeout_ms)
+            ),
+            deadline,
+        )
+    finally:
+        client.close()
+
+
+def _episode_exact_match_worker(
+    snippet: str,
+    num_results: int,
+    deadline: float,
+) -> dict[str, object]:
+    """Fetch, normalize, scan, and build the bounded response in one worker."""
+    active_count, total_content_chars, rows = _episode_exact_match_fetch_snapshot_sync(
+        deadline
+    )
+    if time.monotonic() >= deadline:
+        raise _EpisodeExactMatchDeadlineExceeded
+    matches: list[dict[str, str]] = []
+    seen_uuids: set[str] = set()
+    observed_total_chars = 0
+    for row in rows:
+        if time.monotonic() >= deadline:
+            raise _EpisodeExactMatchDeadlineExceeded
+        episode_uuid = str(row.get("episode_uuid") or "").strip()
+        content = row.get("content")
+        if not episode_uuid or episode_uuid in seen_uuids or not isinstance(content, str):
+            logger.warning("[episode_exact_match] incomplete_scan invalid_row=true")
+            raise _EpisodeExactMatchIncompleteScan
+        seen_uuids.add(episode_uuid)
+        content_chars = len(content)
+        observed_total_chars += content_chars
+        if (
+            content_chars > _EPISODE_EXACT_MATCH_MAX_SINGLE_CONTENT_CHARS
+            or observed_total_chars > _EPISODE_EXACT_MATCH_MAX_TOTAL_CONTENT_CHARS
+        ):
+            logger.warning("[episode_exact_match] scan_limit_exceeded during_scan=true")
+            raise _EpisodeExactMatchScanLimitExceeded
+        normalized_content = _normalize_exact_match_text(content)
+        if time.monotonic() >= deadline:
+            raise _EpisodeExactMatchDeadlineExceeded
+        if snippet in normalized_content:
+            matches.append({
+                "episode_uuid": episode_uuid,
+                "match_method": _EPISODE_EXACT_MATCH_METHOD,
+            })
+
+    if (
+        len(rows) != active_count
+        or len(seen_uuids) != active_count
+        or observed_total_chars != total_content_chars
+    ):
+        logger.warning(
+            "[episode_exact_match] incomplete_scan expected=%d observed=%d",
+            active_count,
+            len(rows),
+        )
+        raise _EpisodeExactMatchIncompleteScan
+
+    count = len(matches)
+    if time.monotonic() >= deadline:
+        raise _EpisodeExactMatchDeadlineExceeded
+    return {
+        "status": "ok",
+        "match_method": _EPISODE_EXACT_MATCH_METHOD,
+        "count": count,
+        "count_capped": count >= _EPISODE_EXACT_MATCH_SCAN_LIMIT,
+        "ambiguous": count > 1,
+        "results": matches[:num_results],
+    }
+
+
+def _episode_exact_match_release_on_worker_done(
+    _future,
+    loop: asyncio.AbstractEventLoop,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """Release a permit on the owning event loop after the worker really exits."""
+    try:
+        loop.call_soon_threadsafe(semaphore.release)
+    except RuntimeError:
+        logger.warning("[episode_exact_match] permit_release_loop_closed=true")
+
+
+def _episode_exact_match_consume_future_exception(future: asyncio.Future) -> None:
+    """Observe a shielded worker failure after its caller timed out or cancelled."""
+    try:
+        future.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _episode_exact_match_read_body(request: Request) -> bytearray:
+    raw_body = bytearray()
+    async with asyncio.timeout(_EPISODE_EXACT_MATCH_BODY_TIMEOUT_SECONDS):
+        async for chunk in request.stream():
+            if len(raw_body) + len(chunk) > _EPISODE_EXACT_MATCH_MAX_BODY_BYTES:
+                raise OverflowError
+            raw_body.extend(chunk)
+    return raw_body
+
+
+async def episode_exact_match(request: Request) -> JSONResponse:
+    """POST /api/episode_exact_match — strict, side-effect-free episode lookup.
+
+    This endpoint intentionally does not call delivery logging or update retrieval
+    counters. It returns only stable identifiers and match metadata.
+    """
+    deadline = time.monotonic() + _EPISODE_EXACT_MATCH_TOTAL_TIMEOUT_SECONDS
+    content_length = request.headers.get("content-length", "")
+    try:
+        if content_length and int(content_length) > _EPISODE_EXACT_MATCH_MAX_BODY_BYTES:
+            return _episode_exact_match_error(
+                "payload_too_large", "request body too large", 413
+            )
+    except ValueError:
+        return _episode_exact_match_error("bad_request", "invalid content length", 400)
+
+    try:
+        raw_body = await _episode_exact_match_read_body(request)
+    except TimeoutError:
+        return _episode_exact_match_error(
+            "request_timeout", "request body timed out", 408
+        )
+    except OverflowError:
+        return _episode_exact_match_error(
+            "payload_too_large", "request body too large", 413
+        )
+    try:
+        body = json.loads(raw_body)
+    except Exception:
+        return _episode_exact_match_error("bad_json", "invalid JSON body", 400)
+    if not isinstance(body, dict):
+        return _episode_exact_match_error("bad_schema", "JSON body must be an object", 400)
+
+    unknown_fields = set(body) - {"snippet", "num_results"}
+    if unknown_fields:
+        return _episode_exact_match_error(
+            "bad_schema", "only snippet and num_results are allowed", 400
+        )
+    snippet_raw = body.get("snippet")
+    if not isinstance(snippet_raw, str):
+        return _episode_exact_match_error("bad_schema", "snippet must be a string", 400)
+    snippet = _normalize_exact_match_text(snippet_raw)
+    if not (_EPISODE_EXACT_MATCH_MIN <= len(snippet) <= _EPISODE_EXACT_MATCH_MAX):
+        return _episode_exact_match_error(
+            "bad_schema",
+            f"snippet length must be {_EPISODE_EXACT_MATCH_MIN}..{_EPISODE_EXACT_MATCH_MAX}",
+            400,
+        )
+    if any(ord(char) < 32 and char not in "\t\n" for char in snippet):
+        return _episode_exact_match_error(
+            "bad_schema", "snippet contains unsupported control characters", 400
+        )
+
+    num_results = body.get("num_results", _EPISODE_EXACT_MATCH_MAX_RESULTS)
+    if isinstance(num_results, bool) or not isinstance(num_results, int):
+        return _episode_exact_match_error("bad_schema", "num_results must be 1 or 2", 400)
+    if not 1 <= num_results <= _EPISODE_EXACT_MATCH_MAX_RESULTS:
+        return _episode_exact_match_error("bad_schema", "num_results must be 1 or 2", 400)
+
+    acquired = False
+    worker_future = None
+    loop = asyncio.get_running_loop()
+    semaphore = _episode_exact_match_semaphore
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _episode_exact_match_error(
+            "deadline_exceeded", "episode exact match timed out", 503
+        )
+    acquire_timeout = min(0.1, remaining)
+    acquire_is_deadline_bound = remaining <= 0.1
+    try:
+        await asyncio.wait_for(
+            semaphore.acquire(),
+            timeout=acquire_timeout,
+        )
+        acquired = True
+    except TimeoutError:
+        if acquire_is_deadline_bound:
+            return _episode_exact_match_error(
+                "deadline_exceeded", "episode exact match timed out", 503
+            )
+        return _episode_exact_match_error(
+            "busy", "episode exact match temporarily busy", 503
+        )
+
+    try:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _EpisodeExactMatchDeadlineExceeded
+            worker_future = _episode_exact_match_executor.submit(
+                _episode_exact_match_worker,
+                snippet,
+                num_results,
+                deadline,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _EpisodeExactMatchDeadlineExceeded
+            async_worker_future = asyncio.wrap_future(worker_future, loop=loop)
+            async_worker_future.add_done_callback(
+                _episode_exact_match_consume_future_exception
+            )
+            response = await asyncio.wait_for(
+                asyncio.shield(async_worker_future),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            return _episode_exact_match_error(
+                "deadline_exceeded", "episode exact match timed out", 503
+            )
+        except _EpisodeExactMatchDeadlineExceeded:
+            return _episode_exact_match_error(
+                "deadline_exceeded", "episode exact match timed out", 503
+            )
+        except _EpisodeExactMatchScanLimitExceeded:
+            return _episode_exact_match_error(
+                "scan_limit_exceeded", "episode exact match unavailable", 503
+            )
+        except _EpisodeExactMatchIncompleteScan:
+            return _episode_exact_match_error(
+                "incomplete_scan", "episode exact match unavailable", 503
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[episode_exact_match] database_error type=%s", type(exc).__name__
+            )
+            return _episode_exact_match_error(
+                "database_error", "episode exact match unavailable", 503
+            )
+        logger.info(
+            "[episode_exact_match] status=ok count=%d ambiguous=%s",
+            response["count"],
+            response["ambiguous"],
+        )
+        return JSONResponse(response)
+    finally:
+        if acquired:
+            if worker_future is not None and not worker_future.done():
+                def release_permit(future) -> None:
+                    _episode_exact_match_release_on_worker_done(
+                        future,
+                        loop,
+                        semaphore,
+                    )
+
+                worker_future.add_done_callback(release_permit)
+            else:
+                semaphore.release()
 
 
 async def node_neighbors(request: Request) -> JSONResponse:
@@ -1770,6 +2319,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/inbox", "icon": "📥", "ready": True},
     {"name": "采集链路拓扑", "desc": "各设备/工具 → hook → claude-mem → SQLite → 传输 → kg-hub 全链路灯色 + 空闲时长 + 阻塞点",
      "url": "/dashboard/topology", "icon": "🕸", "ready": True},
+    {"name": "监控拓扑", "desc": "watchdog 监控的设备/服务存活:kg-hub/falkordb/队列/openclaw + 各 watchdog 监控边,实时探测灯色 15s 自动刷新",
+     "url": "/dashboard/monitor", "icon": "📡", "ready": True},
 ]
 
 _PORTAL_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -3401,6 +3952,8 @@ app = Starlette(
         Route("/dashboard/topology", dashboard_topology, methods=["GET"]),
         Route("/api/topology/report", topology_report, methods=["POST"]),
         Route("/api/topology/latest", topology_latest, methods=["GET"]),
+        Route("/dashboard/monitor", dashboard_monitor, methods=["GET"]),
+        Route("/dashboard/monitor/status", monitor_status, methods=["GET"]),
         Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
@@ -3411,7 +3964,9 @@ app = Starlette(
         Route("/api/canonical_context", canonical_context, methods=["GET"]),
         Route("/api/usage_ranking", usage_ranking, methods=["GET"]),
         Route("/api/stats", stats, methods=["GET"]),
+        Route("/api/quality-summary", quality_summary, methods=["GET"]),
         Route("/api/episode_search", episode_search, methods=["GET"]),
+        Route("/api/episode_exact_match", episode_exact_match, methods=["POST"]),
         Route("/api/node_neighbors", node_neighbors, methods=["GET"]),
         Route("/api/path_between", path_between, methods=["GET"]),
     ],
