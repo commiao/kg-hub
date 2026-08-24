@@ -3835,7 +3835,7 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 <h2>fact 层质量(Phase B' 预拆的疗效指标)</h2><div class=cards id=fq></div>
 <div class=ts>基线 2026-07-28:文献元数据型 fact 611 条(4.4%)· 中文洞察查询命中 0/10 · 预拆前每篇长文档洞察 fact≈0。指标向好 = 预拆在起作用。</div>
 <script>var D=__DATA__;
-document.getElementById('hb').textContent=(D.status_ts?('refinery 最后心跳: '+D.status_ts+' UTC'+(D.stale?' ⚠ 超过10分钟,容器可能没在跑':'')):'⚠ 尚无 status.json——refinery 容器未启动或共享卷未挂')+(D.last_error?(' · ⚠ 最近错误: '+D.last_error):'');
+document.getElementById('hb').textContent=(D.heartbeat_ts&&!D.heartbeat_invalid?('refinery 最后心跳: '+D.heartbeat_ts+' UTC'+(D.stale?' ⚠ 超过10分钟未见心跳（预警；15分钟才触发采集链路告警）':'')):(D.heartbeat_invalid?'⚠ status.json 的 heartbeat_at 非法或来自未来，无法作为存活信号':(D.heartbeat_missing?'⚠ status.json 未含 heartbeat_at，等待 refinery 新版本部署':'⚠ 尚无 status.json——refinery 容器未启动或共享卷未挂')))+(D.progress_ts?(' · 最近处理状态: '+D.progress_ts+' UTC'):'')+(D.last_error?(' · ⚠ 最近错误: '+D.last_error):'');
 var s=D.l1;document.getElementById('l1').innerHTML='<div class=mc><div class=l>积压剩余</div><div class=v>'+s.backlog_remaining+'</div><div class=s>夜间窗口'+(s.window_open?'开':'关')+' · 每轮'+s.per_cycle+'条</div></div><div class=mc><div class=l>已入图(水印)</div><div class=v>'+s.ingested+'</div><div class=s>拒绝 '+s.rejected+' · 失败 '+s.failed+'</div></div><div class=mc><div class=l>IngestedKey</div><div class=v>'+D.keys.ok+'</div><div class=s>pending '+D.keys.pending+' · error '+D.keys.error+'</div></div>';
 var f=D.fq;document.getElementById('fq').innerHTML='<div class=mc><div class=l>fact 总数</div><div class=v>'+f.total+'</div></div><div class=mc><div class=l>文献元数据型占比</div><div class="v'+(f.meta_pct>4.4?' warn':'')+'">'+f.meta_pct+'%</div><div class=s>'+f.meta+' 条 · 目标:随预拆下降</div></div><div class=mc><div class=l>预拆产物</div><div class=v>'+f.predigest_children+'</div><div class=s>子observation · registry标记 '+f.registry+'</div></div>';
 </script></body></html>"""
@@ -3849,18 +3849,22 @@ async def dashboard_refinery(request: Request) -> HTMLResponse:
         rows, _, _ = await driver.execute_query(cy, **p)
         return int(rows[0].get("c") or 0) if rows else 0
 
-    status, status_ts, stale = {}, "", False
+    status, heartbeat_ts, progress_ts, stale, heartbeat_invalid = {}, "", "", False, False
     try:
         sp = Path(os.environ.get("KG_HUB_REFINERY_STATUS", "/refinery-state/status.json"))
         if sp.exists():
             status = json.loads(sp.read_text())
-            status_ts = (status.get("ts") or "")[:19]
+            heartbeat_raw = status.get("heartbeat_at")
+            heartbeat_ts = (heartbeat_raw or "")[:19]
+            progress_ts = (status.get("ts") or "")[:19]
             try:
                 age = (datetime.now(tz=timezone.utc)
-                       - datetime.fromisoformat(status["ts"])).total_seconds()
+                       - datetime.fromisoformat(str(heartbeat_raw).replace("Z", "+00:00"))).total_seconds()
+                if age < 0:
+                    raise ValueError("heartbeat_at is in the future")
                 stale = age > 600
             except Exception:  # noqa: BLE001
-                pass
+                heartbeat_invalid = bool(heartbeat_raw)
     except Exception:  # noqa: BLE001
         logger.exception("[dashboard_refinery] status.json read failed")
 
@@ -3882,7 +3886,9 @@ async def dashboard_refinery(request: Request) -> HTMLResponse:
 
     wmk = status.get("watermark") or {}
     data = {
-        "status_ts": status_ts, "stale": stale,
+        "heartbeat_ts": heartbeat_ts, "progress_ts": progress_ts,
+        "heartbeat_missing": bool(status) and not heartbeat_ts,
+        "heartbeat_invalid": heartbeat_invalid, "stale": stale,
         "last_error": str(status.get("last_error") or "")[:160],
         "l1": {"backlog_remaining": status.get("backlog_remaining", "—"),
                "window_open": bool(status.get("backlog_window_open")),

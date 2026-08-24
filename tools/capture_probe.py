@@ -605,7 +605,19 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
 
 
 NAS_REFINERY_STATUS = "/volume2/4T/kg-hub-data/refinery-state/status.json"
-REFINERY_STALE_S = 15 * 60       # status.json 超过这么久没更新 = refinery 可能死了
+REFINERY_STALE_S = 15 * 60       # heartbeat_at 超过这么久没更新 = refinery 可能死了
+
+
+def timestamp_age(value: object) -> int | None:
+    """ISO 时间戳距今秒数；支持 Docker 的 Z 后缀，未来时间一律无效。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        age = time.time() - parsed.timestamp()
+        return int(age) if age >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
@@ -634,6 +646,8 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
         f"echo \"integ=$(sqlite3 -readonly '{NAS_DB}' 'PRAGMA integrity_check;' 2>/dev/null | head -1)\"; "
         f"echo \"max=$(sqlite3 -readonly '{NAS_DB}' 'SELECT MAX(id) FROM observations;' 2>/dev/null)\"; "
         f"echo \"mtime=$(date -r '{NAS_DB}' +%s 2>/dev/null)\"; "
+        f"echo \"status_mtime=$(date -r '{NAS_REFINERY_STATUS}' +%s 2>/dev/null)\"; "
+        f"echo \"refinery_started=$({dk} inspect --format '{{{{.State.StartedAt}}}}' kg-hub-refinery 2>/dev/null)\"; "
         f"echo 'status_begin'; cat '{NAS_REFINERY_STATUS}' 2>/dev/null; echo; echo 'status_end'; "
         f"{dk} ps --format '{{{{.Names}}}}|{{{{.Status}}}}' 2>/dev/null"
     )
@@ -649,6 +663,15 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
     def field(k):
         m = re.search(rf"^{k}=(.*)$", raw, re.M)
         return (m.group(1).strip() if m else "")
+
+    status_mtime = field("status_mtime")
+    status_mtime_age = None
+    if status_mtime.isdigit():
+        candidate_age = int(time.time()) - int(status_mtime)
+        status_mtime_age = candidate_age if candidate_age >= 0 else None
+    refinery_started_age = timestamp_age(field("refinery_started"))
+    in_migration_grace = (refinery_started_age is not None
+                          and refinery_started_age <= REFINERY_STALE_S)
 
     # —— 副本库 ——
     integ, size, nmax, mtime = field("integ"), field("size"), field("max"), field("mtime")
@@ -697,27 +720,61 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
         rf["state"] = RED
         rf["detail"] = "容器 kg-hub-refinery 不在运行"
     elif not js:
-        rf["state"] = AMBER
-        rf["detail"] = f"容器 {cs}，但读不到 status.json"
-    else:
-        age = None
-        try:
-            age = int(time.time() - datetime.fromisoformat(js["ts"]).timestamp())
-        except Exception:  # noqa: BLE001
-            pass
+        # 镜像升级后给 15 分钟生成首个 status；超过宽限仍无文件，不能无限黄灯。
+        age = refinery_started_age if in_migration_grace else (
+            status_mtime_age if status_mtime_age is not None else refinery_started_age)
         rf["idle_seconds"] = age
         rf["idle_human"] = human_idle(age)
+        rf["metrics"] = {"status_mtime_age_s": status_mtime_age,
+                         "container_started_age_s": refinery_started_age}
+        if in_migration_grace:
+            rf["state"] = AMBER
+            rf["detail"] = (f"容器 {cs}，但读不到有效 status.json "
+                            f"（迁移宽限 {REFINERY_STALE_S // 60} 分钟）")
+        elif age is None or age > REFINERY_STALE_S:
+            rf["state"] = RED
+            rf["detail"] = (f"⚠️ 容器 {cs}，但 status.json 已缺失"
+                            + (f" {human_idle(age)}" if age is not None else "且无可用时间戳")
+                            + f"（迁移宽限 {REFINERY_STALE_S // 60} 分钟已过）")
+        else:
+            rf["state"] = AMBER
+            rf["detail"] = (f"容器 {cs}，但读不到有效 status.json "
+                            f"（迁移宽限 {REFINERY_STALE_S // 60} 分钟）")
+    else:
+        heartbeat_age = timestamp_age(js.get("heartbeat_at"))
+        progress_age = timestamp_age(js.get("ts"))
+        rf["idle_seconds"] = heartbeat_age
+        rf["idle_human"] = human_idle(heartbeat_age)
         rf["metrics"] = {k: js.get(k) for k in
                          ("live_cursor", "backlog_remaining", "disk_temp", "per_cycle")}
+        rf["metrics"].update({"heartbeat_at": js.get("heartbeat_at"),
+                              "heartbeat_age_s": heartbeat_age,
+                              "progress_age_s": progress_age,
+                              "status_mtime_age_s": status_mtime_age})
         bl, dt = js.get("backlog_remaining"), js.get("disk_temp")
-        base = (f"游标 {js.get('live_cursor')} · 积压 {bl} · 盘温 {dt}°C")
+        base = (f"心跳 {human_idle(heartbeat_age)}前 · "
+                f"处理状态 {human_idle(progress_age)}前 · 游标 {js.get('live_cursor')} · "
+                f"积压 {bl} · 盘温 {dt}°C")
         if js.get("last_error"):
             rf["state"] = RED
             rf["detail"] = f"last_error: {str(js['last_error'])[:60]} · {base}"
-        elif age is not None and age > REFINERY_STALE_S:
-            # 心跳停了才是故障 —— 下面两种"歇工"是它自己选择的，不是坏了。
+        elif heartbeat_age is None:
+            # 老镜像仅可短暂迁移；过宽限仍无独立心跳就是存活信号缺失。
+            fallback_age = (progress_age if progress_age is not None else status_mtime_age)
+            if in_migration_grace:
+                rf["state"] = AMBER
+                rf["detail"] = (f"容器 {cs}，但 status.json 未含有效 heartbeat_at "
+                                f"（迁移宽限 {REFINERY_STALE_S // 60} 分钟）· {base}")
+            else:
+                rf["state"] = RED
+                fallback = ("ts 与文件 mtime 均不可用" if fallback_age is None
+                            else f"旧状态 {human_idle(fallback_age)}前")
+                rf["detail"] = (f"⚠️ status.json 未含有效 heartbeat_at，迁移宽限已过；{fallback} · "
+                                f"{base}")
+        elif heartbeat_age > REFINERY_STALE_S:
+            # 真正的独立心跳停了才是故障；处理进度可能被长批次拖慢。
             rf["state"] = RED
-            rf["detail"] = f"⚠️ status.json {human_idle(age)}没更新，refinery 可能已死 · {base}"
+            rf["detail"] = f"⚠️ 心跳 {human_idle(heartbeat_age)}没更新，refinery 可能已死 · {base}"
         elif js.get("thermal_hold"):
             rf["state"] = AMBER
             rf["detail"] = f"温度门控歇工（盘温 {dt}°C 超阈）· {base}"

@@ -53,6 +53,23 @@ TOKEN = os.environ.get("KG_HUB_API_TOKEN", "")
 DB_PATH = Path(os.environ.get("KG_HUB_REFINERY_DB", "/data/claude-mem/claude-mem.db"))
 STATE_DIR = Path(os.environ.get("KG_HUB_REFINERY_STATE", "/state"))
 INTERVAL = int(os.environ.get("KG_HUB_REFINERY_INTERVAL_SEC", "90"))
+DEFAULT_HEARTBEAT_INTERVAL = 60
+MIN_HEARTBEAT_INTERVAL = 15
+MAX_HEARTBEAT_INTERVAL = 300
+
+
+def bounded_heartbeat_interval(raw: str | None) -> int:
+    """心跳不能过密写盘，也不能慢到躲过 15 分钟存活告警。"""
+    try:
+        value = int(raw or DEFAULT_HEARTBEAT_INTERVAL)
+    except (TypeError, ValueError):
+        return DEFAULT_HEARTBEAT_INTERVAL
+    return min(MAX_HEARTBEAT_INTERVAL, max(MIN_HEARTBEAT_INTERVAL, value))
+
+
+# 这是存活信号，不是批次进度：长批次逐条 poll 时也必须持续刷新。
+HEARTBEAT_INTERVAL = bounded_heartbeat_interval(
+    os.environ.get("KG_HUB_REFINERY_HEARTBEAT_SEC"))
 BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "15"))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
 # 夜间回填窗口(CST 小时,含头不含尾;跨午夜写成 start>end)。2026-08-13 用户定 22-5。
@@ -302,11 +319,15 @@ async def ingest_via_api(obs: dict) -> str:
 
 # ---------- 状态外露 ----------
 
-def write_status(**kw) -> None:
+def write_status(*, heartbeat_only: bool = False, **kw) -> None:
+    """原子更新状态。heartbeat_at 是存活信号；ts 是最近一轮处理状态。"""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         cur = json.loads(STATUS.read_text()) if STATUS.exists() else {}
-        cur.update(kw, ts=datetime.now(tz=timezone.utc).isoformat())
+        now = datetime.now(tz=timezone.utc).isoformat()
+        if not heartbeat_only:
+            cur.update(kw, ts=now)
+        cur["heartbeat_at"] = now
         tmp = STATUS.with_suffix(".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False))
         tmp.replace(STATUS)
@@ -324,6 +345,13 @@ def in_backlog_window() -> bool:
     if BACKLOG_START < BACKLOG_END:          # 同日窗口,如 1-5
         return BACKLOG_START <= h < BACKLOG_END
     return h >= BACKLOG_START or h < BACKLOG_END   # 跨午夜,如 22-5
+
+
+async def heartbeat_loop() -> None:
+    """独立于工作窗口和长批次的 refinery liveness 心跳。"""
+    while True:
+        write_status(heartbeat_only=True)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
 # ---------- 主循环 ----------
@@ -379,6 +407,9 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 async def main() -> int:
     log.info("kg-refinery Level-1 启动 url=%s db=%s interval=%ss backlog=%s",
              KG_HUB_URL, DB_PATH, INTERVAL, BACKLOG_ENABLED)
+    # 主循环的 status 只在一轮处理结束后才落盘；另起任务避免长 poll 批次把它
+    # 误当成进程死亡。heartbeat_at 与处理进度 ts 是两个不同信号。
+    _heartbeat_task = asyncio.create_task(heartbeat_loop())
     # 启动等待 db(首次部署卷可能还空着,15min 后 launchd 同步才到位;别崩溃循环)
     while not DB_PATH.exists():
         log.warning("[startup] %s 不存在(等 Mac 侧同步),60s 后重查", DB_PATH)
