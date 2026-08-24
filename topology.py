@@ -205,7 +205,7 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
   <span><i style="background:var(--red)"></i>阻塞或故障</span>
   <span><i style="background:var(--grey)"></i>未配置</span>
   <span>虚线 = 该跳有滞后或中断</span>
-  <span>底部点线 = 跨层直连（如 OpenClaw 不走 claude-mem）</span>
+  <span>点线 = 跨层直连（如 OpenClaw 不走 claude-mem，绕行走最近空闲通道）</span>
 </div>
 <svg width=0 height=0 style="position:absolute"><defs>
 <marker id=ag viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
@@ -366,7 +366,7 @@ function renderHost(s, hi){
   cols.forEach((c,ci)=>{ colX[ci] = ax; ax += BW + (gapW[ci]||0); });
 
   const crossEdges = el.filter(e=>ci_[e.to].ci - ci_[e.from].ci > 1);
-  const BUS = 14 + crossEdges.length*7;     // 底部绕行通道，每条跨列边一层
+  const BUS = 26;   // 只给「全被占满」的兜底通道留一点余量
   const W = ax + 4;
   const H = PADT + rowTop[nRows] + BUS;
 
@@ -375,6 +375,30 @@ function renderHost(s, hi){
     const ri = row[n.id], y = yOf(ri);
     pos[n.id] = {ci, ri, x: colX[ci], y, cx: colX[ci]+BW/2, cy: y+BH/2};
   }));
+
+  // ── 跨列边的横向通道 ──────────────────────────────────────────────
+  // 原来所有跨列边一律绕到**图最底部**的总线再折回来。图现在有 10 层、
+  // 上千像素高，于是几条绕行线并排纵贯整张图，在大片空白里重叠成一团
+  // （用户 2026-08-24 截图指出）。
+  //
+  // 改为走「离两端最近的空闲行间通道」：每两行之间的空隙中线都是候选，
+  // 选一条中间列在该高度确实没有节点挡路、且没被别的跨列边占用的。
+  // 绝大多数跨列边因此只需要短短一段绕行。
+  const chan = [];
+  for (let r = 0; r < nRows - 1; r++) chan.push((yOf(r) + BH + yOf(r+1)) / 2);
+  chan.push(PADT + rowTop[nRows] + 10);        // 兜底：仍保留图底那条
+  const chanUsed = {};
+  const pickChan = (aci, bci, y1, y2)=>{
+    const mid = (y1 + y2) / 2;
+    const order = chan.map((y,i)=>({y,i})).sort((p,q)=>Math.abs(p.y-mid)-Math.abs(q.y-mid));
+    for (const c of order) {
+      if (chanUsed[c.i]) continue;
+      const blocked = cols.some((col,cc)=> cc > aci && cc < bci && col.nodes.some(n=>{
+        const q = pos[n.id]; return c.y > q.y - 8 && c.y < q.y + BH + 8; }));
+      if (!blocked) { chanUsed[c.i] = 1; return c.y; }
+    }
+    return chan[chan.length-1];                // 全被占满 → 退回图底
+  };
 
   const outs = {}, ins = {};
   el.forEach(e=>{ (outs[e.from] = outs[e.from]||[]).push(e);
@@ -405,13 +429,16 @@ function renderHost(s, hi){
       cc > a.ci && cc < b.ci && c.nodes.some(n=>{
         const q = pos[n.id]; return y1 > q.y - 4 && y1 < q.y + BH + 4; }));
     if (b.ci - a.ci > 1 && !clearStraight) {
-      // ④ 跨列 → 下行/上行各走自己的通道，底部横穿一条独占的 y
+      // ④ 跨列 → 下行/上行各走自己的垂直通道，横穿一条独占的空闲行间通道
       const xd = laneX(e,'down'), xu = laneX(e,'up');
-      const yb = PADT + rowTop[nRows] + 8 + crossEdges.indexOf(e)*7;
-      d = `M${x1} ${y1} L${xd-R} ${y1} Q${xd} ${y1} ${xd} ${y1+R}`
-        + ` L${xd} ${yb-R} Q${xd} ${yb} ${xd+R} ${yb}`
-        + ` L${xu-R} ${yb} Q${xu} ${yb} ${xu} ${yb-R}`
-        + ` L${xu} ${y2+R} Q${xu} ${y2} ${xu+R} ${y2} L${x2} ${y2}`;
+      const yb = pickChan(a.ci, b.ci, y1, y2);
+      // 通道可能在两端的上方也可能在下方，折角方向必须跟着算，
+      // 否则圆角会朝反方向拐出一个小勾。
+      const s1 = yb > y1 ? 1 : -1, s3 = yb > y2 ? 1 : -1;
+      d = `M${x1} ${y1} L${xd-R} ${y1} Q${xd} ${y1} ${xd} ${y1+R*s1}`
+        + ` L${xd} ${yb-R*s1} Q${xd} ${yb} ${xd+R} ${yb}`
+        + ` L${xu-R} ${yb} Q${xu} ${yb} ${xu} ${yb-R*s3}`
+        + ` L${xu} ${y2+R*s3} Q${xu} ${y2} ${xu+R} ${y2} L${x2} ${y2}`;
     } else if (Math.abs(y1-y2) < 1.5) {
       d = `M${x1} ${y1} L${x2} ${y2}`;                       // 同高 → 直线
     } else {
