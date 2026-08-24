@@ -101,6 +101,27 @@ subset_ddl() {
              CASE tbl_name WHEN 'sdk_sessions' THEN 0 ELSE 1 END;"
 }
 
+# ── 为什么增量载荷是「SQLite 文件」而不是 NDJSON 文本 ──────────────────
+# 先说清楚:**文本更小**。实测 gzip 后 —— 20 行 16.4KB vs 20.5KB,
+# 106 行 54.5KB vs 66.9KB(约小 20-25%);1 行时差 3 倍(0.8KB vs 2.5KB,
+# SQLite 有空 schema + 19 个索引的页开销地板)。
+# 而且当初想的两个理由都不成立:表里只有 integer/null/text **没有 BLOB**,
+# JSON 能无损往返;NAS 也有 python3 / jq / sqlite3 3.40(自带 JSON 函数)。
+#
+# 留着文件方案只为一件事:**没有序列化层可以写错**。
+# ATTACH + `INSERT ... SELECT *` 全程由 SQLite 自己搬,不存在列名映射、
+# NULL 与空串、数字与数字串这类要人肉维护的对应关系。
+#
+# 具体收益是 schema 漂移能被挡住并自愈(2026-08-24 实测):claude-mem 加一列后
+#   applier → "has 27 columns but 28 values were supplied" → FAIL
+#   线上库原封不动(size/MAX(id)/integrity 三项前后一致)
+#   sync 收到 FAIL → 回退 full_rebuild → 副本按新 DDL 重造 → 自愈
+# 文本方案要自己维护列清单,漏改就可能**静默写错列**而不是干脆失败。
+#
+# 代价是每次多传 ~20%。按实测 25 KB/s 折合约 0.2 秒 —— 传输早已不是瓶颈,
+# 这个价买"错不了"很划算。若哪天同步频率提到分钟级、地板开销开始显眼,
+# 再换文本不迟。
+#
 # $1=输出文件  $2=observations 的 WHERE 条件
 # 输出库当 main(可写),源库以 mode=ro ATTACH —— 全程不写 claude-mem 的文件。
 # (反过来用 `sqlite3 -readonly 源库` 再 ATTACH 是不行的:-readonly 会把整个
