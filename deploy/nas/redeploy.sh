@@ -25,9 +25,24 @@ for f in $FILES; do
 done
 
 echo "[2/3] 重建镜像 + 重启容器（project=kg-hub，不动 falkordb）"
+# ⚠️ 三个已踩过的坑，都在这里一次性处理（2026-08-25 固化，此前手工补救了 3 次）：
+#   ① watchdog/ingester/refinery 共用 kg-hub-server:latest 镜像，重建后它们会被
+#      compose 留在 **Created** 未启动状态 —— 症状极具迷惑性：tailnet ping 通、
+#      容器"存在"，但 HTTP 立即 000（连接拒绝而非超时），像是网络故障。
+#   ② compose 重建偶尔留下重名幽灵容器（如 235aa24cc52e_kg-hub-refinery），
+#      占着名字不干活，需 rm -f。
+#   ③ refinery 此前不在重启列表里，改了 kg_refinery.py 却不生效。
 ssh -o BatchMode=yes -o ConnectTimeout=20 "$NAS" \
   "cd $SRC && $DK compose build kg_hub_server >/dev/null 2>&1 && \
-   $DK compose -p kg-hub up -d --no-deps kg_hub_server watchdog ingester >/dev/null 2>&1 && echo '      done'"
+   $DK compose -p kg-hub up -d --no-deps kg_hub_server watchdog ingester refinery >/dev/null 2>&1 && echo '      up done'"
+
+echo "      清幽灵容器 + 拉起卡在 Created 的"
+ssh -o BatchMode=yes -o ConnectTimeout=20 "$NAS" "
+  ghosts=\$($DK ps -a --format '{{.Names}}' | grep -E '^[0-9a-f]{12}_kg-hub-' || true)
+  [ -n \"\$ghosts\" ] && { echo \"      幽灵: \$ghosts\"; $DK rm -f \$ghosts >/dev/null 2>&1; }
+  stuck=\$($DK ps -a --filter status=created --format '{{.Names}}' | grep kg-hub || true)
+  [ -n \"\$stuck\" ] && { echo \"      拉起 Created: \$stuck\"; $DK start \$stuck >/dev/null 2>&1; }
+  exit 0"
 
 echo "[3/3] 探活"
 # shellcheck disable=SC1090
