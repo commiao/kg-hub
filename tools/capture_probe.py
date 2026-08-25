@@ -938,6 +938,10 @@ def collect() -> dict:
     oc_nodes = probe_openclaw()
     tool_nodes += [n for n in oc_nodes if n["layer"] == "tool"]
     hook_nodes = probe_hooks(tool_seen)
+    # 详细 hook 清单与职责由 config/hook_registry.json 统一维护。拓扑里的 hook
+    # 节点保留作链路概览；独立 Hook 面板读取这份 inventory，区分配置/批准/执行证据。
+    from hook_inventory import collect as collect_hook_inventory
+    hook_inventory = collect_hook_inventory(tool_seen)
     # hook 行序对齐工具行序，否则拓扑图上 tool→hook 的连线会交叉
     order = [n["id"].split(":", 1)[1] for n in tool_nodes]
     hook_nodes.sort(key=lambda h: (order.index(h["id"].split(":", 1)[1])
@@ -957,6 +961,19 @@ def collect() -> dict:
         AMBER if any(n["state"] == AMBER for n in nodes) else GREEN)
     blockers = [{"id": n["id"], "label": n["label"], "detail": n.get("detail", "")}
                 for n in nodes if n["state"] == RED]
+    for tool in hook_inventory:
+        if tool["state"] == RED and not any(
+                b["id"] == f"hook-inventory:{tool['tool']}" for b in blockers):
+            bad = [h for h in tool["hooks"] if h["state"] == RED]
+            blockers.append({
+                "id": f"hook-inventory:{tool['tool']}",
+                "label": f"{tool['label']} Hook",
+                "detail": "；".join(
+                    f"{h['event']} {h['label']}："
+                    + ("未批准" if h["approval"] == "missing" else "未配置")
+                    for h in bad[:4]),
+            })
+            worst = RED
 
     return {
         "generated_at": now_iso(),
@@ -968,6 +985,7 @@ def collect() -> dict:
         "layers": [k for k, _ in _layer_defs()],
         "nodes": nodes,
         "edges": edges,
+        "hook_inventory": hook_inventory,
     }
 
 

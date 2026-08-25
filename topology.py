@@ -195,10 +195,37 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
 .back{display:inline-block;margin:0 0 .5rem;font-size:13px;color:var(--mut);
   text-decoration:none}
 .back:hover{text-decoration:underline}
+.tabs{display:flex;gap:6px;margin:10px 0 14px}
+.tab{border:1px solid var(--line);background:var(--card);color:var(--mut);
+  border-radius:7px;padding:5px 12px;cursor:pointer;font:inherit;font-size:12px}
+.tab.on{color:var(--fg);border-color:var(--green);
+  background:color-mix(in srgb,var(--green) 10%,var(--card))}
+.hookpanel{display:none}
+.hookhost{background:var(--card);border:1px solid var(--line);border-radius:10px;
+  padding:14px;margin-bottom:16px}
+.hookgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px}
+.toolcard{border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.toolhead{display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--band)}
+.toolhead b{flex:1}.toolnote{font-size:11px;color:var(--mut);padding:0 12px 8px;background:var(--band)}
+.hrow{display:grid;grid-template-columns:92px minmax(110px,.8fr) minmax(180px,1.5fr);
+  gap:8px;padding:9px 12px;border-top:1px solid var(--line);font-size:11.5px}
+.hrow .event{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mut)}
+.hrow .purpose{color:var(--fg)}.hrow .meta{color:var(--mut);font-size:10.5px;margin-top:3px}
+.hrow.red{border-left:3px solid var(--red)}.hrow.green{border-left:3px solid var(--green)}
+.hrow.grey{border-left:3px solid var(--grey)}.hrow.amber{border-left:3px solid var(--amber)}
+.srcs{font-size:10.5px;color:var(--mut);padding:8px 12px;border-top:1px solid var(--line)}
+.statusdot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.statusdot.green{background:var(--green)}.statusdot.amber{background:var(--amber)}
+.statusdot.red{background:var(--red)}.statusdot.grey{background:var(--grey)}
+@media(max-width:700px){.hrow{grid-template-columns:82px 1fr}.hrow .purpose{grid-column:1/-1}}
 </style>
 <a class=back href="/portal">← 报表门户</a>
 <h1>采集链路拓扑</h1>
 <div class=sub>工具 → hook → claude-mem → SQLite → 传输 → NAS 副本 → refinery → kg-hub → FalkorDB ｜ 每 60s 自动刷新 ｜ 点节点看详情</div>
+<div class=tabs>
+  <button id=tab-topology class="tab on" onclick="switchView('topology')">链路拓扑</button>
+  <button id=tab-hooks class=tab onclick="switchView('hooks')">Hook 面板</button>
+</div>
 <div class=legend>
   <span><i style="background:var(--green)"></i>正常</span>
   <span><i style="background:var(--amber)"></i>空闲/滞后（非故障）</span>
@@ -218,6 +245,7 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
   <path d="M0 1 L6 4 L0 7" fill=none stroke="var(--grey)" stroke-width=1.2/></marker>
 </defs></svg>
 <div id=root></div>
+<div id=hooks class=hookpanel></div>
 <script>
 const D = __DATA__;
 // LH=行距 BW/BH=节点框（BW 要容得下最长标签 "claude-mem worker"）。
@@ -243,6 +271,57 @@ function render(){
       if(d) d.style.display = d.style.display==='block' ? 'none' : 'block';
     };
   });
+  renderHooks();
+  switchView(localStorage.getItem('kg_topology_view')||'topology');
+}
+
+function switchView(view){
+  const hooks = view==='hooks';
+  document.getElementById('root').style.display = hooks ? 'none' : 'block';
+  document.getElementById('hooks').style.display = hooks ? 'block' : 'none';
+  document.querySelector('.legend').style.display = hooks ? 'none' : 'flex';
+  document.getElementById('tab-topology').classList.toggle('on',!hooks);
+  document.getElementById('tab-hooks').classList.toggle('on',hooks);
+  localStorage.setItem('kg_topology_view', hooks?'hooks':'topology');
+}
+
+function evidenceText(e){
+  if(!e) return '无执行证据';
+  const age = e.age_s!=null ? ` · ${fmt(e.age_s)}前` : '';
+  return `${e.detail||e.kind||'无执行证据'}${age}`;
+}
+
+function renderHooks(){
+  const box = document.getElementById('hooks');
+  box.innerHTML = (D.snapshots||[]).map((s,hi)=>{
+    const inv = s.hook_inventory||[];
+    if(!inv.length) return `<div class=hookhost><b>${esc(s._host)}</b><div class=empty>该探针版本尚未上报 hook_inventory</div></div>`;
+    const cards = inv.map(t=>{
+      const sum=t.summary||{};
+      const rows=(t.hooks||[]).map(h=>`<div class="hrow ${esc(h.state||'grey')}">
+        <div><span class="statusdot ${esc(h.state||'grey')}"></span>
+          <span class=event>${esc(h.event||'—')}</span>
+          ${h.matcher?`<div class=meta>匹配 ${esc(h.matcher)}</div>`:''}</div>
+        <div><b>${esc(h.label||h.component)}</b><div class=meta>${esc(h.action||'')}</div></div>
+        <div class=purpose>${esc(h.purpose||'未登记用途')}
+          <div class=meta>配置：${h.configured?'存在':'缺失'} · 批准：${esc(h.approval||'n/a')} · 范围：${esc(h.scope||'—')}
+            ${h.coverage?` · ⚠ ${esc(h.coverage)}`:''}</div>
+          <div class=meta>执行：${esc(evidenceText(h.runtime_evidence))}</div>
+          <div class=meta>来源：${esc(h.source||'—')}</div>
+        </div></div>`).join('');
+      const src=(t.sources||[]).map(x=>`${x.found?'✓':'—'} ${x.scope||''} ${x.path}`).join(' · ');
+      return `<section class=toolcard>
+        <div class=toolhead><span class="statusdot ${esc(t.state)}"></span><b>${esc(t.label)}</b>
+          <span class=pill>${sum.configured||0} 已配 / ${sum.missing||0} 缺失${sum.unapproved?` / ${sum.unapproved} 未批准`:''}${sum.limited_scope?` / ${sum.limited_scope} 范围受限`:''}</span></div>
+        ${t.note?`<div class=toolnote>${esc(t.note)}</div>`:''}
+        ${rows||'<div class=empty>此工具没有本机 IDE hook</div>'}
+        <div class=srcs>配置源：${esc(src||'无（不适用）')}</div>
+      </section>`;
+    }).join('');
+    return `<div class=hookhost><div class=hh><b>${esc(s._host)}</b>
+      <span class=pill>注册表 v1 · 配置/批准/执行证据分开判定</span></div>
+      <div class=hookgrid>${cards}</div></div>`;
+  }).join('')||'<div class=empty>还没有 hook 快照</div>';
 }
 
 function renderHost(s, hi){

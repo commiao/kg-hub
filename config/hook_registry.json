@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "components": [
+    {
+      "id": "claude-mem",
+      "label": "claude-mem",
+      "patterns": ["worker-service.cjs", "claude-mem"],
+      "purpose": "采集会话上下文、工具调用、文件编辑和会话总结，写入 claude-mem"
+    },
+    {
+      "id": "kg-push",
+      "label": "kg-hub PUSH",
+      "patterns": ["kg_push_hook.py"],
+      "purpose": "在会话开始或提交提示时注入 kg-hub canonical / 相关观察"
+    },
+    {
+      "id": "task-hub",
+      "label": "task-hub",
+      "patterns": ["task-hub.py", "session_context.py", "heartbeat.py"],
+      "purpose": "注入任务看板与登记协议，并用工具活动为当前任务续租"
+    },
+    {
+      "id": "ops-context",
+      "label": "运维上下文",
+      "patterns": ["ops-hook-context.sh"],
+      "purpose": "在会话开始时注入本机运维状态"
+    }
+  ],
+  "actions": {
+    "start": "启动或确认后台 worker",
+    "version-check": "检查插件版本和兼容性",
+    "context": "读取并注入历史上下文",
+    "session-init": "登记新会话及首条用户提示",
+    "file-context": "读取文件前补充相关历史上下文",
+    "file-edit": "记录文件编辑",
+    "observation": "记录工具调用及其结果",
+    "summarize": "会话结束时生成总结并收尾",
+    "session-context": "注入 task-hub 看板与任务协议",
+    "heartbeat": "按当前工作目录为持有任务续租",
+    "push": "检索并注入 kg-hub canonical / 相关观察",
+    "ops-context": "注入运维上下文"
+  },
+  "tools": [
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "sources": [
+        {"kind": "json", "path": "~/.claude/settings.json", "scope": "用户"},
+        {"kind": "latest_glob", "path": "~/.claude/plugins/cache/thedotmack/claude-mem/*/hooks/hooks.json", "scope": "claude-mem 插件"}
+      ],
+      "expected": [
+        {"component": "claude-mem", "required": true},
+        {"component": "kg-push", "required": true},
+        {"component": "task-hub", "required": true}
+      ]
+    },
+    {
+      "id": "cursor",
+      "label": "Cursor",
+      "sources": [
+        {"kind": "json", "path": "~/.cursor/hooks.json", "scope": "用户"},
+        {"kind": "json", "path": "/Users/mac/workspace_cursor/.cursor/hooks.json", "scope": "workspace_cursor 项目"}
+      ],
+      "expected": [
+        {"component": "claude-mem", "required": true, "scope": "user"},
+        {"component": "kg-push", "required": true, "scope": "user"},
+        {"component": "task-hub", "required": true}
+      ]
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "sources": [
+        {"kind": "latest_glob", "path": "~/.codex/plugins/cache/*/claude-mem/*/hooks/codex-hooks.json", "scope": "claude-mem 插件"}
+      ],
+      "approval": "~/.codex/config.toml",
+      "expected": [
+        {"component": "claude-mem", "required": true}
+      ]
+    },
+    {
+      "id": "qoder",
+      "label": "Qoder",
+      "sources": [
+        {"kind": "json", "path": "~/Library/Application Support/Qoder/SharedClientCache/hooks.json", "scope": "用户"},
+        {"kind": "json", "path": "~/.qoder/hooks.json", "scope": "用户"}
+      ],
+      "expected": [
+        {"component": "claude-mem", "required": false}
+      ],
+      "note": "本机有 qoder_cm_hook.sh 适配器，但未发现 Qoder 宿主的 hooks 配置"
+    },
+    {
+      "id": "openclaw",
+      "label": "OpenClaw",
+      "sources": [],
+      "expected": [],
+      "note": "不走本机 IDE hook；VPS 上由 cron / push.log 驱动知识胶囊直推"
+    }
+  ]
+}
