@@ -240,6 +240,15 @@ WATERMARK = STATE_DIR / "watermark.json"
 STATUS = STATE_DIR / "status.json"
 DECISIONS_LOG = STATE_DIR / "ingest_decisions.jsonl"
 CST = timezone(timedelta(hours=8))  # Asia/Shanghai,夜间窗口按此判
+# 409 退避(2026-08-25 修活锁):服务端 error 键存在时 POST 必回 409。原实现把
+# 409 当"下轮重试",于是 LLM 供应商失效期间每 90s 重试全部积压 —— 一夜刷了
+# **6864 条 409 日志**、白烧 CPU/IO,而 backlog_remaining 一动不动、last_error
+# 为 null、watchdog state=OK。**"持续失败但看起来在跑"正是本项目要消灭的失效
+# 模式,我自己造了一个。** 现在同一 obs 连续 409 按指数退避,冷却期直接跳过不发请求。
+# 退避序列(轮):1 → 2 → 4 → 8 → 16 → 32,上限 ~48min(服务端 error 键 24h 过期,
+# 退避到上限后仍会周期性试探,不会永久放弃)。
+BACKOFF_MAX_CYCLES = 32
+
 # 温度门控(2026-08 过热事件:空闲盘温 58/59°C,DSM 强制关机线 ~61°C,余量仅
 # 2-3°C——持续写盘曾连续两周把 NAS 压关机)。群晖盘温免 sudo 直读
 # /run/synostorage/disks/sata*/temperature,compose 把该目录挂到 /disktemp(ro)。
@@ -515,13 +524,19 @@ async def heartbeat_loop() -> None:
 # ---------- 主循环 ----------
 
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
-                        quotas: QuotaTracker, decided: dict, kind: str) -> dict:
+                        quotas: QuotaTracker, decided: dict,
+                        backoff: dict[int, list[int]], cycle: int, kind: str) -> dict:
     """decided: 进程内决策缓存 {obs_id: accept}。deferred 条目下轮重评会重复
     quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。"""
-    stats = {"ingested": 0, "rejected": 0, "deferred": 0}
+    stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0}
     for obs in rows:
         oid = obs["id"]
         if oid in wm["ingested"] or oid in wm["rejected"] or oid in wm["failed"]:
+            continue
+        # 409 退避:冷却期内直接跳过,连请求都不发(活锁的根治点)
+        bo = backoff.get(oid)
+        if bo and cycle < bo[1]:
+            stats["backoff_skipped"] += 1
             continue
         if oid in decided:
             accept = decided[oid]
@@ -547,12 +562,19 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             wm["ingested"].add(oid)
             stats["ingested"] += 1
             decided.pop(oid, None)
+            backoff.pop(oid, None)   # 成功即清退避,恢复后立刻全速
             log.info("[%s] obs-%d → %s", kind, oid, st)
         elif st == "409":
-            # error 键服务端 24h 自动清理(cleanup_stuck_jobs)——409 只是暂时挡板,
-            # 不永久放弃;deferred 留待键过期后重试。
+            # 指数退避:n 次连续 409 → 等 2^(n-1) 轮再试(上限 BACKOFF_MAX_CYCLES)。
+            # 服务端 error 键 24h 会过期,故退避到上限后仍周期试探,不永久放弃。
+            n = (backoff.get(oid, [0, 0])[0]) + 1
+            wait = min(2 ** (n - 1), BACKOFF_MAX_CYCLES)
+            backoff[oid] = [n, cycle + wait]
             stats["deferred"] += 1
-            log.warning("[%s] obs-%d → 409(上次抽取失败;键 24h 过期后自动重试)", kind, oid)
+            # 只在前 3 次打 warning,之后降 debug —— 日志量本身也是故障放大器
+            (log.warning if n <= 3 else log.debug)(
+                "[%s] obs-%d → 409(第 %d 次,退避 %d 轮≈%dmin)",
+                kind, oid, n, wait, wait * INTERVAL // 60)
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
@@ -582,8 +604,11 @@ async def main() -> int:
     quotas = QuotaTracker()
     quota_day = datetime.now(tz=CST).date()
     decided: dict[int, bool] = {}  # 进程内决策缓存(防 deferred 重评的配额幻影消耗)
+    backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
+    cycle = 0
 
     while True:
+        cycle += 1
         try:
             if datetime.now(tz=CST).date() != quota_day:  # 日配额按天重置
                 quotas = QuotaTracker()
@@ -614,7 +639,7 @@ async def main() -> int:
             live_ids = [i for i in fetch_ids(min_id_exclusive=cursor)
                         if i not in terminal][:200]
             s_live = await process_batch(
-                fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, "live")
+                fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live")
             # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
             new_cursor = cursor
@@ -638,7 +663,7 @@ async def main() -> int:
                 if in_backlog_window() and pending_ids:
                     s_back = await process_batch(
                         fetch_rows_by_ids(pending_ids[:BACKLOG_PER_CYCLE]),
-                        wm, cfg, quotas, decided, "backlog")
+                        wm, cfg, quotas, decided, backoff, cycle, "backlog")
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
 
             write_status(
@@ -648,6 +673,7 @@ async def main() -> int:
                 backlog_remaining=backlog_remaining,
                 backlog_window_open=in_backlog_window(),
                 per_cycle=BACKLOG_PER_CYCLE,
+                backoff_pending=len(backoff),
                 watermark={"ingested": len(wm["ingested"]), "rejected": len(wm["rejected"]),
                            "failed": len(wm["failed"])},
                 last_error=None,

@@ -16,7 +16,8 @@ Anomalies tracked:
   server_down       /health not reachable
   queue_backlog     pending > BACKLOG_THRESHOLD
   stuck_jobs        oldest_pending_age > STUCK_THRESHOLD min
-  recent_errors     errored_last_1h > 0
+  recent_errors     errored_last_1h > 0（新增错误；持续故障时会归零，见下）
+  extraction_failing  errored_total > 阈值（存量卡住，持续故障的诚实信号）
 
 For each: emit one alert on OK→BAD, one on BAD→OK. No alert while BAD persists.
 
@@ -341,6 +342,7 @@ def main() -> int:
         "disk_temp_high": False,
         "capture_blocked": False,
         "capture_probe_stale": False,
+        "extraction_failing": False,
     }
     details: dict[str, str] = {}
 
@@ -401,6 +403,30 @@ def main() -> int:
                 details["stuck_jobs"] = (
                     f"oldest pending {int(oldest_age)}s old "
                     f"(threshold {STUCK_SECONDS}s)"
+                )
+            # ── 抽取持续失败(2026-08-25 补的盲区)────────────────────────
+            # recent_errors 判据是 errored_last_1h > 0 —— 它测的是「**新增**错误」,
+            # 而故障持续时新增会归零:LLM 供应商 key 到期后,重试全被 409 挡住、
+            # 不再产生新 error 键 → errored_1h = 0 → **告警在故障持续期间自己
+            # CLEAR 了**。实测 8/24 16:01 FIRE / 17:35 CLEAR、23:01 FIRE /
+            # 00:00 CLEAR,而故障一直持续到次日 11:00 人工发现,零产出 9 小时。
+            #
+            # 故这里改测**存量**:error 键总数 > 阈值 = 有一批数据卡着进不了图,
+            # 无论它们是刚失败的还是失败后一直没能重试。存量只有被清理(24h 过期
+            # 或人工)或成功入图才会降 —— 这才是"故障是否结束"的诚实信号。
+            err_total = int(stats.get("errored_total", 0))
+            # 阈值 5:测试复盘发现 20 太高——事故初期(16:01)只有 7 条 error 键时
+            # 抽取其实已全挂,却要等堆到 20+ 才报,白等几小时。5 条足以区分
+            # "零星失败"(writer.lock 抢锁等,历史上 1-2 条)与"供应商挂了"。
+            err_gate = int(cfg.get("extraction_error_threshold", 5))
+            if err_total > err_gate:
+                new_anomalies["extraction_failing"] = True
+                samples = stats.get("recent_error_samples") or []
+                why = (samples[0].get("error", "")[:120] if samples else "")
+                details["extraction_failing"] = (
+                    f"⚠️ {err_total} 条 obs 卡在抽取失败(阈值 {err_gate}),数据进不了图。"
+                    + (f"样本原因:{why}" if why else "")
+                    + " → 多为 LLM 供应商失效(key 过期/配额/限流),查 kg_hub_server 日志"
                 )
             if errored_1h > 0:
                 new_anomalies["recent_errors"] = True
