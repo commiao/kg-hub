@@ -1,6 +1,10 @@
 """refinery 存活心跳的回归测试。"""
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # 仓库根:否则 ModuleNotFoundError
+
 import asyncio
 import json
 import tempfile

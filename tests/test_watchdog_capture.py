@@ -64,3 +64,24 @@ def test_multi_host_independent():
          _snap(host="win", age=99999, stale=True)], {})
     assert len(blocked) == 1 and "mac" in blocked[0]
     assert len(stale) == 1 and "win" in stale[0]
+
+
+# ── 手工 runner(2026-08-25 补)────────────────────────────────────────────
+# 本文件是 pytest 风格,但本机没装 pytest。此前直接 `python3 tests/xxx.py`
+# 只会**定义函数、一个断言都不执行**,还返回 exit 0 —— 于是它从写下那天起
+# 就是个"看起来在跑其实没跑"的假测试,正是本项目一直在消灭的失效模式。
+# 加 runner 让它无论有没有 pytest 都真的执行并如实退出码。
+if __name__ == "__main__":
+    fns = [(n, f) for n, f in sorted(globals().items())
+           if n.startswith("test_") and callable(f)]
+    ok = fail = 0
+    for name, fn in fns:
+        try:
+            fn()
+            print(f"  ✅ {name}")
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ❌ {name}: {type(exc).__name__}: {exc}")
+            fail += 1
+    print(f"\n{ok} passed, {fail} failed")
+    sys.exit(1 if fail else 0)

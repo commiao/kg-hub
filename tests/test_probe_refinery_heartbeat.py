@@ -1,6 +1,10 @@
 """拓扑探针对 refinery 的存活判定必须只看独立心跳。"""
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # 仓库根:否则 ModuleNotFoundError
+
 import json
 import time
 import unittest
