@@ -606,6 +606,9 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
 
 NAS_REFINERY_STATUS = "/volume2/4T/kg-hub-data/refinery-state/status.json"
 REFINERY_STALE_S = 15 * 60       # heartbeat_at 超过这么久没更新 = refinery 可能死了
+# A brief Docker/log sink hiccup must page someone, but a historical count must
+# not hold the topology red forever after logging has recovered.
+REFINERY_LOG_DROP_ALERT_S = 15 * 60
 
 
 def timestamp_age(value: object) -> int | None:
@@ -743,6 +746,12 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
     else:
         heartbeat_age = timestamp_age(js.get("heartbeat_at"))
         progress_age = timestamp_age(js.get("ts"))
+        try:
+            log_dropped_total = max(0, int(js.get("log_dropped_total") or 0))
+        except (TypeError, ValueError):
+            log_dropped_total = 0
+        log_last_drop_at = js.get("log_last_drop_at")
+        log_drop_age = timestamp_age(log_last_drop_at)
         rf["idle_seconds"] = heartbeat_age
         rf["idle_human"] = human_idle(heartbeat_age)
         rf["metrics"] = {k: js.get(k) for k in
@@ -750,12 +759,24 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
         rf["metrics"].update({"heartbeat_at": js.get("heartbeat_at"),
                               "heartbeat_age_s": heartbeat_age,
                               "progress_age_s": progress_age,
-                              "status_mtime_age_s": status_mtime_age})
+                              "status_mtime_age_s": status_mtime_age,
+                              "log_dropped_total": log_dropped_total,
+                              "log_last_drop_at": log_last_drop_at,
+                              "log_last_drop_age_s": log_drop_age})
         bl, dt = js.get("backlog_remaining"), js.get("disk_temp")
         base = (f"心跳 {human_idle(heartbeat_age)}前 · "
                 f"处理状态 {human_idle(progress_age)}前 · 游标 {js.get('live_cursor')} · "
                 f"积压 {bl} · 盘温 {dt}°C")
-        if js.get("last_error"):
+        if log_dropped_total and log_drop_age is None:
+            rf["state"] = RED
+            rf["detail"] = (f"⚠️ 日志队列累计丢弃 {log_dropped_total} 条，但 "
+                            f"log_last_drop_at 无效，无法确认已恢复 · {base}")
+        elif log_dropped_total and log_drop_age <= REFINERY_LOG_DROP_ALERT_S:
+            rf["state"] = RED
+            rf["detail"] = (f"⚠️ 日志队列最近 {human_idle(log_drop_age)} 丢弃；"
+                            f"累计 {log_dropped_total} 条（{REFINERY_LOG_DROP_ALERT_S // 60} 分钟"
+                            f"告警窗口内）· {base}")
+        elif js.get("last_error"):
             rf["state"] = RED
             rf["detail"] = f"last_error: {str(js['last_error'])[:60]} · {base}"
         elif heartbeat_age is None:

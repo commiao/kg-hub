@@ -29,11 +29,16 @@ Env(compose):
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
+import logging.handlers
 import os
+import queue
+import signal
 import sqlite3
 import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -45,8 +50,156 @@ from utils.ingest_filter import (  # noqa: E402
     QuotaTracker, evaluate, load_config, log_decision,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [refinery] %(message)s")
-log = logging.getLogger("refinery")
+
+# A Docker log driver can still stall when its sink is unavailable.  The refinery
+# heartbeat shares this process with batch work, so its application logging must
+# never wait for stderr.  The listener may block on stderr; producers only make
+# a bounded, non-blocking queue attempt and deliberately drop excess records.
+REFINERY_LOG_QUEUE_SIZE = 1_024
+
+
+class DroppingQueueHandler(logging.handlers.QueueHandler):
+    """Never block or synchronously report errors from a bounded log queue."""
+
+    def __init__(self, log_queue: queue.Queue) -> None:
+        super().__init__(log_queue)
+        self._lock = threading.Lock()
+        self._dropped = 0
+        self._last_drop_at: str | None = None
+        # `write_status` can be called repeatedly while this process is alive.
+        # Remember which process-local drops have reached disk, so a heartbeat
+        # never re-adds the same events to the persistent cumulative counter.
+        self._persisted_dropped = 0
+        self._persisted_total = 0
+
+    @property
+    def dropped(self) -> int:
+        with self._lock:
+            return self._dropped
+
+    @property
+    def last_drop_at(self) -> str | None:
+        with self._lock:
+            return self._last_drop_at
+
+    def _record_drop(self) -> None:
+        # This path deliberately contains no logging: it is used precisely
+        # when a logging sink is unavailable or corrupt.
+        try:
+            timestamp = datetime.now(tz=timezone.utc).isoformat()
+        except Exception:  # noqa: BLE001 - keep the producer fail-open
+            timestamp = None
+        with self._lock:
+            self._dropped += 1
+            if timestamp is not None:
+                self._last_drop_at = timestamp
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except Exception:  # noqa: BLE001 - queue errors must not reach stderr
+            self._record_drop()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Override QueueHandler.emit so prepare errors cannot call handleError.
+
+        The stdlib implementation forwards preparation/enqueue exceptions to
+        ``handleError``. That may synchronously write to stderr, reintroducing
+        the exact Docker-log backpressure that this queue isolates.
+        """
+        try:
+            self.enqueue(self.prepare(record))
+        except Exception:  # noqa: BLE001 - including formatter failures
+            self._record_drop()
+
+    def status_fields(self, persisted_total: object,
+                      persisted_last_drop_at: object) -> tuple[int, str | None, int]:
+        """Return durable log-loss fields and the snapshot used to make them."""
+        try:
+            prior_total = max(0, int(persisted_total or 0))
+        except (TypeError, ValueError):
+            prior_total = 0
+        prior_last = (persisted_last_drop_at
+                      if isinstance(persisted_last_drop_at, str) else None)
+        with self._lock:
+            total = max(prior_total, self._persisted_total)
+            total += max(0, self._dropped - self._persisted_dropped)
+            return total, self._last_drop_at or prior_last, self._dropped
+
+    def mark_status_persisted(self, total: int, dropped_snapshot: int) -> None:
+        """Acknowledge only fields that made it through the atomic file replace."""
+        with self._lock:
+            self._persisted_total = max(self._persisted_total, total)
+            self._persisted_dropped = max(self._persisted_dropped, dropped_snapshot)
+
+
+class NonBlockingQueueListener(logging.handlers.QueueListener):
+    """Drain on clean exit, but never make shutdown wait on a stuck stderr."""
+
+    def stop(self, timeout: float = 1.0) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        try:
+            self.enqueue_sentinel()
+        except queue.Full:
+            # There is no value in preserving queued output during shutdown if
+            # the listener cannot accept its sentinel. Drop it and retry.
+            try:
+                while True:
+                    self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.enqueue_sentinel()
+            except Exception:  # noqa: BLE001 - shutdown must remain fail-open
+                return
+        except Exception:  # noqa: BLE001 - shutdown must remain fail-open
+            return
+        thread.join(timeout=timeout)
+        if not thread.is_alive():
+            self._thread = None
+
+
+def configure_refinery_logging() -> tuple[
+        logging.Logger, DroppingQueueHandler, logging.handlers.QueueListener]:
+    """Send refinery logs through a bounded queue before writing to stderr."""
+    # Production logging must not invoke the logging module's synchronous
+    # stderr diagnostics if a handler fails. DroppingQueueHandler additionally
+    # overrides emit, so this is a defence-in-depth policy for listener errors.
+    logging.raiseExceptions = False
+    log_queue: queue.Queue = queue.Queue(maxsize=REFINERY_LOG_QUEUE_SIZE)
+    queue_handler = DroppingQueueHandler(log_queue)
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setFormatter(logging.Formatter("%(asctime)s [refinery] %(message)s"))
+    listener = NonBlockingQueueListener(log_queue, stderr_handler)
+
+    refinery_log = logging.getLogger("refinery")
+    refinery_log.setLevel(logging.INFO)
+    refinery_log.handlers.clear()
+    refinery_log.addHandler(queue_handler)
+    refinery_log.propagate = False
+    listener.start()
+    return refinery_log, queue_handler, listener
+
+
+log, REFINERY_LOG_HANDLER, REFINERY_LOG_LISTENER = configure_refinery_logging()
+
+
+def shutdown_refinery_logging() -> None:
+    """Stop the daemon listener when possible without delaying process exit."""
+    try:
+        REFINERY_LOG_LISTENER.stop()
+    except Exception:  # noqa: BLE001 - logging cleanup must never block exit
+        pass
+
+
+def _handle_sigterm(signum: int, _frame: object) -> None:
+    shutdown_refinery_logging()
+    raise SystemExit(128 + signum)
+
+
+atexit.register(shutdown_refinery_logging)
 
 KG_HUB_URL = os.environ.get("KG_HUB_URL", "http://kg_hub_server:8080").rstrip("/")
 TOKEN = os.environ.get("KG_HUB_API_TOKEN", "")
@@ -328,9 +481,14 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
         if not heartbeat_only:
             cur.update(kw, ts=now)
         cur["heartbeat_at"] = now
+        log_total, log_last_drop_at, dropped_snapshot = REFINERY_LOG_HANDLER.status_fields(
+            cur.get("log_dropped_total"), cur.get("log_last_drop_at"))
+        cur["log_dropped_total"] = log_total
+        cur["log_last_drop_at"] = log_last_drop_at
         tmp = STATUS.with_suffix(".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False))
         tmp.replace(STATUS)
+        REFINERY_LOG_HANDLER.mark_status_persisted(log_total, dropped_snapshot)
     except Exception:  # noqa: BLE001
         log.exception("[status] write failed (non-fatal)")
 
@@ -501,4 +659,9 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    previous_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        sys.exit(asyncio.run(main()))
+    finally:
+        shutdown_refinery_logging()
+        signal.signal(signal.SIGTERM, previous_sigterm)

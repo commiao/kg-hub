@@ -89,6 +89,40 @@ class ProbeRefineryHeartbeatTests(unittest.TestCase):
         self.assertEqual(node["state"], probe.RED)
         self.assertIn("心跳", node["detail"])
 
+    def test_recent_log_drops_block_even_with_a_fresh_heartbeat(self):
+        now = datetime.now(tz=timezone.utc)
+        node = refinery_node({
+            "ts": now.isoformat(),
+            "heartbeat_at": now.isoformat(),
+            "log_dropped_total": 3,
+            "log_last_drop_at": (now - timedelta(seconds=30)).isoformat(),
+        })
+        self.assertEqual(node["state"], probe.RED)
+        self.assertIn("日志队列", node["detail"])
+        self.assertEqual(node["metrics"]["log_dropped_total"], 3)
+
+    def test_old_log_drop_is_history_not_a_permanent_blocker(self):
+        now = datetime.now(tz=timezone.utc)
+        node = refinery_node({
+            "ts": now.isoformat(),
+            "heartbeat_at": now.isoformat(),
+            "log_dropped_total": 3,
+            "log_last_drop_at": (now - timedelta(seconds=probe.REFINERY_LOG_DROP_ALERT_S + 1)).isoformat(),
+        })
+        self.assertEqual(node["state"], probe.GREEN)
+        self.assertEqual(node["metrics"]["log_dropped_total"], 3)
+
+    def test_log_drop_without_a_valid_timestamp_blocks_until_explained(self):
+        now = datetime.now(tz=timezone.utc)
+        node = refinery_node({
+            "ts": now.isoformat(),
+            "heartbeat_at": now.isoformat(),
+            "log_dropped_total": 1,
+            "log_last_drop_at": "bad",
+        })
+        self.assertEqual(node["state"], probe.RED)
+        self.assertIn("log_last_drop_at", node["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

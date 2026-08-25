@@ -40,6 +40,15 @@ services:
     image: kg-hub-server:latest
     container_name: kg-hub-server
     restart: unless-stopped
+    # Preserve service liveness under Docker log backpressure: after the bounded
+    # buffer fills, Docker drops logs rather than blocking stdout/stderr writers.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
     depends_on:
       falkordb:
         condition: service_healthy
@@ -91,6 +100,14 @@ services:
     image: kg-hub-server:latest        # same image as kg_hub_server (code + httpx)
     container_name: kg-hub-watchdog
     restart: unless-stopped
+    # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
     depends_on:
       - kg_hub_server
     environment:
@@ -122,6 +139,14 @@ services:
     image: kg-hub-server:latest
     container_name: kg-hub-ingester
     restart: unless-stopped
+    # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
     depends_on:
       falkordb:
         condition: service_healthy
@@ -162,6 +187,14 @@ services:
     image: kg-hub-server:latest
     container_name: kg-hub-refinery
     restart: unless-stopped
+    # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
     depends_on:
       - kg_hub_server
     environment:
