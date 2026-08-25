@@ -35,6 +35,7 @@ NAS_DIR="/volume2/4T/kg-hub-data/claude-mem"
 DST="$NAS_DIR/claude-mem.db"
 APPLIER_LOCAL="$(cd "$(dirname "$0")" && pwd)/nas_apply_claude_mem_delta.sh"
 APPLIER_REMOTE="/volume1/docker/kg-hub-src/tools/nas_apply_claude_mem_delta.sh"
+INBOX_LOCAL="/Users/mac/public-sync/kg-hub-inbox"   # Synology Drive 同步盘,主传输路径
 STATE="/Users/mac/.kg-hub/state"
 STAMP="$STATE/claude-mem-synced.obsid"
 mkdir -p "$STATE"
@@ -44,6 +45,12 @@ ts() { date '+%F %T'; }
 SSHOPT="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
 [ -f "$SRC" ] || { echo "$(ts) no source db"; exit 0; }
+
+# --rebuild:强制走兜底重建。兜底本来只在副本损坏/格式不符时触发,属于罕用路径
+# —— 而罕用路径的通病是"用到时才发现早就坏了"。给它一个能随时手动走一遍的入口,
+# 既方便给新 NAS 播种,也让这条路可以被定期演练。
+FORCE_REBUILD=""
+[ "$1" = "--rebuild" ] && FORCE_REBUILD=1
 
 # ── 并发锁 ─────────────────────────────────────────────────────────────
 # launchd 的 StartInterval **不会**在上一轮还活着时另起一轮,所以一次卡死
@@ -144,6 +151,57 @@ INSERT INTO observations SELECT * FROM s.observations WHERE $2;
 " 2>/dev/null
 }
 
+# ── 推送 payload 并触发远端合并 ────────────────────────────────────────
+# $1 = 本地增量库路径   $2 = 合并后应有的 MAX(id)
+#
+# 主路径走 **Synology Drive 同步盘**,不走 ssh 管道。理由是可用性,不是速度。
+# 2026-08-24 在公司 Wi-Fi 上实测,tailscale 退化到 50% 丢包时:
+#     ssh 小包             3/3 通
+#     ssh 大块 133KB 起    全部 Timeout(连 6KB 稳态增量都失败过)
+#     同步盘               4MB/15s、8KB/7s 正常
+# 也就是说这条链路只保得住控制面。于是:控制面(读 watermark、触发合并、
+# 校验结果)继续走 ssh 小包,真正的字节走同步盘。
+#
+# 同步盘因此**每 15 分钟被走一遍**,不会变成"用到时才发现早就坏了"的罕用
+# 路径 —— 这正是先前否掉「稳态 ssh + 兜底同步盘」两条链路方案的那个理由。
+#
+# ssh 管道保留为兜底:Drive 客户端掉线等导致同步盘迟迟不到时,当轮改走它。
+# $3 = merge(默认,稳态增量) | replace(兜底重建,整份换掉)
+# 走了哪条路要落到文件而不是变量:调用方写的是 `out=$(push_payload ...)`,
+# 命令替换开子 shell,函数里对变量的赋值传不回父进程(2026-08-24 实测打出空的 [])。
+VIA_FILE="$STATE/.push_via"
+push_via() { printf '%s' "$1" > "$VIA_FILE"; }
+push_payload() {
+  _src="$1"; _expect="$2"; _mode="${3:-merge}"
+  push_via "?"
+  _gz=$(mktemp /tmp/cm-push.XXXXXX) && gzip -c "$_src" > "$_gz"
+  _bytes=$(wc -c < "$_gz" | tr -d ' ')
+  _sha=$(shasum -a 256 "$_gz" | cut -d' ' -f1)
+  _fname="cm-$_expect-$$.db.gz"
+  _out=""
+
+  if mkdir -p "$INBOX_LOCAL" 2>/dev/null; then
+    # 先写 .part 再改名:Drive 一见文件就开始同步,而 applier 只按传入的确切
+    # 文件名找 —— 半截文件带 .part 前缀,不可能被误认领。
+    cp -f "$_gz" "$INBOX_LOCAL/.$_fname.part" \
+      && mv -f "$INBOX_LOCAL/.$_fname.part" "$INBOX_LOCAL/$_fname"
+    _out=$(ssh $SSHOPT "$NAS" \
+      "MODE='$_mode' sh '$APPLIER_REMOTE' '$_expect' '$_fname' '$_bytes' '$_sha'" 2>&1)
+    rm -f "$INBOX_LOCAL/$_fname" "$INBOX_LOCAL/.$_fname.part"
+    case "$_out" in
+      *"OK merged="*) rm -f "$_gz"; push_via 同步盘; echo "$_out"; return 0 ;;
+      *未送达*)       echo "$(ts) 同步盘未送达,本轮改走 ssh 管道" >&2 ;;
+      *)              rm -f "$_gz"; push_via 同步盘; echo "$_out"; return 1 ;;  # 远端明确判失败,换路也没用
+    esac
+  fi
+
+  _out=$(ssh $SSHOPT "$NAS" "MODE='$_mode' sh '$APPLIER_REMOTE' '$_expect'" < "$_gz" 2>&1)
+  rm -f "$_gz"
+  push_via ssh管道
+  echo "$_out"
+  case "$_out" in *"OK merged="*) return 0 ;; *) return 1 ;; esac
+}
+
 # ── 全量兜底通道 ───────────────────────────────────────────────────────
 full_rebuild() {
   why="$1"
@@ -151,25 +209,20 @@ full_rebuild() {
   TMP=$(mktemp /tmp/cm-snap.XXXXXX) && rm -f "$TMP" && TMP="$TMP.db"
   make_subset_db "$TMP" "1=1" \
     || { echo "$(ts) ERROR 构造全量副本失败"; return 1; }
-  SIZE=$(wc -c < "$TMP" | tr -d ' ')
-  # 远端在 mv 之前必须自己验:`cat > tmp && mv` 挡不住短流 —— ssh 一断,远端
-  # cat 收到的是干净的 EOF → exit 0 → mv 把半截库装上去(2026-08-21 实测,
-  # NAS 库变成 17301504 字节且 malformed,日志和退出码都看不出异常)。
-  # 原子 mv 防的是"读到写一半的文件",防不住"写完的是个短文件"。
-  R="gunzip -c > '$DST.tmp' \
-   && [ \"\$(wc -c < '$DST.tmp' | tr -d ' ')\" = '$SIZE' ] \
-   && [ \"\$(sqlite3 -readonly '$DST.tmp' 'PRAGMA integrity_check;' 2>/dev/null | head -1)\" = 'ok' ] \
-   && [ \"\$(sqlite3 -readonly '$DST.tmp' 'SELECT MAX(id) FROM observations;' 2>/dev/null)\" = '$local_max' ] \
-   && mv -f '$DST.tmp' '$DST' && rm -f '$DST-wal' '$DST-shm' \
-   || { rm -f '$DST.tmp'; exit 9; }"
+  # 走与稳态同一条推送路径(同步盘为主)、同一个 applier、同一套校验 ——
+  # 只是模式为 replace。以前这里内联了一份自己的远端命令,等于第二套实现,
+  # 而它罕用、没人走,坏了也不会有人知道。
   for i in 1 2 3; do
-    if gzip -c "$TMP" | ssh $SSHOPT "$NAS" "$R" >/dev/null 2>&1; then
+    if out=$(push_payload "$TMP" "$local_max" replace); then
       echo "$local_max" > "$STAMP"
-      echo "$(ts) 全量重建完成 (MAX id=$local_max)"; return 0
+      echo "$(ts) 全量重建完成 (MAX id=$local_max) ${out#OK } [$(cat "$VIA_FILE" 2>/dev/null)]"; return 0
     fi
+    case "$out" in
+      *FAIL*) echo "$(ts) 全量重建被远端拒绝: $out"; return 1 ;;
+    esac
     sleep 10
   done
-  echo "$(ts) 全量重建失败(NAS 不可达或远端校验未过)"; return 1
+  echo "$(ts) 全量重建失败(两条路都不通): $out"; return 1
 }
 
 # ── 探 NAS 侧状态:watermark + 完整性 + applier 是否就位 ────────────────
@@ -189,7 +242,20 @@ nas_integ=$(echo "$probe" | sed -n 's/^integ=//p')
 nas_applier=$(echo "$probe" | sed -n 's/^applier=//p')
 nas_fts=$(echo "$probe"     | sed -n 's/^fts=//p')
 
-# 需要全量重建的三种情况
+# ── applier 保鲜:哈希不一致就重推(3KB,可忽略),杜绝版本漂移 ────────────
+# **必须在下面任何 full_rebuild 之前** —— 兜底重建现在也经由 applier(replace
+# 模式),NAS 上若还是不认识 replace 的旧版,重建会直接失败。
+want=$(shasum -a 256 "$APPLIER_LOCAL" | cut -c1-16)
+if [ "$nas_applier" != "$want" ]; then
+  echo "$(ts) 推送 applier ($nas_applier → $want)"
+  ssh $SSHOPT "$NAS" \
+    "cat > '$APPLIER_REMOTE.tmp' && mv -f '$APPLIER_REMOTE.tmp' '$APPLIER_REMOTE'" \
+    < "$APPLIER_LOCAL" \
+    || { echo "$(ts) applier 推送失败,本轮跳过"; exit 0; }
+fi
+
+# 需要全量重建的几种情况
+[ -n "$FORCE_REBUILD" ] && { full_rebuild "手动 --rebuild"; exit $?; }
 case "$nas_max" in ''|*[!0-9]*) full_rebuild "NAS 侧 watermark 读不到($nas_integ)"; exit $? ;; esac
 [ "$nas_integ" = "ok" ] || { full_rebuild "NAS 侧库损坏($nas_integ)"; exit $?; }
 [ "$nas_max" -le "$local_max" ] || { full_rebuild "NAS($nas_max) 领先本机($local_max),数据分叉"; exit $?; }
@@ -202,15 +268,6 @@ if [ "$nas_max" -eq "$local_max" ]; then
   echo "$(ts) 无新 obs (MAX id=$local_max), skip"; exit 0
 fi
 
-# ── applier 保鲜:哈希不一致就重推(2KB,可忽略),杜绝版本漂移 ────────────
-want=$(shasum -a 256 "$APPLIER_LOCAL" | cut -c1-16)
-if [ "$nas_applier" != "$want" ]; then
-  echo "$(ts) 推送 applier ($nas_applier → $want)"
-  cat "$APPLIER_LOCAL" | ssh $SSHOPT "$NAS" \
-    "cat > '$APPLIER_REMOTE.tmp' && mv -f '$APPLIER_REMOTE.tmp' '$APPLIER_REMOTE'" \
-    || { echo "$(ts) applier 推送失败,本轮跳过"; exit 0; }
-fi
-
 # ── 生成增量库 ─────────────────────────────────────────────────────────
 TMP=$(mktemp /tmp/cm-delta.XXXXXX) && rm -f "$TMP" && TMP="$TMP.db"
 make_subset_db "$TMP" "id > $nas_max" \
@@ -221,12 +278,12 @@ kb=$(gzip -c "$TMP" | wc -c | awk '{printf "%.1f", $1/1024}')
 
 # ── 推送 + 远端合并 ────────────────────────────────────────────────────
 for i in 1 2 3; do
-  out=$(gzip -c "$TMP" | ssh $SSHOPT "$NAS" "sh '$APPLIER_REMOTE' '$local_max'" 2>&1)
+  if out=$(push_payload "$TMP" "$local_max" merge); then
+    echo "$local_max" > "$STAMP"
+    echo "$(ts) synced +$nrow 条 (${kb}KB) $nas_max → $local_max"
+    exit 0
+  fi
   case "$out" in
-    *"OK merged="*)
-      echo "$local_max" > "$STAMP"
-      echo "$(ts) synced +$nrow 条 (${kb}KB) $nas_max → $local_max"
-      exit 0 ;;
     *FAIL*)
       # 远端明确判定失败(合并/校验不过) —— 重试同样的输入没意义,
       # 且线上库未被触碰,直接回退全量重建。
@@ -235,5 +292,5 @@ for i in 1 2 3; do
   esac
   sleep 10
 done
-echo "$(ts) 增量推送失败(NAS 不可达),下个周期重试"
+echo "$(ts) 增量推送失败(同步盘与 ssh 都不通),下个周期重试"
 exit 0
