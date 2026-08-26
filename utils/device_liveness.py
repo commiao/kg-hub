@@ -1,8 +1,9 @@
 """NAS 侧 Tailscale 设备在线信号的共享读取与判定。
 
-生产者在 NAS host 上原子写入 ``tailscale status --json`` 的原始输出；容器只读
-消费该文件。在线状态来自 Tailscale 实况，文件 mtime 是采样时间。过期、缺失、
-损坏或未来时间戳一律降级为 unknown，绝不把旧 ``Online: true`` 当作在线证据。
+独立 producer 容器原子写入 ``tailscale status --json`` 的原始输出；server 与
+watchdog 容器只读消费。在线状态来自 Tailscale 实况，文件 mtime 是采样时间。
+过期、缺失、损坏或未来时间戳一律降级为 unknown，绝不把旧 ``Online: true``
+当作在线证据。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from typing import Any
 DEFAULT_PATH = Path(os.environ.get(
     "KG_HUB_DEVICE_LIVENESS_PATH", "/device-liveness/tailscale-status.json"))
 DEFAULT_CONFIG_PATH = Path(os.environ.get(
-    "KG_HUB_DEVICE_LIVENESS_CONFIG", "/device-liveness/device-liveness.json"))
+    "KG_HUB_DEVICE_LIVENESS_CONFIG", "/device-liveness-config/device-liveness.json"))
 DEFAULT_CAPTURE_STALE_AFTER_S = 30 * 60
 try:
     DEFAULT_MAX_AGE_S = int(os.environ.get("KG_HUB_DEVICE_LIVENESS_MAX_AGE_S", "180"))
@@ -85,12 +86,23 @@ def parse_status(status: object, *, age_s: float,
             "offline" if online is False else "unknown")
         record = {
             "state": state,
+            "peer_identity": normalize_host(peer_key),
             "host_name": str(peer.get("HostName") or ""),
             "dns_name": str(peer.get("DNSName") or ""),
             "last_seen": str(peer.get("LastSeen") or ""),
         }
         for alias in _peer_aliases(peer, peer_key):
-            devices[alias] = record
+            previous = devices.get(alias)
+            if previous is None:
+                devices[alias] = record
+            elif previous.get("peer_identity") != record["peer_identity"]:
+                # HostName/DNSName 可变且可能重复。同名时绝不让后遍历的 peer
+                # 覆盖前一个在线态；显式配置稳定 node-key 仍可消除歧义。
+                devices[alias] = {
+                    "state": "unknown",
+                    "ambiguous": True,
+                    "peer_identity": "",
+                }
 
     source_state = "fresh" if 0 <= age_s <= max_age_s else "stale"
     return {
@@ -170,13 +182,18 @@ def device_state(liveness: dict[str, Any] | None, host: object,
     devices = liveness.get("devices") or {}
     record = None
     matched = ""
+    ambiguous = False
     if isinstance(devices, dict):
         for identity in _identity_candidates(host, aliases):
             candidate = devices.get(identity)
             if isinstance(candidate, dict):
-                record, matched = candidate, identity
-                break
+                if candidate.get("state") in {"online", "offline"}:
+                    record, matched = candidate, identity
+                    break
+                ambiguous = ambiguous or bool(candidate.get("ambiguous"))
     if not isinstance(record, dict):
+        if ambiguous:
+            return "unknown", f"Tailscale 身份 {host} 存在同名冲突，请配置稳定 node-key"
         return "unknown", f"Tailscale 快照未找到 {host}（含身份映射）"
     state = str(record.get("state") or "unknown")
     if state not in {"online", "offline"}:

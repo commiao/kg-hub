@@ -18,6 +18,8 @@ Anomalies tracked:
   stuck_jobs        oldest_pending_age > STUCK_THRESHOLD min
   recent_errors     errored_last_1h > 0（新增错误；持续故障时会归零，见下）
   extraction_failing  errored_total > 阈值（存量卡住，持续故障的诚实信号）
+  capture_probe_stale  设备明确在线但采集探针超时
+  capture_monitor_unhealthy  topology/Tailscale 监控证据源不可判
 
 For each: emit one alert on OK→BAD, one on BAD→OK. No alert while BAD persists.
 
@@ -249,14 +251,15 @@ def check_search_probe() -> tuple[str, float, str]:
 
 
 class CaptureDecision(NamedTuple):
-    """每个告警维度独立三态：list=已知结果，None=本轮不可判，沿用上一轮。"""
+    """业务维度三态；监控源异常单列，避免把 unknown 冒充健康。"""
 
     blocked: list[str] | None
     stale: list[str] | None
+    source_errors: tuple[str, ...] = ()
 
 
 def check_capture_chain(_notify_cfg: dict) -> CaptureDecision:
-    """采集链路健康：读 kg-hub 的拓扑快照，判断"该喊人"的两件事。
+    """采集链路健康：读 kg-hub 拓扑，区分业务异常与监控证据源异常。
 
     返回 CaptureDecision。字段为空 list 表示明确健康；None 表示本轮未知，调用方
     必须沿用上一轮状态，不能把“读不到”解释成 resolved。
@@ -269,12 +272,12 @@ def check_capture_chain(_notify_cfg: dict) -> CaptureDecision:
 
     ## 探针失联必须有独立 online 证据
 
-    旧快照本身无法区分“Mac 睡眠”与“探针进程死亡”。只有 NAS host 的新鲜
+    旧快照本身无法区分“Mac 睡眠”与“探针进程死亡”。只有 NAS 独立 producer 的新鲜
     Tailscale 快照明确显示设备 online，旧采集快照才是一条独立告警；offline
-    明确不报，unknown（包括 Tailscale 快照自身过期）则沿用上一轮状态。
+    明确不报。unknown 时业务告警沿用上一轮，另报 capture_monitor_unhealthy。
     """
     if not KG_HUB_URL:
-        return CaptureDecision(None, None)
+        return CaptureDecision(None, None, ("未配置 kg-hub topology API",))
     try:
         r = httpx.get(f"{KG_HUB_URL.rstrip('/')}/api/topology/latest",
                       headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"} if KG_HUB_TOKEN else {},
@@ -282,22 +285,24 @@ def check_capture_chain(_notify_cfg: dict) -> CaptureDecision:
         if r.status_code >= 400:
             print(f"[watchdog] topology API HTTP {r.status_code}; "
                   "not classifying as capture_probe_stale")
-            return CaptureDecision(None, None)
+            return CaptureDecision(
+                None, None, (f"topology API HTTP {r.status_code}，采集状态不可判",))
         payload = r.json() or {}
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             print("[watchdog] topology API returned non-ok payload; holding capture state")
-            return CaptureDecision(None, None)
+            return CaptureDecision(None, None, ("topology API 返回非 ok，采集状态不可判",))
         snaps = payload.get("snapshots")
         if not isinstance(snaps, list):
             print("[watchdog] topology API snapshots is not a list; holding capture state")
-            return CaptureDecision(None, None)
+            return CaptureDecision(None, None, ("topology API snapshots 格式错误",))
     except Exception as exc:  # noqa: BLE001
         print(f"[watchdog] topology API unreadable ({type(exc).__name__}: {exc}); "
               "not classifying as capture_probe_stale")
-        return CaptureDecision(None, None)
+        return CaptureDecision(
+            None, None, (f"topology API 不可读: {type(exc).__name__}",))
 
-    # 容器不假设装有 tailscale CLI。NAS host 每分钟把 `tailscale status --json`
-    # 原子写进 /device-liveness；watchdog 与 dashboard 只读同一份独立设备在线信号。
+    # server/watchdog 不装 tailscale CLI。独立 producer 每分钟把状态原子写进
+    # /device-liveness；两个消费者只读同一份独立设备在线信号。
     # capture host/identity/threshold 只读公开 device-liveness.json。notify.json
     # 只控制通知开关/渠道，不能覆盖阈值，否则 dashboard 与 watchdog 会分裂。
     device_cfg = load_config()
@@ -334,6 +339,11 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         cfg.get("capture_stale_after_min"),
         DEFAULT_CAPTURE_STALE_AFTER_S // 60) * 60
     blocked, stale = [], []
+    source_errors: list[str] = []
+    if isinstance(liveness, dict) and liveness.get("source_state") != "fresh":
+        source_errors.append(str(
+            liveness.get("detail") or
+            f"设备在线信号 {liveness.get('source_state') or 'unknown'}"))
     blocked_unknown = stale_unknown = False
 
     # 必须看“配置清单 ∪ 已有快照”：否则只要任意 host 仍在上报，另一个从未上报
@@ -344,6 +354,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         if not isinstance(sn, dict):
             blocked_unknown = True
             stale_unknown = True
+            source_errors.append("topology snapshot 不是 object")
             continue
         host = str(sn.get("_host") or "?")
         key = normalize_host(host)
@@ -356,16 +367,18 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
 
     if not host_labels:
         blocked_unknown = stale_unknown = True
+        source_errors.append("topology 没有可判定的采集 host")
 
     for key, host in host_labels.items():
         sn = snapshots_by_host.get(key)
         if sn is None:
-            state = device_state(liveness, host, aliases)[0]
+            state, state_detail = device_state(liveness, host, aliases)
             if state == "online":
                 stale.append(f"{host} 设备在线，但从未收到采集链路快照")
             elif state == "unknown":
                 blocked_unknown = True
                 stale_unknown = True
+                source_errors.append(state_detail)
             # offline/online 都明确说明旧 blocker 不适用；仅 unknown 才 HOLD。
             continue
 
@@ -375,18 +388,21 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         if snapshot_stale is None:
             blocked_unknown = True
             stale_unknown = True
+            source_errors.append(f"{host} topology snapshot 缺少有效年龄")
             continue
         if snapshot_stale:
             if liveness is None:
                 state = str(sn.get("_device_state") or "unknown")
+                state_detail = "拓扑未提供明确设备在线态"
             else:
-                state = device_state(liveness, host, aliases)[0]
+                state, state_detail = device_state(liveness, host, aliases)
             if state == "online":
                 stale.append(
                     f"{host} 设备在线，但探针 {int(age or 0) // 60} 分钟未上报")
             elif state == "unknown":
                 blocked_unknown = True
                 stale_unknown = True
+                source_errors.append(state_detail)
             # known online/offline 时旧 blocker 都不再可信且应清除；只有 unknown
             # host 才 HOLD。fresh blocker 会在其它 host 分支重新把聚合态判为 BAD。
             continue
@@ -396,7 +412,9 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
     # 任一明确坏态足以 FIRE；没有坏态时，只要还有旧/不可判 host 就必须 HOLD。
     blocked_decision = blocked if blocked else (None if blocked_unknown else [])
     stale_decision = stale if stale else (None if stale_unknown else [])
-    return CaptureDecision(blocked_decision, stale_decision)
+    return CaptureDecision(
+        blocked_decision, stale_decision,
+        tuple(dict.fromkeys(error for error in source_errors if error)))
 
 
 def apply_capture_decision(decision: CaptureDecision, prev_anomalies: dict,
@@ -428,6 +446,14 @@ def apply_capture_decision(decision: CaptureDecision, prev_anomalies: dict,
                 + "\n  ".join(decision.stale[:6])
                 + "\n查该机 launchctl print gui/$UID/com.kg-hub.capture-probe"
                   " 与 ~/.kg-hub/logs/capture-probe.err.log")
+
+    if ("capture_monitor_unhealthy" in new_anomalies or decision.source_errors or
+            prev_anomalies.get("capture_monitor_unhealthy")):
+        new_anomalies["capture_monitor_unhealthy"] = bool(decision.source_errors)
+        if decision.source_errors:
+            details["capture_monitor_unhealthy"] = (
+                "采集监控证据源不可用（不据此误报探针失联）:\n  "
+                + "\n  ".join(decision.source_errors[:6]))
 
 
 def main() -> int:
@@ -474,6 +500,7 @@ def main() -> int:
         "disk_temp_high": False,
         "capture_blocked": False,
         "capture_probe_stale": False,
+        "capture_monitor_unhealthy": False,
         "extraction_failing": False,
     }
     details: dict[str, str] = {}

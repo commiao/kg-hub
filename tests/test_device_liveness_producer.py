@@ -1,4 +1,4 @@
-"""host-side producer 必须原子更新，并在采样失败时保留 last-good。"""
+"""隔离 producer 必须原子更新，并在采样失败时保留 last-good。"""
 
 from __future__ import annotations
 

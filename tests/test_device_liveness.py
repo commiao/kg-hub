@@ -1,4 +1,4 @@
-"""NAS host-side Tailscale 在线快照的可信度边界。"""
+"""NAS `device_liveness` producer 在线快照的可信度边界。"""
 
 from __future__ import annotations
 
@@ -41,6 +41,19 @@ class DeviceLivenessTests(unittest.TestCase):
         self.assertEqual(device_state(live, "MacBook-Pro-4")[0], "online")
         self.assertEqual(device_state(live, "macbook-pro-4.example.ts.net")[0], "online")
         self.assertEqual(device_state(live, "sleeping-mac.local")[0], "offline")
+
+    def test_duplicate_mutable_alias_is_unknown_but_stable_identity_resolves(self) -> None:
+        duplicate = json.loads(json.dumps(RAW))
+        duplicate["Peer"]["node-key:b"]["HostName"] = "MacBook-Pro-4"
+        live = parse_status(duplicate, age_s=10)
+        state, detail = device_state(live, "MacBook-Pro-4")
+        self.assertEqual(state, "unknown")
+        self.assertIn("同名冲突", detail)
+        self.assertEqual(
+            device_state(
+                live, "MacBook-Pro-4",
+                {"MacBook-Pro-4": ["node-key:a"]})[0],
+            "online")
 
     def test_stale_status_downgrades_old_online_to_unknown(self) -> None:
         live = parse_status(RAW, age_s=181, max_age_s=180)
@@ -125,11 +138,17 @@ class DeviceLivenessTests(unittest.TestCase):
         compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
         server = compose.split("  kg_hub_server:", 1)[1].split("  watchdog:", 1)[0]
         self.assertIn(
-            "/device-liveness:/device-liveness:ro",
+            "/device-liveness/runtime:/device-liveness:ro",
+            server)
+        self.assertIn(
+            "/device-liveness.json:/device-liveness-config/device-liveness.json:ro",
             server)
         self.assertNotIn("/notify-config:/config", server)
         watchdog = compose.split("  watchdog:", 1)[1].split("  ingester:", 1)[0]
-        self.assertIn("/device-liveness:/device-liveness:ro", watchdog)
+        self.assertIn("/device-liveness/runtime:/device-liveness:ro", watchdog)
+        self.assertIn(
+            "/device-liveness.json:/device-liveness-config/device-liveness.json:ro",
+            watchdog)
         self.assertIn("/notify-config:/config:ro", watchdog)
 
     def test_liveness_producer_is_least_privilege_and_persistent(self) -> None:
@@ -139,8 +158,15 @@ class DeviceLivenessTests(unittest.TestCase):
         self.assertIn("read_only: true", producer)
         self.assertIn("network_mode: none", producer)
         self.assertIn("no-new-privileges:true", producer)
-        self.assertIn("/tailscale-var/tailscaled.sock", producer)
-        self.assertIn("/device-liveness", producer)
+        self.assertIn(
+            "/volume2/@appdata/Tailscale/tailscaled.sock:/tailscale-var/tailscaled.sock:ro",
+            producer)
+        self.assertNotIn("/volume2/@appdata/Tailscale:/tailscale-var:ro", producer)
+        self.assertIn(
+            "/device-liveness/runtime:/device-liveness", producer)
+        self.assertNotIn("/device-liveness:/device-liveness\n", producer)
+        self.assertIn('failures=$$((failures+1))', producer)
+        self.assertIn(r'[ \"$$failures\" -lt 3 ] || exit 1', producer)
 
     def test_deploy_wrapper_syncs_runtime_files_and_recreates_services(self) -> None:
         root = Path(__file__).resolve().parent.parent
@@ -152,6 +178,13 @@ class DeviceLivenessTests(unittest.TestCase):
             self.assertIn(runtime_file, text)
         self.assertIn("deploy/nas/redeploy.sh", text)
         self.assertIn("device_liveness", text)
+        self.assertIn(
+            'MAP_OUT="$DATA_DIR/device-liveness.json"',
+            text)
+        self.assertIn('SNAPSHOT_OUT="$DATA_DIR/runtime/tailscale-status.json"', text)
+        self.assertIn(r'deadline=\$((\$(date +%s) + 75))', text)
+        self.assertIn(r'test \"\$after\" -gt \"\$before\"', text)
+        self.assertNotIn("KG_HUB_DEVICE_LIVENESS_CONFIG_HOST", text)
         self.assertNotIn("sudo", text)
         self.assertNotIn("sh '$SRC/$REL'", text)
         self.assertTrue(deploy.stat().st_mode & stat.S_IXUSR)

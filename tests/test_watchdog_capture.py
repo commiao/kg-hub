@@ -26,43 +26,47 @@ def _liveness(*, online=(), offline=(), source_state="fresh", age=10):
 
 
 def test_green_silent():
-    assert judge_snapshots([_snap()], {}) == ([], [])
+    assert judge_snapshots([_snap()], {}) == CaptureDecision([], [])
 
 
 def test_amber_silent():
     """黄灯(空闲/滞后)是被观测的常态,绝不能告警。"""
-    assert judge_snapshots([_snap(overall="amber")], {}) == ([], [])
+    assert judge_snapshots([_snap(overall="amber")], {}) == CaptureDecision([], [])
 
 
 def test_red_blocker_fires():
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(overall="red", blockers=[{"label": "Mac→NAS", "detail": "落后 900 条"}])], {})
+    blocked, stale = decision.blocked, decision.stale
     assert stale == []
     assert len(blocked) == 1 and "Mac→NAS" in blocked[0] and "900" in blocked[0]
 
 
 def test_stale_probe_fires():
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="mac", age=7200, stale=True)], {},
         _liveness(online=("mac",)))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked == []
     assert len(stale) == 1 and "120 分钟" in stale[0]
 
 
 def test_stale_suppresses_blocked():
     """探针失联时灯色是旧数据,不该再按它报阻塞 —— 否则一个故障报两条。"""
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(age=7200, stale=True, overall="red",
                blockers=[{"label": "x", "detail": "y"}])], {},
         _liveness(online=("h",)))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked == [] and len(stale) == 1
 
 
 def test_offline_device_suppresses_stale_probe():
     """Mac 睡眠/离线时整条采集链自然断线，不应误报探针故障。"""
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="mac", age=7200, stale=True)], {},
         _liveness(offline=("mac",)))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked == [] and stale == []
 
 
@@ -81,10 +85,12 @@ def test_offline_stale_snapshot_clears_previous_capture_anomalies():
 
 def test_expired_liveness_cannot_masquerade_as_online():
     """旧 Tailscale 快照里的 online 不能当真；设备状态应降级 unknown。"""
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="mac", age=7200, stale=True)], {},
         _liveness(online=("mac",), source_state="stale", age=600))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked is None and stale is None
+    assert decision.source_errors
 
 
 def test_real_capture_host_can_map_to_different_tailscale_identity():
@@ -92,9 +98,10 @@ def test_real_capture_host_can_map_to_different_tailscale_identity():
     cfg = {"capture_device_aliases": {
         "MacBook-Pro-4": ["MacBook Pro (3)", "mac-office"],
     }}
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="MacBook-Pro-4", age=7200, stale=True)], cfg,
         _liveness(online=("mac-office",)))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked == [] and len(stale) == 1
 
 
@@ -106,6 +113,7 @@ def test_unknown_liveness_holds_stale_and_old_blocker_decisions():
         _liveness(source_state="stale", age=600))
     assert decision.stale is None
     assert decision.blocked is None
+    assert decision.source_errors
 
 
 def test_fresh_blocker_is_definitive_even_when_liveness_unknown():
@@ -121,8 +129,10 @@ def test_fresh_blocker_is_definitive_even_when_liveness_unknown():
 def test_no_snapshot_only_alerts_for_configured_online_host():
     """从未上报也必须先有独立 online 证据；监控 host 清单可静态配置。"""
     cfg = {"capture_probe_hosts": ["mac"]}
-    assert judge_snapshots([], cfg, _liveness(offline=("mac",))) == ([], [])
-    blocked, stale = judge_snapshots([], cfg, _liveness(online=("mac",)))
+    assert judge_snapshots(
+        [], cfg, _liveness(offline=("mac",))) == CaptureDecision([], [])
+    decision = judge_snapshots([], cfg, _liveness(online=("mac",)))
+    blocked, stale = decision.blocked, decision.stale
     assert blocked == [] and len(stale) == 1 and "mac" in stale[0]
 
 
@@ -159,9 +169,10 @@ def test_no_snapshot_without_host_identity_holds_previous_stale():
 
 
 def test_cfg_threshold_overrides_server_stale_flag():
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="mac", age=300, stale=False)],
         {"capture_stale_after_min": 1}, _liveness(online=("mac",)))
+    blocked, stale = decision.blocked, decision.stale
     assert len(stale) == 1
 
 
@@ -180,10 +191,11 @@ def test_non_positive_or_invalid_threshold_matches_dashboard_fallback():
 
 
 def test_multi_host_independent():
-    blocked, stale = judge_snapshots(
+    decision = judge_snapshots(
         [_snap(host="mac", overall="red", blockers=[{"label": "a", "detail": "b"}]),
          _snap(host="win", age=99999, stale=True)], {},
         _liveness(online=("mac", "win")))
+    blocked, stale = decision.blocked, decision.stale
     assert len(blocked) == 1 and "mac" in blocked[0]
     assert len(stale) == 1 and "win" in stale[0]
 
@@ -194,7 +206,7 @@ def test_normalized_duplicate_host_keeps_newest_snapshot():
         [_snap(host="Mac", age=60, stale=False),
          _snap(host="mac.local", age=7200, stale=True)], {},
         _liveness(online=("mac",)))
-    assert decision == ([], [])
+    assert decision == CaptureDecision([], [])
 
 
 def test_configured_online_host_without_snapshot_is_not_lost_when_others_report():
@@ -212,9 +224,11 @@ def test_topology_api_failure_is_not_misclassified_as_probe_stale():
     with patch("tools.watchdog.httpx.get", return_value=response):
         decision = check_capture_chain({})
         assert decision.blocked is None and decision.stale is None
+        assert decision.source_errors
     with patch("tools.watchdog.httpx.get", side_effect=RuntimeError("boom")):
         decision = check_capture_chain({})
         assert decision.blocked is None and decision.stale is None
+        assert decision.source_errors
     bad_payload = type("Response", (), {
         "status_code": 200,
         "json": lambda self: {"ok": False, "snapshots": []},
@@ -222,6 +236,7 @@ def test_topology_api_failure_is_not_misclassified_as_probe_stale():
     with patch("tools.watchdog.httpx.get", return_value=bad_payload):
         decision = check_capture_chain({})
         assert decision.blocked is None and decision.stale is None
+        assert decision.source_errors
 
 
 def test_notify_config_cannot_override_public_capture_threshold():
@@ -240,7 +255,7 @@ def test_notify_config_cannot_override_public_capture_threshold():
           patch("tools.watchdog.load_status",
                 return_value=_liveness(online=("mac",)))):
         decision = check_capture_chain({"capture_stale_after_min": 1})
-    assert decision == ([], [])
+    assert decision == CaptureDecision([], [])
 
 
 def test_unknown_decision_holds_previous_capture_anomalies():
@@ -252,6 +267,18 @@ def test_unknown_decision_holds_previous_capture_anomalies():
 
     apply_capture_decision(CaptureDecision([], []), prev, current, details)
     assert current == {"capture_blocked": False, "capture_probe_stale": False}
+
+
+def test_source_failure_is_separate_monitoring_anomaly():
+    current = {"capture_blocked": False, "capture_probe_stale": False,
+               "capture_monitor_unhealthy": False}
+    details = {}
+    apply_capture_decision(
+        CaptureDecision(None, None, ("Tailscale 快照过期",)),
+        {}, current, details)
+    assert current["capture_monitor_unhealthy"] is True
+    assert current["capture_probe_stale"] is False
+    assert "Tailscale 快照过期" in details["capture_monitor_unhealthy"]
 
 
 # ── 手工 runner(2026-08-25 补)────────────────────────────────────────────

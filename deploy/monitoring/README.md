@@ -13,7 +13,7 @@ VPS(oc-vps-aliyun-us, 常开)         NAS(home-nas-syno, 常开)
   daily-summary.sh ── 每日心跳
         ▲ 互盯:VPS↔NAS,任一整体挂,另一台飞书报
 Mac: mcp_server.py ── 用 kg-hub 连不上时飞书预警(L3,客户端视角)
-NAS device_liveness 容器 ── 每分钟读取 host Tailscale LocalAPI ── 写真实设备在线态到 /device-liveness(ro 消费)
+NAS device_liveness 容器 ── 每分钟读取 host Tailscale LocalAPI ── 写在线态到 host `device-liveness/runtime/`(ro 消费)
 告警通道:飞书群机器人 webhook(真值只在各机 webhook.conf,不入库)
 ```
 
@@ -79,15 +79,19 @@ bash deploy/nas/deploy-device-liveness.sh
 `deploy/nas/redeploy.sh` 同步 producer、`topology.py`、`watchdog.py`、共享解析模块和 compose，
 重建/recreate `device_liveness`、server 与 watchdog；最后校验首份快照。producer
 以 NAS 登录用户的 UID/GID 运行，root filesystem 只读、无网络、丢弃全部 capabilities，
-并启用 `no-new-privileges`；只有公开快照目录可写。
+并启用 `no-new-privileges`；只挂载单个 Tailscale socket，且只有 `runtime/` 快照
+子目录可写，身份映射与阈值配置不进入 producer。
 producer 会用 Python 完整解析 JSON，并校验 `BackendState` 与 `Peer` 最小 schema，
 再做原子替换。CLI 失败、JSON 损坏或 schema 不符都保留 last-good；mtime 超过
 180 秒后消费者将设备态降级为 `unknown`，旧 `Online: true` 不会冒充实况。
+连续三次采样失败会让 producer 退出并由 Docker 自动重启；watchdog 另外触发
+`capture_monitor_unhealthy`，明确提示监控证据源失效，而不是误报某台 Mac 探针。
 
-server 只读挂载整个公开 `/device-liveness` 目录，使 host atomic rename 后的新 inode
-立即可见；它不挂 notify-config。watchdog 同时只读挂公开目录与 `/config`，后者
-只放 `notify.json`。因此 webhook 不进入 dashboard 容器，producer 执行的也是镜像内
-已构建脚本，而不是 `commiao` 可写的 git checkout。
+server 把 host `runtime/` 单独只读挂到 `/device-liveness`，producer atomic rename
+后的新 inode 立即可见；可信配置文件另行只读挂到 `/device-liveness-config`，且不挂
+notify-config。watchdog 同时只读挂这两处与 `/config`，后者只放 `notify.json`。
+因此 producer 不能改告警策略，webhook 不进入 dashboard 容器；producer 执行的也是
+镜像内已构建脚本，而不是 `commiao` 可写的 git checkout。
 
 `capture_stale_after_min`、host 清单、身份映射和 liveness 新鲜度都只以公开
 `device-liveness.json` 为准；dashboard 与 watchdog 每轮热读同一文件。
@@ -95,6 +99,7 @@ server 只读挂载整个公开 `/device-liveness` 目录，使 host atomic rena
 状态矩阵：设备 offline/sleep + 旧采集快照 = 看板断线、不告警；设备 fresh online
 + 快照超过 30 分钟 = `capture_probe_stale`；快照新鲜且有 red blocker = 仍告警；
 工具长期无新数据 = amber/idle，不告警。只有 Tailscale 信号或 topology API 本轮
-unknown 时才沿用上一轮状态；明确 offline/sleep 会清除该 host 的旧 stale/blocker。
+unknown 时业务告警沿用上一轮状态，同时单独报 `capture_monitor_unhealthy`；明确
+offline/sleep 会清除该 host 的旧 stale/blocker。
 多 host 按“配置清单 ∪ 已有快照”聚合，offline 不会盖掉另一台的 fresh blocker 或
 unknown 状态。

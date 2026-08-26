@@ -1,10 +1,10 @@
 #!/bin/sh
-# NAS host-side producer：采样真实 Tailscale 在线态，给容器只读消费。
-# 推荐由 DSM Task Scheduler 每分钟执行；失败时保留上一份文件，让消费者按 mtime
-# 自动把它降级为 unknown，而不是拿静态配置或旧 online 冒充设备仍在线。
+# `device_liveness` 容器内 producer：通过只读挂载的 NAS Tailscale CLI 与
+# LocalAPI socket 采样真实在线态。容器每分钟调用本脚本；失败时保留上一份文件，
+# 让只读消费者按 mtime 自动降级为 unknown，而不是用旧 online 冒充设备仍在线。
 set -eu
 
-OUT=${KG_HUB_DEVICE_LIVENESS_PATH:-/volume2/4T/kg-hub-data/device-liveness/tailscale-status.json}
+OUT=${KG_HUB_DEVICE_LIVENESS_PATH:-/volume2/4T/kg-hub-data/device-liveness/runtime/tailscale-status.json}
 
 if [ -n "${KG_HUB_TAILSCALE_BIN:-}" ]; then
   TS_BIN=$KG_HUB_TAILSCALE_BIN
