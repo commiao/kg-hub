@@ -78,10 +78,17 @@ services:
       - KG_HUB_PREDIGEST=${KG_HUB_PREDIGEST:-0}
       # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
       - KG_HUB_REFINERY_STATUS=/refinery-state/status.json
+      # NAS host 每分钟写入真实 `tailscale status --json`；server 只读，用于让
+      # dashboard 区分“设备睡眠”与“设备在线但探针失联”。
+      - KG_HUB_DEVICE_LIVENESS_PATH=/device-liveness/tailscale-status.json
+      - KG_HUB_DEVICE_LIVENESS_CONFIG=/device-liveness/device-liveness.json
+      - KG_HUB_DEVICE_LIVENESS_MAX_AGE_S=180
     volumes:
       - /volume2/4T/kg-hub-data/models:/models
       - /volume2/4T/kg-hub-data/ingest-backup:/backup
       - /volume2/4T/kg-hub-data/refinery-state:/refinery-state:ro
+      # 整个公开目录挂载，host atomic rename 后容器会解析新 inode；不含 webhook。
+      - /volume2/4T/kg-hub-data/device-liveness:/device-liveness:ro
     ports:
       # Host port 17171 (off the common 8080) -> container 8080. Bind to loopback
       # only: closes LAN exposure. Tailscale userspace networking auto-forwards
@@ -116,13 +123,17 @@ services:
       - KG_HUB_FEISHU_WEBHOOK=${KG_HUB_FEISHU_WEBHOOK}
       - KG_HUB_FALKORDB_SLOW_SEC=8
       - KG_HUB_BACKLOG_THRESHOLD=20
+      - KG_HUB_DEVICE_LIVENESS_PATH=/device-liveness/tailscale-status.json
+      - KG_HUB_DEVICE_LIVENESS_CONFIG=/device-liveness/device-liveness.json
+      - KG_HUB_DEVICE_LIVENESS_MAX_AGE_S=180
       # 盘温预警:DSM 61°C 强制关机且无任何通知(8/16 因此停机 24h 无人知)。
       # 59°C 就喊人,给"及时开机/加风扇"留反应时间。
       - KG_HUB_DISK_TEMP_WARN=${KG_HUB_DISK_TEMP_WARN:-59}
     volumes:
       - /run/synostorage/disks:/disktemp:ro   # 盘温直读(免 sudo)
       - /volume2/4T/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
-      - /volume2/4T/kg-hub-data/notify-config:/config    # hot-reloadable notify rules (no rebuild)
+      - /volume2/4T/kg-hub-data/device-liveness:/device-liveness:ro # public dynamic state
+      - /volume2/4T/kg-hub-data/notify-config:/config:ro # notify secret/rules; watchdog only
     command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
 
   # Ongoing ingest worker (runs ON the NAS, always-on). The one-time claude-mem
