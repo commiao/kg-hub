@@ -42,6 +42,7 @@ from pathlib import Path
 HOME = Path.home()
 CM_DB = HOME / ".claude-mem" / "claude-mem.db"
 CM_ENV = HOME / ".claude-mem" / ".env"
+CM_LOG_DIR = HOME / ".claude-mem" / "logs"
 CM_HEALTH = "http://localhost:37701/api/health"
 SYNC_STAMP = HOME / ".kg-hub" / "state" / "claude-mem-synced.obsid"
 SYNC_LOG = HOME / ".kg-hub" / "logs" / "claude-mem-sync.out.log"
@@ -450,16 +451,131 @@ def probe_hooks(tool_seen: dict) -> list[dict]:
     return nodes
 
 
+_LOG_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
+_QUEUE_DEPTH_RE = re.compile(r"queueDepth=(\d+)")
+_WORKER_LOG_BLOCK_BYTES = 1024 * 1024
+
+
+def _worker_log_lines_reverse(path: Path):
+    """从末尾分块倒读日志；找到最新证据即可停，不受固定 tail 窗口挤出影响。"""
+    try:
+        with path.open("rb") as fh:
+            pos = path.stat().st_size
+            carry = b""
+            while pos > 0:
+                size = min(_WORKER_LOG_BLOCK_BYTES, pos)
+                pos -= size
+                fh.seek(pos)
+                parts = (fh.read(size) + carry).split(b"\n")
+                carry = parts.pop(0)
+                for raw in reversed(parts):
+                    if raw:
+                        yield raw.decode(errors="replace")
+            if carry:
+                yield carry.decode(errors="replace")
+    except OSError:
+        return
+
+
+def _epoch_seconds(value: object) -> float | None:
+    try:
+        epoch = float(value)
+        return epoch / 1000.0 if epoch > 1e11 else epoch
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _log_epoch(line: str) -> float | None:
+    stamp = _LOG_TS_RE.match(line)
+    if stamp is None:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(stamp.group(1), fmt).astimezone().timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _worker_generation_diagnostics() -> dict:
+    """把“进程活着”和“AI 生成链路可用”拆成两个独立信号。
+
+    `/api/health=ok` 只证明 worker HTTP 进程存在。若 SDK 鉴权失败晚于最新
+    observation，说明失败尚未被一次真实落库证明恢复，必须判红。日志里的队列深度
+    一并外露，帮助区分偶发请求失败和持续积压。
+    """
+    failure_epoch = queue_depth = queue_epoch = None
+    try:
+        logs = sorted(CM_LOG_DIR.glob("claude-mem-*.log"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        logs = []
+    # worker 会同时写按启动日与按自然日命名的多个日志，不能只看 mtime 最新的一份。
+    # 取最近活跃的四份，按行内时间戳合并“最新失败”和“最新队列深度”。
+    for path in logs[:4]:
+        path_failure = path_queue_depth = path_queue_epoch = None
+        for line in _worker_log_lines_reverse(path):
+            if path_queue_depth is None:
+                depth = _QUEUE_DEPTH_RE.search(line)
+                if depth is not None:
+                    path_queue_depth = int(depth.group(1))
+                    path_queue_epoch = _log_epoch(line)
+            if path_failure is None and "SDK authentication failed" in line:
+                path_failure = _log_epoch(line)
+            if path_failure is not None and path_queue_depth is not None:
+                break
+        if path_failure is not None and (
+                failure_epoch is None or path_failure > failure_epoch):
+            failure_epoch = path_failure
+        if path_queue_epoch is not None and (
+                queue_epoch is None or path_queue_epoch > queue_epoch):
+            queue_epoch = path_queue_epoch
+            queue_depth = path_queue_depth
+
+    observation_epoch = None
+    if CM_DB.exists():
+        try:
+            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            row = con.execute("SELECT MAX(created_at_epoch) FROM observations").fetchone()
+            con.close()
+            observation_epoch = _epoch_seconds(row[0] if row else None)
+        except Exception:  # noqa: BLE001 - DB 读失败由 storage 节点独立报告
+            pass
+    return {
+        "auth_failure_epoch": failure_epoch,
+        "observation_epoch": observation_epoch,
+        "queue_depth": queue_depth,
+        "auth_unrecovered": bool(
+            failure_epoch is not None
+            and (observation_epoch is None or observation_epoch <= failure_epoch)
+        ),
+    }
+
+
 def probe_worker() -> dict:
-    """claude-mem worker：唯一真正的"服务不可达就是红"的节点。"""
+    """claude-mem worker：HTTP 存活与 observation 生成链路都必须健康。"""
     data, err = http_json(CM_HEALTH, timeout=4)
     if err or not data:
         return {"id": "worker", "layer": "worker", "label": "claude-mem",
                 "state": RED, "detail": f"health 不可达（{err or 'empty'}）@ :37701"}
     up = int(data.get("uptime") or 0)
+    diag = _worker_generation_diagnostics()
+    metrics = {"pid": data.get("pid"), "uptime_s": up,
+               "queue_depth": diag["queue_depth"]}
+    if diag["auth_unrecovered"]:
+        obs_age = (time.time() - diag["observation_epoch"]
+                   if diag["observation_epoch"] is not None else None)
+        queue = (f"；内存队列 {diag['queue_depth']}"
+                 if diag["queue_depth"] is not None else "")
+        return {
+            "id": "worker", "layer": "worker", "label": "claude-mem",
+            "state": RED, "metrics": metrics,
+            "detail": ("⚠️ Claude SDK 鉴权失败（401 invalid_api_key），且尚无更新的 "
+                       f"observation 证明恢复；最后落库 {human_idle(obs_age)}前{queue}"),
+        }
     return {"id": "worker", "layer": "worker", "label": "claude-mem",
             "state": GREEN if data.get("status") == "ok" else RED,
-            "metrics": {"pid": data.get("pid"), "uptime_s": up},
+            "metrics": metrics,
             "detail": (f"v{data.get('version')} pid={data.get('pid')} "
                        f"已运行 {human_idle(up)}｜{(data.get('ai') or {}).get('authMethod', '?')}")}
 
