@@ -33,6 +33,45 @@ services:
       retries: 6
       start_period: 20s
 
+  # Read the NAS Tailscale LocalAPI every minute and atomically publish a
+  # validated snapshot. DSM on this host has no user crontab, so this dedicated
+  # least-privilege container owns scheduling; server/watchdog remain read-only.
+  device_liveness:
+    image: kg-hub-server:latest
+    container_name: kg-hub-device-liveness
+    restart: unless-stopped
+    user: "${KG_HUB_DEVICE_LIVENESS_USER:-1027:100}"
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - KG_HUB_DEVICE_LIVENESS_PATH=/device-liveness/tailscale-status.json
+      - KG_HUB_TAILSCALE_BIN=/usr/local/bin/tailscale-host
+      - KG_HUB_TAILSCALE_SOCKET=/tailscale-var/tailscaled.sock
+    volumes:
+      - /var/packages/Tailscale/target/bin/tailscale:/usr/local/bin/tailscale-host:ro
+      - /volume2/@appdata/Tailscale:/tailscale-var:ro
+      - /volume2/4T/kg-hub-data/device-liveness:/device-liveness
+    tmpfs:
+      - /tmp:size=4m,mode=1777
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "2"
+        mode: "non-blocking"
+        max-buffer-size: "1m"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,time; p=\"/device-liveness/tailscale-status.json\"; raise SystemExit(0 if time.time()-os.stat(p).st_mtime < 180 else 1)'"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    command: ["sh", "-c", "while true; do sh /app/deploy/monitoring/nas/tailscale-liveness-snapshot.sh || true; sleep 60; done"]
+
   kg_hub_server:
     build:
       context: .

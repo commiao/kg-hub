@@ -128,20 +128,24 @@ class RedeployTest(unittest.TestCase):
     def test_removes_existing_ghost_before_compose_up(self) -> None:
         result, state = self.run_redeploy()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        for service in ("watchdog", "ingester", "refinery", "kg_hub_server"):
+        for service in ("device_liveness", "watchdog", "ingester", "refinery", "kg_hub_server"):
             self.assertTrue((state / f"up-{service}").exists())
         self.assertTrue((state / "started").exists())
         self.assertFalse((state / "ghost").exists())
-        self.assertEqual((state / "up-count").read_text(), "4")
+        self.assertEqual((state / "up-count").read_text(), "5")
+        self.assertIn(
+            "name=^/kg-hub-device-liveness$",
+            (state / "docker.log").read_text(encoding="utf-8"),
+        )
 
     def test_cleans_new_ghost_and_retries_once(self) -> None:
         result, state = self.run_redeploy(fail_first_up=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("watchdog 首次拉起失败", result.stdout)
-        for service in ("watchdog", "ingester", "refinery", "kg_hub_server"):
+        self.assertIn("device_liveness 首次拉起失败", result.stdout)
+        for service in ("device_liveness", "watchdog", "ingester", "refinery", "kg_hub_server"):
             self.assertTrue((state / f"up-{service}").exists())
         self.assertFalse((state / "ghost").exists())
-        self.assertEqual((state / "up-count").read_text(), "5")
+        self.assertEqual((state / "up-count").read_text(), "6")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class ProducerTests(unittest.TestCase):
             fake = temp / "tailscale"
             fake.write_text(textwrap.dedent("""\
                 #!/bin/sh
+                [ -z "${ARGS_OUT:-}" ] || printf '%s\\n' "$*" > "$ARGS_OUT"
                 [ "${FAIL:-0}" != 1 ] || exit 9
                 if [ "${MALFORMED:-0}" = 1 ]; then
                   printf '%s\\n' '{malformed'
@@ -39,15 +40,21 @@ class ProducerTests(unittest.TestCase):
             """), encoding="utf-8")
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
             out = temp / "config" / "tailscale-status.json"
+            args_out = temp / "tailscale.args"
             env = os.environ.copy()
             env.update({"KG_HUB_TAILSCALE_BIN": str(fake),
-                        "KG_HUB_DEVICE_LIVENESS_PATH": str(out)})
+                        "KG_HUB_DEVICE_LIVENESS_PATH": str(out),
+                        "KG_HUB_TAILSCALE_SOCKET": "/tailscale-var/tailscaled.sock",
+                        "ARGS_OUT": str(args_out)})
 
             ok = subprocess.run(["sh", str(PRODUCER)], env=env, text=True,
                                 capture_output=True, check=False)
             self.assertEqual(ok.returncode, 0, ok.stderr)
             good = out.read_text(encoding="utf-8")
             self.assertIn('"Online":true', good)
+            self.assertEqual(
+                args_out.read_text(encoding="utf-8").strip(),
+                "--socket=/tailscale-var/tailscaled.sock status --json")
             self.assertEqual(list(out.parent.glob("*.tmp.*")), [])
 
             env["FAIL"] = "1"

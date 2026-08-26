@@ -35,7 +35,13 @@ mkdir -p "$OUT_DIR"
 TMP="${OUT}.tmp.$$"
 trap 'rm -f "$TMP"' EXIT HUP INT TERM
 
-if ! "$TS_BIN" status --json >"$TMP"; then
+if [ -n "${KG_HUB_TAILSCALE_SOCKET:-}" ]; then
+  set -- "--socket=$KG_HUB_TAILSCALE_SOCKET" status --json
+else
+  set -- status --json
+fi
+
+if ! "$TS_BIN" "$@" >"$TMP"; then
   echo "tailscale status --json failed; last good snapshot retained" >&2
   exit 1
 fi

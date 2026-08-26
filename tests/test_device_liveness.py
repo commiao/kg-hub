@@ -132,6 +132,16 @@ class DeviceLivenessTests(unittest.TestCase):
         self.assertIn("/device-liveness:/device-liveness:ro", watchdog)
         self.assertIn("/notify-config:/config:ro", watchdog)
 
+    def test_liveness_producer_is_least_privilege_and_persistent(self) -> None:
+        compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text()
+        producer = compose.split("  device_liveness:", 1)[1].split("  kg_hub_server:", 1)[0]
+        self.assertIn("restart: unless-stopped", producer)
+        self.assertIn("read_only: true", producer)
+        self.assertIn("network_mode: none", producer)
+        self.assertIn("no-new-privileges:true", producer)
+        self.assertIn("/tailscale-var/tailscaled.sock", producer)
+        self.assertIn("/device-liveness", producer)
+
     def test_deploy_wrapper_syncs_runtime_files_and_recreates_services(self) -> None:
         root = Path(__file__).resolve().parent.parent
         deploy = root / "deploy" / "nas" / "deploy-device-liveness.sh"
@@ -141,9 +151,8 @@ class DeviceLivenessTests(unittest.TestCase):
                              "utils/device_liveness.py", "docker-compose.yml"):
             self.assertIn(runtime_file, text)
         self.assertIn("deploy/nas/redeploy.sh", text)
-        self.assertIn("install -o root -g root -m 0755", text)
-        self.assertIn("/usr/local/libexec/kg-hub", text)
-        self.assertIn("'$INSTALL_PATH'", text)
+        self.assertIn("device_liveness", text)
+        self.assertNotIn("sudo", text)
         self.assertNotIn("sh '$SRC/$REL'", text)
         self.assertTrue(deploy.stat().st_mode & stat.S_IXUSR)
         self.assertTrue(producer.stat().st_mode & stat.S_IXUSR)
