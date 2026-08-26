@@ -110,10 +110,11 @@ ssh -o BatchMode=yes -o ConnectTimeout=20 "$NAS" "
   cat \"\$build_log\"; rm -f \"\$build_log\"
 
   # NAS Compose 批量 recreate 会在重命名 refinery 后卡死且不返回。显式逐个删除
-  # 旧容器再创建，避免进入 rename 路径；server 最后处理，将 HTTP 中断压到最短。
+  # 旧容器再创建，避免进入 rename 路径；server 接近最后处理，将 HTTP 中断压到最短；
+  # watchdog 必须最后启动，避免它在 server 重建窗口发出部署诱发的 server_down。
   cleanup_ghosts
   trap 'cleanup_ghosts; start_created' EXIT
-  for service in device_liveness watchdog ingester refinery kg_hub_server; do
+  for service in device_liveness ingester refinery kg_hub_server watchdog; do
     recreate_service \"\$service\"
   done
   cleanup_ghosts

@@ -133,9 +133,14 @@ class RedeployTest(unittest.TestCase):
         self.assertTrue((state / "started").exists())
         self.assertFalse((state / "ghost").exists())
         self.assertEqual((state / "up-count").read_text(), "5")
+        docker_log = (state / "docker.log").read_text(encoding="utf-8")
         self.assertIn(
             "name=^/kg-hub-device-liveness$",
-            (state / "docker.log").read_text(encoding="utf-8"),
+            docker_log,
+        )
+        self.assertLess(
+            docker_log.index("compose -p kg-hub up -d --no-deps kg_hub_server"),
+            docker_log.index("compose -p kg-hub up -d --no-deps watchdog"),
         )
 
     def test_cleans_new_ghost_and_retries_once(self) -> None:
