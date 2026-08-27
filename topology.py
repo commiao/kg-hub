@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
+from utils.device_liveness import (DEFAULT_CAPTURE_STALE_AFTER_S,
+                                   DEFAULT_MAX_AGE_S, DEFAULT_PATH, device_state,
+                                   load_config, load_status, positive_int)
+
 # 链路分层：从左到右就是数据流向
 LAYERS = [
     ("device", "设备"),
@@ -35,7 +39,33 @@ LAYERS = [
 ]
 
 MAX_SNAPSHOT_BYTES = 256 * 1024   # 单份快照上限，防误传大 payload
-STALE_AFTER_S = 30 * 60           # 快照本身超过 30 分钟未更新 → 探针可能挂了
+STALE_AFTER_S = DEFAULT_CAPTURE_STALE_AFTER_S  # capture_probe 兼容导出
+
+
+def capture_stale_after_s(device_cfg: dict | None = None) -> int:
+    """公开 device-liveness 配置是 dashboard/watchdog 阈值的唯一真源。"""
+    cfg = device_cfg if isinstance(device_cfg, dict) else {}
+    minutes = positive_int(
+        cfg.get("capture_stale_after_min"), DEFAULT_CAPTURE_STALE_AFTER_S // 60)
+    return minutes * 60
+
+
+def annotate_liveness(snap: dict, liveness: dict, aliases: object = None,
+                      *, stale_after_s: int = STALE_AFTER_S) -> dict:
+    """把独立设备在线态合并到快照的展示/告警元数据。
+
+    ``_snapshot_stale`` 只陈述快照年龄；``_stale`` 是可告警语义，必须同时满足
+    设备明确 online。这样 Mac 睡眠显示断线，而旧 online 采样也不会冒充实况。
+    """
+    state, detail = device_state(liveness, snap.get("_host"), aliases)
+    age = snap.get("_age_s")
+    snapshot_stale = bool(isinstance(age, (int, float)) and age > stale_after_s)
+    snap["_device_state"] = state
+    snap["_device_liveness_detail"] = detail
+    snap["_snapshot_stale"] = snapshot_stale
+    snap["_stale"] = bool(snapshot_stale and state == "online")
+    snap["_disconnected"] = state == "offline"
+    return snap
 
 
 async def topology_report(request: Request) -> JSONResponse:
@@ -77,7 +107,7 @@ async def topology_report(request: Request) -> JSONResponse:
                          "nodes": len(nodes)})
 
 
-async def _load_snapshots() -> list[dict]:
+async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
     """读出各设备最新快照，补上 _host/_recv/_age_s/_stale。
 
     面板(HTML)和 /api/topology/latest(JSON) 共用 —— 告警必须看**和人眼完全同一份**
@@ -93,6 +123,17 @@ async def _load_snapshots() -> list[dict]:
         "ORDER BY t.received_at DESC")
 
     snaps = []
+    device_cfg = device_cfg if isinstance(device_cfg, dict) else load_config()
+    try:
+        max_age_s = int(device_cfg.get(
+            "device_liveness_max_age_sec", DEFAULT_MAX_AGE_S))
+    except (TypeError, ValueError):
+        max_age_s = DEFAULT_MAX_AGE_S
+    liveness = load_status(
+        device_cfg.get("device_liveness_path") or DEFAULT_PATH,
+        max_age_s=max_age_s)
+    aliases = device_cfg.get("capture_device_aliases")
+    stale_after_s = capture_stale_after_s(device_cfg)
     now = datetime.now(tz=timezone.utc)
     for r in rows:
         try:
@@ -108,8 +149,7 @@ async def _load_snapshots() -> list[dict]:
         snap["_host"] = r.get("host") or "?"
         snap["_recv"] = recv
         snap["_age_s"] = age
-        # 探针自己失联也要能看出来：快照过期就整体降级
-        snap["_stale"] = bool(age is not None and age > STALE_AFTER_S)
+        annotate_liveness(snap, liveness, aliases, stale_after_s=stale_after_s)
         snaps.append(snap)
     return snaps
 
@@ -117,20 +157,24 @@ async def _load_snapshots() -> list[dict]:
 async def dashboard_topology(request: Request) -> HTMLResponse:
     """GET /dashboard/topology — 渲染拓扑图。"""
     try:
-        snaps = await _load_snapshots()
+        device_cfg = load_config()
+        snaps = await _load_snapshots(device_cfg)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<p>拓扑取数失败: {exc}</p>", status_code=503)
-    data = {"snapshots": snaps, "layers": LAYERS, "stale_after_s": STALE_AFTER_S}
+    data = {"snapshots": snaps, "layers": LAYERS,
+            "stale_after_s": capture_stale_after_s(device_cfg)}
     return HTMLResponse(_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
 async def topology_latest(request: Request) -> JSONResponse:
     """GET /api/topology/latest — 快照 JSON，给 watchdog 告警用。"""
     try:
-        snaps = await _load_snapshots()
+        device_cfg = load_config()
+        snaps = await _load_snapshots(device_cfg)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
-    return JSONResponse({"ok": True, "stale_after_s": STALE_AFTER_S,
+    return JSONResponse({"ok": True,
+                         "stale_after_s": capture_stale_after_s(device_cfg),
                          "snapshots": snaps})
 
 
@@ -162,6 +206,10 @@ h1{font-size:17px;margin:0 0 4px;font-weight:600}
 .pill.green{color:#fff;background:var(--green);border-color:transparent}
 .pill.amber{color:#211d10;background:var(--amber);border-color:transparent}
 .pill.red{color:#fff;background:var(--red);border-color:transparent}
+.pill.grey{color:#fff;background:var(--grey);border-color:transparent}
+.host.disconnected .wrap{opacity:.42;filter:grayscale(1)}
+.host.blind .wrap{opacity:.6}
+.host.disconnected{border-style:dashed}
 /* 自适应：宽屏用原尺寸，窄屏等比缩放，保证 kg-hub 那一列永远在首屏内 */
 .wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 svg{display:block;width:100%;height:auto;max-width:1180px}
@@ -594,15 +642,25 @@ function renderHost(s, hi){
       + `</g>`;
   }).join('')).join('');
 
+  const ds = s._device_state||'unknown';
+  const device = ds==='online'
+    ? `<span class="pill green" title="${esc(s._device_liveness_detail||'')}">设备在线</span>`
+    : ds==='offline'
+      ? `<span class="pill grey" title="${esc(s._device_liveness_detail||'')}">设备离线/睡眠 · 链路断开</span>`
+      : `<span class="pill grey" title="${esc(s._device_liveness_detail||'')}">设备状态未知</span>`;
   const stale = s._stale ? `<span class="pill red">探针失联 ${fmt(s._age_s)}</span>` : '';
+  const blind = s._snapshot_stale && ds==='unknown'
+    ? `<span class="pill grey">旧快照 · 暂不告警</span>` : '';
   const age = s._age_s!=null ? `<span class=pill>上报于 ${fmt(s._age_s)}前</span>` : '';
-  const blockers = (s.blockers&&s.blockers.length)
+  // 旧快照里的 blocker 是历史，不继续画红；新鲜快照的 blocker 与设备态无关，仍展示。
+  const blockers = (!s._snapshot_stale&&s.blockers&&s.blockers.length)
     ? `<div class=blockers>${s.blockers.map(b=>
         `<div>🔴 <b>${esc(b.label)}</b> — ${esc(b.detail)}</div>`).join('')}</div>` : '';
+  const overall = s._snapshot_stale && ds!=='online' ? 'grey' : (s.overall||'grey');
 
-  return `<div class=host>
+  return `<div class="host ${s._disconnected?'disconnected':''} ${s._snapshot_stale&&ds==='unknown'?'blind':''}">
     <div class=hh><b>${esc(s._host)}</b>
-      <span class="pill ${esc(s.overall)}">${esc(s.overall)}</span>${age}${stale}</div>
+      <span class="pill ${esc(overall)}">${esc(overall)}</span>${device}${age}${stale}${blind}</div>
     <div class=wrap><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
       ${bandSvg}${heads}${bracket}${edges}${boxes}
     </svg></div>
