@@ -76,7 +76,14 @@ TOOL_FRESH_S = 4 * 3600          # 4h 内有产出 = 活跃
 # id > nas_max。它直接就是"数据被卡了多久"这个要测的量本身，不受空闲期影响:
 # 空闲期没有未同步行，无从计算，自然不报。
 # 同一个坑的第三种壳:条数(工作量)→距上次同步(被空闲污染)→积压行等待时长(真量)。
-SYNC_STALL_RED_S = 45 * 60       # 连续 3 个周期没能成功同步 = 故障
+# 同一个坑的第四种壳:上面写着"连续 3 个周期",代码却量的是墙钟分钟。二者只在
+# "机器一直醒着"时等价 —— launchd 的 StartInterval 在睡眠期间根本不触发,唤醒后
+# 只补跑一次。于是 45 分钟这个阈值直接落进了笔记本的正常作息分布里,必然误报:
+# 2026-09-03 就因 Mac 三次入睡(10:37/10:55/11:10)报了一次 capture_blocked,而
+# 那 83 分钟里总共只产出 1 条观测,根本没有"拿不到的新观察"。
+# 改为按同步器**实际执行次数**判定 —— 日志里每跑一次留一行,数行数即可,
+# 既不必读电源状态,也天然区分"跑了但失败"与"压根没轮到跑"。
+SYNC_STALL_RED_CYCLES = 3        # 真正跑过 3 次仍未追平 = 故障
 SYNC_STALL_AMBER_S = 25 * 60     # 跳过 1 个周期 = 留意
 SYNC_LAG_ROWS_HUGE = 500         # 落差大到不像单周期的量，单独提示积压
 
@@ -615,11 +622,31 @@ def probe_sqlite() -> tuple[dict, int | None]:
 
 def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
     """Mac→NAS 同步跳：T-0028 的现场。判据是两侧 MAX(obs.id) 的落差。"""
+    def _sync_runs_since(lines: list[str], since_epoch: float) -> int:
+        """同步器在 since_epoch 之后真正执行了几次。
+
+        每次运行都写一行 `YYYY-MM-DD HH:MM:SS ...`。数"跑过几次"而不是"过了几
+        分钟"，是因为墙钟时间在可休眠设备上根本不代表机会次数（见本文件顶部
+        SYNC_STALL_RED_CYCLES 处的说明）。
+        """
+        runs = 0
+        for line in reversed(lines):
+            stamp = line[:19]
+            try:
+                moment = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue           # 非时间戳行(如脚本报错输出)不计入机会次数
+            if moment < since_epoch:
+                break              # 日志是时序的，早于窗口即可停止回溯
+            runs += 1
+        return runs
+
     last_line = ""
+    sync_lines: list[str] = []
     if SYNC_LOG.exists():
         try:
-            tail = SYNC_LOG.read_text(errors="replace").splitlines()
-            last_line = tail[-1] if tail else ""
+            sync_lines = SYNC_LOG.read_text(errors="replace").splitlines()
+            last_line = sync_lines[-1] if sync_lines else ""
         except Exception:  # noqa: BLE001
             pass
     stamp_age = None
@@ -696,13 +723,22 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
     node["metrics"]["backlog_age_s"] = (
         int(backlog_age) if backlog_age is not None else None)
 
+    # 积压期间同步器真正跑了几次。这是"周期数"的唯一诚实来源。
+    runs_since = (_sync_runs_since(sync_lines, time.time() - backlog_age)
+                  if backlog_age is not None else None)
+    node["metrics"]["sync_runs_since_backlog"] = runs_since
+
     if lag <= 0:
         node["state"] = GREEN          # 追平了就是健康，无关多久没同步
     elif backlog_age is None:
         node["state"] = AMBER          # 有落差但算不出等待时长，留意不报警
-    elif backlog_age > SYNC_STALL_RED_S:
-        node["state"] = RED
+    elif runs_since is not None and runs_since >= SYNC_STALL_RED_CYCLES:
+        node["state"] = RED            # 给过 3 次机会仍未追平 = 真故障
     elif backlog_age > SYNC_STALL_AMBER_S:
+        # 等得久但同步器没跑够 3 次:多半是机器休眠。留意，不报警。
+        # 代价说明白:若同步器本身死了(一次都不跑)，这里只会黄不会红。
+        # 那种"任务没在跑"应由 launchd 任务存活性单独判定，不该混进本判据 ——
+        # 混进来正是它此前用墙钟冒充周期数的原因。
         node["state"] = AMBER
     else:
         node["state"] = GREEN          # 积压刚产生，属本周期正常累积
@@ -712,9 +748,14 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
     node["detail"] = (f"落差 {lag} 条（本机 {local_max} / NAS {nas_max}）｜"
                       + (f"积压最久 {human_idle(backlog_age)}｜" if backlog_age else "")
                       + f"上次成功同步 {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
+    if runs_since is not None:
+        node["detail"] += f"｜期间同步器执行 {runs_since} 次"
     if node["state"] == RED:
         node["detail"] += (f"  ⚠️ 最老未同步 obs 已等 {human_idle(backlog_age)}（{lag} 条），"
-                           f"kg-hub 拿不到新观察")
+                           f"同步器已跑 {runs_since} 次仍未追平，kg-hub 拿不到新观察")
+    elif (node["state"] == AMBER and runs_since == 0
+          and backlog_age is not None and backlog_age > SYNC_STALL_AMBER_S):
+        node["detail"] += "  ｜同步器在此期间一次都没轮到执行（机器多半在休眠），不判故障"
     elif lag >= SYNC_LAG_ROWS_HUGE:
         node["detail"] += f"  ｜积压 {lag} 条偏大，留意是否在追赶"
     return node
@@ -1093,7 +1134,11 @@ def collect() -> dict:
 
     return {
         "generated_at": now_iso(),
-        "host": os.uname().nodename.split(".")[0],
+        # 稳定身份优先(KG_HUB_CAPTURE_HOST):OS 主机名会被 macOS 自动改号
+        # (MacBook Pro (3)→MacBook-Pro-4),且与 Tailscale 设备名(mac-office)不符,
+        # 导致 watchdog 的 device-liveness 身份匹配失配 → capture_monitor_unhealthy。
+        # 显式配一个与 Tailscale DNSName 一致的稳定名,让匹配一劳永逸。
+        "host": env.get("KG_HUB_CAPTURE_HOST") or os.uname().nodename.split(".")[0],
         "overall": worst,
         "blockers": blockers,
         # 唯一真源是 topology.LAYERS。这里曾经手抄一份,结果加了新层却漏改这里,
