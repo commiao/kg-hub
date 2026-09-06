@@ -4,7 +4,7 @@
 kind_confidence:
   - origin / durability / 确定性 kind:纯派生(utils.origin),无 LLM
   - kind 派生不出(unclassified)且是 openclaw-capsule-*:跑 LLM 分类器 pass
-    (Mac 本地 anthropic,凭据取 ~/.claude-mem/.env);低置信弃权=unclassified
+    (模型网关配置取 kg-hub 自己的 .env);低置信弃权=unclassified
   - 派生不出的 origin 一律标 unknown(不留空,北极星 P2)
 
 安全: --dry-run 先看分布不写;写前自动备份受影响节点旧值到 data/。
@@ -32,12 +32,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path.home() / ".claude-mem" / ".env", override=False)
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 except Exception:
     pass
 
 from utils.origin import (  # noqa: E402
     derive_origin, derive_durability, derive_kind, KIND_PROMPT, parse_kind_json,
+)
+from model_gateway_client import (  # noqa: E402
+    gateway_model, model_operation, stable_operation_id,
 )
 
 KIND_CONF_THRESHOLD = 0.7
@@ -57,12 +60,14 @@ async def _llm_kind(client, body: str) -> tuple[str, float, bool]:
     """独立分类器 pass(与 server.classify_kind 同 prompt/解析)。
     返回 (kind, conf, failed);failed=True 表示 LLM 调用异常(区别于"跑成功但判 unclassified")。"""
     try:
-        resp = await client.messages.create(
-            model=os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus"),
-            max_tokens=120,
-            messages=[{"role": "user", "content": KIND_PROMPT.format(body=(body or "")[:6000])}],
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        prompt = KIND_PROMPT.format(body=(body or "")[:6000])
+        with model_operation("backfill.schema-kind", stable_operation_id(prompt)):
+            resp = await client.messages.create(
+                model=gateway_model(),
+                max_tokens=120,
+                messages=[{"role": "user", "content": prompt}],
+                extra_body={"thinking": {"type": "disabled"}},
+            )
         k, c = parse_kind_json("".join(getattr(b, "text", "") for b in resp.content))
         return (k, c, False)
     except Exception as e:
@@ -121,10 +126,8 @@ async def main() -> int:
     # LLM 分类(仅胶囊,串行控速;client 复用一个,修 D5)
     llm_fail = 0
     if need_llm:
-        from anthropic import AsyncAnthropic
-        client = AsyncAnthropic(
-            auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
-            base_url=os.environ["ANTHROPIC_BASE_URL"], max_retries=2, timeout=90.0)
+        from model_gateway_client import create_gateway_client
+        client = create_gateway_client(timeout=90.0)
         try:
             for rec, content in need_llm:
                 kind, conf, failed = await _llm_kind(client, content)

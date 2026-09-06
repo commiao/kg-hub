@@ -36,6 +36,7 @@ from graphiti_client import build_graphiti  # noqa: E402
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from utils.writer_lock import writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
+from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
 
 
 WATERMARK_PATH = Path(__file__).resolve().parent.parent / "data" / ".ingested.json"
@@ -158,17 +159,19 @@ GROUP_ID = "kg_hub"
 
 async def ingest_one(g, path: Path, source_desc: str, ref_time: datetime) -> tuple[int, int]:
     body = capsule_bytes(path).decode("utf-8")
-    result = await g.add_episode(
-        name=episode_name_from_path(path),
-        episode_body=body,
-        source=EpisodeType.text,
-        source_description=source_desc,
-        reference_time=ref_time,
-        group_id=GROUP_ID,
-        entity_types=ENTITY_TYPES,
-        edge_types=EDGE_TYPES,
-        edge_type_map=EDGE_TYPE_MAP,
-    )
+    operation_id = stable_operation_id(path.name, source_desc, body)
+    with model_operation("ingest.openclaw", operation_id):
+        result = await g.add_episode(
+            name=episode_name_from_path(path),
+            episode_body=body,
+            source=EpisodeType.text,
+            source_description=source_desc,
+            reference_time=ref_time,
+            group_id=GROUP_ID,
+            entity_types=ENTITY_TYPES,
+            edge_types=EDGE_TYPES,
+            edge_type_map=EDGE_TYPE_MAP,
+        )
     return len(result.nodes), len(result.edges)
 
 

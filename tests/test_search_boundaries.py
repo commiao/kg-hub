@@ -1,6 +1,8 @@
 import sys as _sys
+import os as _os
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # 仓库根:否则 ModuleNotFoundError
+_os.environ.setdefault("KG_HUB_API_TOKEN", "unit-test-only-token")
 import unittest
 
 from kg_hub_server import bounded_search_episode_uuids

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,26 +32,26 @@ from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
 )
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
+from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
 
 GROUP_ID = "kg_hub"
 
 
 async def llm_complete(prompt: str, max_tokens: int = 3200) -> str:
-    """镜像 kg_hub_server._llm_complete 的配置(百炼代理 + thinking 关)。
-    max_retries=5 与 graphiti 抽取侧对齐(百炼限频抖动常见)。"""
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(
-        auth_token=os.environ.get("ANTHROPIC_AUTH_TOKEN"),
-        base_url=os.environ.get("ANTHROPIC_BASE_URL"),
-        max_retries=5, timeout=90.0,
-    )
-    msg = await client.messages.create(
-        model=os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus"),
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-        extra_body={"thinking": {"type": "disabled"}},
-    )
-    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    """Mirror kg_hub_server via the stable, no-transport-retry gateway client."""
+    from model_gateway_client import create_gateway_client, gateway_model
+    client = create_gateway_client(timeout=90.0)
+    try:
+        with model_operation(
+            "backfill.predigest-plan", stable_operation_id(prompt, max_tokens)
+        ):
+            msg = await client.messages.create(
+                model=gateway_model(), max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    finally:
+        await client.close()
 
 
 async def backfill_one(g, name: str, content: str, prov: str, dry: bool) -> tuple[int, int]:
@@ -85,13 +84,18 @@ async def backfill_one(g, name: str, content: str, prov: str, dry: bool) -> tupl
         try:
             async with async_writer_lock(owner=f"predigest_backfill({child})",
                                          timeout_seconds=180.0):
-                result = await g.add_episode(
-                    name=child, episode_body=obs_to_episode_body(obs, name),
-                    source=EpisodeType.text,
-                    source_description=f"predigest-backfill: {name} type={obs['type']}",
-                    reference_time=ref, group_id=GROUP_ID,
-                    entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
-                    edge_type_map=EDGE_TYPE_MAP)
+                child_body = obs_to_episode_body(obs, name)
+                with model_operation(
+                    "backfill.predigest-child",
+                    stable_operation_id(name, child, child_body),
+                ):
+                    result = await g.add_episode(
+                        name=child, episode_body=child_body,
+                        source=EpisodeType.text,
+                        source_description=f"predigest-backfill: {name} type={obs['type']}",
+                        reference_time=ref, group_id=GROUP_ID,
+                        entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                        edge_type_map=EDGE_TYPE_MAP)
         except (WriterLockBusy, Exception) as exc:  # noqa: BLE001
             print(f"  [fail] {child}: {type(exc).__name__}: {exc}(继续)")
             continue

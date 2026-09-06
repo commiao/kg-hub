@@ -45,7 +45,10 @@ kg-hub 把自己的报表/看板收拢成卡片，通过 `/portal_manifest` 交�
 - **本机仓库**：`/Users/mac/workspace_claudeCode/kg-hub`，git remote `git@github-commiao:commiao/kg-hub.git`，主分支 `main`。
 - **访问门户**：tailnet 内任意设备浏览器开 `http://100.123.208.32:17171/portal`（无需 token）。
 - **SSH 到 NAS**：`ssh commiao@100.123.208.32`（key-based，走 tailscale；本机已配好，无需密码）。
-- **凭据/配置**：`~/.claude-mem/.env`，关键变量 `KG_HUB_URL`、`KG_HUB_API_TOKEN`、`KG_HUB_FALKORDB_*`。脚本/工具都从这里读。
+- **服务端配置**：owner-only 的 `deploy/nas/.env`，由
+  `deploy/nas/configure-model-gateway-token.sh` 初始化；其中 API token、FalkorDB 密码和 model-gateway caller token 各司其职。
+- **客户端配置**：各工具自己的 owner-only 配置只需 `KG_HUB_URL` 与
+  `KG_HUB_API_TOKEN`。不要从 `~/.claude-mem/.env` 读取服务端或 provider 凭证。
 
 ---
 
@@ -84,7 +87,8 @@ kg-hub 把自己的报表/看板收拢成卡片，通过 `/portal_manifest` 交�
 ```sh
 deploy/nas/redeploy.sh
 ```
-做：同步 `kg_hub_server.py` 到 NAS（原子 tmp+mv）→ `docker compose build kg_hub_server` → `docker compose -p kg-hub up -d --no-deps kg_hub_server watchdog ingester` → 探活。
+做：同步 `kg_hub_server.py` 到 NAS（原子 tmp+mv）→ 用 canonical env + root compose + 私网 override 重建/重启服务 → 探活。脚本的每个 Compose 调用都固定带
+`--env-file deploy/nas/.env -f docker-compose.yml -f deploy/model-gateway-network.override.yml -p kg-hub`。
 多文件：`FILES="kg_hub_server.py 其他.py" deploy/nas/redeploy.sh`。
 
 详见 `docs/REPORTS.md`。
@@ -107,8 +111,11 @@ compose 项目:  -p kg-hub                              （注意不是目录名
 cat kg_hub_server.py | ssh commiao@100.123.208.32 \
   'cat > /volume1/docker/kg-hub-src/.t && mv -f /volume1/docker/kg-hub-src/.t /volume1/docker/kg-hub-src/kg_hub_server.py'
 ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && \
-  sudo -n /var/packages/ContainerManager/target/usr/bin/docker compose build kg_hub_server && \
-  sudo -n /var/packages/ContainerManager/target/usr/bin/docker compose -p kg-hub up -d --no-deps kg_hub_server'
+  sudo -n /var/packages/ContainerManager/target/usr/bin/docker compose --env-file deploy/nas/.env \
+    -f docker-compose.yml -f deploy/model-gateway-network.override.yml -p kg-hub build kg_hub_server && \
+  sudo -n /var/packages/ContainerManager/target/usr/bin/docker compose --env-file deploy/nas/.env \
+    -f docker-compose.yml -f deploy/model-gateway-network.override.yml -p kg-hub \
+    up -d --no-deps kg_hub_server'
 ```
 
 ---
@@ -116,7 +123,7 @@ ssh commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && \
 ## 7. 验证
 
 ```sh
-set -a; source ~/.claude-mem/.env; set +a
+# 从当前工具自己的 owner-only 客户端配置加载 KG_HUB_URL/KG_HUB_API_TOKEN。
 curl -s -o /dev/null -w "health=%{http_code}\n"  "$KG_HUB_URL/health"
 curl -s -o /dev/null -w "portal=%{http_code}\n"  "$KG_HUB_URL/portal"
 curl -s -o /dev/null -w "dash=%{http_code}\n"    "$KG_HUB_URL/dashboard/capsules"

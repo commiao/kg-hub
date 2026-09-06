@@ -1,0 +1,28 @@
+# Attach only model-calling kg-hub services to the operator-approved existing
+# network. Docker Compose must not create this cross-project trust boundary.
+services:
+  kg_hub_server:
+    environment:
+      # Override the legacy direct-provider variables even when this file is
+      # temporarily paired with the pre-migration base Compose on the NAS.
+      ANTHROPIC_AUTH_TOKEN: ""
+      KG_HUB_MODEL_GATEWAY_TOKEN: ${KG_HUB_MODEL_GATEWAY_TOKEN:?set independent kg-hub caller token}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-kg_hub.entity_extract}
+    networks:
+      - default
+      - model_gateway_private
+  ingester:
+    environment:
+      ANTHROPIC_AUTH_TOKEN: ""
+      KG_HUB_MODEL_GATEWAY_TOKEN: ${KG_HUB_MODEL_GATEWAY_TOKEN:?set independent kg-hub caller token}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-kg_hub.entity_extract}
+    networks:
+      - default
+      - model_gateway_private
+
+networks:
+  model_gateway_private:
+    external: true
+    name: ${MODEL_GATEWAY_PRIVATE_NETWORK:?set an existing reviewed private network}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "mcp-memory-to-muxcp",
+      "match_all": ["mcp", "内存"],
+      "expand_terms": ["muxcp"],
+      "source_episode": "claude-mem-obs-4218",
+      "reason": "已有记录将持续的 MCP 进程内存占用定位到 muxcp 生命周期。"
+    },
+    {
+      "id": "wechat-traffic-to-reading-metrics",
+      "match_all": ["公众号", "流量"],
+      "expand_terms": ["公众号", "阅读量"],
+      "source_episode": "openclaw-capsule-CAPSULE-2026-07-22-001",
+      "reason": "已有运营反馈记录包含公众号发布后的阅读指标轨迹。"
+    }
+  ]
+}

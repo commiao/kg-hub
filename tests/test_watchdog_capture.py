@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import tools.watchdog as W  # noqa: E402
 from tools.watchdog import (CaptureDecision, apply_capture_decision,
                             check_capture_chain, judge_snapshots)  # noqa: E402
 
@@ -286,6 +287,78 @@ def test_source_failure_is_separate_monitoring_anomaly():
 # 只会**定义函数、一个断言都不执行**,还返回 exit 0 —— 于是它从写下那天起
 # 就是个"看起来在跑其实没跑"的假测试,正是本项目一直在消灭的失效模式。
 # 加 runner 让它无论有没有 pytest 都真的执行并如实退出码。
+# ---------------------------------------------------------------- unknown 沿用上限
+#
+# 2026-09-03：探针 POST kg-hub 收到 55 次 502，每次都让本轮不可判 → 无限沿用旧
+# blocked → capture_blocked 表现为抖动/粘滞。沿用是为了防假恢复，但不能无限。
+
+
+def _unknown_round(prev_bad, streak_before, kind="capture_blocked"):
+    prev = {kind: prev_bad}
+    cur, details = {}, {}
+    prev_counters = {f"{kind}_unknown": streak_before}
+    new_counters = {}
+    decision = (CaptureDecision(None, None) if kind == "capture_blocked"
+                else CaptureDecision([], None))
+    apply_capture_decision(decision, prev, cur, details, prev_counters, new_counters)
+    return cur, details, new_counters
+
+
+def test_unknown_holds_within_cap():
+    for streak_before in range(0, W.CAPTURE_UNKNOWN_HOLD_ROUNDS):
+        cur, details, counters = _unknown_round(True, streak_before)
+        assert cur["capture_blocked"] is True, f"第 {streak_before+1} 轮不该释放"
+        assert "沿用" in details["capture_blocked"]
+        assert counters["capture_blocked_unknown"] == streak_before + 1
+
+
+def test_unknown_releases_past_cap():
+    cur, details, _ = _unknown_round(True, W.CAPTURE_UNKNOWN_HOLD_ROUNDS)
+    assert cur["capture_blocked"] is False, "越过上限必须停止沿用"
+    assert "capture_blocked:clear" in details
+
+
+def test_release_message_does_not_claim_resolved():
+    """越过上限是"放弃判定"，不是"已修复"。发成 resolved 就是又一条撒谎的信号。"""
+    _, details, _ = _unknown_round(True, W.CAPTURE_UNKNOWN_HOLD_ROUNDS + 3)
+    msg = details["capture_blocked:clear"]
+    assert "不等于故障已修复" in msg
+    assert "capture_monitor_unhealthy" in msg or "capture_probe_stale" in msg
+
+
+def test_known_decision_resets_streak():
+    prev = {"capture_blocked": True}
+    cur, details, new_counters = {}, {}, {}
+    apply_capture_decision(CaptureDecision([], []), prev, cur, details,
+                           {"capture_blocked_unknown": 9}, new_counters)
+    assert new_counters["capture_blocked_unknown"] == 0, "拿到确定判定就该清零"
+    assert cur["capture_blocked"] is False
+
+
+def test_unknown_when_previously_clean_stays_clean():
+    cur, details, _ = _unknown_round(False, 0)
+    assert cur["capture_blocked"] is False
+    assert "capture_blocked" not in details
+
+
+def test_stale_branch_has_same_cap():
+    prev = {"capture_probe_stale": True}
+    cur, details, counters = {}, {}, {}
+    apply_capture_decision(CaptureDecision([], None), prev, cur, details,
+                           {"capture_probe_stale_unknown": W.CAPTURE_UNKNOWN_HOLD_ROUNDS},
+                           counters)
+    assert cur["capture_probe_stale"] is False
+    assert "capture_probe_stale:clear" in details
+
+
+def test_backward_compatible_without_counters():
+    """旧调用方(4 个位置参数)不传 counters 时仍按单轮沿用，不炸。"""
+    prev = {"capture_blocked": True}
+    cur, details = {}, {}
+    apply_capture_decision(CaptureDecision(None, None), prev, cur, details)
+    assert cur["capture_blocked"] is True
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

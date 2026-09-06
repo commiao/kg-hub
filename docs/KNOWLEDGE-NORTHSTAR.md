@@ -127,7 +127,7 @@
 **① 采集/Schema —— 已完成(2026-07-23)**:
 - `origin_device/origin_tool/origin_project` + `durability` + `kind`/`kind_confidence` 已提为一等字段(`utils/origin.py` 纯派生;`kg_hub_server._tag_schema_fields` 在每次 ingest 打标;kind 走独立 LLM 分类器 pass,低置信弃权 unclassified)。
 - 存量 2302 节点全部回填完毕(`tools/backfill_schema.py`):0 空值。kind 分布 项目事实1532/事故397/决策276/方法论20/手册11/素材4/生命周期1/unclassified61(=~60 无 type 小尾巴 + 1 低置信胶囊)。
-- **运维教训**:Mac 的 `~/.claude-mem/.env` ANTHROPIC token 对直连 401 失效;胶囊 kind 的 LLM 分类改在 **NAS 容器内**跑(`docker exec kg-hub-ingester python -m tools.backfill_schema --retry-llm`,容器 token 有效)。回填工具的 D2 防护(失败计数+非零退出+--retry-llm)正是为此。
+- **运维教训（旧直连问题的现行修复）**：不要在 Mac 或 NAS 容器保存/直连 provider token。付费模型调用统一经 model-gateway，kg-hub 只提交 `kg_hub.*` business key 和独立 caller token；回填工具仍保留 D2 防护（稳定 durable operation ID、失败计数、非零退出和显式 retry），未知结果重试复用同一幂等键。
 
 **② 治理 —— 核心已落地(2026-07-23)**:
 - **退休回路**(补"只进不出"缺口):反馈待办「④待退休」自动列过期 time-bound(行情/日报/快照 >30 天,当前 24 条),一键/批量归档(`archived=true` 可逆,看板与 search 均 `NOT archived` 过滤)。端点 `/dashboard/archive_episode`。只收 time-bound——evergreen+usage=0 是弱信号(usage 探针覆盖不全,会误伤 2228),不据此退休。

@@ -51,6 +51,7 @@ from utils.ingest_filter import (  # noqa: E402
     summarize_decisions,
     QuotaTracker,
 )
+from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
 
 
 CLAUDE_MEM_DB = Path.home() / ".claude-mem" / "claude-mem.db"
@@ -161,17 +162,19 @@ def reference_time_from(obs: dict) -> datetime:
 
 async def ingest_one(g, obs: dict) -> tuple[int, int]:
     body = build_episode_body(obs)
-    result = await g.add_episode(
-        name=f"claude-mem-obs-{obs['id']}",
-        episode_body=body,
-        source=EpisodeType.text,
-        source_description=f"claude-mem obs id={obs['id']} project={obs.get('project','?')} type={obs.get('type','?')}",
-        reference_time=reference_time_from(obs),
-        group_id=GROUP_ID,
-        entity_types=ENTITY_TYPES,
-        edge_types=EDGE_TYPES,
-        edge_type_map=EDGE_TYPE_MAP,
-    )
+    operation_id = stable_operation_id(obs["id"], obs.get("content_hash"), body)
+    with model_operation("ingest.claude-mem", operation_id):
+        result = await g.add_episode(
+            name=f"claude-mem-obs-{obs['id']}",
+            episode_body=body,
+            source=EpisodeType.text,
+            source_description=f"claude-mem obs id={obs['id']} project={obs.get('project','?')} type={obs.get('type','?')}",
+            reference_time=reference_time_from(obs),
+            group_id=GROUP_ID,
+            entity_types=ENTITY_TYPES,
+            edge_types=EDGE_TYPES,
+            edge_type_map=EDGE_TYPE_MAP,
+        )
     return len(result.nodes), len(result.edges)
 
 

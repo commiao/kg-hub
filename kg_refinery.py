@@ -584,6 +584,25 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     return stats
 
 
+def select_backlog_batch(pending_ids: list[int], backoff: dict[int, list[int]],
+                         cycle: int, limit: int = BACKLOG_PER_CYCLE) -> list[int]:
+    """积压窗口取数:冷却中的 id 不占名额。
+
+    2026-09-03→09-06 积压 7919 三天零进展:队头 8 条因网关 425 反复失败,
+    `pending_ids[:8]` 每轮取到的都是它们——退避只是让它们"跳过",名额却仍被占着,
+    身后 7900 条一条也轮不到。这里先排除冷却中的再截前 N 条:失败项退避期间把名额
+    让给后面的,退避到期照常回来重试,不丢数据。"""
+    picked: list[int] = []
+    for oid in pending_ids:
+        bo = backoff.get(oid)
+        if bo and cycle < bo[1]:
+            continue
+        picked.append(oid)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
 async def main() -> int:
     log.info("kg-refinery Level-1 启动 url=%s db=%s interval=%ss backlog=%s",
              KG_HUB_URL, DB_PATH, INTERVAL, BACKLOG_ENABLED)
@@ -662,7 +681,7 @@ async def main() -> int:
                 backlog_remaining = len(pending_ids)
                 if in_backlog_window() and pending_ids:
                     s_back = await process_batch(
-                        fetch_rows_by_ids(pending_ids[:BACKLOG_PER_CYCLE]),
+                        fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
                         wm, cfg, quotas, decided, backoff, cycle, "backlog")
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
 

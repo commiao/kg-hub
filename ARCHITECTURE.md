@@ -8,6 +8,11 @@
 > **最近更新**：2026-06-13
 > **目标读者**：(1) 6 个月后回来的自己 (2) 接手人 (3) 跟他人解释这套系统是什么时的 single source of truth
 
+> **当前模型边界（2026-08，覆盖下文历史直连描述）**：业务层只选择 business key；
+> `claude_mem.observation` 与 `kg_hub.entity_extract` 由 NAS model-gateway 分别解析真实
+> provider/model/credential。kg-hub 只持有独立 caller token，不读取 provider token。
+> launchd/Compose/监控只做 ready 或连接状态检查，不发送模型请求。
+
 ---
 
 ## 1. 一图概览
@@ -24,7 +29,7 @@
 ┌─────────────────────────────────────┐          │
 │ L1: claude-mem (各设备本地)          │          │
 │   ─ Bun worker @ localhost:37701    │          │
-│   ─ qwen3.6-plus 抽 obs              │          │
+│   ─ claude_mem.observation 抽 obs     │          │
 │   ─ SQLite: ~/.claude-mem/*.db       │          │
 │   ─ 每设备一份，互不相通              │          │
 └───────────────┬─────────────────────┘          │
@@ -92,7 +97,7 @@
                 ↓
 3. claude-mem worker 接收           (POST localhost:37701)
                 ↓
-4. qwen3.6-plus 生成结构化观察      (title/facts/narrative/concepts)
+4. claude_mem.observation 生成观察   (网关内部解析真实模型)
                 ↓
 5. SQLite 写入                       (~/.claude-mem/claude-mem.db)
                 ↓
@@ -160,7 +165,7 @@ SessionStart hook 调 kg-hub /api/canonical_context
 | MCP 接口暴露给 IDE | kg-hub + claude-mem 各自 MCP server，**经 muxcp 聚合** | 各 IDE 不自己写 |
 | 跨设备配置同步 | cc-switch + WebDAV | kg-hub 不管 |
 | 跨网络互通 | Tailscale | 不暴露公网 HTTPS |
-| LLM 凭证管理 | `~/.claude-mem/.env`（claude-mem 控制） | 其他工具读它不写它 |
+| 模型调用边界 | NAS model-gateway 管 provider/model/credential | kg-hub 只传 business key + caller token |
 
 **反模式**（DESIGN.md §3 决策 10 已锁定）：
 - ❌ OpenClaw 自己维护图谱子系统
@@ -213,13 +218,13 @@ Step 2: 配置同步层
 Step 3: claude-mem (底层捕获)
   □ 走 cookbook/docs/INSTALL.md 选你 OS 章节
   □ npx claude-mem@latest install
-  □ 配 LLM provider (用 cc-switch 同步的 .env 或重新登录 Claude OAuth)
+  □ 按 credvault quickstart 输出连接 `claude_mem.observation` business key；不复制 provider token
   □ 装 LaunchAgent / systemd / Task Scheduler
   □ 验证: curl http://localhost:37701/api/health
 
 Step 4: kg-hub 客户端 (查询接入)
   □ 不需要本地跑 kg-hub server (服务跑在中央 NAS)
-  □ 配 ~/.claude-mem/.env 加 KG_HUB_URL / KG_HUB_API_TOKEN
+  □ 在当前工具自己的 owner-only 客户端配置中加 KG_HUB_URL / KG_HUB_API_TOKEN
   □ 走 kg-hub/docs/INTEGRATION-GUIDE.md §2 + §3 配本机客户端
 
 Step 5: muxcp (MCP 聚合，可选但推荐)

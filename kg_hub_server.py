@@ -8,7 +8,7 @@ Routes:
 
 Auth:
   Authorization: Bearer <KG_HUB_API_TOKEN> on every request except /health.
-  Token persisted in ~/.claude-mem/.env (DESIGN decision 15).
+  Token persisted in kg-hub's own .env.
 
 Concurrency:
   Writes acquire utils.writer_lock (DESIGN decision 12) — serializes against
@@ -41,8 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+from kg_hub_env import load_kg_hub_env
+load_kg_hub_env(override=True)
 
 from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
@@ -73,6 +73,7 @@ from utils.predigest import (  # noqa: E402
 )
 from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
+from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -84,7 +85,7 @@ KIND_CONF_THRESHOLD = 0.7
 API_TOKEN = os.environ.get("KG_HUB_API_TOKEN")
 if not API_TOKEN:
     raise RuntimeError(
-        "KG_HUB_API_TOKEN missing from ~/.claude-mem/.env — generate with "
+        "KG_HUB_API_TOKEN missing from kg-hub's own .env — generate with "
         "`python -c 'import secrets; print(secrets.token_urlsafe(32))'`"
     )
 GROUP_ID = "kg_hub"
@@ -251,7 +252,7 @@ async def merge_or_get_ingested_key(
         "  k.updated_at = $now, "
         "  k.created_by_request = $request_id "
         "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
-        "       k.error_message AS error_message, "
+        "       k.error_message AS error_message, k.created_at AS created_at, "
         "       k.created_by_request = $request_id AS newly_created",
         sd=source_description,
         sid=source_obs_id,
@@ -264,6 +265,7 @@ async def merge_or_get_ingested_key(
         "status": rows[0].get("status"),
         "episode_uuid": rows[0].get("episode_uuid"),  # may be None for newly_created
         "error_message": rows[0].get("error_message"),
+        "created_at": rows[0].get("created_at"),   # 本次尝试的纪元,见 do_extract
         "newly_created": bool(rows[0].get("newly_created")),
     }
 
@@ -499,7 +501,8 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
 
 
 async def _locked_add_episode(graphiti, name: str, episode_body: str,
-                              sd: str, ref_time: datetime):
+                              sd: str, ref_time: datetime,
+                              attempt_epoch: str | None = None):
     """单条 episode 的 加锁→抽取,锁竞争重试策略与整篇路径一致。耗尽则 raise。"""
     attempt = 0
     while True:
@@ -508,11 +511,13 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
                 owner=f"api_ingest_predigest({name})",
                 timeout_seconds=INGEST_LOCK_TIMEOUT_SEC,
             ):
-                return await graphiti.add_episode(
-                    name=name, episode_body=episode_body, source=EpisodeType.text,
-                    source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
-                    entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
-                    edge_type_map=EDGE_TYPE_MAP)
+                operation_id = stable_operation_id(name, sd, episode_body, attempt_epoch)
+                with model_operation("ingest.predigest-child", operation_id):
+                    return await graphiti.add_episode(
+                        name=name, episode_body=episode_body, source=EpisodeType.text,
+                        source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
+                        entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                        edge_type_map=EDGE_TYPE_MAP)
         except WriterLockBusy:
             attempt += 1
             if attempt > INGEST_LOCK_RETRIES:
@@ -521,7 +526,8 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
 
 
 async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
-                             route: str, started: datetime) -> bool:
+                             route: str, started: datetime,
+                             attempt_epoch: str | None = None) -> bool:
     """Phase B' 预拆路径(REFINERY-DESIGN §3')。返回 True=已完整处理(含状态回写);
     返回 False=调用方落回整篇路径(**任何失败都不丢数据**)。
 
@@ -585,7 +591,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         try:
             result = await _locked_add_episode(
                 graphiti, child_name, obs_to_episode_body(obs, body.name),
-                f"{sd} · predigest type={obs['type']}", ref_time)
+                f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch)
         except Exception:  # noqa: BLE001
             logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
             continue
@@ -636,6 +642,7 @@ async def do_extract(
     graphiti,
     body: IngestBody,
     ref_time: datetime,
+    attempt_epoch: str | None = None,
 ) -> None:
     """
     The actual heavy work: acquire writer.lock, call graphiti.add_episode,
@@ -646,10 +653,19 @@ async def do_extract(
 
     Tracking key is (source_description, source_obs_id); episode_uuid is
     populated post-extraction from graphiti's assigned UUID.
+
+    attempt_epoch: the IngestedKey row's created_at for this claim. It scopes
+    every paid model call's Idempotency-Key to *this* attempt (see below).
     """
     sd = body.source_description
     sid = body.source_obs_id
     started = datetime.now(tz=timezone.utc)
+    # 付费操作身份带上"本次尝试"的纪元。此前只由 (sd, sid, name, body) 决定 →
+    # 跨天重试算出同一把幂等钥匙 → 网关回滚见证永不忘记 → 任何一次抽取中途失败过
+    # 的观测,24h 后永久 425(2026-09-05 一夜 73 条;积压队头 8 条由此卡死三天)。
+    # 同一次尝试内钥匙仍稳定(在飞合并/网关缓存重放不受影响);error 键清理后的
+    # 下一次尝试是新操作、新钥匙、重新计费——上次那次的结果确实没有拿到。
+    epoch = attempt_epoch or started.isoformat()
     # Durable backup BEFORE extraction — survives even if extraction or the graph fails.
     _backup_episode(body, ref_time)
     logger.info(
@@ -664,7 +680,7 @@ async def do_extract(
         route = predigest_route(body.name, body.episode_body)
         if route:
             try:
-                if await _predigest_extract(graphiti, body, ref_time, route, started):
+                if await _predigest_extract(graphiti, body, ref_time, route, started, epoch):
                     return
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[ingest:predigest_unexpected] sd=%s sid=%s", sd, sid)
@@ -688,17 +704,21 @@ async def do_extract(
                         "[ingest:lock_acquired] sd=%s sid=%s waited=%.1fs attempt=%d",
                         sd, sid, (lock_acquired - started).total_seconds(), attempt + 1,
                     )
-                    result = await graphiti.add_episode(
-                        name=body.name,
-                        episode_body=body.episode_body,
-                        source=EpisodeType.text,
-                        source_description=sd,
-                        reference_time=ref_time,
-                        group_id=GROUP_ID,
-                        entity_types=ENTITY_TYPES,
-                        edge_types=EDGE_TYPES,
-                        edge_type_map=EDGE_TYPE_MAP,
+                    operation_id = stable_operation_id(
+                        sd, sid, body.name, body.episode_body, epoch
                     )
+                    with model_operation("ingest.episode", operation_id):
+                        result = await graphiti.add_episode(
+                            name=body.name,
+                            episode_body=body.episode_body,
+                            source=EpisodeType.text,
+                            source_description=sd,
+                            reference_time=ref_time,
+                            group_id=GROUP_ID,
+                            entity_types=ENTITY_TYPES,
+                            edge_types=EDGE_TYPES,
+                            edge_type_map=EDGE_TYPE_MAP,
+                        )
                 break  # lock acquired + extraction completed
             except WriterLockBusy:
                 attempt += 1
@@ -927,7 +947,7 @@ async def ingest(request: Request) -> JSONResponse:
     # 4. We own this row — do the extraction.
     if body.sync:
         # Old-callers path: block until done.
-        await do_extract(g, body, ref_time)
+        await do_extract(g, body, ref_time, merge_result.get("created_at"))
         rows, _, _ = await g.driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
             "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
@@ -955,7 +975,7 @@ async def ingest(request: Request) -> JSONResponse:
         )
 
     # Default async path: return 202 immediately, background does the work.
-    asyncio.create_task(do_extract(g, body, ref_time))
+    asyncio.create_task(do_extract(g, body, ref_time, merge_result.get("created_at")))
     return JSONResponse(
         {"status": "accepted",
          "source_description": sd, "source_obs_id": sid,
@@ -2313,6 +2333,10 @@ PORTAL_REPORTS = [
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
     {"name": "精炼层", "desc": "统一摄入 refinery:claude-mem 复活线吞吐/积压烧进度 + fact 层质量指标",
      "url": "/dashboard/refinery", "icon": "⚗️", "ready": True},
+    {"name": "模型用量与成本", "desc": "按业务 key 的月/日/时调用量(成本代理,非 token 账单)+ 当前待入图积压",
+     "url": "/dashboard/gateway_usage", "icon": "💰", "ready": True},
+    {"name": "采集链路吞吐", "desc": "各环节月/日/时**已完成量**与待处理量;live 线与积压线分开,停滞一眼可见",
+     "url": "/dashboard/pipeline", "icon": "🚰", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
      "url": "/dashboard/feedback", "icon": "📣", "ready": True},
     {"name": "反馈待办", "desc": "自动列出需你拍板的:待分层(AI已建议)+待补运营数据",
@@ -2864,7 +2888,7 @@ async def capsule_requeue(request: Request) -> JSONResponse:
             g, ib.source_description, ib.source_obs_id, str(uuidlib.uuid4()))
         if not merge_result["newly_created"]:
             return JSONResponse({"ok": False, "error": "重试竞争失败,请再点一次"}, status_code=409)
-    asyncio.create_task(do_extract(g, ib, ref_time))
+    asyncio.create_task(do_extract(g, ib, ref_time, merge_result.get("created_at")))
     await g.driver.execute_query(
         "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q", sid=sid)
     return JSONResponse({"ok": True, "queued": True, "provenance": prov})
@@ -3083,22 +3107,20 @@ async def dashboard_curate(request: Request) -> HTMLResponse:
 
 
 async def _llm_complete(prompt: str, max_tokens: int = 1600) -> str:
-    """One-shot LLM completion via the server's existing 百炼-proxied Anthropic
-    endpoint (thinking disabled, like graphiti_client.build_llm). Used for
+    """One-shot LLM completion via the stable model-gateway client. Used for
     on-demand case-pack synthesis. Raises on failure (caller returns an error)."""
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(
-        auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
-        base_url=os.environ["ANTHROPIC_BASE_URL"],
-        max_retries=2, timeout=90.0,
-    )
-    resp = await client.messages.create(
-        model=os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus"),
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-        extra_body={"thinking": {"type": "disabled"}},
-    )
-    return "".join(getattr(b, "text", "") for b in resp.content)
+    from model_gateway_client import create_gateway_client, gateway_model
+    client = create_gateway_client(timeout=90.0)
+    try:
+        operation_id = stable_operation_id(prompt, max_tokens)
+        with model_operation("server.one-shot", operation_id):
+            resp = await client.messages.create(
+                model=gateway_model(), max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        return "".join(getattr(b, "text", "") for b in resp.content)
+    finally:
+        await client.close()
 
 
 async def classify_kind(body: str) -> tuple[str, float]:
@@ -3841,6 +3863,332 @@ var f=D.fq;document.getElementById('fq').innerHTML='<div class=mc><div class=l>f
 </script></body></html>"""
 
 
+_DASH_PIPELINE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=300>
+<title>kg-hub 采集链路吞吐</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:940px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}
+th,td{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent);padding:8px 10px;text-align:right}
+th:first-child,td:first-child{text-align:left}
+th{font-size:12px;color:GrayText;font-weight:500}
+td.n{font-family:ui-monospace,Menlo,monospace}
+tr.stall td{background:color-mix(in srgb,#D64545 12%,transparent)}
+.flag{font-size:11px;padding:2px 7px;border-radius:8px;background:#FDEDED;color:#8A1C1C;margin-left:6px}
+.lbl{font-size:12px;color:GrayText;margin:1.4rem 0 .3rem}
+.row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.nm{width:120px;font-family:ui-monospace,Menlo,monospace;font-size:12px;flex:none}
+.bar{width:170px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent);flex:none}
+.bar>i{display:block;height:100%;background:#5B8FF9}
+.ct{font-size:12px;width:56px;text-align:right;flex:none;font-family:ui-monospace,monospace}
+.ts{color:GrayText;font-size:12px}
+.warn{background:#FDEDED;color:#8A1C1C;border-radius:8px;padding:.5rem .8rem;font-size:13px;margin:.6rem 0}
+.note{font-size:12px;color:GrayText;margin:.4rem 0 0}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>采集链路吞吐</h1>
+<div id=warn></div>
+<div class=note id=note></div>
+<table><thead><tr><th>环节</th><th>本月已完成</th><th>今日已完成</th><th>最近 1 小时</th><th>待处理</th></tr></thead>
+<tbody id=stages></tbody></table>
+<div class=lbl>入图量 · 按日（最近 14 天，分线）</div><div id=daily></div>
+<div class=lbl>入图量 · 按小时（最近 48 小时，分线）</div><div id=hourly></div>
+<script>
+const D=__DATA__;
+if(D.error){const w=document.getElementById('warn');w.className='warn';w.textContent=D.error}
+document.getElementById('note').textContent=
+ '「已完成」= 真正落入知识图的 Episode 数（按 created_at 分桶，UTC）。积压线与 live 线以 refinery 的 boundary_id='
+ +(D.boundary_id??'—')+' 划分：obs id ≤ boundary 属积压。快照 '+(D.generated_at||'—')+'。';
+const tb=document.getElementById('stages');
+(D.stages||[]).forEach(s=>{
+ const tr=document.createElement('tr');
+ if(s.stalled)tr.className='stall';
+ const name=document.createElement('td');
+ name.textContent=s.name;
+ if(s.stalled){const f=document.createElement('span');f.className='flag';
+  f.textContent='停滞：待处理 '+s.pending+' 而本月仅完成 '+s.month;name.append(f)}
+ tr.append(name);
+ ['month','day','hour','pending'].forEach(k=>{
+  const td=document.createElement('td');td.className='n';
+  td.textContent=(s[k]===null||s[k]===undefined)?'—':s[k];tr.append(td)});
+ tb.append(tr)});
+function bars(rows,labelKey,target,keep){
+ const box=document.getElementById(target);
+ const buckets=new Map();
+ (rows||[]).forEach(r=>{const k=String(r[labelKey]);
+  if(!buckets.has(k))buckets.set(k,new Map());
+  buckets.get(k).set(String(r.lane),Number(r.count)||0)});
+ let labels=[...buckets.keys()].sort().reverse();
+ if(keep)labels=labels.slice(0,keep);
+ if(!labels.length){const e=document.createElement('div');e.className='ts';
+  e.textContent='暂无数据';box.append(e);return}
+ const peak=Math.max(...labels.map(l=>[...buckets.get(l).values()].reduce((a,b)=>a+b,0)),1);
+ labels.forEach(l=>{const per=buckets.get(l);
+  const total=[...per.values()].reduce((a,b)=>a+b,0);
+  const row=document.createElement('div');row.className='row';
+  const nm=document.createElement('span');nm.className='nm';nm.textContent=l;
+  const bar=document.createElement('span');bar.className='bar';
+  const fill=document.createElement('i');fill.style.width=Math.max(2,Math.round(total*100/peak))+'%';
+  bar.append(fill);
+  const ct=document.createElement('span');ct.className='ct';ct.textContent=total;
+  const dt=document.createElement('span');dt.className='ts';dt.style.flex='1';
+  dt.textContent=[...per.entries()].sort().map(([k,v])=>k+' '+v).join(' · ');
+  row.append(nm,bar,ct,dt);box.append(row)})}
+bars(D.daily,'bucket','daily',14);
+bars(D.hourly,'bucket','hourly',48);
+</script></body></html>"""
+
+
+async def _latest_topology_metrics() -> dict:
+    """取最新拓扑快照里 Mac→NAS 同步节点的 metrics(两侧 MAX id 与落差)。
+
+    复用 topology._load_snapshots —— 面板与告警必须看同一份数据,自己再查一遍
+    会制造"两个真相"。读不到就返回空,由调用方显示 "—",不猜。
+    """
+    try:
+        from topology import _load_snapshots
+        snapshots = await _load_snapshots()
+    except Exception:  # noqa: BLE001
+        return {}
+
+    def find_sync(node: Any) -> dict | None:
+        if isinstance(node, dict):
+            if node.get("id") == "sync" and isinstance(node.get("metrics"), dict):
+                return node["metrics"]
+            for value in node.values():
+                found = find_sync(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = find_sync(value)
+                if found is not None:
+                    return found
+        return None
+
+    for snapshot in snapshots:
+        payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+        metrics = find_sync(payload if payload is not None else snapshot)
+        if metrics:
+            return metrics
+    return {}
+
+
+async def dashboard_pipeline(request: Request) -> HTMLResponse:
+    """采集链路吞吐:每个环节的月/日/时**已完成量**与**待处理量**。
+
+    为什么必须按环节分「已完成」而不是只看总量:2026-09-06 复盘发现积压
+    `backlog_remaining` 连续 3 天恒为 7919 却无人察觉 —— 因为总入图量在涨(live 线
+    正常)、模型调用量也在涨,任何汇总视图都显示"健康"。只有把 live 线与积压线的
+    **完成量分开**,才看得出「待处理 7919、本月完成 0」这种停滞。
+
+    分线依据:episode 名形如 `claude-mem-obs-<id>`,与 refinery 的 boundary_id 比较
+    即可判定该条属积压线还是 live 线。
+    """
+    driver = get_status_driver()
+    now = datetime.now(tz=timezone.utc)
+    data: dict = {"stages": [], "daily": [], "hourly": [], "error": None,
+                  "boundary_id": None,
+                  "generated_at": now.isoformat(timespec="seconds")}
+
+    status: dict = {}
+    try:
+        sp = Path(os.environ.get("KG_HUB_REFINERY_STATUS",
+                                 "/refinery-state/status.json"))
+        if sp.exists():
+            status = json.loads(sp.read_text())
+    except Exception:  # noqa: BLE001
+        pass
+    boundary = status.get("boundary_id")
+    data["boundary_id"] = boundary
+
+    async def buckets(length: int, floor: str) -> list[dict]:
+        """按 created_at 前缀分桶,并按 boundary 分 live / backlog / 其他源。"""
+        cypher = (
+            "MATCH (n:Episodic) WHERE n.created_at >= $floor "
+            f"WITH n, substring(n.created_at, 0, {length}) AS bucket "
+            "WITH bucket, CASE "
+            "  WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
+            "  WHEN toInteger(substring(n.name, 15)) <= $boundary THEN '积压线' "
+            "  ELSE 'live 线' END AS lane "
+            "RETURN bucket, lane, count(*) AS c ORDER BY bucket"
+        )
+        rows, _, _ = await driver.execute_query(
+            cypher, floor=floor, boundary=int(boundary or 0))
+        return [{"bucket": r.get("bucket"), "lane": r.get("lane"),
+                 "count": int(r.get("c") or 0)} for r in rows]
+
+    try:
+        if boundary is None:
+            raise RuntimeError("refinery status.json 缺 boundary_id")
+        data["hourly"] = await buckets(
+            13, (now - timedelta(hours=48)).strftime("%Y-%m-%dT%H"))
+        data["daily"] = await buckets(
+            10, (now - timedelta(days=14)).strftime("%Y-%m-%d"))
+        month_rows = await buckets(7, now.strftime("%Y-%m"))
+    except Exception as exc:  # noqa: BLE001
+        data["error"] = f"入图量读取失败:{type(exc).__name__}"
+        month_rows = []
+
+    def total(rows: list[dict], lane: str, prefix: str | None = None) -> int:
+        return sum(r["count"] for r in rows
+                   if r["lane"] == lane
+                   and (prefix is None or str(r["bucket"]).startswith(prefix)))
+
+    day_key = now.strftime("%Y-%m-%d")
+    hour_key = now.strftime("%Y-%m-%dT%H")
+    topology = await _latest_topology_metrics()
+    lag = topology.get("lag_rows")
+    nas_max = topology.get("nas_max_obs_id")
+    cursor = status.get("live_cursor")
+    live_pending = (int(nas_max) - int(cursor)
+                    if isinstance(nas_max, int) and isinstance(cursor, int)
+                    and nas_max >= cursor else None)
+
+    for name, lane, pending in (
+        ("Mac→NAS 同步", None, lag),
+        ("入图 · live 线", "live 线", live_pending),
+        ("入图 · 积压线", "积压线", status.get("backlog_remaining")),
+        ("入图 · 其他源", "其他源", None),
+    ):
+        month = total(month_rows, lane) if lane else None
+        day = total(data["daily"], lane, day_key) if lane else None
+        hour = total(data["hourly"], lane, hour_key) if lane else None
+        data["stages"].append({
+            "name": name, "month": month, "day": day, "hour": hour,
+            "pending": pending,
+            # 这才是本看板存在的理由:有活要干,却按本月速度永远干不完。
+            # 用比例而非 "== 0":积压线本月完成 1 条、待处理 7919,严格意义上
+            # 不是零,但同样是停滞 —— 照此速度需要几百年。阈值 1% 意味着
+            # "按本月产出,清空待处理要 100 个月以上"。
+            "stalled": bool(lane and isinstance(pending, int) and pending > 0
+                            and isinstance(month, int)
+                            and month * 100 < pending),
+        })
+
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_PIPELINE_HTML.replace("__DATA__", payload))
+
+
+_DASH_GATEWAY_USAGE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=300>
+<title>kg-hub 模型用量与成本</title>
+<style>:root{color-scheme:light dark}
+body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:900px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
+a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:1rem 0}
+.mc{background:color-mix(in srgb,CanvasText 6%,transparent);border-radius:8px;padding:.7rem .9rem}
+.mc .l{font-size:13px;color:GrayText}.mc .v{font-size:22px;font-weight:500}
+.lbl{font-size:12px;color:GrayText;margin:1.3rem 0 .3rem}
+.row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
+.nm{width:132px;font-family:ui-monospace,Menlo,monospace;font-size:12px;flex:none}
+.bar{width:150px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent);flex:none}
+.bar>i{display:block;height:100%;background:#5B8FF9}
+.ct{font-size:12px;width:56px;text-align:right;flex:none;font-family:ui-monospace,monospace}
+.ts{color:GrayText;font-size:12px}
+.warn{background:#FDEDED;color:#8A1C1C;border-radius:8px;padding:.5rem .8rem;font-size:13px;margin:.6rem 0}
+.note{font-size:12px;color:GrayText;margin:.4rem 0 0}</style></head><body>
+<a class=back href="/portal">← 报表门户</a><h1>模型用量与成本</h1>
+<div id=warn></div>
+<div class=note id=note></div>
+<div class=cards id=cards></div>
+<div class=lbl>按月</div><div id=monthly></div>
+<div class=lbl>按日（最近 14 天）</div><div id=daily></div>
+<div class=lbl>按小时（最近 48 小时）</div><div id=hourly></div>
+<script>
+const D=__DATA__;
+// 一律 textContent 写入：标签与 business_key 来自见证库，虽已校验过形状，
+// 但看板不该是第二道信任边界。
+function put(id,txt){const e=document.getElementById(id);if(txt){e.textContent=txt}else{e.remove()}}
+if(D.error){const w=document.getElementById('warn');w.className='warn';w.textContent=D.error}
+document.getElementById('note').textContent=
+ '「调用量」= 网关放行并发起外呼的次数（成本代理，非 token 账单）。403/限流在外呼前被拒，不计入。'
+ +'快照 '+(D.generated_at||'—')+'（小时窗 '+(D.window&&D.window.hourly_hours||'—')
+ +'h／日窗 '+(D.window&&D.window.daily_days||'—')+'d）'
+ +(D.backlog_at?('；积压快照 '+D.backlog_at):'');
+const cards=document.getElementById('cards');
+function card(label,value){const d=document.createElement('div');d.className='mc';
+ const l=document.createElement('div');l.className='l';l.textContent=label;
+ const v=document.createElement('div');v.className='v';v.textContent=value;
+ d.append(l,v);cards.append(d)}
+Object.keys(D.totals||{}).sort().forEach(k=>card(k,D.totals[k]));
+if(typeof D.backlog==='number')card('kg-hub 待入图积压',D.backlog);
+if(!Object.keys(D.totals||{}).length&&typeof D.backlog!=='number')card('暂无数据','—');
+function bars(rows,labelKey,target,keep){
+ const box=document.getElementById(target);
+ const buckets=new Map();
+ (rows||[]).forEach(r=>{const k=String(r[labelKey]);
+  if(!buckets.has(k))buckets.set(k,new Map());
+  buckets.get(k).set(String(r.business_key),Number(r.count)||0)});
+ let labels=[...buckets.keys()].sort().reverse();
+ if(keep)labels=labels.slice(0,keep);
+ if(!labels.length){const e=document.createElement('div');e.className='ts';
+  e.textContent='暂无数据';box.append(e);return}
+ const peak=Math.max(...labels.map(l=>[...buckets.get(l).values()].reduce((a,b)=>a+b,0)),1);
+ labels.forEach(l=>{const per=buckets.get(l);
+  const total=[...per.values()].reduce((a,b)=>a+b,0);
+  const row=document.createElement('div');row.className='row';
+  const nm=document.createElement('span');nm.className='nm';nm.textContent=l;
+  const bar=document.createElement('span');bar.className='bar';
+  const fill=document.createElement('i');fill.style.width=Math.max(2,Math.round(total*100/peak))+'%';
+  bar.append(fill);
+  const ct=document.createElement('span');ct.className='ct';ct.textContent=total;
+  const dt=document.createElement('span');dt.className='ts';dt.style.flex='1';
+  dt.textContent=[...per.entries()].sort().map(([k,v])=>k.split('.')[0]+' '+v).join(' · ');
+  row.append(nm,bar,ct,dt);box.append(row)})}
+bars(D.monthly,'month','monthly',0);
+bars(D.daily,'day','daily',14);
+bars(D.hourly,'hour','hourly',48);
+</script></body></html>"""
+
+
+async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
+    """模型用量与成本:按 business_key 的月/日/时调用量 + 当前积压。
+
+    数据来自 tools/export_gateway_usage.py 定时导出的快照(共享卷 ro),**不直接查
+    回滚见证库** —— 网关把见证不可用当致命(对外 503「网关本地配置不可用」),任何
+    在请求路径上碰那个库的读者都可能把整条链路打成 503(T-0046 已实测其敏感度)。
+    导出器读文件副本、与活库零锁交互。
+
+    「调用量」是**成本代理**而非账单:计的是网关放行并发起外呼的次数(见证
+    attempts / daily_counts),不含 token 数;403 与限流在外呼前被拒,不计入。
+    """
+    data: dict = {"totals": {}, "monthly": [], "daily": [], "hourly": [],
+                  "window": {}, "generated_at": None, "backlog": None,
+                  "backlog_at": None, "error": None}
+    path = Path(os.environ.get("KG_HUB_GATEWAY_USAGE", "/gateway-usage/usage.json"))
+    try:
+        if path.exists():
+            snapshot = json.loads(path.read_text())
+            for key in ("totals", "monthly", "daily", "hourly", "window",
+                        "generated_at"):
+                if key in snapshot:
+                    data[key] = snapshot[key]
+        else:
+            data["error"] = f"用量快照不存在({path})—— 导出器未运行或共享卷未挂"
+    except Exception as exc:  # noqa: BLE001
+        data["error"] = f"用量快照不可读:{type(exc).__name__}"
+
+    # 积压:refinery 的 backlog_remaining 是 kg-hub 侧唯一权威数字。
+    try:
+        rp = Path(os.environ.get("KG_HUB_REFINERY_STATUS",
+                                 "/refinery-state/status.json"))
+        if rp.exists():
+            rstatus = json.loads(rp.read_text())
+            if isinstance(rstatus.get("backlog_remaining"), int):
+                data["backlog"] = rstatus["backlog_remaining"]
+            data["backlog_at"] = (rstatus.get("ts") or "")[:19] or None
+    except Exception:  # noqa: BLE001
+        pass
+
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return HTMLResponse(_DASH_GATEWAY_USAGE_HTML.replace("__DATA__", payload))
+
+
 async def dashboard_refinery(request: Request) -> HTMLResponse:
     """精炼层看板:refinery status.json(共享卷 ro)+ 图内 fact 层质量指标。"""
     driver = get_status_driver()
@@ -3943,6 +4291,9 @@ app = Starlette(
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/refinery", dashboard_refinery, methods=["GET"]),
+        Route("/dashboard/gateway_usage", dashboard_gateway_usage,
+              methods=["GET"]),
+        Route("/dashboard/pipeline", dashboard_pipeline, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
         Route("/dashboard/archive_episode", archive_episode, methods=["POST"]),

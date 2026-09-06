@@ -67,6 +67,25 @@ def _flatten_hooks(path: Path, scope: str) -> list[dict]:
     return out
 
 
+def _flatten_dsh_hooks(path: Path, scope: str) -> list[dict]:
+    """识别 DeepSeek Harness 用户 patch 中启用的 Hook Bridge。"""
+    try:
+        text = path.read_text(errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return [{"event": "配置解析", "matcher": "", "command": "",
+                 "source": str(path), "scope": scope, "group_index": 0,
+                 "hook_index": 0, "parse_error": type(exc).__name__}]
+    active_text = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    plugins = re.findall(
+        r"@deepseek-ai/dsh-hooks-(?:claude-code|codex)", active_text)
+    return [{
+        "event": "PluginMount", "matcher": "", "command": plugin,
+        "source": str(path), "scope": scope, "group_index": index,
+        "hook_index": 0, "timeout": None, "async": False,
+    } for index, plugin in enumerate(dict.fromkeys(plugins))]
+
+
 def _action(command: str) -> str:
     m = re.search(r"\bhook\s+(?:claude-code|codex|cursor)\s+([a-z-]+)", command)
     if m:
@@ -83,6 +102,8 @@ def _action(command: str) -> str:
         return "heartbeat"
     if "ops-hook-context.sh" in command:
         return "ops-context"
+    if "dsh-hooks-claude-code" in command or "dsh-hooks-codex" in command:
+        return "bridge"
     return "custom"
 
 
@@ -153,7 +174,13 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
                 "found": bool(paths), "resolved": [str(p) for p in paths],
             })
             for path in paths:
-                raw.extend(_flatten_hooks(path, source.get("scope", "")))
+                kind = source.get("kind")
+                if kind == "presence":
+                    continue
+                if kind == "dsh_cordis":
+                    raw.extend(_flatten_dsh_hooks(path, source.get("scope", "")))
+                else:
+                    raw.extend(_flatten_hooks(path, source.get("scope", "")))
 
         approval_text = ""
         approval_path = tool.get("approval")
@@ -223,7 +250,8 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
                    else "green" if items and any(x["configured"] for x in items) else "grey")
         inventories.append({
             "tool": tool["id"], "label": tool["label"], "state": overall,
-            "note": tool.get("note", ""), "sources": source_status, "hooks": items,
+            "difference": tool.get("difference", ""), "note": tool.get("note", ""),
+            "sources": source_status, "hooks": items,
             "summary": {
                 "total": len(items),
                 "configured": sum(1 for x in items if x["configured"]),

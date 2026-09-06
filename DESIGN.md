@@ -4,6 +4,12 @@
 >
 > 📌 **认知资产化改造计划见 [docs/LANDING-PLAN-cognitive-asset.md](docs/LANDING-PLAN-cognitive-asset.md)**（从囤积到经营：冻结→度量→降噪→防膨胀；含被拒处方清单——#2 讨论层 / #6 Discussion Insights 已明确否决，勿重启）。
 
+> **2026-08 当前模型边界（覆盖下文历史直连说明）**：kg-hub 业务层只提交
+> `kg_hub.entity_extract` business key；`model_gateway_client.py` 通过 NAS model-gateway
+> 调用。真实 provider、模型名、API key 和轮换全部属于网关/凭证层。kg-hub 仅持有独立
+> caller token，不读取 `ANTHROPIC_AUTH_TOKEN`，也不从 `~/.claude-mem/.env` 复制 provider
+> 凭证。自动健康检查只读本地/私网 ready 状态，绝不发送 messages 或付费模型请求。
+
 ---
 
 ## 1. 项目动机
@@ -104,6 +110,9 @@
 
 ### 决策 4：实体抽取继续用 qwen3.6-plus
 
+> ⚠️ **此处是历史模型选型，不再是调用契约。** 当前调用契约是
+> `kg_hub.entity_extract` business key；最终 provider/model 由 model-gateway 路由解析。
+
 **选择**：复用 claude-mem 现有的百炼 coding plan
 
 **Rejected**：
@@ -186,7 +195,8 @@
 - 默认 LLM 抽取的边类型是自创名字（如 `IMPLEMENTS_ARTIFACT`），不是 v0.2 schema 的 `implemented_as`。**必须通过 `entity_types=` / `edge_types=` 参数约束**
 - graphiti-core 0.29 的 Kuzu driver **不自动建 FTS 索引**，要手动 `INSTALL fts; LOAD fts;` + 跑 4 条 `CREATE_FTS_INDEX`
 - 调用 qwen3.6-plus 时必须注入 `extra_body={"thinking":{"type":"disabled"}}`，否则强制 tool_choice 被拒
-- `load_dotenv` 须传 `override=True`（Claude Code shell 自带 `ANTHROPIC_BASE_URL`）
+- （历史 SPIKE）当时直连端点时 `load_dotenv` 需要 `override=True`；生产代码现已禁止读取
+  claude-mem/provider token，只接受网关 caller token、私网 gateway URL 和 business key
 
 **含义**：
 - 原 Phase 1（自建 Memgraph + FastAPI + MCP，1 周预算）→ 缩减到"接 Graphiti"（1-2 天）
@@ -365,7 +375,7 @@ OpenClaw Gateway 内置一套事件钩子系统，5 个钩子：
 ### 决策 15：kg-hub server 鉴权模型 + OpenClaw 接入约定
 
 **选择**：
-- **鉴权**：`Authorization: Bearer <KG_HUB_API_TOKEN>` header，token 持久化在 `~/.claude-mem/.env`
+- **鉴权**：`Authorization: Bearer <KG_HUB_API_TOKEN>` header；服务端 token 持久化在 owner-only 的 `deploy/nas/.env`，客户端把同一 API token 放在各自工具的 owner-only 配置
 - **网络层**：只监听 Tailscale 网段（公网不开）—— 跟决策 7 "网络层走 Tailscale 内网" 一致
 - **OpenClaw 接入**：**读优先**（skill kg-query + curl wrapper），**写延后**（保留 rsync Phase 2 路径，写 plugin 到 3.F 再说）
 
@@ -376,7 +386,7 @@ OpenClaw Gateway 内置一套事件钩子系统，5 个钩子：
 
 **理由（鉴权）**：
 - Bearer token 实现简单（HTTP header 一行）
-- Token 复用 `~/.claude-mem/.env` 这个**项目已有的密钥存储**，零新机制
+- API token 与模型 caller token 分开：前者只鉴权客户端 HTTP，后者只供 kg-hub 调 model-gateway；provider 凭证只在 credvault
 - Tailscale 网段限制是 belt-and-suspenders 第二道防线
 
 **OpenClaw 接入两阶段**：
@@ -405,7 +415,7 @@ Phase 3.F（延后）：WRITE plugin 接入                                    �
 
 **含义**：
 - Phase 3.A 写的 FastAPI server 必须支持 `Authorization: Bearer ...` middleware
-- `~/.claude-mem/.env` 新增 `KG_HUB_API_TOKEN=<random-32-char>` 一行
+- `deploy/nas/configure-model-gateway-token.sh` 在服务端 0600 env 中生成 `KG_HUB_API_TOKEN`；客户端按工具保存对应 API token
 - OpenClaw VPS 的 `~/.openclaw/env.sh` 加 `KG_HUB_URL` + `KG_HUB_TOKEN`（同一 token）
 - kg-hub server bind 端口 8080，Tailscale IP 上监听（不绑 0.0.0.0 在公网）
 
@@ -750,7 +760,7 @@ WebDAV 同步根（公开内容）：
 | 中央 HTTP API | FastAPI (Python) | 仅用于 ingest `/api/ingest`，查询走 MCP |
 | 中央 MCP server | **Graphiti 内置 MCP** (Python) | 决策 9（取消原"Node.js 自写 MCP"计划） |
 | 设备端 push agent | Python + launchd / cron | 用户已熟悉 launchd 管理 |
-| LLM 调用 | qwen3.6-plus via 百炼 Anthropic 协议端点 | 决策 4 |
+| LLM 调用 | `kg_hub.entity_extract` via NAS model-gateway | 当前模型边界；决策 4 仅记录历史模型选择 |
 | Embedding | fastembed BAAI/bge-small-en-v1.5（local，384-dim） | SPIKE 验证可行，免外部依赖 |
 | 数据格式 | episode（自然语言 + 时间戳 + source）+ Cypher 查询 | 决策 10 |
 
@@ -784,6 +794,41 @@ WebDAV 同步根（公开内容）：
     - 实测 2026-05-21：手动 `kg_add_episode` 撞上正在跑的 ingester，需换 `source_obs_id` 重投才能成功（详见 README "故障排查"）
 
   **当时为什么接受**：Phase 2 阶段写入流量低（人肉触发居多），偶尔失败重投即可。**何时重新审视**：写入流量稳定上来后（OpenClaw push 模式上线 / 多设备同步启用），需要从 file lock 改成内存队列或 Redis 队列，让后台任务和 API 写入排同一个队列，不互相阻塞。
+
+- ✅ **MCP 进程泄漏兜底**（2026-07-17 上线）：MCP 客户端会话结束时不完全清理子进程 → 大量 orphaned MCP 服务器进程被 macOS 重 parent 到 launchd → 长时间累积（实测 10 天累积到 207 进程 / 3.28 GB RSS，最老 chroma-mcp 存活 10 天 13 小时）。**兜底策略**（分层）：
+
+  | 层 | 覆盖 | 频率 | 脚本 |
+  |---|---|---|---|
+  | 1 | orphaned `/muxcp -config` 进程（PPID=1） | 5 min | `~/.config/muxcp/bin/cleanup-orphan-muxcp.sh`（2026-05-25 起）|
+  | 2 | orphaned muxcp 子进程 + codex plugin server | 30 min | `~/.local/bin/mcp-orphan-sweep.sh`（2026-07-17 起）|
+
+  **Layer 2 特别规则**：
+  - **绝不触碰** `kg_hub_server.py`——`com.kg-hub.server.plist` 管理，PPID=1 是**合法状态**
+  - **绝不触碰** `/muxcp -config`——Layer 1 已覆盖，避免重复
+  - **绝不触碰** 任何 elapsed < 5 分钟的进程——launchd 重启窗口安全余量
+  - MAX_KILLS=50 上限——单次异常暴涨时自动 abort，触发人工介入
+  - 全流程 SIGTERM 优先 + 5s 后 SIGKILL 兜底
+  - 日志 `~/.kg-hub/logs/mcp-sweep.log`；禁用开关 `touch ~/.kg-hub/mcp-sweep.disabled`
+
+  **当时为什么接受**：muxcp 属自维护项目，理论上可加 `setsid()` + SIGTERM 转发给子进程根治，但短期优先修 Codex hybrid 用户体验，进程管理留待专门迭代。**何时重新审视**：muxcp 加了 signal 传播能力后，Layer 1/2 应被停用（保留脚本作为兜底但 LaunchAgent 禁用），验证 muxcp 自清能力至少 2 周稳定后再删。
+
+  **2026-07-17 update — muxcp 侧根治 fix 已落地（未推 upstream）**：
+
+  在 muxcp fork（`commiao/muxcp`）分支 `fix-stdio-child-reap` commit `f65eaa7` 里，改 `internal/gateway/backend.go` stdio 分支：不再走 `client.NewStdioMCPClient`（该 helper 在 mcp-go v0.45.0 `client/stdio.go:40` 硬编码 `context.Background()`，绕过了 muxcp 的 signal-aware ctx），改用底层 `transport.NewStdioWithOptions` + 显式 `Start(ctx)`，附带 `SysProcAttr{Setpgid:true}` 给子进程建独立 process group。
+
+  **两根本 bug 现在都修了**：
+  1. Bug 1（muxcp 侧）：stdio 分支不传 signal-aware ctx —— 已在本 commit 修
+  2. Bug 2（mcp-go 侧）：`NewStdioMCPClient` 内部硬编码 `Background()` —— 用底层 API 绕开（更彻底的修法需给 mcp-go 提 upstream PR）
+
+  **实测证据**（对照测试，子进程用 `sh -c 'cat > /dev/null; sleep 3600'` 故意不处理 EOF）：
+  - OLD binary: SIGTERM 后 muxcp 卡在 `cmd.Wait()`，`exit=None`，`sh` 子进程幸存 → 泄漏
+  - NEW binary: SIGTERM 后 6 秒内 muxcp `exit=0`，所有子进程被 SIGKILL → 干净
+
+  **部署**：`~/.local/bin/muxcp` 已换为新 binary（SHA `7d4f4353...`），旧 binary 备份为 `~/.local/bin/muxcp.bak.20260717-162049-pre-childreap`（SHA `4a14cb32...`）。
+
+  **仍需保留 Layer 1/2 sweep**：因为它们覆盖 SIGKILL / crash 场景（Go signal handler catch 不到），此类场景 muxcp fix 也救不了，兜底不可缺。
+
+  **何时重新审视兜底**：Layer 1/2 观察日志 2 周，若 `sweep=0 (no candidates)` 稳定 → 说明 muxcp fix 已覆盖绝大多数泄漏路径，可把 StartInterval 从 30 min 拉长到 6 h 或直接禁用（保留脚本文件作为紧急兜底）。
 
 ---
 

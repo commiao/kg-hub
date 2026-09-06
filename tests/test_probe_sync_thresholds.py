@@ -17,7 +17,7 @@ import tools.capture_probe as P
 M = 60
 
 
-def judge(lag, backlog_age_s, stamp_age_s=None):
+def judge(lag, backlog_age_s, stamp_age_s=None, sync_runs=0):
     """跑真实 probe_sync 的判定段：把 nas/local watermark 与积压时长喂进去。
 
     通过 monkeypatch 让取数返回合成值，判定逻辑本体不复刻。"""
@@ -41,7 +41,18 @@ def judge(lag, backlog_age_s, stamp_age_s=None):
             return type("S", (), {"st_mtime": time.time() - (stamp_age_s or 0)})()
     orig_stamp, orig_log = P.SYNC_STAMP, P.SYNC_LOG
     P.SYNC_STAMP = _Stamp
-    P.SYNC_LOG = type("L", (), {"exists": staticmethod(lambda: False)})
+    # 同步器在积压窗口内"真正执行了几次"是第四轮判据的核心维度：
+    # 墙钟时长在可休眠设备上不代表机会次数（笔记本睡着时任务根本不触发）。
+    if sync_runs:
+        base = time.time() - (backlog_age_s or 0) + 1
+        text = "\n".join(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base + i))
+            + "  synced (obs MAX id=1000)" for i in range(sync_runs))
+        P.SYNC_LOG = type("L", (), {
+            "exists": staticmethod(lambda: True),
+            "read_text": staticmethod(lambda *a, **k: text)})
+    else:
+        P.SYNC_LOG = type("L", (), {"exists": staticmethod(lambda: False)})
     try:
         return P.probe_sync(local_max, "dummy-host")["state"]
     finally:
@@ -57,16 +68,22 @@ CASES = [
     (56,   3*M,    5*M,   P.GREEN, "实测最忙单周期 56 条，刚积压 → 健康"),
     (600,  2*M,    2*M,   P.GREEN, "积压 600 条但刚产生 → 追赶中，不是故障"),
     (3,   30*M,   30*M,   P.AMBER, "积压等了 30 分钟(跳过 1 周期) → 留意"),
-    (41,  66*M,   66*M,   P.RED,   "8-21 真故障：积压等了 66 分钟"),
-    (1,   46*M,   46*M,   P.RED,   "只差 1 条但已等 46 分钟 → 仍是故障(时间才是判据)"),
+    # ↓ 第四轮判据（2026-09-03）：RED 要求同步器**真的跑过 ≥3 次仍未追平**。
+    #   此前这两例只按墙钟时长判红，而墙钟在可休眠设备上会把"机器睡着"读成"同步失败"。
+    (41,  66*M,   66*M,   P.RED,   "8-21 真故障：积压 66 分钟且同步器跑了 5 次仍未追平", 5),
+    (1,   46*M,   46*M,   P.RED,   "只差 1 条但同步器跑了 4 次都没搬动 → 真卡住", 4),
+    (41,  66*M,   66*M,   P.AMBER, "★同样积压 66 分钟，但同步器只跑了 1 次(机器在睡) → 不告警", 1),
+    (41,  66*M,   66*M,   P.AMBER, "★同样积压 66 分钟，同步器一次都没轮到 → 不告警", 0),
     (10,  None,   50*M,   P.AMBER, "算不出等待时长(库读不到) → 留意但不告警，不猜"),
 ]
 ok = fail = 0
-for lag, bage, sage, want, why in CASES:
-    got = judge(lag, bage, sage)
+for case in CASES:
+    lag, bage, sage, want, why = case[:5]
+    runs = case[5] if len(case) > 5 else 0
+    got = judge(lag, bage, sage, runs)
     mark = "✅" if got == want else "❌"
     ok, fail = (ok + 1, fail) if got == want else (ok, fail + 1)
     ba = "—" if bage is None else f"{bage//60}分"
-    print(f"  {mark} 落差{lag:>4} / 积压{ba:>4} / 上次同步{sage//60:>4}分前 → {got:<5} (期望 {want:<5}) {why}")
+    print(f"  {mark} 落差{lag:>4} / 积压{ba:>4} / 同步器跑{runs}次 → {got:<5} (期望 {want:<5}) {why}")
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

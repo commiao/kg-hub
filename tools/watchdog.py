@@ -16,7 +16,7 @@ Anomalies tracked:
   server_down       /health not reachable
   queue_backlog     pending > BACKLOG_THRESHOLD
   stuck_jobs        oldest_pending_age > STUCK_THRESHOLD min
-  recent_errors     errored_last_1h > 0（新增错误；持续故障时会归零，见下）
+  recent_errors     errored_last_1h > 2（新增错误突增；持续故障时会归零，见下）
   extraction_failing  errored_total > 阈值（存量卡住，持续故障的诚实信号）
   capture_probe_stale  设备明确在线但采集探针超时
   capture_monitor_unhealthy  topology/Tailscale 监控证据源不可判
@@ -46,8 +46,10 @@ from utils.device_liveness import (DEFAULT_CAPTURE_STALE_AFTER_S,
                                    load_config, load_status, normalize_host,
                                    positive_int)
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+from kg_hub_env import load_kg_hub_env
+
+# kg-hub 自己的 .env(容器里通常不存在,配置来自 compose);绝不读 claude-mem 的私有目录
+load_kg_hub_env(override=True)
 
 
 KG_HUB_URL = os.environ.get("KG_HUB_URL", "http://127.0.0.1:8080")
@@ -417,15 +419,52 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         tuple(dict.fromkeys(error for error in source_errors if error)))
 
 
+# unknown 最多沿用几轮。
+# 沿用是为了防"读不到就当 resolved"的假恢复（原设计意图）；但**无限**沿用有两个
+# 反效果：①故障其实已结束却永不 CLEAR ②探针每次上报失败都把旧灯拖着亮，
+# 表现为抖动/粘滞（2026-09-03 实测：探针 POST kg-hub 收到 55 次 502，
+# 每次都让本轮不可判 → 沿用旧 blocked）。
+# 越过上限后不再断言一个无法验证的结论，"看不见"这件事本身交给
+# capture_monitor_unhealthy / capture_probe_stale 表达——一个故障不报两条。
+CAPTURE_UNKNOWN_HOLD_ROUNDS = int(os.environ.get("KG_HUB_CAPTURE_UNKNOWN_HOLD", "3"))
+
+
+def _hold_or_release(kind: str, prev_bad: bool, streak: int, details: dict,
+                     what: str) -> bool:
+    """unknown 轮的沿用/释放决策。返回本轮该不该继续判 bad。"""
+    if not prev_bad:
+        return False
+    if streak <= CAPTURE_UNKNOWN_HOLD_ROUNDS:
+        details[kind] = (f"{what}本轮不可判，沿用上一轮状态"
+                         f"（第 {streak}/{CAPTURE_UNKNOWN_HOLD_ROUNDS} 轮）")
+        return True
+    # 停止沿用。CLEAR 文案必须说明这不是"已修复"，否则就是又一个撒谎的信号。
+    details[f"{kind}:clear"] = (
+        f"连续 {streak} 轮无法判定，停止沿用未经验证的结论 —— "
+        f"**这不等于故障已修复**；证据源本身的问题见 capture_monitor_unhealthy / "
+        f"capture_probe_stale")
+    return False
+
+
 def apply_capture_decision(decision: CaptureDecision, prev_anomalies: dict,
-                           new_anomalies: dict, details: dict) -> None:
-    """把三态判定并入 edge-trigger 状态，unknown 明确沿用 prev。"""
+                           new_anomalies: dict, details: dict,
+                           prev_counters: dict | None = None,
+                           new_counters: dict | None = None) -> None:
+    """把三态判定并入 edge-trigger 状态。
+
+    unknown 沿用 prev，但**有上限**（见 CAPTURE_UNKNOWN_HOLD_ROUNDS）。
+    不传 counters 时退化为单轮行为（streak 恒为 1），与旧调用方兼容。
+    """
+    prev_counters = prev_counters if prev_counters is not None else {}
+    new_counters = new_counters if new_counters is not None else {}
     if decision.blocked is None:
-        new_anomalies["capture_blocked"] = bool(
-            prev_anomalies.get("capture_blocked", False))
-        if new_anomalies["capture_blocked"]:
-            details["capture_blocked"] = "采集链路状态本轮不可判，沿用上一轮阻塞状态"
+        streak = int(prev_counters.get("capture_blocked_unknown", 0)) + 1
+        new_counters["capture_blocked_unknown"] = streak
+        new_anomalies["capture_blocked"] = _hold_or_release(
+            "capture_blocked", bool(prev_anomalies.get("capture_blocked", False)),
+            streak, details, "采集链路状态")
     else:
+        new_counters["capture_blocked_unknown"] = 0
         new_anomalies["capture_blocked"] = bool(decision.blocked)
         if decision.blocked:
             details["capture_blocked"] = (
@@ -433,12 +472,14 @@ def apply_capture_decision(decision: CaptureDecision, prev_anomalies: dict,
                 + "\n看 /dashboard/topology")
 
     if decision.stale is None:
-        new_anomalies["capture_probe_stale"] = bool(
-            prev_anomalies.get("capture_probe_stale", False))
-        if new_anomalies["capture_probe_stale"]:
-            details["capture_probe_stale"] = (
-                "设备在线/探针状态本轮不可判，沿用上一轮失联状态")
+        streak = int(prev_counters.get("capture_probe_stale_unknown", 0)) + 1
+        new_counters["capture_probe_stale_unknown"] = streak
+        new_anomalies["capture_probe_stale"] = _hold_or_release(
+            "capture_probe_stale",
+            bool(prev_anomalies.get("capture_probe_stale", False)),
+            streak, details, "设备在线/探针状态")
     else:
+        new_counters["capture_probe_stale_unknown"] = 0
         new_anomalies["capture_probe_stale"] = bool(decision.stale)
         if decision.stale:
             details["capture_probe_stale"] = (
@@ -587,14 +628,24 @@ def main() -> int:
                     + (f"样本原因:{why}" if why else "")
                     + " → 多为 LLM 供应商失效(key 过期/配额/限流),查 kg_hub_server 日志"
                 )
-            if errored_1h > 0:
+            # 门槛取自真实分布(2026-09-03 复盘本机 alerts.log 的 16 次 FIRE):
+            #   1 条 → 12 次(75%)  2 条 → 1 次  5/7/35 条 → 各 1 次
+            # 四分之三的告警只有 1 条错误,而那正是弱模型偶发不遵守输出契约
+            #   (EdgeDuplicate/ExtractedEntities 少填必填字段;实测 24h 仅 4 条、
+            #   单次即自愈)。">0 就报"把这类噪音与真事故塞进同一条通道。
+            # 之所以敢抬门槛:持续失败**已由 extraction_failing 独立覆盖** —— 它测
+            # 存量(errored_total > 5),正是为"告警在故障持续期自己 CLEAR"补的判据。
+            # 故 recent_errors 只需回答"是否突然冒出一批新错误"。门槛 2 保留了
+            # 5/7/35 那三次真事故,压掉 13/16 的噪音。
+            err_1h_gate = int(cfg.get("recent_error_threshold", 2))
+            if errored_1h > err_1h_gate:
                 new_anomalies["recent_errors"] = True
                 samples = stats.get("recent_error_samples") or []
                 sample_txt = "; ".join(
                     f"{s.get('sid', '?')}: {s.get('error', '')}" for s in samples[:3]
                 )
                 details["recent_errors"] = (
-                    f"{errored_1h} errored in last hour"
+                    f"{errored_1h} errored in last hour(门槛 {err_1h_gate})"
                     + (f" — {sample_txt}" if sample_txt else "")
                 )
 
@@ -609,10 +660,13 @@ def main() -> int:
             details["falkordb_slow"] = pmsg
 
     # 2c. 采集链路（各设备/工具 → claude-mem → SQLite → NAS → kg-hub）
+    # counters 跨轮持久化，unknown 沿用才有"连续第几轮"可数。
+    prev_counters = state.get("counters", {}) or {}
+    new_counters: dict = {}
     if cfg.get("capture_chain_enabled", True):
         apply_capture_decision(
             check_capture_chain(cfg) if alive else CaptureDecision(None, None),
-            prev_anomalies, new_anomalies, details)
+            prev_anomalies, new_anomalies, details, prev_counters, new_counters)
 
     # 3. edge-triggered alerts (only on state transitions)
     for kind, is_bad_now in new_anomalies.items():
@@ -620,11 +674,14 @@ def main() -> int:
         if is_bad_now and not was_bad:
             emit_alert("fire", kind, details.get(kind, "anomaly detected"))
         elif was_bad and not is_bad_now:
-            emit_alert("clear", kind, "resolved")
+            # CLEAR 默认"resolved"，但"停止沿用未经验证的结论"不是恢复，
+            # 必须用各判据自己给的文案，否则发出的是一条假恢复。
+            emit_alert("clear", kind, details.get(f"{kind}:clear", "resolved"))
 
     # 4. persist state
     save_state({
         "anomalies": new_anomalies,
+        "counters": new_counters,
         "last_run": now_iso(),
         "last_stats": stats,
     })

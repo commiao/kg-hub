@@ -43,7 +43,7 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path.home() / ".claude-mem" / ".env", override=False)
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=False)
 except Exception:
     pass
 

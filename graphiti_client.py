@@ -2,7 +2,7 @@
 Shared Graphiti client factory.
 
 Extracted from spike-graphiti/spike.py so ingesters reuse identical wiring:
-- LLM: qwen3.6-plus via 百炼 Anthropic adapter (with thinking forced off)
+- LLM: logical ``kg_hub.entity_extract`` route via the NAS model gateway
 - Embedder: fastembed BAAI/bge-small-en-v1.5 (384-dim, local)
 - Cross encoder: noop pass-through (we don't use reranking yet)
 - Graph: FalkorDB (Redis-protocol, runs in Docker container `kg-hub-falkordb`)
@@ -16,29 +16,32 @@ lock (Phase 1 → Phase 2 requires concurrent ingest + MCP read).
 import asyncio
 import os
 import threading
-import time
+import typing
 from pathlib import Path
 
 # MUST be set before graphiti_core imports (EMBEDDING_DIM is a frozen pydantic field).
 os.environ.setdefault("EMBEDDING_DIM", "384")
 
 # Force fully-sequential LLM calls inside Graphiti (per-episode entity/edge
-# extraction otherwise fans out up to SEMAPHORE_LIMIT=20 concurrent calls, which
-# trips 百炼's "concurrency allocated quota exceeded" 429s). Set before any
+# extraction otherwise fans out up to SEMAPHORE_LIMIT=20 concurrent paid calls).
+# Set before any
 # graphiti_core import so helpers.SEMAPHORE_LIMIT picks it up.
 os.environ.setdefault("SEMAPHORE_LIMIT", "1")
 
-from dotenv import load_dotenv
+from kg_hub_env import load_kg_hub_env
 
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+load_kg_hub_env(override=True)
 
-from anthropic import AsyncAnthropic
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client import LLMConfig
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
+from graphiti_core.llm_client.client import ModelSize
+from graphiti_core.prompts.models import Message
+from model_gateway_client import create_gateway_client, gateway_model, gateway_token
+from pydantic import BaseModel
 
 # --- Perf fix (task #7): make EDGE dedup vector-only ---------------------------
 # resolve_extracted_edges() runs EDGE_HYBRID_SEARCH_RRF (bm25 fulltext + cosine
@@ -62,7 +65,7 @@ if _cosine_methods:
 
 
 # FalkorDB connection (Docker container `kg-hub-falkordb`). Reads from
-# ~/.claude-mem/.env (loaded above) so we never hardcode the password.
+# kg-hub's project .env (loaded above) so we never hardcode the password.
 #
 # FalkorDB multi-tenancy: graphiti routes writes to a graph named after the
 # `group_id` parameter on add_episode(). We deliberately align the driver-level
@@ -74,47 +77,52 @@ FALKORDB_PORT = int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379"))
 FALKORDB_DATABASE = os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub")
 
 
+class SingleAttemptAnthropicClient(AnthropicClient):
+    """Graphiti 0.29.0 adapter with no semantic retry loop.
+
+    The upstream ``AnthropicClient.generate_response`` retries parsing and
+    Pydantic validation failures twice, turning one Graphiti operation into as
+    many as three paid model requests.  Transport retries are already disabled
+    in :mod:`model_gateway_client`; this override also makes the semantic layer
+    exactly one attempt.  Callers may retry only as a new, explicit business
+    operation after observing the failure.
+    """
+
+    async def generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+        group_id: str | None = None,
+        prompt_name: str | None = None,
+    ) -> dict[str, typing.Any]:
+        del group_id  # retained for graphiti-core's public method contract
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        response, input_tokens, output_tokens = await self._generate_response(
+            messages, response_model, max_tokens, model_size
+        )
+        self.token_tracker.record(prompt_name, input_tokens, output_tokens)
+        if response_model is not None:
+            # Validation errors intentionally propagate.  In particular, never
+            # append a corrective prompt and make another paid request.
+            return response_model(**response).model_dump()
+        return response
+
+
 def build_llm() -> AnthropicClient:
-    auth_token = os.environ["ANTHROPIC_AUTH_TOKEN"]
-    base_url = os.environ["ANTHROPIC_BASE_URL"]
-    model = os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus")
+    # LLMConfig insists on a non-empty key although the separately constructed
+    # SDK client owns transport. Reuse the gateway caller token, never a direct
+    # provider or legacy ANTHROPIC_AUTH_TOKEN.
+    auth_token = gateway_token()
+    model = gateway_model()
     cfg = LLMConfig(api_key=auth_token, model=model, max_tokens=4096)
-    # 百炼 coding plan has concurrent-request quota; bump retries so transient
-    # 429s ride out within the SDK rather than failing whole episodes.
-    # timeout: without it, a half-open socket (e.g. after the Mac sleeps and the
-    # connection is silently dropped) wedges a request forever — the whole ingest
-    # hangs with 0 progress. A per-request timeout makes it fail fast and retry.
-    async_client = AsyncAnthropic(
-        auth_token=auth_token, base_url=base_url, max_retries=5, timeout=120.0
-    )
-
-    # 百炼 qwen3.6-plus runs in thinking mode by default, which forbids
-    # forced tool_choice. Inject thinking={"type":"disabled"} on every call.
-    orig_create = async_client.messages.create
-
-    # Rate limit: 百炼 plan allows ~6000 calls / 5h (≈20/min). Enforce a minimum
-    # gap between call STARTS so we stay under quota and leave headroom for other
-    # apps. Default 4s ≈ 15/min ≈ 4500/5h (~75% of quota). Tune via
-    # KG_HUB_LLM_MIN_INTERVAL_SEC. Combined with SEMAPHORE_LIMIT=1, calls are fully
-    # sequential — the lock is held across the sleep so starts are strictly spaced.
+    # Gateway owns provider choice and cost ceilings. SDK transport retries are
+    # disabled centrally; every logical call gets one stable Idempotency-Key.
     min_interval = float(os.environ.get("KG_HUB_LLM_MIN_INTERVAL_SEC", "4.0"))
-    throttle_lock = asyncio.Lock()
-    last_call = {"t": 0.0}
-
-    async def create_with_thinking_off(*args, **kwargs):
-        extra_body = dict(kwargs.get("extra_body") or {})
-        extra_body.setdefault("thinking", {"type": "disabled"})
-        kwargs["extra_body"] = extra_body
-        if min_interval > 0:
-            async with throttle_lock:
-                wait = min_interval - (time.monotonic() - last_call["t"])
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                last_call["t"] = time.monotonic()
-        return await orig_create(*args, **kwargs)
-
-    async_client.messages.create = create_with_thinking_off  # type: ignore[assignment]
-    return AnthropicClient(config=cfg, client=async_client)
+    async_client = create_gateway_client(timeout=120.0, min_interval=min_interval)
+    return SingleAttemptAnthropicClient(config=cfg, client=async_client)
 
 
 class FastembedEmbedder(EmbedderClient):
@@ -204,7 +212,7 @@ async def build_graphiti(
         llm_client=build_llm(),
         embedder=FastembedEmbedder(),
         cross_encoder=NoOpCrossEncoder(),
-        # 百炼 coding plan throttles on concurrent LLM calls. Serialize.
+        # Keep business extraction serialized; gateway applies the signed ceiling.
         max_coroutines=1,
     )
     await g.build_indices_and_constraints()

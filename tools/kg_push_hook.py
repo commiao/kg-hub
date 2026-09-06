@@ -48,11 +48,11 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Load FalkorDB credentials from ~/.claude-mem/.env (kg-hub convention).
+# Load FalkorDB credentials from kg-hub's project .env.
 # Best-effort: if dotenv is missing or .env is absent, we fall back to env vars.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path.home() / ".claude-mem" / ".env", override=False)
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 except Exception:
     pass
 

@@ -253,19 +253,20 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
   padding:14px;margin-bottom:16px}
 .hookgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px}
 .toolcard{border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.toolhead{display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--band)}
-.toolhead b{flex:1}.toolnote{font-size:11px;color:var(--mut);padding:0 12px 8px;background:var(--band)}
-.hrow{display:grid;grid-template-columns:92px minmax(110px,.8fr) minmax(180px,1.5fr);
+.toolhead{display:flex;align-items:center;gap:8px;padding:9px 12px;background:var(--band)}
+.toolhead b{flex:1}.tooldiff{font-size:10.5px;color:var(--mut);padding:0 12px 8px;background:var(--band)}
+.hrow{display:grid;grid-template-columns:88px minmax(130px,1fr) minmax(105px,.7fr);
   gap:8px;padding:9px 12px;border-top:1px solid var(--line);font-size:11.5px}
 .hrow .event{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mut)}
-.hrow .purpose{color:var(--fg)}.hrow .meta{color:var(--mut);font-size:10.5px;margin-top:3px}
+.hrow .meta{color:var(--mut);font-size:10.5px;margin-top:3px}.hstatus{text-align:right}
 .hrow.red{border-left:3px solid var(--red)}.hrow.green{border-left:3px solid var(--green)}
 .hrow.grey{border-left:3px solid var(--grey)}.hrow.amber{border-left:3px solid var(--amber)}
-.srcs{font-size:10.5px;color:var(--mut);padding:8px 12px;border-top:1px solid var(--line)}
+.srcs{font-size:10.5px;color:var(--mut);padding:7px 12px;border-top:1px solid var(--line)}
+.srcs summary{cursor:pointer}.srcs div{margin-top:5px;line-height:1.5}
 .statusdot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .statusdot.green{background:var(--green)}.statusdot.amber{background:var(--amber)}
 .statusdot.red{background:var(--red)}.statusdot.grey{background:var(--grey)}
-@media(max-width:700px){.hrow{grid-template-columns:82px 1fr}.hrow .purpose{grid-column:1/-1}}
+@media(max-width:700px){.hrow{grid-template-columns:82px 1fr}.hstatus{grid-column:1/-1;text-align:left}}
 </style>
 <a class=back href="/portal">← 报表门户</a>
 <h1>采集链路拓扑</h1>
@@ -334,9 +335,9 @@ function switchView(view){
 }
 
 function evidenceText(e){
-  if(!e) return '无执行证据';
-  const age = e.age_s!=null ? ` · ${fmt(e.age_s)}前` : '';
-  return `${e.detail||e.kind||'无执行证据'}${age}`;
+  if(!e||e.kind==='none') return '未验证';
+  const age = e.age_s!=null ? `${fmt(e.age_s)}前` : '已见';
+  return e.kind==='hook-log' ? `日志 ${age}` : `下游 ${age}`;
 }
 
 function renderHooks(){
@@ -346,24 +347,30 @@ function renderHooks(){
     if(!inv.length) return `<div class=hookhost><b>${esc(s._host)}</b><div class=empty>该探针版本尚未上报 hook_inventory</div></div>`;
     const cards = inv.map(t=>{
       const sum=t.summary||{};
-      const rows=(t.hooks||[]).map(h=>`<div class="hrow ${esc(h.state||'grey')}">
-        <div><span class="statusdot ${esc(h.state||'grey')}"></span>
-          <span class=event>${esc(h.event||'—')}</span>
-          ${h.matcher?`<div class=meta>匹配 ${esc(h.matcher)}</div>`:''}</div>
-        <div><b>${esc(h.label||h.component)}</b><div class=meta>${esc(h.action||'')}</div></div>
-        <div class=purpose>${esc(h.purpose||'未登记用途')}
-          <div class=meta>配置：${h.configured?'存在':'缺失'} · 批准：${esc(h.approval||'n/a')} · 范围：${esc(h.scope||'—')}
-            ${h.coverage?` · ⚠ ${esc(h.coverage)}`:''}</div>
-          <div class=meta>执行：${esc(evidenceText(h.runtime_evidence))}</div>
-          <div class=meta>来源：${esc(h.source||'—')}</div>
-        </div></div>`).join('');
+      const rows=(t.hooks||[]).map(h=>{
+        const status=!h.configured?(h.state==='red'?'缺失':'未配置'):
+          h.approval==='missing'?'未批准':h.state==='amber'?'范围受限':'已配置';
+        return `<div class="hrow ${esc(h.state||'grey')}">
+          <div><span class="statusdot ${esc(h.state||'grey')}"></span>
+            <span class=event>${esc(h.event||'—')}</span>
+            ${h.matcher?`<div class=meta>${esc(h.matcher)}</div>`:''}</div>
+          <div><b>${esc(h.label||h.component)}</b>
+            <div class=meta>${esc(h.purpose||h.action||'—')}</div></div>
+          <div class=hstatus><b>${esc(status)}</b>
+            <div class=meta>${esc(h.scope||'—')} · ${esc(evidenceText(h.runtime_evidence))}</div>
+            ${h.coverage?`<div class=meta>⚠ ${esc(h.coverage)}</div>`:''}
+          </div></div>`;
+      }).join('');
       const src=(t.sources||[]).map(x=>`${x.found?'✓':'—'} ${x.scope||''} ${x.path}`).join(' · ');
+      const found=(t.sources||[]).filter(x=>x.found).length, total=(t.sources||[]).length;
+      const summary=sum.total?`${sum.configured||0}/${sum.total} 已配`:'不适用';
       return `<section class=toolcard>
         <div class=toolhead><span class="statusdot ${esc(t.state)}"></span><b>${esc(t.label)}</b>
-          <span class=pill>${sum.configured||0} 已配 / ${sum.missing||0} 缺失${sum.unapproved?` / ${sum.unapproved} 未批准`:''}${sum.limited_scope?` / ${sum.limited_scope} 范围受限`:''}</span></div>
-        ${t.note?`<div class=toolnote>${esc(t.note)}</div>`:''}
-        ${rows||'<div class=empty>此工具没有本机 IDE hook</div>'}
-        <div class=srcs>配置源：${esc(src||'无（不适用）')}</div>
+          <span class=pill>${summary}${sum.unapproved?` · ${sum.unapproved} 未批准`:''}${sum.limited_scope?` · ${sum.limited_scope} 受限`:''}</span></div>
+        ${t.difference?`<div class=tooldiff>${esc(t.difference)}</div>`:''}
+        ${rows||'<div class=empty>无本机 IDE Hook</div>'}
+        ${total?`<details class=srcs><summary>配置源 ${found}/${total}</summary><div>${esc(src)}</div></details>`:
+          '<div class=srcs>无本机配置源</div>'}
       </section>`;
     }).join('');
     return `<div class=hookhost><div class=hh><b>${esc(s._host)}</b>

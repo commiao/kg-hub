@@ -14,7 +14,8 @@
 # 才发飞书,平时静默。
 
 CPU_TIME_THRESHOLD=120   # 累计 CPU 秒数;超过即判定空转
-ENV_FILE="$HOME/.claude-mem/.env"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENV_FILE=${KG_HUB_ENV_FILE:-"$SCRIPT_DIR/../.env"}
 LOG="$HOME/.kg-hub/logs/claude-mem-guard.log"
 mkdir -p "$(dirname "$LOG")"
 ts() { date '+%F %T'; }

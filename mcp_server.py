@@ -39,8 +39,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+from kg_hub_env import load_kg_hub_env
+load_kg_hub_env(override=True)
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -245,7 +245,7 @@ async def kg_add_episode(
         return {
             "status": "error",
             "code": "missing_token",
-            "message": "KG_HUB_API_TOKEN not set in ~/.claude-mem/.env",
+            "message": "KG_HUB_API_TOKEN not set in kg-hub's own .env",
         }
 
     body = {

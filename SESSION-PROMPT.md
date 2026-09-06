@@ -1,5 +1,10 @@
 # 新会话启动 prompt
 
+> ⚠️ **历史 Phase 0 启动材料**：项目现已进入生产阶段，不能把本页当作当前部署手册。
+> 当前模型契约只有 `kg_hub.entity_extract` business key + 独立 gateway caller token；真实
+> provider/model/API key 由 NAS model-gateway 管理。禁止从 `~/.claude-mem/.env` 复制凭证，
+> 自动心跳只检查 ready/连接状态，不发送模型请求。
+
 > 把下面这段 **完整复制** 粘到新会话的第一条消息里。
 > 不要省略，不要简写——目的就是让新会话的 AI 不用看上文也能上下文齐全。
 
@@ -32,7 +37,8 @@
 - 父项目 claude-mem 已经稳定运行，**绝对不要动它的任何文件**
 - **Phase 0 的数据源是 OpenClaw 胶囊导出**（不是 claude-mem obs），导出快照放在 `kg-hub/data/openclaw-snapshot-2026-05-14/`（如果还没导出，先提醒用户导出）
 - claude-mem 的 SQLite 在 `~/.claude-mem/claude-mem.db`（**Phase 0 不用，Phase 2 才用**）
-- LLM 走阿里百炼 qwen3.6-plus（凭证在 `~/.claude-mem/.env`，不要打印 token）
+- LLM 只通过 `kg_hub.entity_extract` business key 调 NAS model-gateway；kg-hub 只持有独立
+  caller token，不读取或复制 `~/.claude-mem/.env` 中的 provider 凭证
 - 不要急着上技术栈，先把 Phase 0 的数据探索做扎实
 
 **禁止行为**：

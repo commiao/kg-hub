@@ -5,6 +5,10 @@
 >
 > 作者：本次会话分析产出　最后更新：2026-07-09　状态：**待执行（未提交）**
 
+> **部署命令说明（现行）**：本文的历史执行记录中可能保留旧的短 Compose
+> 命令；当前部署只使用 `deploy/nas/redeploy.sh`，或从仓库根目录显式带
+> `--env-file deploy/nas/.env -f docker-compose.yml -f deploy/model-gateway-network.override.yml -p kg-hub`。
+
 ---
 
 ## 0. 背景与判定原则
@@ -32,7 +36,7 @@ kg-hub 与文章里的个人 Obsidian **不是同一物种**：文章是「一�
 
 1. **FalkorDB 仅绑 NAS `127.0.0.1:6379`**，Mac 连不上；图谱读写脚本**必须在 NAS 上跑**（`ssh commiao@100.123.208.32`，key-based tailscale）。
 2. **server 无任意 Cypher 写端点**（安全姿态）；任何图谱写操作只能通过 NAS 上跑的受控管理脚本，**不新增公网写端点**。
-3. **部署纪律**：改 `kg_hub_server.py` / 过滤器配置等运行时文件 → `git commit && push` → 同步到 NAS `/volume1/docker/kg-hub-src` → `sudo -n docker compose -p kg-hub up -d --no-deps <svc>` → **校验 NAS sha == git HEAD**（PORTAL-HANDOFF 坑 #8）。compose project 名是 `kg-hub`（非目录名）。
+3. **部署纪律**：改 `kg_hub_server.py` / 过滤器配置等运行时文件 → `git commit && push` → 同步到 NAS `/volume1/docker/kg-hub-src` → 用 `deploy/nas/redeploy.sh` → **校验 NAS sha == git HEAD**（PORTAL-HANDOFF 坑 #8）。该脚本固定使用 canonical env、root compose、model-gateway 私网 override 和 `-p kg-hub`。
 4. **docs 不随 redeploy 部署**（redeploy 只同步 server 文件）；纯文档改动无需 redeploy，也不会造成漂移。
 5. **重新 ingest canonical 会重置 usage_count**（已知 bug，修复在分支未合，curate 时须避开重 ingest 路径）。
 6. 三容器 `kg_hub_server / watchdog / ingester` 共用镜像 `kg-hub-server:latest`。本地 Python 环境：`spike-graphiti/.venv/bin/python`。

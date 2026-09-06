@@ -85,5 +85,15 @@ for c in range(1, 21):
     total += len(calls)
 check(f"20 轮内只发 {total} 次请求(旧实现会发 20 次)", total <= 6)
 
+# 队头阻塞:冷却中的 id 不得占用积压名额(2026-09-06 积压 7919 三天零进展的直接机制)
+pending = list(range(1, 21))                 # 20 条待处理,按 id 升序
+cooling = {i: [3, 99] for i in range(1, 9)}  # 前 8 条正在退避(下次可试 cycle=99)
+picked = R.select_backlog_batch(pending, cooling, cycle=10, limit=8)
+check("冷却中的 8 条不占名额,轮到身后的 9..16", picked == list(range(9, 17)))
+picked = R.select_backlog_batch(pending, cooling, cycle=99, limit=8)
+check("退避到期后照常回到队头重试(不丢数据)", picked == list(range(1, 9)))
+check("无退避时与旧切片 [:N] 一致", R.select_backlog_batch(pending, {}, cycle=1, limit=8) == pending[:8])
+check("名额上限严格", len(R.select_backlog_batch(pending, {}, cycle=1, limit=3)) == 3)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

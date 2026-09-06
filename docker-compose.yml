@@ -6,10 +6,11 @@
 #
 # Layout on NAS:
 #   /volume1/docker/kg-hub-src/        <- this repo (Project folder = build context)
-#   /volume2/4T/kg-hub-data/falkordb  <- FalkorDB RDB+AOF (rsynced from Mac)
-#   /volume2/4T/kg-hub-data/models    <- fastembed bge-small cache
+#   ${KG_HUB_DATA_ROOT}/falkordb  <- FalkorDB RDB+AOF (rsynced from Mac)
+#   ${KG_HUB_DATA_ROOT}/models    <- fastembed bge-small cache
 #
-# Secrets come from .env in this same folder (see deploy/nas/.env.example).
+# Secrets come from the explicitly selected deploy/nas/.env
+# (template: deploy/nas/.env.example); do not rely on an implicit root .env.
 
 services:
   falkordb:
@@ -25,7 +26,7 @@ services:
       - "127.0.0.1:6379:6379"   # NAS-local only — never exposed on the network
       - "127.0.0.1:3001:3000"   # FalkorDB browser UI, NAS-local only
     volumes:
-      - /volume2/4T/kg-hub-data/falkordb:/var/lib/falkordb/data
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/falkordb:/var/lib/falkordb/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$FALKORDB_PASSWORD\" --no-auth-warning PING | grep -q PONG"]
       interval: 10s
@@ -57,7 +58,9 @@ services:
       # exact socket, keep the container networkless, and run only the fixed status command.
       - /volume2/@appdata/Tailscale/tailscaled.sock:/tailscale-var/tailscaled.sock:ro
       # Trusted mapping/threshold config stays outside this writable runtime directory.
-      - /volume2/4T/kg-hub-data/device-liveness/runtime:/device-liveness
+      # 与全局约定一致派生自单一数据根（test_nas_configuration 强制）：
+      # 硬编码路径会让换盘/迁移时漏改一处就静默挂错目录。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/runtime:/device-liveness
     tmpfs:
       - /tmp:size=4m,mode=1777
     logging:
@@ -104,9 +107,9 @@ services:
       - KG_HUB_FALKORDB_PORT=6379
       - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
       - KG_HUB_FALKORDB_DATABASE=kg_hub
-      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - KG_HUB_MODEL_GATEWAY_TOKEN=${KG_HUB_MODEL_GATEWAY_TOKEN:?set independent kg-hub caller token}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kg_hub.entity_extract}
       - EMBEDDING_DIM=384
       - FASTEMBED_CACHE_PATH=/models
       # HF unreachable from NAS container; model pre-seeded in /models, force offline.
@@ -123,17 +126,22 @@ services:
       # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
       - KG_HUB_REFINERY_STATUS=/refinery-state/status.json
       # device_liveness 容器每分钟写入真实 `tailscale status --json`；server
-      # 只读，用于让 dashboard 区分“设备睡眠”与“设备在线但探针失联”。
+      # 只读，用于让 dashboard 区分"设备睡眠"与"设备在线但探针失联"。
       - KG_HUB_DEVICE_LIVENESS_PATH=/device-liveness/tailscale-status.json
       - KG_HUB_DEVICE_LIVENESS_CONFIG=/device-liveness-config/device-liveness.json
       - KG_HUB_DEVICE_LIVENESS_MAX_AGE_S=180
+      # 门户「模型用量与成本」卡读 tools/export_gateway_usage.py 的快照(ro 共享卷)。
+      # 刻意不让 server 直连回滚见证库:网关把见证不可用当致命(对外 503),
+      # 请求路径上的读者一旦持锁就可能打挂整条链路(T-0046)。
+      - KG_HUB_GATEWAY_USAGE=/gateway-usage/usage.json
     volumes:
-      - /volume2/4T/kg-hub-data/models:/models
-      - /volume2/4T/kg-hub-data/ingest-backup:/backup
-      - /volume2/4T/kg-hub-data/refinery-state:/refinery-state:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/models:/models
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/ingest-backup:/backup
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/refinery-state:/refinery-state:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/gateway-usage:/gateway-usage:ro
       # 动态快照目录与可信配置分别只读挂载；producer 无法改告警策略。
-      - /volume2/4T/kg-hub-data/device-liveness/runtime:/device-liveness:ro
-      - /volume2/4T/kg-hub-data/device-liveness/device-liveness.json:/device-liveness-config/device-liveness.json:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/runtime:/device-liveness:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/device-liveness.json:/device-liveness-config/device-liveness.json:ro
     ports:
       # Host port 17171 (off the common 8080) -> container 8080. Bind to loopback
       # only: closes LAN exposure. Tailscale userspace networking auto-forwards
@@ -176,11 +184,22 @@ services:
       - KG_HUB_DISK_TEMP_WARN=${KG_HUB_DISK_TEMP_WARN:-59}
     volumes:
       - /run/synostorage/disks:/disktemp:ro   # 盘温直读(免 sudo)
-      - /volume2/4T/kg-hub-data/watchdog:/root/.kg-hub   # persist state + alerts.log
-      - /volume2/4T/kg-hub-data/device-liveness/runtime:/device-liveness:ro # public dynamic state
-      - /volume2/4T/kg-hub-data/device-liveness/device-liveness.json:/device-liveness-config/device-liveness.json:ro # trusted public rules
-      - /volume2/4T/kg-hub-data/notify-config:/config:ro # notify secret/rules; watchdog only
-    command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; sleep 90; done"]
+      # 用量导出:只读回滚见证 + 写快照给门户「模型用量与成本」卡。
+      # 导出器读**文件副本**,与活库零锁交互 —— 网关把见证不可用当致命(对外 503),
+      # 直接在活库上持锁可能打挂整条链路(T-0046 实测)。
+      # 设备在线快照(device-liveness 容器每 60s 写)。缺这个挂载会让
+      # check_capture_chain 拿不到独立 online 证据 → capture_monitor_unhealthy
+      # 永久亮灯:消费方代码已上线、输入挂载却没跟上(2026-09-03 查明)。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/runtime:/device-liveness:ro
+      # 可信告警策略（别名等）单独只读挂载；缺它 load_config() 恒返回 {}，
+      # device_state 的别名匹配整条失效（2026-09-03 查明 capture_device_aliases 未接线）。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/device-liveness.json:/device-liveness-config/device-liveness.json:ro
+      - /volume1/docker/model-gateway-witness:/witness:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/gateway-usage:/gateway-usage
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/watchdog:/root/.kg-hub   # persist state + alerts.log
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/notify-config:/config:ro # 热加载只需读；:ro 是安全约束(该目录含飞书密钥)，
+                                # 有 test_device_liveness 守着，别为"热加载"去掉它
+    command: ["sh", "-c", "sleep 25; while true; do python -m tools.watchdog || true; python -m tools.export_gateway_usage --witness /witness/rollback-witness.sqlite3 --out /gateway-usage/usage.json || true; sleep 90; done"]
 
   # Ongoing ingest worker (runs ON the NAS, always-on). The one-time claude-mem
   # rebuild is COMPLETE, so that step was dropped from the loop. This now drives
@@ -212,9 +231,9 @@ services:
       - KG_HUB_FALKORDB_PORT=6379
       - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
       - KG_HUB_FALKORDB_DATABASE=kg_hub
-      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - KG_HUB_MODEL_GATEWAY_TOKEN=${KG_HUB_MODEL_GATEWAY_TOKEN:?set independent kg-hub caller token}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kg_hub.entity_extract}
       - EMBEDDING_DIM=384
       - FASTEMBED_CACHE_PATH=/models
       # HF is unreachable from the NAS container (EADDRNOTAVAIL). Model is pre-seeded
@@ -224,9 +243,9 @@ services:
       - SEMAPHORE_LIMIT=1
       - KG_HUB_LLM_MIN_INTERVAL_SEC=4.0
     volumes:
-      - /volume2/4T/kg-hub-data/models:/models
-      - /volume2/4T/kg-hub-data/ingest-state:/app/data
-      - /volume2/4T/kg-hub-data/openclaw-src:/openclaw-src:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/models:/models
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/ingest-state:/app/data
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/openclaw-src:/openclaw-src:ro
     # canonical docs only. openclaw capsules 已改走 VPS 直推 /api/ingest
     # (2026-07-23,见 docs/KNOWLEDGE-GOVERNANCE.md)——此前这里和 Mac launchd
     # 各跑一条摄入线,双写重复入图;两条旧线同日退役,勿恢复。
@@ -272,6 +291,6 @@ services:
     volumes:
       # 群晖盘温直读(免sudo),温度门控数据源
       - /run/synostorage/disks:/disktemp:ro
-      - /volume2/4T/kg-hub-data/claude-mem:/data/claude-mem:ro
-      - /volume2/4T/kg-hub-data/refinery-state:/state
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/claude-mem:/data/claude-mem:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/refinery-state:/state
     command: ["sh", "-c", "sleep 40; python -m kg_refinery"]

@@ -13,7 +13,7 @@ Reuses Tier 1's injection↔session join (data/.push_hook.log + claude-mem.db). 
 scope caveat: this machine's Claude Code sessions only; still a proxy, not causal truth
 (Tier 3 ablation is the calibrator). Read-only — reports, does not write the graph yet.
 
-LLM: the project's 百炼-proxied Anthropic endpoint (ANTHROPIC_* in ~/.claude-mem/.env).
+LLM: the project's model gateway (business key and caller token in kg-hub .env).
 qwen3.6-plus runs in thinking mode, which forbids forced tool_choice → we ask for plain
 JSON and parse it, and inject thinking={"type":"disabled"} like graphiti_client.build_llm.
 Calls are throttled (百calls quota ~20/min) and sequential.
@@ -38,7 +38,7 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path.home() / ".claude-mem" / ".env", override=False)
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=False)
 except Exception:
     pass
 
@@ -75,13 +75,8 @@ _JSON_RE = re.compile(r"\{.*?\}", re.S)
 
 
 def build_client():
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(
-        auth_token=os.environ["ANTHROPIC_AUTH_TOKEN"],
-        base_url=os.environ["ANTHROPIC_BASE_URL"],
-        max_retries=4, timeout=120.0,
-    )
-    return client
+    from model_gateway_client import create_gateway_client
+    return create_gateway_client(timeout=120.0)
 
 
 async def judge_one(client, model, name, capsule, session) -> dict:

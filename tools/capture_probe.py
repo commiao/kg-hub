@@ -460,6 +460,43 @@ def probe_hooks(tool_seen: dict) -> list[dict]:
 
 _LOG_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
 _QUEUE_DEPTH_RE = re.compile(r"queueDepth=(\d+)")
+
+# 判「产出是否发生」，不枚举失败原因。
+# 上游错误码会变（401 invalid_api_key → 400 anthropic-beta → 502 网关），枚举字面量
+# 注定追不上：8/28 起故障形态从 401 换成 400，而判据仍锁在 401 上，于是采集静默
+# 5.5 天面板全绿。批次「有没有变成 observation」这件事与失败原因无关，才是该量的量。
+# outputClass=xml 成功落库、idle 无事可做；其余一律是「这批素材没了」。
+_OUTPUT_CLASS_RE = re.compile(r"outputClass=([A-Za-z_]+)")
+_GOOD_OUTPUT_CLASSES = frozenset({"xml", "idle"})
+# 连续丢弃多少批才判红。1~2 批可能是弱模型偶发不遵守输出契约（实测约 4 次/天，
+# 单次即自愈）；持续丢弃且期间零落库才是链路坏了。
+GENERATION_STALL_DISCARDS = 5
+# 从丢弃行里摘一句真实原因，避免 detail 里硬编码"401"这种会撒谎的措辞。
+# 按具体度排序：带状态码的错误最有用，泛化短语只作兜底。
+# re.search 取最左匹配，若把泛化短语放同一个 pattern 里，一行内同时出现时会
+# 抢到不那么具体的那个（实测："SDK authentication failed; API Error: 401 …"
+# 会摘出前者，丢掉真正可行动的 401）。
+_STATUS_RE = re.compile(r"(?:API Error|HTTP)[: ]+(\d{3})")
+# 上游把人话塞在 JSON 的 message 字段里；只报 `API Error: 400 {` 对半夜看告警的人毫无用处。
+_MESSAGE_RE = re.compile(r'"message"\s*:\s*"([^"]{1,120})"')
+_FALLBACK_HINT_RE = re.compile(
+    r"Prompt is too long|context_length_exceeded"
+    r"|SDK authentication failed|[Tt]imed? ?[Oo]ut")
+
+
+def _failure_hint(line: str) -> str | None:
+    """从日志行摘一句**可行动**的原因：状态码 + 上游 message。"""
+    status = _STATUS_RE.search(line)
+    message = _MESSAGE_RE.search(line)
+    if status is not None:
+        code = status.group(1)
+        return f"{code} {message.group(1)}" if message else f"HTTP {code}"
+    if message is not None:
+        return message.group(1)
+    hit = _FALLBACK_HINT_RE.search(line)
+    return hit.group(0).strip() if hit else None
+
+
 _WORKER_LOG_BLOCK_BYTES = 1024 * 1024
 
 
@@ -505,20 +542,35 @@ def _log_epoch(line: str) -> float | None:
 
 
 def _worker_generation_diagnostics() -> dict:
-    """把“进程活着”和“AI 生成链路可用”拆成两个独立信号。
+    """把“进程活着”和“素材真的变成了 observation”拆成两个独立信号。
 
-    `/api/health=ok` 只证明 worker HTTP 进程存在。若 SDK 鉴权失败晚于最新
-    observation，说明失败尚未被一次真实落库证明恢复，必须判红。日志里的队列深度
-    一并外露，帮助区分偶发请求失败和持续积压。
+    `/api/health=ok` 只证明 worker HTTP 进程存在。真正要回答的是：**送进去的批次
+    有没有变成 observation**。所以这里数的是「最新一条 observation 之后又有多少批
+    被丢弃」——与失败原因无关，401 / 400 / 502 / prompt-too-long 一视同仁。
+
+    空闲免疫：没有流量就没有丢弃，`discards_since_observation` 恒为 0，不会因为
+    “夜里没人干活所以没有新 observation”而误判——那正是此前三轮误报的病根。
     """
+    observation_epoch = None
+    if CM_DB.exists():
+        try:
+            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            row = con.execute("SELECT MAX(created_at_epoch) FROM observations").fetchone()
+            con.close()
+            observation_epoch = _epoch_seconds(row[0] if row else None)
+        except Exception:  # noqa: BLE001 - DB 读失败由 storage 节点独立报告
+            pass
+
     failure_epoch = queue_depth = queue_epoch = None
+    discards = 0
+    failure_hint = None
     try:
         logs = sorted(CM_LOG_DIR.glob("claude-mem-*.log"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         logs = []
     # worker 会同时写按启动日与按自然日命名的多个日志，不能只看 mtime 最新的一份。
-    # 取最近活跃的四份，按行内时间戳合并“最新失败”和“最新队列深度”。
+    # 取最近活跃的四份，按行内时间戳合并“最新失败”“最新队列深度”“丢弃计数”。
     for path in logs[:4]:
         path_failure = path_queue_depth = path_queue_epoch = None
         for line in _worker_log_lines_reverse(path):
@@ -529,8 +581,24 @@ def _worker_generation_diagnostics() -> dict:
                     path_queue_epoch = _log_epoch(line)
             if path_failure is None and "SDK authentication failed" in line:
                 path_failure = _log_epoch(line)
-            if path_failure is not None and path_queue_depth is not None:
-                break
+            cls = _OUTPUT_CLASS_RE.search(line)
+            is_discard = cls is not None and cls.group(1) not in _GOOD_OUTPUT_CLASSES
+            line_epoch = _log_epoch(line)
+            newer_than_obs = (observation_epoch is None or line_epoch is None
+                              or line_epoch > observation_epoch)
+            if is_discard:
+                # 只数「比最新 observation 更新」的丢弃：更早的已被一次成功落库证明翻篇。
+                if newer_than_obs:
+                    discards += 1
+                elif line_epoch is not None:
+                    # 倒读时已越过最新 observation，本文件再往前都是旧账，停。
+                    break
+            # 原因提取与丢弃计数解耦：鉴权失败行不带 outputClass，但同样要如实报因。
+            if failure_hint is None and newer_than_obs:
+                failure_hint = _failure_hint(line)
+            if path_failure is not None and path_queue_depth is not None and discards:
+                if observation_epoch is None:
+                    break
         if path_failure is not None and (
                 failure_epoch is None or path_failure > failure_epoch):
             failure_epoch = path_failure
@@ -539,28 +607,22 @@ def _worker_generation_diagnostics() -> dict:
             queue_epoch = path_queue_epoch
             queue_depth = path_queue_depth
 
-    observation_epoch = None
-    if CM_DB.exists():
-        try:
-            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
-            row = con.execute("SELECT MAX(created_at_epoch) FROM observations").fetchone()
-            con.close()
-            observation_epoch = _epoch_seconds(row[0] if row else None)
-        except Exception:  # noqa: BLE001 - DB 读失败由 storage 节点独立报告
-            pass
     return {
         "auth_failure_epoch": failure_epoch,
         "observation_epoch": observation_epoch,
         "queue_depth": queue_depth,
+        "discards_since_observation": discards,
+        "failure_hint": failure_hint,
         "auth_unrecovered": bool(
             failure_epoch is not None
             and (observation_epoch is None or observation_epoch <= failure_epoch)
         ),
+        "generation_stalled": discards >= GENERATION_STALL_DISCARDS,
     }
 
 
 def probe_worker() -> dict:
-    """claude-mem worker：HTTP 存活与 observation 生成链路都必须健康。"""
+    """claude-mem worker：HTTP 存活与 observation 产出链路都必须健康。"""
     data, err = http_json(CM_HEALTH, timeout=4)
     if err or not data:
         return {"id": "worker", "layer": "worker", "label": "claude-mem",
@@ -568,17 +630,27 @@ def probe_worker() -> dict:
     up = int(data.get("uptime") or 0)
     diag = _worker_generation_diagnostics()
     metrics = {"pid": data.get("pid"), "uptime_s": up,
-               "queue_depth": diag["queue_depth"]}
-    if diag["auth_unrecovered"]:
+               "queue_depth": diag["queue_depth"],
+               "discards_since_observation": diag["discards_since_observation"]}
+
+    if diag["auth_unrecovered"] or diag["generation_stalled"]:
         obs_age = (time.time() - diag["observation_epoch"]
                    if diag["observation_epoch"] is not None else None)
         queue = (f"；内存队列 {diag['queue_depth']}"
                  if diag["queue_depth"] is not None else "")
+        # 原因取自日志实况，不硬编码。此前这里写死“401 invalid_api_key”，
+        # 而 8/28 起真实故障已换成 400 anthropic-beta —— 措辞本身会撒谎。
+        reason = diag["failure_hint"] or "未能从日志提取具体原因"
+        if diag["generation_stalled"]:
+            what = (f"观察产出停滞：最新 observation 之后已丢弃 "
+                    f"{diag['discards_since_observation']} 批，无一落库")
+        else:
+            what = "鉴权失败尚未被新的 observation 证明恢复"
         return {
             "id": "worker", "layer": "worker", "label": "claude-mem",
             "state": RED, "metrics": metrics,
-            "detail": ("⚠️ Claude SDK 鉴权失败（401 invalid_api_key），且尚无更新的 "
-                       f"observation 证明恢复；最后落库 {human_idle(obs_age)}前{queue}"),
+            "detail": (f"⚠️ {what}（{reason}）；"
+                       f"最后落库 {human_idle(obs_age)}前{queue}"),
         }
     return {"id": "worker", "layer": "worker", "label": "claude-mem",
             "state": GREEN if data.get("status") == "ok" else RED,

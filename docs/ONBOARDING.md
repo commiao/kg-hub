@@ -92,16 +92,19 @@ Authorization: Bearer <KG_HUB_API_TOKEN>
 ```
 
 Token 存哪：
-- Mac 上是 `~/.claude-mem/.env` 里 `KG_HUB_API_TOKEN=...`
+- kg-hub 服务端是 0600 `deploy/nas/.env` 中的 `KG_HUB_API_TOKEN`；Mac 客户端放在当前工具自己的 owner-only 配置里
 - OpenClaw VPS 上是 `~/.openclaw/env.sh` 里 `KG_HUB_TOKEN=...`
 - 新接入工具：跟管理员拿 token，**不要硬编码进源码**
 
+不要把这个客户端 API token 与 `KG_HUB_MODEL_GATEWAY_TOKEN` 混用；后者只供服务端调用 model-gateway，provider 凭证只在 credvault。
+
 ### 网络可达性
 
-`kg-hub` 当前监听 **Mac 上 `0.0.0.0:8080`**：
+`kg-hub` 的 canonical NAS Compose 只把服务端发布到宿主环回
+`127.0.0.1:17171`，再由经审核的 Tailscale 转发提供给 tailnet：
 
-- 本机：`http://127.0.0.1:8080`
-- Tailscale 网内其它设备：`http://mac-office:8080`（或 IP `100.99.15.39`）
+- NAS 本机：`http://127.0.0.1:17171`
+- Tailscale 网内其它设备：`http://<nas-tailscale-ip>:17171`
 
 加入 Tailscale 才能跨设备访问（公网不开放）。
 

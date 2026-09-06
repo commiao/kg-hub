@@ -47,6 +47,7 @@ if ! curl -fsS --max-time 15 \
         -G "$KG_HUB_URL/api/search" \
         --data-urlencode "q=$QUERY" \
         --data-urlencode "num_results=$NUM_RESULTS" \
+        --data-urlencode "boundaries=1" \
         -H "Authorization: Bearer $KG_HUB_TOKEN"; then
     echo "" >&2
     echo "error: kg-hub query failed. Mac may be offline or Tailscale degraded." >&2

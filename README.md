@@ -116,11 +116,37 @@ kg-hub/
 | 架构模式 | Local-First + Central Sync（设备本地写 + 异步推中央） |
 | 中央存储 | Memgraph（社区版 Docker） |
 | 部署位置 | NAS 或 always-on 小机器，走 Tailscale 内网 |
-| 实体抽取 LLM | qwen3.6-plus（复用 claude-mem 的百炼 coding plan） |
+| 实体抽取 LLM | `kg_hub.entity_extract` 业务 key（NAS model-gateway 解析真实模型/凭证） |
 | 客户端接入 | MCP（与 claude-mem 同协议） |
 | 设备端持久化 | 复用 claude-mem 的 SQLite，本项目只加读取 + push 逻辑 |
 | 优先级 | 先做中央，本地 KG 副本（Phase 3）按需后做 |
 | **Phase 0 数据源** 🆕 | **OpenClaw 胶囊 + 知识库导出**（不用 claude-mem obs） |
+
+### NAS model-gateway 私网连接（操作者显式执行）
+
+kg-hub 只知道 `kg_hub.entity_extract` 业务 key，不保存供应商模型或 API key。先由操作者创建
+共享私网，再同时带 override 启动两个 Compose 项目：
+
+```bash
+docker network create model-gateway-private
+export MODEL_GATEWAY_PRIVATE_NETWORK=model-gateway-private
+docker compose -f /path/to/credvault/deploy/docker-compose.example.yml \
+  -f /path/to/credvault/deploy/docker-compose.private-network.yml up -d
+docker compose --env-file deploy/nas/.env -f docker-compose.yml \
+  -f deploy/model-gateway-network.override.yml up -d
+```
+
+NAS 项目自己的 `.env`（绝不加载 `~/.claude-mem/.env`）使用
+`ANTHROPIC_BASE_URL=http://model-gateway:39000`、`KG_HUB_MODEL_GATEWAY_TOKEN` 独立 caller token
+和 `ANTHROPIC_MODEL=kg_hub.entity_extract`。override 引用既有 external network，不创建公网/LAN
+端口，也不自动执行。SDK 传输重试和 Graphiti 0.29.0 的语义解析重试都已关闭；一次
+`generate_response` 最多一次模型请求，解析/校验失败直接返回业务层。健康检查只读本地
+ready 状态，绝不请求模型。
+
+所有生产 ingest、predigest、backfill 与 canonical-doc 路径都会先绑定稳定 operation ID。
+中央 messages wrapper 由 namespace、operation ID 和确定性请求摘要派生
+`Idempotency-Key`；同一计划任务在 unknown 后重跑会复用同一 key，不会把“结果未知”变成
+第二次供应商调用。不同文档/业务操作得到不同 key。
 
 ## 不在本项目范围内（明确划线）
 

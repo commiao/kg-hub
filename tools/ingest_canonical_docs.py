@@ -43,6 +43,7 @@ from graphiti_client import build_graphiti  # noqa: E402
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from utils.writer_lock import writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
+from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -170,17 +171,19 @@ async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
     # vector-only, see graphiti_client.py). graphiti 0.29's add_episode no longer
     # accepts skip_extraction, so it's removed; canonical docs get auto-structured
     # like any other episode.
-    result = await g.add_episode(
-        name=doc["name"],
-        episode_body=body,
-        source=EpisodeType.text,
-        source_description=doc["desc"],
-        reference_time=ref,
-        group_id=GROUP_ID,
-        entity_types=ENTITY_TYPES,
-        edge_types=EDGE_TYPES,
-        edge_type_map=EDGE_TYPE_MAP,
-    )
+    operation_id = stable_operation_id(doc["path"], doc["name"], body)
+    with model_operation("ingest.canonical", operation_id):
+        result = await g.add_episode(
+            name=doc["name"],
+            episode_body=body,
+            source=EpisodeType.text,
+            source_description=doc["desc"],
+            reference_time=ref,
+            group_id=GROUP_ID,
+            entity_types=ENTITY_TYPES,
+            edge_types=EDGE_TYPES,
+            edge_type_map=EDGE_TYPE_MAP,
+        )
     return len(result.nodes), len(result.edges)
 
 

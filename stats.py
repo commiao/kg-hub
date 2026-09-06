@@ -20,9 +20,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Load FalkorDB connection settings from ~/.claude-mem/.env
-from dotenv import load_dotenv
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+# Load FalkorDB connection settings from kg-hub's own project env.
+from kg_hub_env import load_kg_hub_env
+load_kg_hub_env(override=True)
 
 from falkordb import FalkorDB
 

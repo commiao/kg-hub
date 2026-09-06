@@ -20,9 +20,8 @@ os.environ["EMBEDDING_DIM"] = "384"
 
 from dotenv import load_dotenv
 
-load_dotenv(Path.home() / ".claude-mem" / ".env", override=True)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
-from anthropic import AsyncAnthropic
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.driver.kuzu_driver import KuzuDriver
@@ -34,23 +33,11 @@ from graphiti_core.nodes import EpisodeType
 
 # ----- LLM client: wrap qwen3.6-plus via 百炼 Anthropic adapter -----
 def build_llm() -> AnthropicClient:
-    auth_token = os.environ["ANTHROPIC_AUTH_TOKEN"]
-    base_url = os.environ["ANTHROPIC_BASE_URL"]
-    model = os.environ.get("ANTHROPIC_MODEL", "qwen3.6-plus")
-    cfg = LLMConfig(api_key=auth_token, model=model, max_tokens=4096)
-    async_client = AsyncAnthropic(auth_token=auth_token, base_url=base_url, max_retries=1)
+    from model_gateway_client import create_gateway_client, gateway_model
+    model = gateway_model()
+    cfg = LLMConfig(api_key="gateway-managed", model=model, max_tokens=4096)
+    async_client = create_gateway_client(timeout=120.0)
 
-    # 百炼 qwen3.6-plus runs in thinking mode by default, which forbids
-    # forced tool_choice. Inject thinking={"type":"disabled"} on every call.
-    orig_create = async_client.messages.create
-
-    async def create_with_thinking_off(*args, **kwargs):
-        extra_body = dict(kwargs.get("extra_body") or {})
-        extra_body.setdefault("thinking", {"type": "disabled"})
-        kwargs["extra_body"] = extra_body
-        return await orig_create(*args, **kwargs)
-
-    async_client.messages.create = create_with_thinking_off
     return AnthropicClient(config=cfg, client=async_client)
 
 

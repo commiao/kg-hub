@@ -3,6 +3,10 @@
 > 4 个 Phase。每个 Phase **预计 1 周**（业余时间，含调试）。
 > Phase 0 必须先做完，证明数据有意义再投资 Phase 1+。
 
+> ⚠️ **历史路线图说明（2026-08）**：下文 qwen/百炼直连与“复用 claude-mem 凭证”描述
+> 仅记录当时执行路径，已废弃。当前 kg-hub 只调用 `kg_hub.entity_extract` business key，
+> 由 NAS model-gateway 解析真实 provider/model/credential；自动心跳不请求模型。
+
 ---
 
 ## Phase 0：数据探索（先做这个！）
@@ -44,7 +48,7 @@
   - 从胶囊正文抽 `caused_by` / `fixed_by` / `diagnosed_by` / `implemented_as` / `relates_to` 等边
 - [ ] 0.C.2 选 5 个**高质量胶囊**（quality_rating ≥ 4.5）先试，看 LLM 抽得对不对
 - [ ] 0.C.3 满意后批量跑全部 179 胶囊 → `triples.jsonl`
-- [ ] 0.C.4 跑 qwen3.6-plus（百炼端点，复用 claude-mem 凭证）
+- [ ] 0.C.4 （历史方案）当时计划直连 qwen；新执行必须走 `kg_hub.entity_extract` 网关业务 key
 
 #### 0.D 可视化 + 验证
 
@@ -154,7 +158,8 @@ Phase 1 末尾发现 Kuzu embedded 是**单写者锁**——一旦上自动化�
   - 决策：**不**在 claude-mem.db 加 `kg_push_state` 表（原 ROADMAP 提案）—— claude-mem 是只读边界
   - 改用：独立 watermark `data/.ingested.claude_mem.json`，keyed by `obs.id`
 - [x] 2.2.2 episode_body 拼装：title + subtitle + narrative + facts 列表 + concepts + files
-- [x] 2.2.3 qwen3.6-plus 经 `graphiti_client.build_llm()` 复用（注入 thinking=disabled）
+- [x] 2.2.3 `graphiti_client.build_llm()` 已改为 `kg_hub.entity_extract` 网关 business key；
+  provider/model/thinking 细节由网关路由管理
 - [x] 2.2.4 幂等：watermark 跳过已 ingest 的 obs.id
 
 ### 2.3 launchd 定时（已 load）
@@ -212,7 +217,7 @@ Phase 1 末尾发现 Kuzu embedded 是**单写者锁**——一旦上自动化�
 > 一处 auth、一处 idempotency、一处 rate-limit。**MCP 写工具内部转发到这**，所以 Phase 3 后面所有写入路径都走这一个进程。
 
 - [x] 3.A.1 `kg_hub_server.py` FastAPI 应用：5 路由 `/health` `/api/ingest` `/api/ingest/status` `/api/search` `/api/queue_stats`
-- [x] 3.A.2 鉴权：`Authorization: Bearer <KG_HUB_API_TOKEN>` header，token 在 `~/.claude-mem/.env`
+- [x] 3.A.2 鉴权：`Authorization: Bearer <KG_HUB_API_TOKEN>` header；当前服务端 token 在 0600 `deploy/nas/.env`，客户端按工具单独保存
 - [x] 3.A.3 服务端 idempotency：`MERGE (k:IngestedKey {sd, sid})` 原子 check-and-create
 - [x] 3.A.4 写入用 `async_writer_lock`（决策 12 异步版）+ graphiti
 - [x] 3.A.5 launchd plist `com.kg-hub.server`（KeepAlive Crashed=true，ThrottleInterval=30s）

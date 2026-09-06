@@ -4,6 +4,10 @@
 > **不是什么**：不是详细架构（那是 [ARCHITECTURE.md](ARCHITECTURE.md)），不是部署手册（那是 [`docs/INTEGRATION-GUIDE.md`](docs/INTEGRATION-GUIDE.md) + cookbook），不是决策记录（那是 [DESIGN.md](DESIGN.md)）。
 > **要点导览**：30 秒定位 → 全栈一图 → 5 组件速看 → 3 个典型场景 → 想深入读哪份文档。
 
+> **当前模型边界（2026-08）**：kg-hub 只调用 `kg_hub.entity_extract` business key；NAS
+> model-gateway 决定真实 provider/model/credential。kg-hub 不保存 provider key，自动健康
+> 检查不调用模型。
+
 ---
 
 ## 30 秒搞懂这是什么
@@ -115,7 +119,7 @@ Tailscale → cc-switch → claude-mem → kg-hub 客户端 →
 | 设备覆盖 | MacBook + NAS 24/7（在线） |
 | IDE 覆盖 | Claude Code / Cursor / Codex / Qoder（接入） |
 | 数据源 | claude-mem obs + OpenClaw 胶囊（双源自动 sync） |
-| LLM provider | qwen3.6-plus（阿里百炼 coding plan） |
+| kg-hub 模型入口 | `kg_hub.entity_extract` business key → NAS model-gateway |
 | 下一步 | Phase 3 — OpenClaw 主动 push + schema cleanup |
 
 ---

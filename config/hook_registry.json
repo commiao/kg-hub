@@ -24,26 +24,34 @@
       "label": "运维上下文",
       "patterns": ["ops-hook-context.sh"],
       "purpose": "在会话开始时注入本机运维状态"
+    },
+    {
+      "id": "hook-bridge",
+      "label": "Hook Bridge",
+      "patterns": ["dsh-hooks-claude-code", "dsh-hooks-codex"],
+      "purpose": "复用 Claude Code / Codex shell hook"
     }
   ],
   "actions": {
-    "start": "启动或确认后台 worker",
-    "version-check": "检查插件版本和兼容性",
-    "context": "读取并注入历史上下文",
-    "session-init": "登记新会话及首条用户提示",
-    "file-context": "读取文件前补充相关历史上下文",
-    "file-edit": "记录文件编辑",
-    "observation": "记录工具调用及其结果",
-    "summarize": "会话结束时生成总结并收尾",
-    "session-context": "注入 task-hub 看板与任务协议",
-    "heartbeat": "按当前工作目录为持有任务续租",
-    "push": "检索并注入 kg-hub canonical / 相关观察",
-    "ops-context": "注入运维上下文"
+    "start": "启动 worker",
+    "version-check": "版本检查",
+    "context": "注入历史",
+    "session-init": "登记会话",
+    "file-context": "读取前关联",
+    "file-edit": "记录编辑",
+    "observation": "记录调用",
+    "summarize": "会话收尾",
+    "session-context": "注入任务",
+    "heartbeat": "任务续租",
+    "push": "注入知识",
+    "ops-context": "运维状态",
+    "bridge": "兼容桥"
   },
   "tools": [
     {
       "id": "claude",
       "label": "Claude Code",
+      "difference": "原生 Hook · 用户级 · 全链路",
       "sources": [
         {"kind": "json", "path": "~/.claude/settings.json", "scope": "用户"},
         {"kind": "latest_glob", "path": "~/.claude/plugins/cache/thedotmack/claude-mem/*/hooks/hooks.json", "scope": "claude-mem 插件"}
@@ -57,6 +65,7 @@
     {
       "id": "cursor",
       "label": "Cursor",
+      "difference": "原生 Hook · 用户/项目两级",
       "sources": [
         {"kind": "json", "path": "~/.cursor/hooks.json", "scope": "用户"},
         {"kind": "json", "path": "/Users/mac/workspace_cursor/.cursor/hooks.json", "scope": "workspace_cursor 项目"}
@@ -70,6 +79,7 @@
     {
       "id": "codex",
       "label": "Codex",
+      "difference": "插件 Hook · 需逐项批准",
       "sources": [
         {"kind": "latest_glob", "path": "~/.codex/plugins/cache/*/claude-mem/*/hooks/codex-hooks.json", "scope": "claude-mem 插件"}
       ],
@@ -81,6 +91,7 @@
     {
       "id": "qoder",
       "label": "Qoder",
+      "difference": "适配器 · 宿主未配置",
       "sources": [
         {"kind": "json", "path": "~/Library/Application Support/Qoder/SharedClientCache/hooks.json", "scope": "用户"},
         {"kind": "json", "path": "~/.qoder/hooks.json", "scope": "用户"}
@@ -88,14 +99,28 @@
       "expected": [
         {"component": "claude-mem", "required": false}
       ],
-      "note": "本机有 qoder_cm_hook.sh 适配器，但未发现 Qoder 宿主的 hooks 配置"
+      "note": "有适配器，无宿主配置"
+    },
+    {
+      "id": "deepseek-harness",
+      "label": "DeepSeek Harness",
+      "difference": "原生插件 · 可桥接 Claude/Codex",
+      "sources": [
+        {"kind": "presence", "path": "~/Library/Application Support/dsh-desktop/harness/profiles/web/package.json", "scope": "安装"},
+        {"kind": "dsh_cordis", "path": "~/Library/Application Support/dsh-desktop/harness/profiles/web/cordis.patch.yml", "scope": "用户配置"}
+      ],
+      "expected": [
+        {"component": "hook-bridge", "required": false}
+      ],
+      "note": "已安装，Hook Bridge 未启用"
     },
     {
       "id": "openclaw",
       "label": "OpenClaw",
+      "difference": "非 IDE Hook · VPS 定时直推",
       "sources": [],
       "expected": [],
-      "note": "不走本机 IDE hook；VPS 上由 cron / push.log 驱动知识胶囊直推"
+      "note": "由 cron / push.log 直推"
     }
   ]
 }

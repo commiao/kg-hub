@@ -30,18 +30,29 @@
 
 ## 1. 前置:部署中央仓库(每用户一次)
 
-1. 常开机克隆仓库 → `docker compose -p kg-hub up -d`(falkordb + kg_hub_server + ingester + watchdog)。
-2. 设 `FALKORDB_PASSWORD`、`KG_HUB_API_TOKEN`(随机长串)。
-3. 装 Tailscale;**server 端口经 tailscale 暴露**(本项目用 `127.0.0.1:17171→容器8080`,靠 NAS tailscale userspace 转发 inbound→localhost,所以 tailnet 设备用 `<tailscale-ip>:17171` 可达;falkordb 的 6379 **不**暴露)。
-4. 验证:`curl http://<tailscale-ip>:17171/health` → `{"status":"ok"}`。
+1. 常开机克隆仓库，在仓库根目录执行 credvault quickstart 输出的私网连接步骤，确保外部网络 `model-gateway-private` 已创建且 model-gateway 已接入；不要发布 gateway 端口。
+2. 用 kg-hub 专属的 0600 caller-token 文件初始化服务端配置（不要先 `cp .env.example`）：
+   ```sh
+   sh deploy/nas/configure-model-gateway-token.sh /absolute/path/to/caller-token-kg-hub
+   ```
+   helper 会原子创建 `deploy/nas/.env`（0600），自动生成独立的
+   `FALKORDB_PASSWORD` 与 `KG_HUB_API_TOKEN`，并写入 gateway caller token。
+3. 从仓库根目录用固定 env、compose 文件和 project name 启动：
+   ```sh
+   docker compose --env-file deploy/nas/.env \
+     -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
+     -p kg-hub up -d
+   ```
+4. 装 Tailscale；**server 端口经 Tailscale 暴露**（本项目用 `127.0.0.1:17171→容器8080`，FalkorDB 6379 不对 tailnet 暴露）。
+5. 验证：`curl http://<tailscale-ip>:17171/health` → `{"status":"ok"}`。
 
-> 部署/持久化/监控细节见 `docs/incident-retrospective.md`。
+> 完整部署、数据根和迁移细节见 `deploy/nas/MIGRATION.md`；日常重启用 `sh deploy/nas/redeploy.sh`。
 
 ---
 
 ## 2. 通用客户端配置(每设备一次)
 
-所有工具共用一份 env:**`~/.claude-mem/.env`**(Windows:`%USERPROFILE%\.claude-mem\.env`)。
+客户端只需要 kg-hub HTTP 地址和 API token；保存到**各工具自己的、仅当前用户可读的客户端配置**。不存在所有工具共用的 `~/.claude-mem/.env`。claude-mem 自己的 env 只属于 claude-mem，不能当成 kg-hub 服务端配置源。
 
 ```ini
 KG_HUB_URL=http://<tailscale-ip>:17171     # 中央机
@@ -49,6 +60,9 @@ KG_HUB_API_TOKEN=<你的-token>
 KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
 # 注:KG_HUB_FALKORDB_* 现在客户端基本不需要(读写都走 HTTP)
 ```
+
+这里的 `KG_HUB_API_TOKEN` 是**客户端 → kg-hub server** 的 Bearer token；服务端
+`deploy/nas/.env` 中的 `KG_HUB_MODEL_GATEWAY_TOKEN` 是**kg-hub → model-gateway** 的 caller token。两者用途不同，不能混用；provider 凭证只在 credvault，kg-hub 与客户端都不保存。
 
 **muxcp 网关**(各工具 MCP 都连它):确认 `~/.config/muxcp/run-muxcp.sh` 存在且其上游含 `kg_hub`(指向本机 `mcp_server.py`,纯 HTTP 客户端)。
 
@@ -136,10 +150,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 
 ## 6. 同一用户跨设备/跨工具:一致性约定
 
-1. 所有设备 `.env` 指向**同一个** `KG_HUB_URL` + token → 天然聚合进你自己的中央图。
+1. 所有设备在各自工具的客户端配置中指向**同一个** `KG_HUB_URL` + `KG_HUB_API_TOKEN` → 天然聚合进你自己的中央图。
 2. 写入两条路:交互记忆经 claude-mem→同步→ingester;主动沉淀直接 `POST /api/ingest`(稳定 `source_obs_id` 保证幂等)。
 3. 读取统一:任意工具 `kg_search`(经 muxcp)或 HTTP `/api/search*` 查同一张图。
-4. 安全红线:token 只放 `.env`(不进 URL query、不写进图);服务只在私网可达;客户端不直连别人的图。
+4. 安全红线：token 只放所属组件的 owner-only secret 配置（不进 URL query、不写进图）；服务只在私网可达；客户端不直连 FalkorDB；provider 凭证只留在 credvault。
 
 ---
 
@@ -170,4 +184,4 @@ curl -s -H "Authorization: Bearer $TOKEN" $KG_HUB_URL/api/stats        # 图规�
 ---
 
 ### 一句话
-> **一套中央仓库(每用户)+ 一份 `.env`(每设备)+ muxcp 统一 MCP + 各工具按机制挂 PUSH/capture**;跨网络重活全收敛到中央机,客户端只留一个可容忍的 HTTP 往返。换设备照本手册 §2→§3→§7 走一遍即可。
+> **一套中央仓库（每用户）+ 各工具自己的客户端配置 + muxcp 统一 MCP + 各工具按机制挂 PUSH/capture**；跨网络重活全收敛到中央机，客户端只留一个可容忍的 HTTP 往返。换设备照本手册 §2→§3→§7 走一遍即可。

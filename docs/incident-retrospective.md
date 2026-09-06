@@ -76,7 +76,7 @@ NAS 切换(约 06-09)后发现两条链路**静默中断了 5 天**——SSH/HTT
   1. **server** 新增 `GET /api/canonical_context?kw=&top_n=&bump=1`:两遍检索(canonical CONTAINS + Episodic 全文)+ rank(canonical 优先)+ **服务端自增 usage_count/last_used_at**,全部在 NAS localhost FalkorDB 上完成(server↔db 本地直连,可靠)。
   2. **push hook** 改为**纯 HTTP 一次调用**(`urllib`,去掉直连 FalkorDB):读 + bump 一次往返。
 - **效果**:hook 耗时 **3.6s → 0.07s**;bump 100% 可靠并验证落库(DESIGN usage_count 20→21,`last_used_at` 更新为当日);hook 不再依赖 `falkordb` 模块,跨网络只剩一个可容忍的 HTTP 往返。
-- **部署**:NAS `kg-hub-server:latest` 镜像重建(`docker compose -p kg-hub build/up`,复用 CM 项目名,UI 未脱同步)。
+- **部署（当时）**：NAS `kg-hub-server:latest` 镜像重建。现行命令必须使用 `deploy/nas/redeploy.sh`，或显式带 `--env-file deploy/nas/.env -f docker-compose.yml -f deploy/model-gateway-network.override.yml -p kg-hub`；这里的旧短命令不再可执行。
 
 ### 一条经验
 > **跨设备链路"看起来通"≠真的通**:SSH 通不代表 scp 通(SFTP 子系统)、HTTP 读通不代表写也跟得上(超时预算)。迁移后要对**每一条**读/写/同步链路做端到端验证,而不是只 ping 一下主机。原则上,跨网络的写操作应收敛到与数据同机的服务端(localhost),客户端只留一个可容忍的 HTTP 往返。

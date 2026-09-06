@@ -10,7 +10,8 @@
 #   - sdk_sessions.platform_source -> capture 最近一次会话
 #   - /api/* -> 中央服务可达 + usage_count 最近 bump
 
-ENVF="$HOME/.claude-mem/.env"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ENVF=${KG_HUB_ENV_FILE:-"$SCRIPT_DIR/../.env"}
 URL=$(grep '^KG_HUB_URL=' "$ENVF" 2>/dev/null | cut -d= -f2- | tr -d '"')
 TOK=$(grep '^KG_HUB_API_TOKEN=' "$ENVF" 2>/dev/null | cut -d= -f2- | tr -d '"')
 DB="$HOME/.claude-mem/claude-mem.db"

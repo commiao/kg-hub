@@ -23,8 +23,15 @@ def _registry(tmp_path, tools):
             "id": "claude-mem", "label": "claude-mem",
             "patterns": ["worker-service.cjs"],
             "purpose": "采集",
+        }, {
+            "id": "hook-bridge", "label": "Hook Bridge",
+            "patterns": ["dsh-hooks-claude-code", "dsh-hooks-codex"],
+            "purpose": "复用现有 Hook",
         }],
-        "actions": {"session-context": "注入任务看板", "context": "注入历史"},
+        "actions": {
+            "session-context": "注入任务看板", "context": "注入历史",
+            "bridge": "兼容桥",
+        },
         "tools": tools,
     }))
     return path
@@ -120,6 +127,59 @@ class HookInventoryTest(unittest.TestCase):
             self.assertEqual(result[0]["state"], "amber")
             self.assertEqual(result[0]["summary"]["limited_scope"], 1)
             self.assertIn("其它 workspace", result[0]["hooks"][0]["coverage"])
+
+    def test_deepseek_harness_bridge_is_detected_from_cordis_patch(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            package = tmp_path / "package.json"
+            package.write_text("{}")
+            patch = tmp_path / "cordis.patch.yml"
+            patch.write_text("""
+- id: hooks-claude-code
+  name: '@deepseek-ai/dsh-hooks-claude-code'
+  config:
+    configPath: ~/.claude/settings.json
+""")
+            reg = _registry(tmp_path, [{
+                "id": "deepseek-harness", "label": "DeepSeek Harness",
+                "difference": "原生插件 · 可桥接 Claude/Codex",
+                "sources": [
+                    {"kind": "presence", "path": str(package), "scope": "安装"},
+                    {"kind": "dsh_cordis", "path": str(patch), "scope": "用户配置"},
+                ],
+                "expected": [{"component": "hook-bridge", "required": False}],
+            }])
+            with mock.patch.object(H, "REGISTRY_PATH", reg), \
+                    mock.patch.object(H, "PUSH_LOG", tmp_path / "none.log"):
+                result = H.collect()
+            tool = result[0]
+            self.assertEqual(tool["state"], "green")
+            self.assertEqual(tool["difference"], "原生插件 · 可桥接 Claude/Codex")
+            self.assertEqual(tool["hooks"][0]["component"], "hook-bridge")
+            self.assertEqual(tool["hooks"][0]["action"], "bridge")
+            self.assertTrue(all(source["found"] for source in tool["sources"]))
+
+    def test_deepseek_presence_source_is_not_parsed_as_hook_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            package = tmp_path / "package.json"
+            package.write_text('{"name":"dsh-profile-web"}')
+            patch = tmp_path / "cordis.patch.yml"
+            patch.write_text("# @deepseek-ai/dsh-hooks-claude-code\n[]\n")
+            reg = _registry(tmp_path, [{
+                "id": "deepseek-harness", "label": "DeepSeek Harness",
+                "sources": [
+                    {"kind": "presence", "path": str(package), "scope": "安装"},
+                    {"kind": "dsh_cordis", "path": str(patch), "scope": "用户配置"},
+                ],
+                "expected": [{"component": "hook-bridge", "required": False}],
+            }])
+            with mock.patch.object(H, "REGISTRY_PATH", reg), \
+                    mock.patch.object(H, "PUSH_LOG", tmp_path / "none.log"):
+                result = H.collect()
+            self.assertEqual(result[0]["state"], "grey")
+            self.assertFalse(result[0]["hooks"][0]["configured"])
+            self.assertEqual(result[0]["hooks"][0]["component"], "hook-bridge")
 
 
 if __name__ == "__main__":

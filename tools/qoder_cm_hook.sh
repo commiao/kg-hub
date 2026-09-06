@@ -39,4 +39,4 @@ _P=$({ ls -dt "$_C/plugins/cache/thedotmack/claude-mem"/[0-9]*/ 2>/dev/null; \
 [ -n "$_P" ] || { echo "claude-mem: plugin not found" >&2; exit 0; }
 
 export PATH="$($SHELL -lc 'echo $PATH' 2>/dev/null):$PATH"
-printf '%s' "$PAYLOAD" | node "$_P/scripts/bun-runner.js" "$_P/scripts/worker-service.cjs" hook claude-code "$MODE"
+printf '%s' "$PAYLOAD" | node "$_P/scripts/bun-runner.js" "$_P/scripts/worker-service.cjs" hook qoder "$MODE"
