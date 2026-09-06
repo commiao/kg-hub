@@ -142,3 +142,26 @@ NAS 切换(约 06-09)后发现两条链路**静默中断了 5 天**——SSH/HTT
 
 ### 一条经验
 > "看不到"往往不是单点故障,而是**派生回路多环静默串断**:源头(产 obs)、信号(bump)、出口(报告)。逐环用"是否有新数据流过"端到端验证,比盯任一单点更快定位。三处里两处又是"迁移后直连 FalkorDB / 钩子未随迁移重挂"——再次印证:**迁移后要对每条读/写/同步链路逐一端到端验证**。
+
+## 积压 7919 三天零进展:幂等钥匙跨天不变 × 见证库永不忘记(2026-09-06)
+
+`/dashboard/pipeline` 上线后立刻显形:积压线本月完成 1 条、待处理 7919、连续三夜零进展,而 live 线与调用量都在涨——任何汇总视图都显示"健康"。
+
+### 根因链(每一环都有数据钉住)
+1. `do_extract` 的 `operation_id = sha256(sd, sid, name, body)`,跨天重试算出**同一把** Idempotency-Key;第一条 prompt 只依赖 episode 正文,钥匙完全确定。
+2. 网关先查幂等缓存(24h TTL),过期后查回滚见证库 `attempts`;见证按设计**永不删除**,命中即 425「该请求已存在回滚见证,禁止自动重放」。
+3. server 的 error 键恰在 24h 后清理 → refinery 恰在缓存过期后重试 → 必撞见证。**任何一次抽取中途失败过的观测,24h 后永久不可重试。** 图中 85 个 425 error 键里 73 个是见证 425,80 个在首次 POST 后 <10s 失败(死在第一次 LLM 调用)。
+4. live 线 40 条"自愈"是因 graphiti 的 `previous_episodes` 上下文随邻居变化改了钥匙;积压线 reference_time 在历史里、邻居固定,队头 8 条永远同钥匙。`pending_ids[:8]` 每轮取到同样 8 条,身后 7900 条一条轮不到。
+5. 次要源:容器 `SEMAPHORE_LIMIT=2` 下 graphiti 对 fact 相同、节点对不同的两条边并行发出**字节相同**的 resolve_edge prompt → 同钥匙并发 → 第二个撞幂等库 425(obs-20410/20417 实测)。
+
+### 修法(三处,全是硬逻辑)
+- `do_extract`:operation_id 加入 `attempt_epoch`(本次 IngestedKey 的 created_at)。同一次尝试内钥匙稳定;error 键清理后的下一次尝试是新操作、新钥匙、重新计费——上次结果确实没拿到。
+- `model_gateway_client`:同一把钥匙在飞时后来者等第一个的结果,不各自出门。
+- `kg_refinery.select_backlog_batch`:退避冷却中的 id 不占积压名额,到期照常回来。
+
+### 部署时自己踩的坑(记下来)
+手工 `compose up` 漏了 `-f deploy/model-gateway-network.override.yml`,kg-hub-server/ingester 被重建到只剩 `kg-hub_default` 网络,`model-gateway` 解析失败,17 条抽取 ConnectError。**只能用 redeploy.sh 或带上 override 文件的完整命令**;它们留下的 17 个 error 键 24h 后自清。
+
+### 教训
+- 「幂等 = 同请求同钥匙」在"重试是新尝试"的语义下必须带尝试纪元,否则防重放会退化成永久拒绝。
+- 看板要按环节分线看"完成 vs 待处理",汇总量在涨不代表每条线都在动。
