@@ -229,14 +229,15 @@ async def cleanup_stuck_jobs(graphiti) -> int:
     qrows, _, _ = await graphiti.driver.execute_query(
         "MATCH (k:IngestedKey) "
         "WHERE k.status = 'error' AND k.created_at < $t "
-        "  AND (k.error_kind = 'quota_exhausted' "
-        "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限') "
+        "  AND (k.error_kind IN ['quota_exhausted', 'gateway_unavailable'] "
+        "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
+        "       OR k.error_message CONTAINS '网关本地配置不可用') "
         "WITH k DELETE k RETURN count(*) AS c",
         t=quota_threshold,
     )
     qcleaned = int(qrows[0].get("c", 0)) if qrows else 0
     if qcleaned:
-        logger.warning("[ingest:cleanup] removed %d quota error keys (>1h, 配额拒绝不属于观测)",
+        logger.warning("[ingest:cleanup] removed %d gateway-side error keys (>1h, 配额/网关状态拒绝不属于观测)",
                        qcleaned)
     return cleaned + ecleaned + qcleaned
 
@@ -288,9 +289,13 @@ async def merge_or_get_ingested_key(
 
 def classify_extract_error(exc: BaseException) -> str | None:
     """机器可读的失败类别。429 只可能来自网关自己的配额(日/分上限):供应商侧的
-    错误会被网关收敛成 503,所以 429 = 请求没出网关、没计费、与观测内容无关。"""
+    错误会被网关收敛成 503,所以 429 = 请求没出网关、没计费、与观测内容无关。
+    「网关本地配置不可用」是网关自身状态校验失败(如改完费用策略未重启),同样没到
+    供应商——2026-09-07 一次改配额留下 62 个这种键,不该让观测白等 24h。"""
     if getattr(exc, "status_code", None) == 429:
         return "quota_exhausted"
+    if "网关本地配置不可用" in str(exc):
+        return "gateway_unavailable"
     return None
 
 
