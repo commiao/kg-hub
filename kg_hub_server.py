@@ -64,6 +64,7 @@ from graphiti_client import (  # noqa: E402
 )
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from topology import dashboard_topology, topology_report, topology_latest  # noqa: E402
+from dashboard_status import pipeline_signal
 from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
@@ -231,7 +232,9 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         "WHERE k.status = 'error' AND k.created_at < $t "
         "  AND (k.error_kind IN ['quota_exhausted', 'gateway_unavailable'] "
         "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
-        "       OR k.error_message CONTAINS '网关本地配置不可用') "
+        "       OR k.error_message CONTAINS '网关本地配置不可用' "
+        "       OR k.error_message STARTS WITH 'APIConnectionError' "
+        "       OR k.error_message STARTS WITH 'ConnectError') "
         "WITH k DELETE k RETURN count(*) AS c",
         t=quota_threshold,
     )
@@ -294,7 +297,14 @@ def classify_extract_error(exc: BaseException) -> str | None:
     供应商——2026-09-07 一次改配额留下 62 个这种键,不该让观测白等 24h。"""
     if getattr(exc, "status_code", None) == 429:
         return "quota_exhausted"
-    if "网关本地配置不可用" in str(exc):
+    text = str(exc)
+    if "网关本地配置不可用" in text:
+        return "gateway_unavailable"
+    # 连不上网关(网关重启/崩溃循环/网络掉线)同样没到供应商。2026-09-07 下午一次
+    # 提速验证把网关压进崩溃循环,一次就留下 193 个这种键——若按 24h 处理,193 条
+    # 观测要为一次基础设施故障白锁一天。
+    if type(exc).__name__ in {"APIConnectionError", "ConnectError", "ConnectTimeout",
+                              "RemoteProtocolError"} or "Connection error" in text:
         return "gateway_unavailable"
     return None
 
@@ -3915,6 +3925,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 td.n{font-family:ui-monospace,Menlo,monospace}
 tr.stall td{background:color-mix(in srgb,#D64545 12%,transparent)}
 .flag{font-size:11px;padding:2px 7px;border-radius:8px;background:#FDEDED;color:#8A1C1C;margin-left:6px}
+.flag.slow{background:#FFF3CD;color:#715500}.activity{font-size:12px;color:GrayText}
 .lbl{font-size:12px;color:GrayText;margin:1.4rem 0 .3rem}
 .row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
 .nm{width:120px;font-family:ui-monospace,Menlo,monospace;font-size:12px;flex:none}
@@ -3927,7 +3938,7 @@ tr.stall td{background:color-mix(in srgb,#D64545 12%,transparent)}
 <a class=back href="/portal">← 报表门户</a><h1>采集链路吞吐</h1>
 <div id=warn></div>
 <div class=note id=note></div>
-<table><thead><tr><th>环节</th><th>本月已完成</th><th>今日已完成</th><th>最近 1 小时</th><th>待处理</th></tr></thead>
+<table><thead><tr><th>环节 / 当前状态</th><th>本月已完成</th><th>今日已完成</th><th>本小时（UTC）</th><th>待处理</th></tr></thead>
 <tbody id=stages></tbody></table>
 <div class=lbl>入图量 · 按日（最近 14 天，分线）</div><div id=daily></div>
 <div class=lbl>入图量 · 按小时（最近 48 小时，分线）</div><div id=hourly></div>
@@ -3943,8 +3954,12 @@ const tb=document.getElementById('stages');
  if(s.stalled)tr.className='stall';
  const name=document.createElement('td');
  name.textContent=s.name;
- if(s.stalled){const f=document.createElement('span');f.className='flag';
-  f.textContent='停滞：待处理 '+s.pending+' 而本月仅完成 '+s.month;name.append(f)}
+ if(s.activity){const a=document.createElement('div');a.className='activity';
+  a.textContent=s.activity.label;name.append(a)}
+ if(s.low_throughput){const f=document.createElement('span');f.className='flag slow';
+  f.textContent=s.throughput_note;name.append(f)}
+ if(s.pending_note){const p=document.createElement('div');p.className='activity';
+  p.textContent=s.pending_note;name.append(p)}
  tr.append(name);
  ['month','day','hour','pending'].forEach(k=>{
   const td=document.createElement('td');td.className='n';
@@ -4100,13 +4115,10 @@ async def dashboard_pipeline(request: Request) -> HTMLResponse:
         data["stages"].append({
             "name": name, "month": month, "day": day, "hour": hour,
             "pending": pending,
-            # 这才是本看板存在的理由:有活要干,却按本月速度永远干不完。
-            # 用比例而非 "== 0":积压线本月完成 1 条、待处理 7919,严格意义上
-            # 不是零,但同样是停滞 —— 照此速度需要几百年。阈值 1% 意味着
-            # "按本月产出,清空待处理要 100 个月以上"。
-            "stalled": bool(lane and isinstance(pending, int) and pending > 0
-                            and isinstance(month, int)
-                            and month * 100 < pending),
+            **(pipeline_signal(status, now, month, pending)
+               if lane in {"live 线", "积压线"} else {"stalled": False}),
+            "pending_note": ("待处理为 NAS 最大 ID 与扫描游标之差（估算，非精确队列条数）"
+                             if lane == "live 线" else None),
         })
 
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
