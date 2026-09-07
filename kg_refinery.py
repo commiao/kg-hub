@@ -669,7 +669,8 @@ async def main() -> int:
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
             if cycle < quota_pause.get("until_cycle", 0):
-                write_status(quota_paused_until_cycle=quota_pause["until_cycle"],
+                write_status(quota_paused=True,
+                             quota_paused_until_cycle=quota_pause["until_cycle"],
                              quota_hits=quota_pause.get("hits", 0), last_error=None)
                 await asyncio.sleep(INTERVAL)
                 continue
@@ -718,6 +719,7 @@ async def main() -> int:
                 backlog_window_open=in_backlog_window(),
                 per_cycle=BACKLOG_PER_CYCLE,
                 backoff_pending=len(backoff),
+                quota_paused=False,
                 quota_paused_until_cycle=quota_pause.get("until_cycle"),
                 quota_hits=quota_pause.get("hits", 0),
                 watermark={"ingested": len(wm["ingested"]), "rejected": len(wm["rejected"]),

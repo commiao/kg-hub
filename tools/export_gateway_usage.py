@@ -23,6 +23,7 @@
       "hourly": [{"hour": "2026-09-03T08", "business_key": "...", "count": 12}, ...],
       "monthly":[{"month": "2026-09", "business_key": "...", "count": 1549}, ...],
       "totals": {"<business_key>": 1549, ...},
+      "ceilings": {"<business_key>": {"daily_requests": 120000, "requests_per_minute": 60}},
       "window": {"hourly_hours": 72, "daily_days": 62}
     }
 
@@ -87,6 +88,13 @@ def collect(witness: Path) -> dict:
                 database,
                 "SELECT at,business_key FROM attempts "
                 f"WHERE at >= '{hourly_floor_iso}'")
+            # 各业务键的日上限。面板要把「今日用量 / 上限」画在采集链路拓扑上,
+            # 上限只有见证库这一份权威(2026-09-07 kg_hub 打满 5000 当夜 218 篇失败,
+            # 而任何看板都没显示"快到顶了")。
+            ceiling_raw = _rows(
+                database,
+                "SELECT business_key,daily_requests,requests_per_minute "
+                "FROM cost_policy_ceiling")
         finally:
             database.close()
 
@@ -129,6 +137,11 @@ def collect(witness: Path) -> dict:
             for (hour, key), count in sorted(hourly_acc.items())
         ],
         "totals": dict(sorted(totals.items())),
+        "ceilings": {
+            str(key): {"daily_requests": int(daily), "requests_per_minute": int(rpm)}
+            for key, daily, rpm in ceiling_raw
+            if isinstance(daily, int) and isinstance(rpm, int)
+        },
         "window": {"hourly_hours": HOURLY_HOURS, "daily_days": DAILY_DAYS},
     }
 

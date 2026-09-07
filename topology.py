@@ -15,7 +15,9 @@ topology — 采集链路动态拓扑图（面板 + 上报 API）。
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
@@ -35,7 +37,7 @@ LAYERS = [
     ("nasdb", "NAS 副本"),
     ("consumer", "消费容器"),
     ("kghub", "kg-hub"),
-    ("graph", "图谱"),
+    ("graph", "图谱 / 模型"),
 ]
 
 MAX_SNAPSHOT_BYTES = 256 * 1024   # 单份快照上限，防误传大 payload
@@ -65,6 +67,119 @@ def annotate_liveness(snap: dict, liveness: dict, aliases: object = None,
     snap["_snapshot_stale"] = snapshot_stale
     snap["_stale"] = bool(snapshot_stale and state == "online")
     snap["_disconnected"] = state == "offline"
+    return snap
+
+
+# 模型网关配额:kg-hub 的每次抽取都要经它调模型,日上限打满则整条线停摆
+# (2026-09-06 夜 kg_hub 打满 5000,218 篇失败,而拓扑上没有任何一格变色)。
+GATEWAY_USAGE_PATH = Path(os.environ.get("KG_HUB_GATEWAY_USAGE", "/gateway-usage/usage.json"))
+REFINERY_STATUS_PATH = Path(os.environ.get("KG_HUB_REFINERY_STATUS", "/refinery-state/status.json"))
+GATEWAY_USAGE_STALE_S = 15 * 60     # export 每 ~90s 跑一次;15 分钟没更新就别再当实况
+GATEWAY_AMBER_RATIO = 0.8
+GATEWAY_PRIMARY_KEY = "kg_hub.entity_extract"
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
+                       now: datetime, stale_after_s: int = GATEWAY_USAGE_STALE_S
+                       ) -> tuple[dict, dict]:
+    """把网关「今日用量 / 日上限」折成拓扑上的一个节点 + 一条 kg-hub→网关的边。
+
+    数据只来自两份 NAS 本地文件,不打网关、不查库:
+    - usage.json(tools/export_gateway_usage.py 从见证库副本导出):daily + ceilings
+    - refinery status.json:quota_paused / quota_hits(refinery 撞到 429 后的整窗停发)
+    日按 UTC 算,与见证库 daily_counts 的口径一致。
+    状态:红 = 已打满或 refinery 正因配额停发;黄 = 任一键 ≥80%;灰 = 没有可信数据;绿 = 其余。
+    """
+    node: dict = {"id": "gateway", "layer": "graph", "label": "模型网关",
+                  "state": "grey", "detail": "", "metrics": {}}
+    edge = {"from": "kghub", "to": "gateway", "state": "grey"}
+    if not usage:
+        node["detail"] = f"未找到网关用量快照 {GATEWAY_USAGE_PATH}"
+        node["sub"] = "无用量快照"
+        return node, edge
+    generated = usage.get("generated_at")
+    try:
+        age_s = int((now - datetime.fromisoformat(str(generated))).total_seconds())
+    except (TypeError, ValueError):
+        age_s = None
+    ceilings = usage.get("ceilings") if isinstance(usage.get("ceilings"), dict) else {}
+    today = now.strftime("%Y-%m-%d")
+    counts: dict[str, int] = {}
+    for item in usage.get("daily") or []:
+        if isinstance(item, dict) and item.get("day") == today:
+            key = str(item.get("business_key"))
+            counts[key] = counts.get(key, 0) + int(item.get("count") or 0)
+    keys = sorted(set(counts) | set(ceilings))
+    per_key: dict[str, dict] = {}
+    worst = 0.0
+    for key in keys:
+        cap = (ceilings.get(key) or {}).get("daily_requests") if isinstance(ceilings.get(key), dict) else None
+        used = counts.get(key, 0)
+        ratio = (used / cap) if isinstance(cap, int) and cap > 0 else None
+        per_key[key] = {"today": used, "daily_requests": cap,
+                        "ratio": (round(ratio, 4) if ratio is not None else None)}
+        if ratio is not None:
+            worst = max(worst, ratio)
+    status = refinery_status or {}
+    paused = bool(status.get("quota_paused"))
+    hits = int(status.get("quota_hits") or 0)
+    node["metrics"] = {"generated_at": generated, "age_s": age_s, "day": today,
+                       "keys": per_key, "quota_paused": paused, "quota_hits": hits}
+
+    primary = per_key.get(GATEWAY_PRIMARY_KEY)
+    if primary and isinstance(primary["daily_requests"], int):
+        pct = f"{primary['ratio'] * 100:.0f}%" if primary["ratio"] is not None else "?"
+        node["sub"] = f"今日 {primary['today']}/{primary['daily_requests']} · {pct}"
+    elif primary:
+        node["sub"] = f"今日 {primary['today']} · 上限未知"
+    else:
+        node["sub"] = "今日无 kg-hub 调用"
+
+    lines = [f"{k}: 今日 {v['today']} / 日上限 {v['daily_requests'] if v['daily_requests'] is not None else '?'}"
+             + (f"({v['ratio'] * 100:.0f}%)" if v["ratio"] is not None else "")
+             for k, v in per_key.items()]
+    if age_s is None or age_s > stale_after_s:
+        node["state"] = "grey"
+        lines.insert(0, f"⚠ 用量快照过旧或无时间戳(age={age_s}s),不作实况")
+    elif paused:
+        node["state"] = "red"
+        lines.insert(0, f"🔴 refinery 因网关配额耗尽整窗停发(累计 {hits} 次)")
+    elif worst >= 1.0:
+        node["state"] = "red"
+        lines.insert(0, "🔴 日上限已打满:后续请求 429,抽取全部失败")
+    elif not ceilings:
+        node["state"] = "grey"
+        lines.insert(0, "⚠ 快照无 ceilings 字段(export 旧版),无法判断余量")
+    elif worst >= GATEWAY_AMBER_RATIO:
+        node["state"] = "amber"
+        lines.insert(0, f"🟡 已用 {worst * 100:.0f}%,窗口尾可能打满")
+    else:
+        node["state"] = "green"
+    node["detail"] = "\n".join(lines)
+    edge["state"] = node["state"]
+    return node, edge
+
+
+def annotate_gateway(snap: dict, node: dict, edge: dict) -> dict:
+    """只在含 kg-hub 节点的快照上挂网关节点(NAS 侧那一段只画一份)。"""
+    nodes = snap.get("nodes")
+    if not isinstance(nodes, list) or not any(
+            isinstance(n, dict) and n.get("id") == "kghub" for n in nodes):
+        return snap
+    if any(isinstance(n, dict) and n.get("id") == "gateway" for n in nodes):
+        return snap
+    nodes.append(dict(node))
+    edges = snap.setdefault("edges", [])
+    if isinstance(edges, list):
+        edges.append(dict(edge))
     return snap
 
 
@@ -135,6 +250,11 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
     aliases = device_cfg.get("capture_device_aliases")
     stale_after_s = capture_stale_after_s(device_cfg)
     now = datetime.now(tz=timezone.utc)
+    try:
+        gw_node, gw_edge = gateway_quota_node(
+            _read_json(GATEWAY_USAGE_PATH), _read_json(REFINERY_STATUS_PATH), now=now)
+    except Exception:  # noqa: BLE001 — 配额格算不出来不能拖垮整张图
+        gw_node = gw_edge = None
     for r in rows:
         try:
             snap = json.loads(r.get("payload") or "{}")
@@ -150,6 +270,8 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         snap["_recv"] = recv
         snap["_age_s"] = age
         annotate_liveness(snap, liveness, aliases, stale_after_s=stale_after_s)
+        if gw_node is not None:
+            annotate_gateway(snap, gw_node, gw_edge)
         snaps.append(snap)
     return snaps
 
@@ -639,7 +761,7 @@ function renderHost(s, hi){
     dets.push(`<div class=det id="${did}"><b>${esc(n.label)}</b>  [${esc(n.state)}]\n`
       + `${esc(n.detail||'')}\n`
       + (n.metrics ? esc(JSON.stringify(n.metrics)) : '') + `</div>`);
-    const idle = n.idle_human ? `空闲 ${esc(n.idle_human)}` : '';
+    const idle = n.idle_human ? `空闲 ${esc(n.idle_human)}` : (n.sub ? esc(n.sub) : '');
     return `<g class=n data-det="${did}">`
       + `<title>${esc(n.detail||n.label)}</title>`
       + `<rect class="box ${esc(n.state)}" x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" rx="8"/>`
