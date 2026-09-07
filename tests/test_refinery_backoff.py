@@ -164,5 +164,13 @@ finally:
     R.save_watermark = _real_save
 check(f"4 条落账写了 4 次水印(增量可见,实测 {saves})", saves == [1, 2, 3, 4])
 
+# 主循环:积压必须排在 live 之前,且每段都落一次状态
+import inspect as _inspect
+_src = _inspect.getsource(R.main)
+check("积压线排在 live 线之前(否则 live 一轮吃掉整个窗口,积压整夜拿不到名额)",
+      _src.index('kind="backlog"' if 'kind="backlog"' in _src else '"backlog"')
+      < _src.index('"live"'))
+check("每段结束都落状态(不再整轮才写一次)", _src.count("snapshot(") >= 3)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

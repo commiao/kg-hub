@@ -718,6 +718,51 @@ async def main() -> int:
                 continue
             boundary = wm["boundary_id"]
 
+            def snapshot(**extra):
+                """每完成一段就落一次状态。
+
+                此前只在**整轮结束**时写一次。而 live 线一轮取 200 条、每条真抽取
+                约 3 分钟 ⇒ 一轮可达 10 小时,期间 backlog_remaining /
+                backlog_window_open 全是几小时前的过期值(2026-09-07 我自己被它误导
+                过一次:以为 refinery 没在干活,实际正在跑)。存活有独立 heartbeat,
+                但**进度**必须增量可见 —— 与今天修的"200 条一批才落一次账"同一类。
+                """
+                write_status(
+                    disk_temp=dtemp, thermal_hold=False, idle_outside_window=False,
+                    boundary_id=boundary, live_cursor=wm.get("live_cursor"),
+                    backlog_window_open=in_backlog_window(),
+                    per_cycle=BACKLOG_PER_CYCLE,
+                    backoff_pending=len(backoff),
+                    quota_paused=False,
+                    quota_paused_until_cycle=quota_pause.get("until_cycle"),
+                    quota_hits=quota_pause.get("hits", 0),
+                    watermark={"ingested": len(wm["ingested"]),
+                               "rejected": len(wm["rejected"]),
+                               "failed": len(wm["failed"])},
+                    last_error=None, **extra)
+
+            # —— backlog 先跑 ——
+            # 顺序在 2026-09-07 夜间实测后调换:live 线自己积压 1006 条、每轮取 200 条,
+            # 一轮就吃掉整个 12 小时窗口,排在它后面的积压那 8 个名额**整夜拿不到**
+            # (backlog_remaining 连续 4 天恒为 7786)。积压先跑保证每轮必得名额;
+            # 代价只是新观测入图晚一轮(90 秒),而积压已经等了几个月。
+            s_back = {"ingested": 0, "rejected": 0, "deferred": 0}
+            backlog_remaining = 0
+            if BACKLOG_ENABLED:
+                seen = wm["ingested"] | wm["rejected"] | wm["failed"]
+                pending_ids = [i for i in fetch_ids(max_id_inclusive=boundary)
+                               if i not in seen]
+                backlog_remaining = len(pending_ids)
+                if in_backlog_window() and pending_ids:
+                    s_back = await process_batch(
+                        fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
+                        wm, cfg, quotas, decided, backoff, cycle, "backlog",
+                        quota_pause=quota_pause)
+                    backlog_remaining -= s_back["ingested"] + s_back["rejected"]
+            snapshot(backlog_processed=s_back, backlog_remaining=backlog_remaining,
+                     live_processed={"ingested": 0, "rejected": 0, "deferred": 0,
+                                     "pending_this_cycle": True})
+
             # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累>200条后永久卡死)
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
             cursor = wm.get("live_cursor") or boundary
@@ -738,36 +783,8 @@ async def main() -> int:
                 wm["live_cursor"] = new_cursor
                 save_watermark(wm)
 
-            # —— backlog:只拉 id 列算余量;窗口开才按需取正文(审查 R6)
-            s_back = {"ingested": 0, "rejected": 0, "deferred": 0}
-            backlog_remaining = 0
-            if BACKLOG_ENABLED:
-                seen = wm["ingested"] | wm["rejected"] | wm["failed"]
-                pending_ids = [i for i in fetch_ids(max_id_inclusive=boundary)
-                               if i not in seen]
-                backlog_remaining = len(pending_ids)
-                if in_backlog_window() and pending_ids:
-                    s_back = await process_batch(
-                        fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
-                        wm, cfg, quotas, decided, backoff, cycle, "backlog",
-                        quota_pause=quota_pause)
-                    backlog_remaining -= s_back["ingested"] + s_back["rejected"]
-
-            write_status(
-                disk_temp=dtemp, thermal_hold=False, idle_outside_window=False,
-                boundary_id=boundary, live_cursor=wm.get("live_cursor"),
-                live_processed=s_live, backlog_processed=s_back,
-                backlog_remaining=backlog_remaining,
-                backlog_window_open=in_backlog_window(),
-                per_cycle=BACKLOG_PER_CYCLE,
-                backoff_pending=len(backoff),
-                quota_paused=False,
-                quota_paused_until_cycle=quota_pause.get("until_cycle"),
-                quota_hits=quota_pause.get("hits", 0),
-                watermark={"ingested": len(wm["ingested"]), "rejected": len(wm["rejected"]),
-                           "failed": len(wm["failed"])},
-                last_error=None,
-            )
+            snapshot(live_processed=s_live, backlog_processed=s_back,
+                     backlog_remaining=backlog_remaining)
         except Exception as exc:  # noqa: BLE001 — 单轮失败不倒进程
             log.exception("[cycle] failed")
             write_status(last_error=f"{type(exc).__name__}: {exc}")
