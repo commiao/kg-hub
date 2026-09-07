@@ -1,0 +1,13 @@
+{
+  "services": {
+    "watchdog": {
+      "networks": ["default", "model_gateway_private"]
+    }
+  },
+  "networks": {
+    "model_gateway_private": {
+      "external": true,
+      "name": "model-gateway-private"
+    }
+  }
+}

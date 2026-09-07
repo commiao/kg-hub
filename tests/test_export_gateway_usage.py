@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,6 +40,49 @@ def make_witness(path: Path) -> None:
 
 
 class ExportContractTests(unittest.TestCase):
+    def health_response(self, document):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(document).encode()
+        opener = mock.Mock()
+        opener.open.return_value = response
+        return opener
+
+    def test_effective_limits_only_local_get_no_credentials_no_provider_call(self):
+        opener = self.health_response({"status": "ok", "external_calls": 0,
+            "effective_limits": {"kg_hub.entity_extract": {
+                "daily_requests": 5000, "requests_per_minute": 60,
+                "unexpected_secret": "must-not-export"}}})
+        with mock.patch.object(E.urllib.request, "build_opener", return_value=opener):
+            data = E.collect_effective_limits("http://model-gateway:39000")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://model-gateway:39000/health/ready")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.header_items(), [])
+        self.assertEqual(data["limits"]["kg_hub.entity_extract"]["daily_requests"], 5000)
+        self.assertNotIn("must-not-export", json.dumps(data))
+
+    def test_invalid_or_unhealthy_response_yields_unknown_not_ceiling(self):
+        for document in [
+            {"status": "ok", "external_calls": 0, "ceilings": {"kg_hub.entity_extract": {"daily_requests": 120000}}},
+            {"status": "error", "external_calls": 0, "effective_limits": {"x": {"daily_requests": 5000, "requests_per_minute": 60}}},
+            {"status": "ok", "external_calls": 1, "effective_limits": {"x": {"daily_requests": 5000, "requests_per_minute": 60}}},
+            {"status": "ok", "external_calls": 0, "effective_limits": {"x": {"daily_requests": True, "requests_per_minute": 60}}},
+        ]:
+            with mock.patch.object(E.urllib.request, "build_opener", return_value=self.health_response(document)):
+                data = E.collect_effective_limits("http://model-gateway:39000")
+            self.assertEqual(data["status"], "unknown")
+            self.assertEqual(data["limits"], {})
+
+    def test_timeout_does_not_export_error_body_and_endpoint_is_fixed(self):
+        opener = mock.Mock()
+        opener.open.side_effect = TimeoutError("sensitive upstream details")
+        with mock.patch.object(E.urllib.request, "build_opener", return_value=opener):
+            data = E.collect_effective_limits("http://model-gateway:39000")
+            self.assertEqual(E.collect_effective_limits("http://model-gateway:39000/v1/invoke")["status"], "unknown")
+        self.assertEqual(opener.open.call_count, 1)
+        self.assertEqual(data["limits"], {})
+        self.assertNotIn("sensitive", json.dumps(data))
+
     def test_healthy_witness_yields_daily_and_ceilings(self):
         with tempfile.TemporaryDirectory() as tmp:
             witness = Path(tmp) / "w.sqlite3"
@@ -46,6 +90,7 @@ class ExportContractTests(unittest.TestCase):
             payload = E.collect(witness)
             self.assertEqual(payload["ceilings"]["kg_hub.entity_extract"]["daily_requests"],
                              120000)
+            self.assertEqual(payload["effective_limits"], {})
             self.assertTrue(any(r["business_key"] == "kg_hub.entity_extract"
                                 for r in payload["daily"]))
 

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
+from dashboard_status import apply_gateway_health, gateway_health, refinery_activity
 
 from utils.device_liveness import (DEFAULT_CAPTURE_STALE_AFTER_S,
                                    DEFAULT_MAX_AGE_S, DEFAULT_PATH, device_state,
@@ -93,7 +94,7 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     """把网关「今日用量 / 日上限」折成拓扑上的一个节点 + 一条 kg-hub→网关的边。
 
     数据只来自两份 NAS 本地文件,不打网关、不查库:
-    - usage.json(tools/export_gateway_usage.py 从见证库副本导出):daily + ceilings
+    - usage.json:daily 来自见证库副本;effective_limits 来自网关零调用健康接口
     - refinery status.json:quota_paused / quota_hits(refinery 撞到 429 后的整窗停发)
     日按 UTC 算,与见证库 daily_counts 的口径一致。
     状态:红 = 已打满或 refinery 正因配额停发;黄 = 任一键 ≥80%;灰 = 没有可信数据;绿 = 其余。
@@ -111,22 +112,26 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     except (TypeError, ValueError):
         age_s = None
     ceilings = usage.get("ceilings") if isinstance(usage.get("ceilings"), dict) else {}
+    limits = usage.get("effective_limits") if isinstance(usage.get("effective_limits"), dict) else {}
     today = now.strftime("%Y-%m-%d")
     counts: dict[str, int] = {}
     for item in usage.get("daily") or []:
         if isinstance(item, dict) and item.get("day") == today:
             key = str(item.get("business_key"))
             counts[key] = counts.get(key, 0) + int(item.get("count") or 0)
-    keys = sorted(set(counts) | set(ceilings))
+    keys = sorted(set(counts) | set(limits) | set(ceilings))
     per_key: dict[str, dict] = {}
     worst = 0.0
     for key in keys:
-        cap = (ceilings.get(key) or {}).get("daily_requests") if isinstance(ceilings.get(key), dict) else None
+        cap = (limits.get(key) or {}).get("daily_requests") if isinstance(limits.get(key), dict) else None
+        cap = cap if type(cap) is int and cap > 0 else None
         used = counts.get(key, 0)
         ratio = (used / cap) if isinstance(cap, int) and cap > 0 else None
         per_key[key] = {"today": used, "daily_requests": cap,
+                        "approval_ceiling": ((ceilings.get(key) or {}).get("daily_requests")
+                                             if isinstance(ceilings.get(key), dict) else None),
                         "ratio": (round(ratio, 4) if ratio is not None else None)}
-        if ratio is not None:
+        if ratio is not None and key == GATEWAY_PRIMARY_KEY:
             worst = max(worst, ratio)
     status = refinery_status or {}
     paused = bool(status.get("quota_paused"))
@@ -143,10 +148,11 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     else:
         node["sub"] = "今日无 kg-hub 调用"
 
-    lines = [f"{k}: 今日 {v['today']} / 日上限 {v['daily_requests'] if v['daily_requests'] is not None else '?'}"
+    lines = [f"{k}: 今日 {v['today']} / 实际日上限 {v['daily_requests'] if v['daily_requests'] is not None else '?'}"
              + (f"({v['ratio'] * 100:.0f}%)" if v["ratio"] is not None else "")
+             + (f";审批上限 {v['approval_ceiling']}(非当前额度)" if v["approval_ceiling"] is not None else "")
              for k, v in per_key.items()]
-    if age_s is None or age_s > stale_after_s:
+    if age_s is None or age_s < -60 or age_s > stale_after_s:
         node["state"] = "grey"
         lines.insert(0, f"⚠ 用量快照过旧或无时间戳(age={age_s}s),不作实况")
     elif paused:
@@ -155,9 +161,9 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     elif worst >= 1.0:
         node["state"] = "red"
         lines.insert(0, "🔴 日上限已打满:后续请求 429,抽取全部失败")
-    elif not ceilings:
+    elif not limits or not primary or primary["ratio"] is None:
         node["state"] = "grey"
-        lines.insert(0, "⚠ 快照无 ceilings 字段(export 旧版),无法判断余量")
+        lines.insert(0, "⚠ 未取得网关有效额度 effective_limits,无法判断余量;审批上限不能代替当前额度")
     elif worst >= GATEWAY_AMBER_RATIO:
         node["state"] = "amber"
         lines.insert(0, f"🟡 已用 {worst * 100:.0f}%,窗口尾可能打满")
@@ -174,12 +180,22 @@ def annotate_gateway(snap: dict, node: dict, edge: dict) -> dict:
     if not isinstance(nodes, list) or not any(
             isinstance(n, dict) and n.get("id") == "kghub" for n in nodes):
         return snap
-    if any(isinstance(n, dict) and n.get("id") == "gateway" for n in nodes):
-        return snap
-    nodes.append(dict(node))
+    existing = next((n for n in nodes if isinstance(n, dict) and n.get("id") == "gateway"), None)
+    if existing is None:
+        nodes.append(dict(node))
+    else:
+        existing.update(node)
     edges = snap.setdefault("edges", [])
     if isinstance(edges, list):
-        edges.append(dict(edge))
+        existing_edge = next((e for e in edges if e.get("from") == "kghub"
+                              and e.get("to") == "gateway"), None)
+        if existing_edge is None:
+            edges.append(dict(edge))
+        else:
+            existing_edge.update(edge)
+    rank = {"grey": 0, "green": 1, "amber": 2, "red": 3}
+    snap["overall"] = max([snap.get("overall", "grey"), node["state"]],
+                          key=lambda state: rank.get(state, 0))
     return snap
 
 
@@ -251,8 +267,10 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
     stale_after_s = capture_stale_after_s(device_cfg)
     now = datetime.now(tz=timezone.utc)
     try:
+        refinery_status = _read_json(REFINERY_STATUS_PATH) or {}
         gw_node, gw_edge = gateway_quota_node(
-            _read_json(GATEWAY_USAGE_PATH), _read_json(REFINERY_STATUS_PATH), now=now)
+            _read_json(GATEWAY_USAGE_PATH), refinery_status, now=now)
+        apply_gateway_health(gw_node, gw_edge, await gateway_health())
     except Exception:  # noqa: BLE001 — 配额格算不出来不能拖垮整张图
         gw_node = gw_edge = None
     for r in rows:
@@ -272,6 +290,19 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         annotate_liveness(snap, liveness, aliases, stale_after_s=stale_after_s)
         if gw_node is not None:
             annotate_gateway(snap, gw_node, gw_edge)
+            activity = refinery_activity(refinery_status, now)
+            for node in snap.get("nodes", []):
+                if node.get("id") == "refinery" and node.get("state") != "red":
+                    node["state"] = activity["state"]
+                    node["sub"] = ("计划暂停" if refinery_status.get("idle_outside_window")
+                                   and activity["state"] == "amber" else activity["label"])
+                    node["idle_human"] = None
+                    node["detail"] = (activity["label"] + "\n心跳："
+                                      + str(refinery_status.get("heartbeat_at"))
+                                      + "\n积压剩余：" + str(refinery_status.get("backlog_remaining")))
+                    for edge in snap.get("edges", []):
+                        if "refinery" in (edge.get("from"), edge.get("to")):
+                            edge["state"] = node["state"]
         snaps.append(snap)
     return snaps
 
@@ -400,7 +431,7 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
 <div class=legend>
   <span><i style="background:var(--green)"></i>正常</span>
   <span><i style="background:var(--amber)"></i>空闲/滞后（非故障）</span>
-  <span><i style="background:var(--red)"></i>阻塞或故障</span>
+  <span><i style="background:var(--red)"></i>故障 / 健康异常（详见节点）</span>
   <span><i style="background:var(--grey)"></i>未配置</span>
   <span>虚线 = 该跳有滞后或中断</span>
   <span>点线 = 跨层直连（如 OpenClaw 不走 claude-mem，绕行走最近空闲通道）</span>

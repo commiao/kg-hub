@@ -1,0 +1,3 @@
+services:
+  kg_hub_server:
+    image: kg-hub-server:historical-outcomes-20260907

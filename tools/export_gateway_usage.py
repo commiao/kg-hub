@@ -24,10 +24,14 @@
       "monthly":[{"month": "2026-09", "business_key": "...", "count": 1549}, ...],
       "totals": {"<business_key>": 1549, ...},
       "ceilings": {"<business_key>": {"daily_requests": 120000, "requests_per_minute": 60}},
+      "effective_limits": {"<business_key>": {"daily_requests": 5000, "requests_per_minute": 60}},
+      "effective_limits_meta": {"source": "gateway:/health/ready", "status": "ok", "checked_at": "..."},
       "window": {"hourly_hours": 72, "daily_days": 62}
     }
 
 小时数据来自 `attempts`；它是单调追加的，解决 provider-status 未决标记不影响它。
+`ceilings` 仅是审批上限。当前额度必须来自网关 `/health/ready` 的有效路由投影；
+接口不可用或旧版缺字段时 `effective_limits` 为空，看板显示未知，不沿用旧额度。
 
 副本自洽性
 ----------
@@ -47,14 +51,64 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_WITNESS = Path("/volume1/docker/model-gateway-witness/rollback-witness.sqlite3")
 DEFAULT_OUT = Path("/volume2/4T/kg-hub-data/gateway-usage/usage.json")
+DEFAULT_GATEWAY = "http://model-gateway:39000"
 HOURLY_HOURS = 72
 DAILY_DAYS = 62
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def collect_effective_limits(gateway_url: str) -> dict:
+    """Read only the gateway's zero-provider local readiness projection.
+
+    Approval ceilings are NOT effective limits. Missing/old/unavailable gateway
+    responses deliberately yield unknown; never substitute witness ceilings.
+    No caller credential or provider endpoint is involved in this GET.
+    """
+    result = {"source": "gateway:/health/ready", "status": "unknown",
+              "checked_at": datetime.now(timezone.utc).isoformat(), "limits": {}}
+    try:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(gateway_url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in {"", "/"}):
+            raise ValueError("invalid local gateway base URL")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        request = urllib.request.Request(gateway_url.rstrip("/") + "/health/ready",
+                                         method="GET")
+        with opener.open(request, timeout=5) as response:
+            raw = response.read(256 * 1024 + 1)
+        if len(raw) > 256 * 1024:
+            raise ValueError("oversize health response")
+        document = json.loads(raw)
+        policies = document.get("effective_limits")
+        if (document.get("status") != "ok" or document.get("external_calls") != 0
+                or not isinstance(policies, dict) or not policies):
+            raise ValueError("effective limits unavailable")
+        limits = {}
+        for key, policy in policies.items():
+            if not isinstance(policy, dict):
+                continue
+            daily, rpm = policy.get("daily_requests"), policy.get("requests_per_minute")
+            if type(daily) is int and daily > 0 and type(rpm) is int and rpm > 0:
+                limits[key] = {"daily_requests": daily, "requests_per_minute": rpm}
+        result.update(status="ok" if limits else "unknown", limits=limits)
+        result["gateway_checked_at"] = document.get("checked_at")
+    except Exception:
+        # Never dump an arbitrary upstream body/exception into public snapshots.
+        result["reason"] = "effective_limits_unavailable"
+    return result
 
 
 def _copy_for_read(source: Path, into: Path, attempt: int = 0) -> Path:
@@ -126,7 +180,7 @@ def _open_consistent_copy(witness: Path, staging: Path, *,
     raise TornSnapshot(f"{attempts} 次复制均未取到自洽副本: {last}")
 
 
-def collect(witness: Path) -> dict:
+def collect(witness: Path, *, gateway_url: str | None = None) -> dict:
     now = datetime.now(tz=timezone.utc)
     with tempfile.TemporaryDirectory() as staging:
         database, deployment, ceiling_raw = _open_consistent_copy(
@@ -174,6 +228,8 @@ def collect(witness: Path) -> dict:
             continue
         hourly_acc[(moment.strftime("%Y-%m-%dT%H"), str(key))] += 1
 
+    effective = (collect_effective_limits(gateway_url) if gateway_url else
+                 {"source": "gateway:/health/ready", "status": "unknown", "limits": {}})
     return {
         "generated_at": now.isoformat(),
         "witness_deployment_id": (str(deployment[0][0]) if deployment else None),
@@ -187,6 +243,8 @@ def collect(witness: Path) -> dict:
             for (hour, key), count in sorted(hourly_acc.items())
         ],
         "totals": dict(sorted(totals.items())),
+        "effective_limits": effective.pop("limits"),
+        "effective_limits_meta": effective,
         "ceilings": {
             str(key): {"daily_requests": int(daily), "requests_per_minute": int(rpm)}
             for key, daily, rpm in ceiling_raw
@@ -216,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--witness", type=Path, default=DEFAULT_WITNESS)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--gateway-url", default=os.environ.get(
+        "KG_HUB_GATEWAY_USAGE_URL", DEFAULT_GATEWAY), help="Local gateway base URL; only GET /health/ready")
     parser.add_argument("--print", action="store_true", help="同时打印摘要")
     args = parser.parse_args(argv)
 
@@ -223,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"witness not found: {args.witness}", file=sys.stderr)
         return 2
     try:
-        payload = collect(args.witness)
+        payload = collect(args.witness, gateway_url=args.gateway_url)
     except Exception as exc:  # noqa: BLE001
         # 读不出来就保留上一轮的 usage.json —— 报表宁可旧，不可错。
         print(f"collect failed, keeping previous snapshot: "

@@ -17,7 +17,7 @@ import topology as T  # noqa: E402
 NOW = datetime(2026, 9, 7, 3, 0, tzinfo=timezone.utc)
 
 
-def usage(count: int, cap: int | None = 120000, *, age_s: int = 60, key: str = T.GATEWAY_PRIMARY_KEY):
+def usage(count: int, cap: int | None = 5000, *, age_s: int = 60, key: str = T.GATEWAY_PRIMARY_KEY):
     data = {
         "generated_at": (NOW - timedelta(seconds=age_s)).isoformat(),
         "daily": [
@@ -25,19 +25,21 @@ def usage(count: int, cap: int | None = 120000, *, age_s: int = 60, key: str = T
             {"day": "2026-09-06", "business_key": key, "count": 5000},   # 昨天的不算今天
             {"day": "2026-09-07", "business_key": "claude_mem.observation", "count": 15},
         ],
-        "ceilings": {},
+        "ceilings": {key: {"daily_requests": 120000, "requests_per_minute": 60}},
+        "effective_limits": {},
     }
     if cap is not None:
-        data["ceilings"] = {key: {"daily_requests": cap, "requests_per_minute": 60},
+        data["effective_limits"] = {key: {"daily_requests": cap, "requests_per_minute": 60},
                             "claude_mem.observation": {"daily_requests": 5000, "requests_per_minute": 60}}
     return data
 
 
 class GatewayQuotaNodeTests(unittest.TestCase):
-    def test_normal_usage_is_green_and_shows_today_over_ceiling(self):
+    def test_normal_usage_uses_actual_cap_not_approval_ceiling(self):
         node, edge = T.gateway_quota_node(usage(211), {"quota_paused": False}, now=NOW)
         self.assertEqual((node["id"], node["layer"], node["state"]), ("gateway", "graph", "green"))
-        self.assertEqual(node["sub"], "今日 211/120000 · 0%")
+        self.assertEqual(node["sub"], "今日 211/5000 · 4%")
+        self.assertIn("审批上限 120000(非当前额度)", node["detail"])
         self.assertEqual(edge, {"from": "kghub", "to": "gateway", "state": "green"})
         self.assertEqual(node["metrics"]["keys"][T.GATEWAY_PRIMARY_KEY]["today"], 211)
 
@@ -65,11 +67,22 @@ class GatewayQuotaNodeTests(unittest.TestCase):
         self.assertEqual(node["state"], "grey")
         self.assertIn("未找到", node["detail"])
 
-    def test_missing_ceilings_is_grey_with_reason(self):
+    def test_missing_effective_limits_never_falls_back_to_ceiling(self):
         node, _ = T.gateway_quota_node(usage(10, cap=None), {}, now=NOW)
         self.assertEqual(node["state"], "grey")
-        self.assertIn("ceilings", node["detail"])
+        self.assertIn("effective_limits", node["detail"])
         self.assertEqual(node["sub"], "今日 10 · 上限未知")
+
+    def test_old_exporter_and_invalid_caps_are_unknown(self):
+        for bad in [None, 0, -1, True, "5000"]:
+            data = usage(10)
+            data["effective_limits"][T.GATEWAY_PRIMARY_KEY]["daily_requests"] = bad
+            node, _ = T.gateway_quota_node(data, {}, now=NOW)
+            self.assertEqual(node["state"], "grey")
+            self.assertIsNone(node["metrics"]["keys"][T.GATEWAY_PRIMARY_KEY]["ratio"])
+        data = usage(10)
+        del data["effective_limits"]
+        self.assertEqual(T.gateway_quota_node(data, {}, now=NOW)[0]["state"], "grey")
 
     def test_annotate_only_snapshots_with_kghub_and_only_once(self):
         node, edge = T.gateway_quota_node(usage(1), {}, now=NOW)
