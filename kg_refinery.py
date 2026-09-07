@@ -248,6 +248,14 @@ CST = timezone(timedelta(hours=8))  # Asia/Shanghai,夜间窗口按此判
 # 退避序列(轮):1 → 2 → 4 → 8 → 16 → 32,上限 ~48min(服务端 error 键 24h 过期,
 # 退避到上限后仍会周期性试探,不会永久放弃)。
 BACKOFF_MAX_CYCLES = 32
+# 单批内并发抽取上限。服务端 do_extract 用 async_writer_lock 串行化 add_episode,
+# 所以这不会让抽取吞吐翻倍;它消除的是**批内队头阻塞**——此前一条慢抽取(p90 180s)
+# 会把身后的快速失败条目全堵住,服务端的锁队列反而空转。2 与服务端 SEMAPHORE_LIMIT
+# 对齐;锁竞争由服务端 180s 超时 ×5 次线性退避兜住,抽取 p90 远在容忍内。
+INGEST_CONCURRENCY = max(1, int(os.environ.get("KG_HUB_REFINERY_INGEST_CONCURRENCY", "2")))
+# 轮询节奏:先密后疏。实测决策间隔中位数 8.1s == 固定轮询周期,说明**过半条目在 1s 内
+# 就有终态**(多为 409/error 快速失败),却要白等一个整周期(2026-09-07 实测)。
+POLL_STEPS_S = (1, 1, 2, 4, 8)
 # 网关回「配额耗尽」(日/分上限)时整窗停发的轮数;到期后再探一条,仍耗尽则再停。
 QUOTA_PAUSE_CYCLES = int(os.environ.get("KG_HUB_REFINERY_QUOTA_PAUSE_CYCLES", "20"))
 
@@ -455,6 +463,7 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
     import urllib.parse
     q = urllib.parse.urlencode({"source_description": sd, "source_obs_id": sid})
     waited = 0
+    step = 0
     while waited < max_wait:
         code, d = _http("GET", f"{KG_HUB_URL}/api/ingest/status?{q}")
         st = d.get("status", "")
@@ -462,8 +471,10 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
             return "quota"      # 网关配额耗尽:请求没到供应商,与这条观测无关
         if st in ("ok", "skipped", "error"):
             return st
-        await asyncio.sleep(8)
-        waited += 8
+        delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
+        step += 1
+        await asyncio.sleep(delay)
+        waited += delay
     return "timeout"
 
 
@@ -532,8 +543,13 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                         backoff: dict[int, list[int]], cycle: int, kind: str,
                         quota_pause: dict | None = None) -> dict:
     """decided: 进程内决策缓存 {obs_id: accept}。deferred 条目下轮重评会重复
-    quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。"""
+    quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。
+
+    三段式:①过滤必须串行(要动日配额且每条只评一次) ②抽取有界并发(消除批内队头
+    阻塞) ③落账串行(水印/退避表的读改写不能交错)。
+    """
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0}
+    to_ingest: list[dict] = []
     for obs in rows:
         oid = obs["id"]
         if oid in wm["ingested"] or oid in wm["rejected"] or oid in wm["failed"]:
@@ -562,7 +578,35 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["rejected"] += 1
             save_watermark(wm)
             continue
-        st = await ingest_via_api(obs)
+        to_ingest.append(obs)
+
+    # ② 有界并发抽取。halt 一旦置起,尚未拿到令牌的条目直接不发——配额耗尽/server
+    # 不可达时不该继续撞,代价上限是并发数(而非整批)。
+    halt = {"stop": False}
+    if to_ingest:
+        gate = asyncio.Semaphore(INGEST_CONCURRENCY)
+
+        async def run(obs: dict):
+            if halt["stop"]:
+                return obs, None
+            async with gate:
+                if halt["stop"]:
+                    return obs, None
+                st = await ingest_via_api(obs)
+                if st in ("quota", "net"):
+                    halt["stop"] = True
+                return obs, st
+
+        results = await asyncio.gather(*(run(o) for o in to_ingest))
+    else:
+        results = []
+
+    # ③ 落账:顺序处理,水印与退避表的读改写不交错
+    for obs, st in results:
+        oid = obs["id"]
+        if st is None:                      # 被 halt 拦下,没发出去 → 下轮重试
+            stats["deferred"] += 1
+            continue
         if st in ("ok", "skipped"):
             wm["ingested"].add(oid)
             stats["ingested"] += 1
@@ -591,12 +635,9 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → 网关配额耗尽,停发 %d 轮(≈%dmin)后再探",
                         kind, oid, QUOTA_PAUSE_CYCLES, QUOTA_PAUSE_CYCLES * INTERVAL // 60)
-            break
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
-            if st == "net":
-                break  # server 不可达,本轮剩余直接留到下轮
         save_watermark(wm)
     return stats
 

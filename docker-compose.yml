@@ -280,6 +280,9 @@ services:
       - KG_HUB_REFINERY_STATE=/state
       - KG_HUB_REFINERY_INTERVAL_SEC=90
       - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=${KG_HUB_REFINERY_PER_CYCLE:-15}
+      # 批内并发抽取上限。服务端写锁串行化 add_episode,所以这不提高抽取吞吐,
+      # 只消除批内队头阻塞(一条 p90 180s 的慢抽取此前会堵住身后的快速失败条目)。
+      - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-2}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
       # 工作窗口(CST)。2026-08-18 按 857 条温度采样重定为 01:00-08:00:
       # 实测 22-23 点是全天最热(盘温<60 的可开工比例仅 25%/40%),01-08 才是凉窗

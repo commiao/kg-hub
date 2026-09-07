@@ -105,10 +105,46 @@ wmq, qp = fresh_wm(), {}
 stats_q = asyncio.run(R.process_batch(rows2, wmq, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
                                        R.QuotaTracker(), {r["id"]: True for r in rows2}, {}, 7, "test",
                                        quota_pause=qp))
-check("配额耗尽后本批立即停发(3 条只发 1 条)", quota_calls == [201])
+check(f"配额耗尽后本批立即停发(3 条最多发 {R.INGEST_CONCURRENCY} 条=并发上限,第 3 条不发)",
+      len(quota_calls) <= R.INGEST_CONCURRENCY and 203 not in quota_calls)
 check("记录停发到期轮次", qp.get("until_cycle") == 7 + R.QUOTA_PAUSE_CYCLES and qp.get("hits") == 1)
 check("不落水印(到期后照常重试)", 201 not in wmq["ingested"] and 201 not in wmq["failed"])
 check("stats 暴露 quota_paused", stats_q.get("quota_paused") == 1)
+
+# 轮询节奏:先密后疏。固定 8s 让"1 秒内就失败"的条目白等一整周期(实测中位 8.1s)
+slept = []
+async def fake_sleep(d): slept.append(d)
+_orig_sleep, _orig_http = asyncio.sleep, R._http
+polls = {"n": 0}
+def fake_http(method, url, body=None, timeout=30):
+    polls["n"] += 1
+    return (200, {"status": "ok"} if polls["n"] >= 4 else {"status": "in_progress"})
+asyncio.sleep, R._http = fake_sleep, fake_http
+try:
+    st = asyncio.run(R.poll_until_done("sd", "sid"))
+finally:
+    asyncio.sleep, R._http = _orig_sleep, _orig_http
+check("poll 拿到终态就返回", st == "ok")
+check(f"首次等待 1s 而非 8s(实测节奏 {slept[:3]})", slept and slept[0] == 1)
+check("节奏先密后疏 1→1→2", slept[:3] == [1, 1, 2])
+check("步长上限 8s", max(R.POLL_STEPS_S) == 8)
+
+# 并发:批内两条同时在飞 → 一条慢抽取不再堵住身后的快速失败
+order = []
+async def slow_then_fast(obs):
+    order.append(("start", obs["id"]))
+    await _orig_sleep(0.2 if obs["id"] == 301 else 0.01)
+    order.append(("end", obs["id"]))
+    return "ok"
+R.ingest_via_api = slow_then_fast
+rows3 = [{**ROWS[0], "id": 301}, {**ROWS[0], "id": 302}]
+wmc = fresh_wm()
+stats_c = asyncio.run(R.process_batch(rows3, wmc, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                                      R.QuotaTracker(), {r["id"]: True for r in rows3}, {}, 1, "test"))
+check("两条都入图", stats_c["ingested"] == 2)
+check("慢条目未阻塞后一条(302 先完成)",
+      order.index(("end", 302)) < order.index(("end", 301)) if R.INGEST_CONCURRENCY > 1 else True)
+check("水印两条都落账", wmc["ingested"] == {301, 302})
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
