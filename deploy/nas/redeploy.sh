@@ -15,7 +15,15 @@ NAS="${KG_HUB_NAS_SSH:-commiao@100.123.208.32}"
 SRC="${KG_HUB_NAS_SRC:-/volume1/docker/kg-hub-src}"
 DK="${KG_HUB_DOCKER:-sudo -n /var/packages/ContainerManager/target/usr/bin/docker}"
 REPO="${KG_HUB_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o ProxyJump=none)
+# ProxyJump=none 默认关掉跳板（直连 tailnet 更快，且不受跳板机可用性影响）。
+# 但直连认证在某些时段会失败，此时必须能走 ~/.ssh/config 里的跳板别名 ——
+# 2026-09-07 就是这样部署的：置 KG_HUB_NAS_SSH=nas-via-vps 并让这里不再写死
+# ProxyJump=none，否则该选项会覆盖别名自带的 ProxyJump、使跳板失效。
+# 用法：KG_HUB_NAS_SSH=nas-via-vps KG_HUB_SSH_ALLOW_PROXYJUMP=1 deploy/nas/redeploy.sh
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
+if [ "${KG_HUB_SSH_ALLOW_PROXYJUMP:-0}" != 1 ]; then
+  SSH_OPTS+=(-o ProxyJump=none)
+fi
 # Complete minimal cutover set. The image imports all four Python modules and
 # Compose needs both manifests before attaching model callers to the private
 # gateway network. Unrelated worktree files stay out of deployment.

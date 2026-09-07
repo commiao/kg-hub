@@ -148,6 +148,27 @@ def read_env(path: Path) -> dict[str, str]:
 
 
 def http_json(url: str, timeout: float = 5.0, token: str | None = None,
+              method: str = "GET", payload: dict | None = None,
+              retries: int = 0, retry_delay: float = 1.5) -> tuple[dict | None, str | None]:
+    """带重试的 HTTP 探测。默认 retries=0，其它调用方行为不变。
+
+    为什么要重试：笔记本从睡眠/深度空闲唤醒时，launchd 会立刻补跑睡眠期间欠下的
+    StartInterval 轮次，而此刻网络栈/被探测进程可能还没恢复接受连接 ——
+    2026-09-07 10:58:20 的 `URLError @ :37701` 就是探针撞上 `DarkWake to FullWake`
+    的 5 秒窗口，worker 6 秒后即正常落库。单次连接失败在这类设备上不构成"不可达"的证据。
+    真死的目标在 retries 次后照样判失败。只在 err 非空时重试；空 body 的 200 不算失败。
+    """
+    last: tuple[dict | None, str | None] = (None, "empty")
+    for attempt in range(retries + 1):
+        last = _http_json_once(url, timeout=timeout, token=token, method=method, payload=payload)
+        if last[1] is None:
+            return last
+        if attempt < retries:
+            time.sleep(retry_delay)
+    return last
+
+
+def _http_json_once(url: str, timeout: float = 5.0, token: str | None = None,
               method: str = "GET", payload: dict | None = None) -> tuple[dict | None, str | None]:
     """返回 (json, error)。任一失败都不抛，交给调用方判状态。"""
     data = json.dumps(payload).encode() if payload is not None else None
@@ -466,7 +487,13 @@ _QUEUE_DEPTH_RE = re.compile(r"queueDepth=(\d+)")
 # 注定追不上：8/28 起故障形态从 401 换成 400，而判据仍锁在 401 上，于是采集静默
 # 5.5 天面板全绿。批次「有没有变成 observation」这件事与失败原因无关，才是该量的量。
 # outputClass=xml 成功落库、idle 无事可做；其余一律是「这批素材没了」。
-_OUTPUT_CLASS_RE = re.compile(r"outputClass=([A-Za-z_]+)")
+# 只认 **PARSER 组件写出的结构化记录**：`[时间戳] [级别] [PARSER] … {…outputClass=X…}`。
+# 不能松成"行里出现 outputClass="——claude-mem 的 hook 会把每条工具调用原文写进同一份
+# 日志（`tool=Bash(grep 'outputClass=prose' …)`），任何一个正在排查它的会话都会把标记串
+# 写进日志，探针随即把自己的调试命令数成"丢弃"（2026-09-07 实测：10 条假丢弃全是我的 grep）。
+# 观测者的动作进了被观测的日志 —— 锚点必须落在只有 PARSER 才会写的位置。
+_OUTPUT_CLASS_RE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} [^\]]+\] \[[A-Z ]+\] \[PARSER\].*\{[^}]*\boutputClass=([A-Za-z_]+)")
 _GOOD_OUTPUT_CLASSES = frozenset({"xml", "idle"})
 # 连续丢弃多少批才判红。1~2 批可能是弱模型偶发不遵守输出契约（实测约 4 次/天，
 # 单次即自愈）；持续丢弃且期间零落库才是链路坏了。
@@ -574,18 +601,23 @@ def _worker_generation_diagnostics() -> dict:
     for path in logs[:4]:
         path_failure = path_queue_depth = path_queue_epoch = None
         for line in _worker_log_lines_reverse(path):
-            if path_queue_depth is None:
+            line_epoch = _log_epoch(line)
+            if line_epoch is None:
+                # 没有时间戳前缀 = 不是一条日志记录，是上一条记录的续行（多为工具调用
+                # 原文的多行 dump）。续行里出现 queueDepth= / outputClass= / Timeout 的
+                # 都是被记录的**别人的命令文本**，不是 worker 的状态；一律跳过，
+                # 既不计数也不作为回溯终点。
+                continue
+            if path_queue_depth is None and "[WORKER]" in line:
                 depth = _QUEUE_DEPTH_RE.search(line)
                 if depth is not None:
                     path_queue_depth = int(depth.group(1))
-                    path_queue_epoch = _log_epoch(line)
-            if path_failure is None and "SDK authentication failed" in line:
-                path_failure = _log_epoch(line)
+                    path_queue_epoch = line_epoch
+            if path_failure is None and "[PARSER]" in line and "SDK authentication failed" in line:
+                path_failure = line_epoch
             cls = _OUTPUT_CLASS_RE.search(line)
             is_discard = cls is not None and cls.group(1) not in _GOOD_OUTPUT_CLASSES
-            line_epoch = _log_epoch(line)
-            newer_than_obs = (observation_epoch is None or line_epoch is None
-                              or line_epoch > observation_epoch)
+            newer_than_obs = observation_epoch is None or line_epoch > observation_epoch
             if is_discard:
                 # 只数「比最新 observation 更新」的丢弃：更早的已被一次成功落库证明翻篇。
                 if newer_than_obs:
@@ -594,7 +626,8 @@ def _worker_generation_diagnostics() -> dict:
                     # 倒读时已越过最新 observation，本文件再往前都是旧账，停。
                     break
             # 原因提取与丢弃计数解耦：鉴权失败行不带 outputClass，但同样要如实报因。
-            if failure_hint is None and newer_than_obs:
+            if (failure_hint is None and newer_than_obs
+                    and ("[PARSER]" in line or "[SDK" in line)):
                 failure_hint = _failure_hint(line)
             if path_failure is not None and path_queue_depth is not None and discards:
                 if observation_epoch is None:
@@ -623,7 +656,7 @@ def _worker_generation_diagnostics() -> dict:
 
 def probe_worker() -> dict:
     """claude-mem worker：HTTP 存活与 observation 产出链路都必须健康。"""
-    data, err = http_json(CM_HEALTH, timeout=4)
+    data, err = http_json(CM_HEALTH, timeout=4, retries=2)
     if err or not data:
         return {"id": "worker", "layer": "worker", "label": "claude-mem",
                 "state": RED, "detail": f"health 不可达（{err or 'empty'}）@ :37701"}
@@ -1287,8 +1320,12 @@ def main() -> int:
         if not url:
             print("[report] 跳过：未配置 KG_HUB_URL", file=sys.stderr)
             return 0
+        # 与 worker 健康探测同样加重试：本任务的上报同为唤醒窗口受害者
+        # （err.log 历史 3 次 `[report] 失败: URLError`）。上报失败会让 NAS 侧
+        # 整轮不可判、进而沿用旧告警状态，一次抖动能拖出一段假红。
         _, err = http_json(f"{url}/api/topology/report", timeout=10,
-                           token=env.get("KG_HUB_API_TOKEN"), method="POST", payload=snap)
+                           token=env.get("KG_HUB_API_TOKEN"), method="POST", payload=snap,
+                           retries=2)
         print(f"[report] {'失败: ' + err if err else 'ok'}", file=sys.stderr)
 
     # 退出码：红=2，黄=1，绿=0 —— 方便被 shell / 监控直接消费。

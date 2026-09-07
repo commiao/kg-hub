@@ -187,6 +187,107 @@ def test_stall_detail_reports_discard_count_and_queue():
     assert node["metrics"]["discards_since_observation"] == 7
 
 
+def test_observer_tool_input_mentioning_marker_is_not_a_discard():
+    """2026-09-07 真实误报：探针把**自己会话的调试命令**数成了 10 条丢弃。
+
+    claude-mem 的 hook 把每条工具调用原文写进日志（多行 dump，续行无时间戳）；
+    任何排查过 outputClass 的会话都会把标记串写进去。判据只能认 [PARSER] 的
+    结构化记录，续行一律跳过 —— 否则观测者的动作会污染被观测的信号。
+    """
+    now = time.time()
+    stamp = datetime.fromtimestamp(now - 30).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    lines = [
+        # 带时间戳的 QUEUE 记录，工具原文里含标记串 —— 不是 PARSER，不算
+        f"[{stamp}] [INFO ] [QUEUE ] [session-524] ENQUEUED | tool=Bash(grep -c "
+        "'outputClass=prose' \"$L\" | 成功 xml: $(grep -c 'outputClass=xml' \"$L\")) | depth=21\n",
+        # 多行 dump 的续行：无时间戳，含标记串 / queueDepth / Timeout 字样 —— 全部跳过
+        "    if 'outputClass=prose' not in line: continue\n",
+        "    grep -oE 'queueDepth=999' | TimeoutError\n",
+        "    'outputClass=prose' \"$f\" | grep -c 'Request interrupted by user'\n",
+    ] * 4  # 16 行污染，远超阈值
+    # 唯一一条真实 WORKER 队列深度记录
+    lines.append(f"[{stamp}] [INFO ] [WORKER] Broadcasting processing status {{queueDepth=3}}\n")
+    node = _run_lines(lines, observation_epoch_s=now - 3600)
+    assert node["state"] == P.GREEN, node["detail"]
+    assert node["metrics"]["discards_since_observation"] == 0
+    assert node["metrics"]["queue_depth"] == 3, "队列深度只能取自 [WORKER] 记录，不能被 dump 里的 999 污染"
+
+
+def test_real_parser_discard_record_still_counts():
+    """收紧锚点后，真实 PARSER 丢弃记录必须仍被计入（防矫枉过正）。"""
+    now = time.time()
+    node = _run_lines(_discards(6, now - 30, "API Error: 400 boom"),
+                      observation_epoch_s=now - 3600)
+    assert node["state"] == P.RED
+    assert node["metrics"]["discards_since_observation"] == 6
+
+
+def test_continuation_line_does_not_stop_backtracking():
+    """续行既不计数也不能当回溯终点，否则一段 dump 会挡住其后的真实旧记录。"""
+    now = time.time()
+    stamp_new = datetime.fromtimestamp(now - 30).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    lines = _discards(7, now - 30, "API Error: 400 boom")
+    lines.append("    dump 续行 outputClass=prose 无时间戳\n")
+    lines.append(f"[{stamp_new}] [INFO ] [WORKER] status {{queueDepth=1}}\n")
+    node = _run_lines(lines, observation_epoch_s=now - 3600)
+    assert node["metrics"]["discards_since_observation"] == 7
+
+
+def test_wake_blip_first_attempt_fails_then_recovers_is_green():
+    """2026-09-07 10:58:20 真实误报：探针撞上 DarkWake→FullWake 的 5 秒窗口。
+    单次 URLError 不构成"不可达"；重试一次成功即绿。"""
+    now = time.time()
+    calls = {"n": 0}
+    def flaky(url, *a, **k):
+        calls["n"] += 1
+        return (None, "URLError") if calls["n"] == 1 else (_health(), None)
+    old_once, old_sleep = P._http_json_once, P.time.sleep
+    P._http_json_once = flaky; P.time.sleep = lambda s: None
+    try:
+        node = _run_lines([], observation_epoch_s=now - 60)
+    finally:
+        P._http_json_once, P.time.sleep = old_once, old_sleep
+    # _run_lines 会覆盖 P.http_json 为恒成功；这里要验的是真实 http_json 的重试，单独再跑一遍
+    calls["n"] = 0
+    P._http_json_once = flaky; P.time.sleep = lambda s: None
+    try:
+        data, err = P.http_json("http://x", timeout=1, retries=2)
+    finally:
+        P._http_json_once, P.time.sleep = old_once, old_sleep
+    assert err is None and data["status"] == "ok"
+    assert calls["n"] == 2, f"应在第 2 次成功后停止，实际调用 {calls['n']} 次"
+
+
+def test_hard_dead_worker_still_red_after_retries():
+    calls = {"n": 0}
+    def dead(url, *a, **k):
+        calls["n"] += 1
+        return (None, "URLError")
+    old_once, old_sleep = P._http_json_once, P.time.sleep
+    P._http_json_once = dead; P.time.sleep = lambda s: None
+    try:
+        data, err = P.http_json("http://x", timeout=1, retries=2)
+    finally:
+        P._http_json_once, P.time.sleep = old_once, old_sleep
+    assert data is None and err == "URLError"
+    assert calls["n"] == 3, "retries=2 应共尝试 3 次"
+
+
+def test_default_retries_zero_keeps_single_attempt():
+    """默认不重试：其它调用方行为不变。"""
+    calls = {"n": 0}
+    def dead(url, *a, **k):
+        calls["n"] += 1
+        return (None, "URLError")
+    old_once = P._http_json_once
+    P._http_json_once = dead
+    try:
+        P.http_json("http://x", timeout=1)
+    finally:
+        P._http_json_once = old_once
+    assert calls["n"] == 1
+
+
 def test_health_unreachable_still_red():
     """进程存活仍是独立信号，不能被产出判据取代。"""
     old = P.http_json
