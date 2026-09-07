@@ -28,6 +28,13 @@
     }
 
 小时数据来自 `attempts`；它是单调追加的，解决 provider-status 未决标记不影响它。
+
+副本自洽性
+----------
+网关每个付费请求都写见证库，`shutil.copy2` 有很大概率正好落在写事务中间，得到一份
+读不出任何表的坏副本（2026-09-07 实测 5 次里 3 次）。所以这里「复制→自检」重试若干
+次；必需的表读失败一律抛 `TornSnapshot`，由 `main()` 保留上一份快照——
+**绝不写出一份"结构合法但全空"的快照**，那会让面板说「今日无调用」这种假话。
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,9 +57,9 @@ HOURLY_HOURS = 72
 DAILY_DAYS = 62
 
 
-def _copy_for_read(source: Path, into: Path) -> Path:
+def _copy_for_read(source: Path, into: Path, attempt: int = 0) -> Path:
     """复制活库后再读。见模块 docstring：绝不在活库上持锁。"""
-    target = into / "witness.sqlite3"
+    target = into / f"witness-{attempt}.sqlite3"
     shutil.copy2(source, target)
     # WAL/日志旁文件若存在也一并带上，否则副本可能读不出最近写入。
     for suffix in ("-wal", "-shm", "-journal"):
@@ -61,24 +69,73 @@ def _copy_for_read(source: Path, into: Path) -> Path:
     return target
 
 
-def _rows(database: sqlite3.Connection, sql: str) -> list[tuple]:
+class TornSnapshot(RuntimeError):
+    """副本落在活库的一次写事务中间，读不出完整数据。"""
+
+
+def _rows(database: sqlite3.Connection, sql: str, *,
+          required: bool = False) -> list[tuple]:
+    """required=True 的表读失败必须抛错，**绝不能静默返回空**。
+
+    2026-09-07 实测:连续 5 次导出有 3 次全表读空——网关每个付费请求都写见证库,
+    写事务期间主库文件本身不自洽,`shutil.copy2` 有很大概率正好复制到事务中间,
+    于是每条查询都抛 DatabaseError。此前这里把错误吞掉返回 [],结果写出一份
+    "结构合法但全空"的快照,拓扑面板据此显示「今日无 kg-hub 调用」——
+    一个监控通路说了假话,正是这套系统反复栽的那个跟头。
+    """
     try:
         return list(database.execute(sql))
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if required:
+            raise TornSnapshot(f"见证库副本不可读: {exc}") from exc
         return []
+
+
+def _open_consistent_copy(witness: Path, staging: Path, *,
+                          attempts: int = 6, delay_s: float = 0.7):
+    """反复「复制→自检」直到拿到一份自洽副本；始终不碰活库的锁。
+
+    自检只读两张恒非空的小表(witness_meta / cost_policy_ceiling)——足以判断副本是否
+    完整，又不像 PRAGMA quick_check 那样扫全库。单次成功率实测约 40%，6 次≈99%；
+    全部失败就抛错，由 main() 保留上一份快照(宁可旧，不可错)。
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(delay_s)
+        try:
+            copy = _copy_for_read(witness, staging, attempt)
+            database = sqlite3.connect(f"file:{copy}?mode=ro", uri=True, timeout=10)
+        except (OSError, sqlite3.Error) as exc:
+            last = exc
+            continue
+        try:
+            meta = _rows(database, "SELECT deployment_id FROM witness_meta LIMIT 1",
+                         required=True)
+            ceiling = _rows(
+                database,
+                "SELECT business_key,daily_requests,requests_per_minute "
+                "FROM cost_policy_ceiling", required=True)
+            if not meta or not ceiling:
+                raise TornSnapshot("见证库副本缺 witness_meta / cost_policy_ceiling")
+        except (TornSnapshot, sqlite3.Error) as exc:
+            database.close()
+            last = exc
+            continue
+        return database, meta, ceiling
+    raise TornSnapshot(f"{attempts} 次复制均未取到自洽副本: {last}")
 
 
 def collect(witness: Path) -> dict:
     now = datetime.now(tz=timezone.utc)
     with tempfile.TemporaryDirectory() as staging:
-        copy = _copy_for_read(witness, Path(staging))
-        database = sqlite3.connect(f"file:{copy}?mode=ro", uri=True, timeout=10)
+        database, deployment, ceiling_raw = _open_consistent_copy(
+            witness, Path(staging))
         try:
-            deployment = _rows(database, "SELECT deployment_id FROM witness_meta LIMIT 1")
             daily_raw = _rows(
                 database,
                 "SELECT day,business_key,attempt_count FROM daily_counts "
-                "ORDER BY day, business_key")
+                "ORDER BY day, business_key", required=True)
             # 只取小时窗内的 attempts。这张表单调追加(约 2000 行/天),不设下界
             # 会让导出开销随历史线性增长——而本报表只画最近 HOURLY_HOURS 小时。
             # at 是 ISO8601,字典序与时序一致,可直接比较。
@@ -87,14 +144,7 @@ def collect(witness: Path) -> dict:
             attempts_raw = _rows(
                 database,
                 "SELECT at,business_key FROM attempts "
-                f"WHERE at >= '{hourly_floor_iso}'")
-            # 各业务键的日上限。面板要把「今日用量 / 上限」画在采集链路拓扑上,
-            # 上限只有见证库这一份权威(2026-09-07 kg_hub 打满 5000 当夜 218 篇失败,
-            # 而任何看板都没显示"快到顶了")。
-            ceiling_raw = _rows(
-                database,
-                "SELECT business_key,daily_requests,requests_per_minute "
-                "FROM cost_policy_ceiling")
+                f"WHERE at >= '{hourly_floor_iso}'", required=True)
         finally:
             database.close()
 
