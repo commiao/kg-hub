@@ -580,33 +580,16 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             continue
         to_ingest.append(obs)
 
-    # ② 有界并发抽取。halt 一旦置起,尚未拿到令牌的条目直接不发——配额耗尽/server
-    # 不可达时不该继续撞,代价上限是并发数(而非整批)。
+    # ② 有界并发抽取,**每条完成即落账**。
+    #
+    # 第一版把落账放在 gather 之后,结果 200 条一批要全跑完(实测 ~100 分钟)才写一次
+    # 水印:网关明明在被调用,而 backlog_remaining / watermark 半小时一动不动,既没有
+    # 增量进度也没有崩溃后的durability。settle() 是纯同步函数,asyncio 单线程且它内部
+    # 没有 await ⇒ 与其他任务不会交错,可以安全地在每个任务里就地落账。
     halt = {"stop": False}
-    if to_ingest:
-        gate = asyncio.Semaphore(INGEST_CONCURRENCY)
 
-        async def run(obs: dict):
-            if halt["stop"]:
-                return obs, None
-            async with gate:
-                if halt["stop"]:
-                    return obs, None
-                st = await ingest_via_api(obs)
-                if st in ("quota", "net"):
-                    halt["stop"] = True
-                return obs, st
-
-        results = await asyncio.gather(*(run(o) for o in to_ingest))
-    else:
-        results = []
-
-    # ③ 落账:顺序处理,水印与退避表的读改写不交错
-    for obs, st in results:
+    def settle(obs: dict, st: str) -> None:
         oid = obs["id"]
-        if st is None:                      # 被 halt 拦下,没发出去 → 下轮重试
-            stats["deferred"] += 1
-            continue
         if st in ("ok", "skipped"):
             wm["ingested"].add(oid)
             stats["ingested"] += 1
@@ -639,6 +622,24 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
         save_watermark(wm)
+
+    if to_ingest:
+        gate = asyncio.Semaphore(INGEST_CONCURRENCY)
+
+        async def run(obs: dict) -> None:
+            if halt["stop"]:
+                stats["deferred"] += 1      # 没发出去,下轮重试
+                return
+            async with gate:
+                if halt["stop"]:
+                    stats["deferred"] += 1
+                    return
+                st = await ingest_via_api(obs)
+            if st in ("quota", "net"):
+                halt["stop"] = True         # 尚未拿到令牌的条目不再发
+            settle(obs, st)
+
+        await asyncio.gather(*(run(o) for o in to_ingest))
     return stats
 
 

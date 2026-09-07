@@ -146,5 +146,23 @@ check("慢条目未阻塞后一条(302 先完成)",
       order.index(("end", 302)) < order.index(("end", 301)) if R.INGEST_CONCURRENCY > 1 else True)
 check("水印两条都落账", wmc["ingested"] == {301, 302})
 
+# 落账必须"每条完成即写",不能等整批 gather 完 —— 第一版就是这么错的:200 条一批
+# 要全跑完(~100 分钟)才写一次水印,网关明明在调用而 backlog_remaining 半小时不动。
+saves = []
+_real_save = R.save_watermark
+R.save_watermark = lambda wm: saves.append(len(wm["ingested"]))
+async def one_by_one(obs):
+    await _orig_sleep(0.01)
+    return "ok"
+R.ingest_via_api = one_by_one
+try:
+    wmi = fresh_wm()
+    rows4 = [{**ROWS[0], "id": 400 + i} for i in range(4)]
+    asyncio.run(R.process_batch(rows4, wmi, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                                R.QuotaTracker(), {r["id"]: True for r in rows4}, {}, 1, "test"))
+finally:
+    R.save_watermark = _real_save
+check(f"4 条落账写了 4 次水印(增量可见,实测 {saves})", saves == [1, 2, 3, 4])
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
