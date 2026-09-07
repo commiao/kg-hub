@@ -127,7 +127,7 @@ async def main() -> int:
     llm_fail = 0
     if need_llm:
         from model_gateway_client import create_gateway_client
-        client = create_gateway_client(timeout=90.0)
+        client = create_gateway_client()
         try:
             for rec, content in need_llm:
                 kind, conf, failed = await _llm_kind(client, content)

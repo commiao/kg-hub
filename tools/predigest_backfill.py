@@ -40,7 +40,7 @@ GROUP_ID = "kg_hub"
 async def llm_complete(prompt: str, max_tokens: int = 3200) -> str:
     """Mirror kg_hub_server via the stable, no-transport-retry gateway client."""
     from model_gateway_client import create_gateway_client, gateway_model
-    client = create_gateway_client(timeout=90.0)
+    client = create_gateway_client()
     try:
         with model_operation(
             "backfill.predigest-plan", stable_operation_id(prompt, max_tokens)

@@ -76,7 +76,7 @@ _JSON_RE = re.compile(r"\{.*?\}", re.S)
 
 def build_client():
     from model_gateway_client import create_gateway_client
-    return create_gateway_client(timeout=120.0)
+    return create_gateway_client()
 
 
 async def judge_one(client, model, name, capsule, session) -> dict:

@@ -121,7 +121,8 @@ def build_llm() -> AnthropicClient:
     # Gateway owns provider choice and cost ceilings. SDK transport retries are
     # disabled centrally; every logical call gets one stable Idempotency-Key.
     min_interval = float(os.environ.get("KG_HUB_LLM_MIN_INTERVAL_SEC", "4.0"))
-    async_client = create_gateway_client(timeout=120.0, min_interval=min_interval)
+    # 超时由工厂按「必须晚于网关路由 timeout」的下限统一决定,这里不再各自定值
+    async_client = create_gateway_client(min_interval=min_interval)
     return SingleAttemptAnthropicClient(config=cfg, client=async_client)
 
 

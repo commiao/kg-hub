@@ -231,9 +231,37 @@ class GatewayClientContractTests(unittest.TestCase):
             client = mgc.create_gateway_client(timeout=33.0)
         self.assertIsInstance(client, Constructor)
         self.assertEqual(captured["max_retries"], 0)
-        self.assertEqual(captured["timeout"], 33.0)
+        # 过小的超时被抬到下限:提前放弃会让网关留下永久 unresolved 记录
+        self.assertEqual(captured["timeout"], mgc.MIN_CLIENT_TIMEOUT_SEC)
         self.assertEqual(captured["auth_token"], "gateway-caller-token")
         self.assertEqual(captured["base_url"], "http://model-gateway:39000")
+
+    def test_client_timeout_must_outlast_the_gateway_route_timeout(self):
+        """客户端提前放弃 = 白烧一次付费调用 + 可能留下永久 unknown 幂等记录。
+
+        2026-09-07:kg-hub 每个调用点都是 90/120s,而路由 timeout 是 150s,方向全反;
+        网关侧因此攒下 67 条未决记录,readiness 长期 error,受控 cutover 被挡住。
+        """
+        self.assertGreater(mgc.MIN_CLIENT_TIMEOUT_SEC, mgc.GATEWAY_ROUTE_TIMEOUT_SEC)
+        # 不足即抬到下限;够大的值原样保留
+        self.assertEqual(mgc.enforced_client_timeout(None), mgc.MIN_CLIENT_TIMEOUT_SEC)
+        self.assertEqual(mgc.enforced_client_timeout(1.0), mgc.MIN_CLIENT_TIMEOUT_SEC)
+        self.assertEqual(mgc.enforced_client_timeout(mgc.GATEWAY_ROUTE_TIMEOUT_SEC),
+                         mgc.MIN_CLIENT_TIMEOUT_SEC)
+        self.assertEqual(mgc.enforced_client_timeout(999.0), 999.0)
+
+    def test_no_caller_hardcodes_a_timeout_below_the_floor(self):
+        """任何调用点都不该再自带一个小于下限的字面量(否则又要靠工厂兜)。"""
+        root = Path(__file__).resolve().parent.parent
+        offenders = []
+        pattern = re.compile(r"create_gateway_client\([^)]*timeout\s*=\s*([0-9.]+)")
+        for path in root.rglob("*.py"):
+            if "/tests/" in str(path) or path.name == "model_gateway_client.py":
+                continue
+            for value in pattern.findall(path.read_text("utf-8", errors="ignore")):
+                if float(value) < mgc.MIN_CLIENT_TIMEOUT_SEC:
+                    offenders.append(f"{path.name}: {value}")
+        self.assertEqual(offenders, [])
 
     def test_all_named_production_callers_use_central_factory(self):
         root = Path(__file__).resolve().parent.parent

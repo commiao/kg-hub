@@ -13,12 +13,30 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+
+# credvault 路由的 `timeout`(routes.json 里每个 business_key 一个,现为 150s):网关
+# 等供应商最多这么久。**客户端必须比它更晚放弃**,否则调用方断开时网关还在等,
+# 那次付费调用白烧;更糟的是供应商同时超过路由 timeout 时,网关会留下一条永久
+# `unknown` 幂等记录 —— readiness 从此报 error,而受控 cutover 硬性要求
+# readiness==ok,部署就被永久挡住(2026-09-07 为此人工清了三轮共 67 条)。
+#
+# 2026-09-07 实测:kg-hub 的**每一个**调用点都是 90 或 120s < 150s,方向全反;
+# 而 claude-mem 的 forwarder 用 175s,方向正确,可作参照。所以这条不变式不能靠
+# 各调用点自觉,必须在工厂里兜住。
+GATEWAY_ROUTE_TIMEOUT_SEC = float(
+    os.environ.get("KG_HUB_GATEWAY_ROUTE_TIMEOUT_SEC", "150"))
+# 余量 30s:够网关把供应商的终态写完幂等/见证记录并回传,不至于卡在最后一步。
+CLIENT_TIMEOUT_MARGIN_SEC = float(
+    os.environ.get("KG_HUB_GATEWAY_CLIENT_TIMEOUT_MARGIN_SEC", "30"))
+MIN_CLIENT_TIMEOUT_SEC = GATEWAY_ROUTE_TIMEOUT_SEC + CLIENT_TIMEOUT_MARGIN_SEC
+_timeout_floor_noted = False
 
 DEFAULT_BUSINESS_MODEL = "kg_hub.entity_extract"
 DEFAULT_GATEWAY_URL = "http://model-gateway:39000"
@@ -225,10 +243,32 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
     return client
 
 
-def create_gateway_client(*, timeout: float = 90.0, min_interval: float = 0.0,
+def enforced_client_timeout(timeout: float | None) -> float:
+    """把客户端超时抬到不低于 MIN_CLIENT_TIMEOUT_SEC。
+
+    抬而不是报错:所有历史调用点都传了过小的值,报错会让它们全部启动失败;而"提前
+    放弃"只会造成浪费与永久未决记录,抬高永远是安全方向。抬高时在 stderr 说一次
+    —— 静默降级正是这套系统反复栽的跟头。
+    """
+    global _timeout_floor_noted
+    if timeout is None:
+        return MIN_CLIENT_TIMEOUT_SEC
+    if timeout >= MIN_CLIENT_TIMEOUT_SEC:
+        return float(timeout)
+    if not _timeout_floor_noted:
+        _timeout_floor_noted = True
+        sys.stderr.write(
+            f"kg-hub: client timeout {timeout}s raised to {MIN_CLIENT_TIMEOUT_SEC}s "
+            f"(must outlast the gateway route timeout {GATEWAY_ROUTE_TIMEOUT_SEC}s)\n")
+    return MIN_CLIENT_TIMEOUT_SEC
+
+
+def create_gateway_client(*, timeout: float | None = None, min_interval: float = 0.0,
                           thinking_disabled: bool = True):
     """Create the sole supported paid-model client (transport retries disabled)."""
     from anthropic import AsyncAnthropic
+
+    timeout = enforced_client_timeout(timeout)
 
     # Validate every boundary before the SDK constructor can create a transport.
     base_url = gateway_base_url()

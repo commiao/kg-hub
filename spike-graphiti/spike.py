@@ -36,7 +36,7 @@ def build_llm() -> AnthropicClient:
     from model_gateway_client import create_gateway_client, gateway_model
     model = gateway_model()
     cfg = LLMConfig(api_key="gateway-managed", model=model, max_tokens=4096)
-    async_client = create_gateway_client(timeout=120.0)
+    async_client = create_gateway_client()
 
     return AnthropicClient(config=cfg, client=async_client)
 

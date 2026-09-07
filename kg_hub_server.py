@@ -3159,7 +3159,7 @@ async def _llm_complete(prompt: str, max_tokens: int = 1600) -> str:
     """One-shot LLM completion via the stable model-gateway client. Used for
     on-demand case-pack synthesis. Raises on failure (caller returns an error)."""
     from model_gateway_client import create_gateway_client, gateway_model
-    client = create_gateway_client(timeout=90.0)
+    client = create_gateway_client()
     try:
         operation_id = stable_operation_id(prompt, max_tokens)
         with model_operation("server.one-shot", operation_id):
