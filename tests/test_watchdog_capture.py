@@ -359,6 +359,136 @@ def test_backward_compatible_without_counters():
     assert cur["capture_blocked"] is True
 
 
+# ── stats 类判据:server 不可达时不得假 CLEAR(T-0059 问题②)──────────────
+# 2026-09-07 实测:每次重建 kg_hub_server,alerts.log 都出现
+#   [FIRE] server_down → [CLEAR] recent_errors(假) → [CLEAR] extraction_failing(假)
+#   → [CLEAR] server_down → [FIRE] recent_errors → [FIRE] extraction_failing
+# 1 条真告警配 4 条噪音。根因:这两项判据在 stats 取不到时被算成 False,
+# edge-trigger 把 True→False 读成"已恢复"。
+
+
+def _run_main(*, alive, stats, prev_anomalies, prev_counters=None, cfg=None):
+    """驱动 main() 一轮,返回 (保存的 state, 发出的告警列表)。
+
+    告警列表元素为 (severity, kind, message)。capture 链路关掉,避免与本组无关的
+    判定混入;last_run 必须非 None,否则 main 会进 60s 开机宽限期。
+    """
+    saved = {}
+    alerts = []
+    state = {"anomalies": dict(prev_anomalies),
+             "counters": dict(prev_counters or {}),
+             "last_run": "2026-09-07T00:00:00+00:00"}
+    conf = {"capture_chain_enabled": False}
+    conf.update(cfg or {})
+    with (patch("tools.watchdog.load_notify_config", return_value=conf),
+          patch("tools.watchdog.load_state", return_value=state),
+          patch("tools.watchdog.save_state", side_effect=lambda s: saved.update(s)),
+          patch("tools.watchdog.check_disk_temp", return_value=(None, "")),
+          patch("tools.watchdog.check_health",
+                return_value=(alive, "ok" if alive else "ConnectError: refused")),
+          patch("tools.watchdog.check_queue", return_value=(stats, "ok")),
+          patch("tools.watchdog.check_search_probe", return_value=("skip", 0.0, "")),
+          patch("tools.watchdog.emit_alert",
+                side_effect=lambda sev, kind, msg: alerts.append((sev, kind, msg)))):
+        W.main()
+    return saved, alerts
+
+
+def _clear_kinds(alerts):
+    return {kind for sev, kind, _ in alerts if sev == "clear"}
+
+
+def test_server_down_holds_recent_errors():
+    """server 不可达 → recent_errors 沿用上一轮 True,不发 CLEAR,计数 1。"""
+    saved, alerts = _run_main(alive=False, stats=None,
+                              prev_anomalies={"recent_errors": True})
+    assert saved["anomalies"]["recent_errors"] is True
+    assert "recent_errors" not in _clear_kinds(alerts)
+    assert saved["counters"]["recent_errors_unknown"] == 1
+
+
+def test_server_down_holds_extraction_failing():
+    saved, alerts = _run_main(alive=False, stats=None,
+                              prev_anomalies={"extraction_failing": True})
+    assert saved["anomalies"]["extraction_failing"] is True
+    assert "extraction_failing" not in _clear_kinds(alerts)
+    assert saved["counters"]["extraction_failing_unknown"] == 1
+
+
+def test_server_down_still_fires_server_down():
+    """真信号不受影响:server_down 该报还得报。"""
+    _saved, alerts = _run_main(alive=False, stats=None, prev_anomalies={})
+    assert ("fire", "server_down") in [(s, k) for s, k, _ in alerts]
+
+
+def test_recent_errors_released_after_hold_limit():
+    """连续不可判越过上限 → 释放,且 CLEAR 文案明说这不是恢复。"""
+    limit = W.CAPTURE_UNKNOWN_HOLD_ROUNDS
+    saved, alerts = _run_main(
+        alive=False, stats=None,
+        prev_anomalies={"recent_errors": True},
+        prev_counters={"recent_errors_unknown": limit})
+    assert saved["anomalies"]["recent_errors"] is False
+    msg = [m for s, k, m in alerts if s == "clear" and k == "recent_errors"]
+    assert msg, "越限后应发 CLEAR"
+    assert "不等于故障已修复" in msg[0]
+    assert msg[0] != "resolved"
+
+
+def test_extraction_failing_released_after_hold_limit():
+    limit = W.CAPTURE_UNKNOWN_HOLD_ROUNDS
+    saved, alerts = _run_main(
+        alive=False, stats=None,
+        prev_anomalies={"extraction_failing": True},
+        prev_counters={"extraction_failing_unknown": limit})
+    assert saved["anomalies"]["extraction_failing"] is False
+    msg = [m for s, k, m in alerts if s == "clear" and k == "extraction_failing"]
+    assert msg and "不等于故障已修复" in msg[0]
+
+
+def test_recovered_clears_normally_with_resolved():
+    """server 恢复且错误真降到阈值下 → 正常 CLEAR,文案是 resolved。"""
+    stats = {"pending": 0, "errored_last_1h": 0, "errored_total": 0,
+             "oldest_pending_age_seconds": None}
+    saved, alerts = _run_main(alive=True, stats=stats,
+                              prev_anomalies={"recent_errors": True,
+                                              "extraction_failing": True})
+    assert saved["anomalies"]["recent_errors"] is False
+    assert saved["anomalies"]["extraction_failing"] is False
+    cleared = {k: m for s, k, m in alerts if s == "clear"}
+    assert cleared.get("recent_errors") == "resolved"
+    assert cleared.get("extraction_failing") == "resolved"
+    # 取到数 → unknown 计数清零
+    assert saved["counters"]["recent_errors_unknown"] == 0
+    assert saved["counters"]["extraction_failing_unknown"] == 0
+
+
+def test_stats_unavailable_while_alive_also_holds():
+    """server 活着但 queue_stats 取数失败,同样不可判 → 沿用,不假 CLEAR。"""
+    saved, alerts = _run_main(alive=True, stats=None,
+                              prev_anomalies={"extraction_failing": True})
+    assert saved["anomalies"]["extraction_failing"] is True
+    assert "extraction_failing" not in _clear_kinds(alerts)
+
+
+def test_deploy_sequence_emits_only_server_down():
+    """回归本次事故序列:一次部署只该有 server_down 一条,不再有 4 条噪音。"""
+    prev = {"recent_errors": True, "extraction_failing": True}
+    # 部署中:server 不可达
+    saved, alerts_down = _run_main(alive=False, stats=None, prev_anomalies=prev)
+    assert _clear_kinds(alerts_down) == set(), "不可达轮不得发任何 CLEAR"
+    assert [k for s, k, _ in alerts_down if s == "fire"] == ["server_down"]
+    # 恢复:错误仍在(真故障未修) → 不该 re-FIRE(状态一直是 True,无跳变)
+    stats = {"pending": 0, "errored_last_1h": 71, "errored_total": 110,
+             "oldest_pending_age_seconds": None}
+    _saved2, alerts_up = _run_main(alive=True, stats=stats,
+                                   prev_anomalies=saved["anomalies"],
+                                   prev_counters=saved["counters"])
+    fired = [k for s, k, _ in alerts_up if s == "fire"]
+    assert "recent_errors" not in fired and "extraction_failing" not in fired
+    assert ("clear", "server_down") in [(s, k) for s, k, _ in alerts_up]
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

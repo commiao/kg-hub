@@ -429,6 +429,21 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
 CAPTURE_UNKNOWN_HOLD_ROUNDS = int(os.environ.get("KG_HUB_CAPTURE_UNKNOWN_HOLD", "3"))
 
 
+# stats 类判据全部依赖 /api/queue_stats。server 不可达或取数失败时它们**不可判**,
+# 绝不能落回 False —— edge-trigger 会把 True→False 读成一条 "resolved",这正是本
+# 项目反复消灭的"读不到就当修好了"。2026-09-07 实测:每次重建 kg_hub_server 都
+# 发 1 条真 server_down + 4 条噪音(recent_errors / extraction_failing 各一对
+# 假 CLEAR + 恢复后 re-FIRE)。故沿用与 capture_* 相同的三态:unknown 沿用上一轮,
+# 但有轮数上限(CAPTURE_UNKNOWN_HOLD_ROUNDS),越限后按同一文案释放。
+STATS_ANOMALY_KINDS: tuple[tuple[str, str], ...] = (
+    ("queue_backlog", "摄入队列积压"),
+    ("stuck_jobs", "卡住的摄入任务"),
+    ("capsule_stale", "OpenClaw 胶囊管线"),
+    ("recent_errors", "近 1h 新增入图错误"),
+    ("extraction_failing", "抽取失败存量"),
+)
+
+
 def _hold_or_release(kind: str, prev_bad: bool, streak: int, details: dict,
                      what: str) -> bool:
     """unknown 轮的沿用/释放决策。返回本轮该不该继续判 bad。"""
@@ -546,6 +561,11 @@ def main() -> int:
     }
     details: dict[str, str] = {}
 
+    # counters 跨轮持久化,unknown 沿用才有"连续第几轮"可数。stats 类判据(第 2 节)
+    # 与采集链路(第 2c 节)共用,故在两者之前就位。
+    prev_counters = state.get("counters", {}) or {}
+    new_counters: dict = {}
+
     # 0. 盘温(优先级最高:硬件保护,且与 server 存活无关)
     hottest, temp_msg = check_disk_temp()
     if hottest is not None and hottest >= DISK_TEMP_WARN:
@@ -594,10 +614,13 @@ def main() -> int:
                         )
                 else:
                     # 取数暂态失败(字段缺失/null):沿用上一轮判定,避免 30h+ 长异常
-                    # 被一次抖动打成 resolved→again 的成对噪音
-                    new_anomalies["capsule_stale"] = bool(prev_anomalies.get("capsule_stale"))
-                    if new_anomalies["capsule_stale"]:
-                        details["capsule_stale"] = "胶囊账龄暂不可读(暂态),沿用上一轮 stale 判定"
+                    # 被一次抖动打成 resolved→again 的成对噪音。沿用**有上限**,
+                    # 否则字段一直缺就会无限期断言一个无法验证的结论。
+                    streak = int(prev_counters.get("capsule_stale_unknown", 0)) + 1
+                    new_counters["capsule_stale_unknown"] = streak
+                    new_anomalies["capsule_stale"] = _hold_or_release(
+                        "capsule_stale", bool(prev_anomalies.get("capsule_stale")),
+                        streak, details, "胶囊账龄")
             if isinstance(oldest_age, (int, float)) and oldest_age > STUCK_SECONDS:
                 new_anomalies["stuck_jobs"] = True
                 details["stuck_jobs"] = (
@@ -649,6 +672,22 @@ def main() -> int:
                     + (f" — {sample_txt}" if sample_txt else "")
                 )
 
+    # ── stats 类判据的三态收口(见 STATS_ANOMALY_KINDS)──────────────────────
+    # 取到数 = 上面各判据都已给出确定结论 → 清零 unknown 计数。用 setdefault 是因为
+    # capsule_stale 的"字段缺失"分支可能刚记了一轮,不能被覆盖掉。
+    # 取不到数(server_down / check_queue 异常)= 本轮**全部不可判** → 沿用上一轮,
+    # 而不是落回 False 发假 CLEAR。
+    if stats:
+        for _kind, _what in STATS_ANOMALY_KINDS:
+            new_counters.setdefault(f"{_kind}_unknown", 0)
+    else:
+        for _kind, _what in STATS_ANOMALY_KINDS:
+            streak = int(prev_counters.get(f"{_kind}_unknown", 0)) + 1
+            new_counters[f"{_kind}_unknown"] = streak
+            new_anomalies[_kind] = _hold_or_release(
+                _kind, bool(prev_anomalies.get(_kind, False)),
+                streak, details, _what)
+
     # 2b. FalkorDB probe — timed /api/search (only if server alive)
     if alive:
         pstatus, plat, pmsg = check_search_probe()
@@ -660,9 +699,6 @@ def main() -> int:
             details["falkordb_slow"] = pmsg
 
     # 2c. 采集链路（各设备/工具 → claude-mem → SQLite → NAS → kg-hub）
-    # counters 跨轮持久化，unknown 沿用才有"连续第几轮"可数。
-    prev_counters = state.get("counters", {}) or {}
-    new_counters: dict = {}
     if cfg.get("capture_chain_enabled", True):
         apply_capture_decision(
             check_capture_chain(cfg) if alive else CaptureDecision(None, None),
