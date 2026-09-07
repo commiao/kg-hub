@@ -222,7 +222,23 @@ async def cleanup_stuck_jobs(graphiti) -> int:
     if ecleaned:
         logger.warning("[ingest:cleanup] removed %d error keys (>24h, 允许重试): %s",
                        ecleaned, erows[0].get("removed", []))
-    return cleaned + ecleaned
+    # 配额类 error 键 1h 即清:网关日/分上限拒绝的请求没到供应商,失败不属于观测本身;
+    # refinery 已按 error_kind 整窗停发,不需要 24h 防抖。按原文兜住新版之前留下的键
+    # (2026-09-06 夜一次打满上限留下 208 个,否则要白等 24h)。
+    quota_threshold = (datetime.now(tz=timezone.utc) - timedelta(hours=1)).isoformat()
+    qrows, _, _ = await graphiti.driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status = 'error' AND k.created_at < $t "
+        "  AND (k.error_kind = 'quota_exhausted' "
+        "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限') "
+        "WITH k DELETE k RETURN count(*) AS c",
+        t=quota_threshold,
+    )
+    qcleaned = int(qrows[0].get("c", 0)) if qrows else 0
+    if qcleaned:
+        logger.warning("[ingest:cleanup] removed %d quota error keys (>1h, 配额拒绝不属于观测)",
+                       qcleaned)
+    return cleaned + ecleaned + qcleaned
 
 
 async def merge_or_get_ingested_key(
@@ -270,6 +286,14 @@ async def merge_or_get_ingested_key(
     }
 
 
+def classify_extract_error(exc: BaseException) -> str | None:
+    """机器可读的失败类别。429 只可能来自网关自己的配额(日/分上限):供应商侧的
+    错误会被网关收敛成 503,所以 429 = 请求没出网关、没计费、与观测内容无关。"""
+    if getattr(exc, "status_code", None) == 429:
+        return "quota_exhausted"
+    return None
+
+
 async def update_ingested_key_status(
     graphiti,
     source_description: str,
@@ -279,15 +303,21 @@ async def update_ingested_key_status(
     nodes: int = 0,
     edges: int = 0,
     error_message: str | None = None,
+    error_kind: str | None = None,
 ) -> None:
-    """Update an existing IngestedKey row after extraction succeeds or fails."""
+    """Update an existing IngestedKey row after extraction succeeds or fails.
+
+    error_kind: machine-readable class of the failure for callers that must react
+    differently (today only "quota_exhausted" — the gateway refused before any
+    provider call, so the failure says nothing about this observation).
+    """
     now = datetime.now(tz=timezone.utc).isoformat()
     await graphiti.driver.execute_query(
         "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
         "SET k.status = $status, k.updated_at = $now, "
         "    k.episode_uuid = $episode_uuid, "
         "    k.nodes = $nodes, k.edges = $edges, "
-        "    k.error_message = $error_message",
+        "    k.error_message = $error_message, k.error_kind = $error_kind",
         sd=source_description,
         sid=source_obs_id,
         status=status,
@@ -296,6 +326,7 @@ async def update_ingested_key_status(
         nodes=int(nodes),
         edges=int(edges),
         error_message=error_message,
+        error_kind=error_kind,
     )
     # 入图成功 → 顺手清掉同 source_obs_id 的隔离记录。
     # 2026-08-24:格式门在 09:06 拦下 5 条 taskhub 胶囊,补标后 13:05 已成功入图,
@@ -687,7 +718,8 @@ async def do_extract(
                 try:
                     await update_ingested_key_status(
                         graphiti, sd, sid, "error",
-                        error_message=f"predigest: {type(exc).__name__}: {exc}")
+                        error_message=f"predigest: {type(exc).__name__}: {exc}",
+                        error_kind=classify_extract_error(exc))
                 except Exception:  # noqa: BLE001
                     pass
                 return
@@ -784,6 +816,7 @@ async def do_extract(
             await update_ingested_key_status(
                 graphiti, sd, sid, "error",
                 error_message=f"{type(exc).__name__}: {exc}",
+                error_kind=classify_extract_error(exc),
             )
         except Exception:
             pass
@@ -1005,7 +1038,7 @@ async def ingest_status(request: Request) -> JSONResponse:
             "       k.source_obs_id AS source_obs_id, "
             "       k.created_at AS created_at, k.updated_at AS updated_at, "
             "       k.nodes AS nodes, k.edges AS edges, "
-            "       k.error_message AS error_message "
+            "       k.error_message AS error_message, k.error_kind AS error_kind "
             "LIMIT 1",
             sd=sd, sid=sid,
         )
@@ -1035,6 +1068,7 @@ async def ingest_status(request: Request) -> JSONResponse:
         "nodes": row.get("nodes"),
         "edges": row.get("edges"),
         "error_message": row.get("error_message"),
+        "error_kind": row.get("error_kind"),
     })
 
 

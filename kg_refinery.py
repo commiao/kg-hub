@@ -248,6 +248,8 @@ CST = timezone(timedelta(hours=8))  # Asia/Shanghai,夜间窗口按此判
 # 退避序列(轮):1 → 2 → 4 → 8 → 16 → 32,上限 ~48min(服务端 error 键 24h 过期,
 # 退避到上限后仍会周期性试探,不会永久放弃)。
 BACKOFF_MAX_CYCLES = 32
+# 网关回「配额耗尽」(日/分上限)时整窗停发的轮数;到期后再探一条,仍耗尽则再停。
+QUOTA_PAUSE_CYCLES = int(os.environ.get("KG_HUB_REFINERY_QUOTA_PAUSE_CYCLES", "20"))
 
 # 温度门控(2026-08 过热事件:空闲盘温 58/59°C,DSM 强制关机线 ~61°C,余量仅
 # 2-3°C——持续写盘曾连续两周把 NAS 压关机)。群晖盘温免 sudo 直读
@@ -456,6 +458,8 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
     while waited < max_wait:
         code, d = _http("GET", f"{KG_HUB_URL}/api/ingest/status?{q}")
         st = d.get("status", "")
+        if st == "error" and d.get("error_kind") == "quota_exhausted":
+            return "quota"      # 网关配额耗尽:请求没到供应商,与这条观测无关
         if st in ("ok", "skipped", "error"):
             return st
         await asyncio.sleep(8)
@@ -525,7 +529,8 @@ async def heartbeat_loop() -> None:
 
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                         quotas: QuotaTracker, decided: dict,
-                        backoff: dict[int, list[int]], cycle: int, kind: str) -> dict:
+                        backoff: dict[int, list[int]], cycle: int, kind: str,
+                        quota_pause: dict | None = None) -> dict:
     """decided: 进程内决策缓存 {obs_id: accept}。deferred 条目下轮重评会重复
     quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。"""
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0}
@@ -575,6 +580,18 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             (log.warning if n <= 3 else log.debug)(
                 "[%s] obs-%d → 409(第 %d 次,退避 %d 轮≈%dmin)",
                 kind, oid, n, wait, wait * INTERVAL // 60)
+        elif st == "quota":
+            # 网关日/分上限:请求根本没到供应商,失败与这条观测无关。继续逐条撞只会白烧
+            # 每篇前面的调用并堆 error 键(2026-09-06 夜 218 篇败/127 篇成),整窗停发,
+            # QUOTA_PAUSE_CYCLES 轮后再探一条。
+            if quota_pause is not None:
+                quota_pause["until_cycle"] = cycle + QUOTA_PAUSE_CYCLES
+                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
+            stats["quota_paused"] = 1
+            stats["deferred"] += 1
+            log.warning("[%s] obs-%d → 网关配额耗尽,停发 %d 轮(≈%dmin)后再探",
+                        kind, oid, QUOTA_PAUSE_CYCLES, QUOTA_PAUSE_CYCLES * INTERVAL // 60)
+            break
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
@@ -624,6 +641,7 @@ async def main() -> int:
     quota_day = datetime.now(tz=CST).date()
     decided: dict[int, bool] = {}  # 进程内决策缓存(防 deferred 重评的配额幻影消耗)
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
+    quota_pause: dict = {}               # 网关配额耗尽 → {"until_cycle", "hits"}
     cycle = 0
 
     while True:
@@ -650,6 +668,11 @@ async def main() -> int:
                 await asyncio.sleep(INTERVAL)
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
+            if cycle < quota_pause.get("until_cycle", 0):
+                write_status(quota_paused_until_cycle=quota_pause["until_cycle"],
+                             quota_hits=quota_pause.get("hits", 0), last_error=None)
+                await asyncio.sleep(INTERVAL)
+                continue
             boundary = wm["boundary_id"]
 
             # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累>200条后永久卡死)
@@ -658,7 +681,8 @@ async def main() -> int:
             live_ids = [i for i in fetch_ids(min_id_exclusive=cursor)
                         if i not in terminal][:200]
             s_live = await process_batch(
-                fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live")
+                fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live",
+                quota_pause=quota_pause)
             # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
             new_cursor = cursor
@@ -682,7 +706,8 @@ async def main() -> int:
                 if in_backlog_window() and pending_ids:
                     s_back = await process_batch(
                         fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
-                        wm, cfg, quotas, decided, backoff, cycle, "backlog")
+                        wm, cfg, quotas, decided, backoff, cycle, "backlog",
+                        quota_pause=quota_pause)
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
 
             write_status(
@@ -693,6 +718,8 @@ async def main() -> int:
                 backlog_window_open=in_backlog_window(),
                 per_cycle=BACKLOG_PER_CYCLE,
                 backoff_pending=len(backoff),
+                quota_paused_until_cycle=quota_pause.get("until_cycle"),
+                quota_hits=quota_pause.get("hits", 0),
                 watermark={"ingested": len(wm["ingested"]), "rejected": len(wm["rejected"]),
                            "failed": len(wm["failed"])},
                 last_error=None,

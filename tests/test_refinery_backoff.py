@@ -95,5 +95,20 @@ check("退避到期后照常回到队头重试(不丢数据)", picked == list(ra
 check("无退避时与旧切片 [:N] 一致", R.select_backlog_batch(pending, {}, cycle=1, limit=8) == pending[:8])
 check("名额上限严格", len(R.select_backlog_batch(pending, {}, cycle=1, limit=3)) == 3)
 
+# 配额耗尽:网关 429 时整窗停发,不逐条撞(2026-09-06 夜 218 篇败/127 篇成)
+async def quota_verdict(obs):
+    quota_calls.append(obs["id"]); return "quota"
+quota_calls = []
+R.ingest_via_api = quota_verdict
+rows2 = [{**ROWS[0], "id": 201}, {**ROWS[0], "id": 202}, {**ROWS[0], "id": 203}]
+wmq, qp = fresh_wm(), {}
+stats_q = asyncio.run(R.process_batch(rows2, wmq, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                                       R.QuotaTracker(), {r["id"]: True for r in rows2}, {}, 7, "test",
+                                       quota_pause=qp))
+check("配额耗尽后本批立即停发(3 条只发 1 条)", quota_calls == [201])
+check("记录停发到期轮次", qp.get("until_cycle") == 7 + R.QUOTA_PAUSE_CYCLES and qp.get("hits") == 1)
+check("不落水印(到期后照常重试)", 201 not in wmq["ingested"] and 201 not in wmq["failed"])
+check("stats 暴露 quota_paused", stats_q.get("quota_paused") == 1)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
