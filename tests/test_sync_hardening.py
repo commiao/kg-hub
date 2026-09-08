@@ -99,6 +99,25 @@ class SyncSafety(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(subprocess.run([sys.executable, str(GUARD), str(lock), '2', 'true']).returncode, 0)
 
+    def test_lock_survives_supervisor_kill_until_writer_exits(self):
+        lock = self.root / 'inherited-lock'
+        marker = self.root / 'writer-started'
+        child = f'import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(1)'
+        held = subprocess.Popen([sys.executable, str(GUARD), str(lock), '5', sys.executable, '-c', child])
+        try:
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(marker.exists())
+            held.kill(); held.wait(timeout=2)
+            blocked = subprocess.run([sys.executable, str(GUARD), str(lock), '2', 'true'])
+            self.assertEqual(blocked.returncode, 75)
+            time.sleep(1.1)
+            self.assertEqual(subprocess.run([sys.executable, str(GUARD), str(lock), '2', 'true']).returncode, 0)
+        finally:
+            if held.poll() is None:
+                held.terminate(); held.wait(timeout=2)
+
     def test_missing_drive_rejected_then_stream_recovers(self):
         self.script.write_text(self.script.read_text().replace('WAIT_MAX=180', 'WAIT_MAX=2'))
         before = self.db.read_bytes()
