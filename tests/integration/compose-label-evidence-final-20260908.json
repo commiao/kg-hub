@@ -1,0 +1,261 @@
+{
+  "project": "t0046-rollback-fixture-20260908-79c09f4c4b66",
+  "started_at": "2026-09-08T07:26:29.155397+00:00",
+  "events": [
+    {
+      "command": [
+        "inspect",
+        "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731"
+      ],
+      "returncode": 0,
+      "stdout": "<projected below>",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=t0046.rollback-fixture=t0046-rollback-fixture-20260908-79c09f4c4b66"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "compose",
+        "--env-file",
+        "/dev/null",
+        "--project-directory",
+        "/tmp",
+        "-f",
+        "-",
+        "-p",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66",
+        "up",
+        "-d",
+        "--no-deps",
+        "--no-build",
+        "--pull",
+        "never",
+        "fixture"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": " Container t0046-rollback-fixture-20260908-79c09f4c4b66-service  Creating\n fixture Your kernel does not support PIDs limit capabilities or the cgroup is not mounted. PIDs limit discarded. \n Container t0046-rollback-fixture-20260908-79c09f4c4b66-service  Created\n Container t0046-rollback-fixture-20260908-79c09f4c4b66-service  Starting\n Container t0046-rollback-fixture-20260908-79c09f4c4b66-service  Started\n"
+    },
+    {
+      "command": [
+        "inspect",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66-service"
+      ],
+      "returncode": 0,
+      "stdout": "<projected below>",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "stop",
+        "--time",
+        "2",
+        "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f"
+      ],
+      "returncode": 0,
+      "stdout": "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rename",
+        "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66-rollback"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "inspect",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66-rollback"
+      ],
+      "returncode": 0,
+      "stdout": "<projected below>",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "compose",
+        "--env-file",
+        "/dev/null",
+        "--project-directory",
+        "/tmp",
+        "-f",
+        "-",
+        "-p",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66",
+        "up",
+        "-d",
+        "--no-deps",
+        "--no-build",
+        "--pull",
+        "never",
+        "fixture"
+      ],
+      "returncode": 1,
+      "stdout": "",
+      "stderr": " Container t0046-rollback-fixture-20260908-79c09f4c4b66-rollback  Recreate\n fixture Your kernel does not support PIDs limit capabilities or the cgroup is not mounted. PIDs limit discarded. \n Container t0046-rollback-fixture-20260908-79c09f4c4b66-rollback  Recreated\n Container t0046-rollback-fixture-20260908-79c09f4c4b66-service  Starting\nError response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: \"/t0046-intentionally-missing\": stat /t0046-intentionally-missing: no such file or directory: unknown\n"
+    },
+    {
+      "command": [
+        "inspect",
+        "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f"
+      ],
+      "returncode": 1,
+      "stdout": "<projected below>",
+      "stderr": "Error: No such object: 61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f\n"
+    },
+    {
+      "command": [
+        "inspect",
+        "t0046-rollback-fixture-20260908-79c09f4c4b66-service"
+      ],
+      "returncode": 0,
+      "stdout": "<projected below>",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "ps",
+        "-aq",
+        "--no-trunc",
+        "--filter",
+        "label=t0046.rollback-fixture=t0046-rollback-fixture-20260908-79c09f4c4b66"
+      ],
+      "returncode": 0,
+      "stdout": "12e648f23f8b4b43cc823027e6a8c29a53cd185887c153b97b9ecab66dcd6da6\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "inspect",
+        "12e648f23f8b4b43cc823027e6a8c29a53cd185887c153b97b9ecab66dcd6da6"
+      ],
+      "returncode": 0,
+      "stdout": "<projected below>",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rm",
+        "-f",
+        "12e648f23f8b4b43cc823027e6a8c29a53cd185887c153b97b9ecab66dcd6da6"
+      ],
+      "returncode": 0,
+      "stdout": "12e648f23f8b4b43cc823027e6a8c29a53cd185887c153b97b9ecab66dcd6da6\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "ps",
+        "-aq",
+        "--filter",
+        "label=t0046.rollback-fixture=t0046-rollback-fixture-20260908-79c09f4c4b66"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "image": {
+    "id": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "volumes": null,
+    "env_keys": [
+      "PATH"
+    ]
+  },
+  "old": {
+    "id": "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f",
+    "name": "/t0046-rollback-fixture-20260908-79c09f4c4b66-service",
+    "labels": {
+      "com.docker.compose.config-hash": "d6b179107466c62059e1368fc3e06be40f773051331dadc5a50b92d85e51f975",
+      "com.docker.compose.container-number": "1",
+      "com.docker.compose.depends_on": "",
+      "com.docker.compose.image": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+      "com.docker.compose.oneoff": "False",
+      "com.docker.compose.project": "t0046-rollback-fixture-20260908-79c09f4c4b66",
+      "com.docker.compose.project.config_files": "-",
+      "com.docker.compose.project.environment_file": "/dev/null",
+      "com.docker.compose.project.working_dir": "/tmp",
+      "com.docker.compose.service": "fixture",
+      "com.docker.compose.version": "2.20.1",
+      "t0046.rollback-fixture": "t0046-rollback-fixture-20260908-79c09f4c4b66"
+    },
+    "running": true,
+    "status": "running",
+    "mounts": [],
+    "network": "none",
+    "ports": [],
+    "memory": 33554432,
+    "cpu_shares": 2,
+    "pids_limit": null
+  },
+  "renamed": {
+    "id": "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f",
+    "name": "/t0046-rollback-fixture-20260908-79c09f4c4b66-rollback",
+    "labels": {
+      "com.docker.compose.config-hash": "d6b179107466c62059e1368fc3e06be40f773051331dadc5a50b92d85e51f975",
+      "com.docker.compose.container-number": "1",
+      "com.docker.compose.depends_on": "",
+      "com.docker.compose.image": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+      "com.docker.compose.oneoff": "False",
+      "com.docker.compose.project": "t0046-rollback-fixture-20260908-79c09f4c4b66",
+      "com.docker.compose.project.config_files": "-",
+      "com.docker.compose.project.environment_file": "/dev/null",
+      "com.docker.compose.project.working_dir": "/tmp",
+      "com.docker.compose.service": "fixture",
+      "com.docker.compose.version": "2.20.1",
+      "t0046.rollback-fixture": "t0046-rollback-fixture-20260908-79c09f4c4b66"
+    },
+    "running": false,
+    "status": "exited",
+    "mounts": [],
+    "network": "none",
+    "ports": [],
+    "memory": 33554432,
+    "cpu_shares": 2,
+    "pids_limit": null
+  },
+  "old_after_failed_up": null,
+  "candidate": {
+    "id": "12e648f23f8b4b43cc823027e6a8c29a53cd185887c153b97b9ecab66dcd6da6",
+    "name": "/t0046-rollback-fixture-20260908-79c09f4c4b66-service",
+    "labels": {
+      "com.docker.compose.config-hash": "c16ad82c1590e9b628050336a6d90cadc9b802bb69b7e670af3651d6bb72f46a",
+      "com.docker.compose.container-number": "1",
+      "com.docker.compose.depends_on": "",
+      "com.docker.compose.image": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+      "com.docker.compose.oneoff": "False",
+      "com.docker.compose.project": "t0046-rollback-fixture-20260908-79c09f4c4b66",
+      "com.docker.compose.project.config_files": "-",
+      "com.docker.compose.project.environment_file": "/dev/null",
+      "com.docker.compose.project.working_dir": "/tmp",
+      "com.docker.compose.replace": "61bc066106460dcc4d9b5264d00e2c5edc295547a7a71ba9eb54edc4c54fca1f",
+      "com.docker.compose.service": "fixture",
+      "com.docker.compose.version": "2.20.1",
+      "t0046.rollback-fixture": "t0046-rollback-fixture-20260908-79c09f4c4b66"
+    },
+    "running": false,
+    "status": "created",
+    "mounts": [],
+    "network": "none",
+    "ports": [],
+    "memory": 33554432,
+    "cpu_shares": 2,
+    "pids_limit": null
+  },
+  "rollback_point_destroyed": true,
+  "remaining_fixture_ids": [],
+  "finished_at": "2026-09-08T07:26:50.843598+00:00"
+}

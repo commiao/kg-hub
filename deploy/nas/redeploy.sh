@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# 一键把本地源码部署到 NAS 的 kg-hub-server 容器并重启、探活。
+# 已暂停：通用 NAS 部署入口因回滚缺陷被禁用（T-0046，2026-09-08）。
+# 普通执行或 source 均退出2；不会同步、构建、重启。不得临时移除保护或绕过。
+# 下方保留旧实现供审阅，不能作为当前可执行部署说明；恢复门槛见验收报告。
 #
 # 为什么需要它：kg_hub_server.py 的源码是 build 时 COPY 进 Docker 镜像的，
 # 改完代码必须「同步到 NAS → 重建镜像 → 重启容器」才生效。这个脚本把那串
 # NAS 细节（主机、路径、project 名 kg-hub、ContainerManager 的 docker 路径、
 # sudo、--no-deps 不动 falkordb）封一次，以后加报表/改 server 只跑这一条。
 #
-# 用法：
-#   deploy/nas/redeploy.sh                 # 同步默认文件 + 重建重启 + 探活
-#   FILES="kg_hub_server.py schema.py" deploy/nas/redeploy.sh   # 多文件
+# 当前调用只返回 DEPLOY_BLOCKED；此脚本不是可 source 的函数库。
 set -euo pipefail
+
+# T-0046: Compose finds renamed backups by labels and deletes them before startup.
+# HTTP health also occurs after discard. A replacement must preserve old runtime.
+printf '%s\n' 'DEPLOY_BLOCKED: 通用部署回滚不安全，已禁止执行；未同步、构建或重启。' \
+  '原因与后续方案见 docs/redeploy-rollback-verification-20260908.md。' >&2
+exit 2
 
 NAS="${KG_HUB_NAS_SSH:-commiao@100.123.208.32}"
 SRC="${KG_HUB_NAS_SRC:-/volume1/docker/kg-hub-src}"
