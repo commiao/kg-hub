@@ -129,6 +129,35 @@ check(f"首次等待 1s 而非 8s(实测节奏 {slept[:3]})", slept and slept[0]
 check("节奏先密后疏 1→1→2", slept[:3] == [1, 1, 2])
 check("步长上限 8s", max(R.POLL_STEPS_S) == 8)
 
+# poll 必须先看 HTTP code:服务端「键不存在」是 404 + {"status":"error"},
+# 只读正文会把它当成这条观测抽取失败(T-0033 记录的隐患;首次轮询缩到 1s 后更易撞上)
+def poll_with(responses):
+    """responses: [(code, body), ...] 按顺序返回;记录轮询次数。"""
+    seq = list(responses)
+    calls = {"n": 0}
+    def http(method, url, body=None, timeout=30):
+        calls["n"] += 1
+        return seq[min(calls["n"] - 1, len(seq) - 1)]
+    _sleep, _http_orig = asyncio.sleep, R._http
+    asyncio.sleep, R._http = fake_sleep, http
+    try:
+        return asyncio.run(R.poll_until_done("sd", "sid")), calls["n"]
+    finally:
+        asyncio.sleep, R._http = _sleep, _http_orig
+
+st_gone, _ = poll_with([(404, {"status": "error", "code": "not_found"})])
+check("404 → gone(不是 error;正文同样是 status=error)", st_gone == "gone")
+st_bad, _ = poll_with([(400, {"status": "error", "code": "bad_request"})])
+check("400 → error(参数问题,重试无用)", st_bad == "error")
+st_ok, n_ok = poll_with([(200, {"status": "in_progress"}), (200, {"status": "ok"})])
+check("200 in_progress → 继续轮询 → ok", st_ok == "ok" and n_ok == 2)
+st_q, _ = poll_with([(200, {"status": "error", "error_kind": "quota_exhausted"})])
+check("200 + quota_exhausted → quota", st_q == "quota")
+st_net, n_net = poll_with([(0, {"error": "net"}), (200, {"status": "ok"})])
+check("网络层失败不当终态,继续轮询", st_net == "ok" and n_net == 2)
+st_5xx, _ = poll_with([(503, {"status": "error"})])
+check("5xx 视为瞬时:轮询到上限而非误判失败", st_5xx == "timeout")
+
 # 并发:批内两条同时在飞 → 一条慢抽取不再堵住身后的快速失败
 order = []
 async def slow_then_fast(obs):

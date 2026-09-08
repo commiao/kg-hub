@@ -467,10 +467,20 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
     while waited < max_wait:
         code, d = _http("GET", f"{KG_HUB_URL}/api/ingest/status?{q}")
         st = d.get("status", "")
-        if st == "error" and d.get("error_kind") == "quota_exhausted":
-            return "quota"      # 网关配额耗尽:请求没到供应商,与这条观测无关
-        if st in ("ok", "skipped", "error"):
-            return st
+        # 必须先看 HTTP code:服务端「键不存在」返回 **404 + {"status":"error"}**,
+        # 旧实现只读正文的 status,于是把「键还没建出来 / 键被清理器删掉」当成
+        # 这条观测抽取失败,日志里是一条假的 error(T-0033 记录的隐患)。
+        # 2026-09-07 把首次轮询从 8s 缩到 1s 后,撞上该窗口的概率变大,所以一起修。
+        if code == 404:
+            return "gone"       # 键不见了:不是抽取失败,本轮 defer、下轮重试
+        if code == 400:
+            return "error"      # 参数问题:重试也不会变好
+        if code == 200:
+            if st == "error" and d.get("error_kind") == "quota_exhausted":
+                return "quota"  # 网关配额耗尽:请求没到供应商,与这条观测无关
+            if st in ("ok", "skipped", "error"):
+                return st
+        # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
         delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
         step += 1
         await asyncio.sleep(delay)
