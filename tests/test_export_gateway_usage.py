@@ -73,6 +73,31 @@ class ExportContractTests(unittest.TestCase):
             self.assertEqual(data["status"], "unknown")
             self.assertEqual(data["limits"], {})
 
+
+    def test_503_valid_quota_projection_preserves_gateway_error(self):
+        import io
+        import urllib.error
+        document = {"status": "error", "external_calls": 0,
+            "effective_limits_status": "ok", "effective_limits_source": "gateway_route_registry",
+            "checks": {"routes": {"status": "ok"}, "state_manifest": {"status": "ok"}},
+            "effective_limits": {"x": {"daily_requests": 5000, "requests_per_minute": 60}}}
+        for http_code, expected in [(503, "ok"), (500, "unknown"), (401, "unknown")]:
+            opener = mock.Mock()
+            opener.open.side_effect = urllib.error.HTTPError(
+                "http://model-gateway:39000/health/ready", http_code, "error", {},
+                io.BytesIO(json.dumps(document).encode()))
+            with mock.patch.object(E.urllib.request, "build_opener", return_value=opener):
+                result = E.collect_effective_limits("http://model-gateway:39000")
+            self.assertEqual(result["status"], expected)
+            if expected == "ok":
+                self.assertEqual(result["gateway_status"], "error")
+                self.assertEqual(result["limits"]["x"]["daily_requests"], 5000)
+        for key in ("routes", "state_manifest"):
+            broken = json.loads(json.dumps(document))
+            broken["checks"][key]["status"] = "error"
+            with mock.patch.object(E.urllib.request, "build_opener", return_value=self.health_response(broken)):
+                self.assertEqual(E.collect_effective_limits("http://model-gateway:39000")["status"], "unknown")
+
     def test_timeout_does_not_export_error_body_and_endpoint_is_fixed(self):
         opener = mock.Mock()
         opener.open.side_effect = TimeoutError("sensitive upstream details")

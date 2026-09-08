@@ -52,6 +52,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.error
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -87,13 +88,33 @@ def collect_effective_limits(gateway_url: str) -> dict:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         request = urllib.request.Request(gateway_url.rstrip("/") + "/health/ready",
                                          method="GET")
-        with opener.open(request, timeout=5) as response:
-            raw = response.read(256 * 1024 + 1)
+        try:
+            response = opener.open(request, timeout=5)
+        except urllib.error.HTTPError as exc:
+            # A local readiness 503 can still carry an independently validated
+            # quota projection. Other HTTP errors remain unavailable.
+            if exc.code != 503:
+                raise
+            response = exc
+        with response as opened:
+            raw = opened.read(256 * 1024 + 1)
         if len(raw) > 256 * 1024:
             raise ValueError("oversize health response")
         document = json.loads(raw)
         policies = document.get("effective_limits")
-        if (document.get("status") != "ok" or document.get("external_calls") != 0
+        result["gateway_status"] = document.get("status")
+        checks = document.get("checks") or {}
+        projection_ok = (
+            document.get("effective_limits_status") == "ok"
+            and document.get("effective_limits_source") == "gateway_route_registry"
+            and isinstance(checks, dict)
+            and all(isinstance(checks.get(key), dict)
+                    and checks[key].get("status") == "ok"
+                    for key in ("routes", "state_manifest"))
+        )
+        legacy_ok = ("effective_limits_status" not in document
+                     and document.get("status") == "ok")
+        if (not (projection_ok or legacy_ok) or document.get("external_calls") != 0
                 or not isinstance(policies, dict) or not policies):
             raise ValueError("effective limits unavailable")
         limits = {}
