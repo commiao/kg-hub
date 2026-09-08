@@ -193,6 +193,35 @@ finally:
     R.save_watermark = _real_save
 check(f"4 条落账写了 4 次水印(增量可见,实测 {saves})", saves == [1, 2, 3, 4])
 
+# 批内进度必须对外可见:每条落账都回调一次,而不是等整批 gather 完
+progress = []
+R.save_watermark = lambda wm: None
+R.ingest_via_api = one_by_one
+wmp = fresh_wm()
+rows5 = [{**ROWS[0], "id": 500 + i} for i in range(4)]
+asyncio.run(R.process_batch(rows5, wmp, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                            R.QuotaTracker(), {r["id"]: True for r in rows5}, {}, 1, "test",
+                            on_progress=lambda st: progress.append(st["ingested"])))
+check(f"4 条各回调一次且累计递增(实测 {progress})", progress == [1, 2, 3, 4])
+
+# 过滤阶段的拒绝也要回调(rejected 计数同样要即时可见)
+progress_r = []
+wmr = fresh_wm()
+rows6 = [{**ROWS[0], "id": 600 + i} for i in range(3)]
+asyncio.run(R.process_batch(rows6, wmr, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                            R.QuotaTracker(), {r["id"]: False for r in rows6}, {}, 1, "test",
+                            on_progress=lambda st: progress_r.append(st["rejected"])))
+check(f"3 条拒绝各回调一次(实测 {progress_r})", progress_r == [1, 2, 3])
+
+# 回调抛错不得影响入图(状态刷新失败是次要的)
+wmb = fresh_wm()
+rows7 = [{**ROWS[0], "id": 700}]
+def boom(_st): raise RuntimeError("status write failed")
+stats_b = asyncio.run(R.process_batch(rows7, wmb, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                                      R.QuotaTracker(), {700: True}, {}, 1, "test", on_progress=boom))
+check("on_progress 抛错不影响入图", stats_b["ingested"] == 1 and 700 in wmb["ingested"])
+R.save_watermark = _real_save
+
 # 主循环:积压必须排在 live 之前,且每段都落一次状态
 import inspect as _inspect
 _src = _inspect.getsource(R.main)

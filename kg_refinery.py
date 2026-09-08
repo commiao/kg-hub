@@ -551,12 +551,18 @@ async def heartbeat_loop() -> None:
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                         quotas: QuotaTracker, decided: dict,
                         backoff: dict[int, list[int]], cycle: int, kind: str,
-                        quota_pause: dict | None = None) -> dict:
+                        quota_pause: dict | None = None,
+                        on_progress=None) -> dict:
     """decided: 进程内决策缓存 {obs_id: accept}。deferred 条目下轮重评会重复
     quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。
 
     三段式:①过滤必须串行(要动日配额且每条只评一次) ②抽取有界并发(消除批内队头
     阻塞) ③落账串行(水印/退避表的读改写不能交错)。
+
+    on_progress(stats):每条落账后回调一次,用于刷新对外状态。stats 是就地更新的
+    同一个字典,调用方拿到的永远是最新累计值。没有它的话,批内进度对外不可见——
+    积压批 8 条要等最后一条(可能在 timeout 重试)才刷一次 status,于是
+    backlog_remaining 明明已经降了却还显示旧值(2026-09-07 夜实测到这一幕)。
     """
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0}
     to_ingest: list[dict] = []
@@ -587,6 +593,11 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             wm["rejected"].add(oid)
             stats["rejected"] += 1
             save_watermark(wm)
+            if on_progress is not None:
+                try:
+                    on_progress(stats)
+                except Exception:  # noqa: BLE001
+                    log.exception("[%s] on_progress failed (non-fatal)", kind)
             continue
         to_ingest.append(obs)
 
@@ -632,6 +643,11 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
         save_watermark(wm)
+        if on_progress is not None:
+            try:
+                on_progress(stats)
+            except Exception:  # noqa: BLE001 — 刷状态失败不该影响入图
+                log.exception("[%s] on_progress failed (non-fatal)", kind)
 
     if to_ingest:
         gate = asyncio.Semaphore(INGEST_CONCURRENCY)
@@ -764,10 +780,15 @@ async def main() -> int:
                                if i not in seen]
                 backlog_remaining = len(pending_ids)
                 if in_backlog_window() and pending_ids:
+                    # 每条落账即刷:积压余量随之递减,不必等整批 8 条跑完
                     s_back = await process_batch(
                         fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
                         wm, cfg, quotas, decided, backoff, cycle, "backlog",
-                        quota_pause=quota_pause)
+                        quota_pause=quota_pause,
+                        on_progress=lambda st: snapshot(
+                            backlog_processed=dict(st),
+                            backlog_remaining=backlog_remaining
+                            - st["ingested"] - st["rejected"]))
                     backlog_remaining -= s_back["ingested"] + s_back["rejected"]
             snapshot(backlog_processed=s_back, backlog_remaining=backlog_remaining,
                      live_processed={"ingested": 0, "rejected": 0, "deferred": 0,
@@ -780,7 +801,10 @@ async def main() -> int:
                         if i not in terminal][:200]
             s_live = await process_batch(
                 fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live",
-                quota_pause=quota_pause)
+                quota_pause=quota_pause,
+                on_progress=lambda st: snapshot(
+                    live_processed=dict(st), backlog_processed=s_back,
+                    backlog_remaining=backlog_remaining))
             # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
             new_cursor = cursor
