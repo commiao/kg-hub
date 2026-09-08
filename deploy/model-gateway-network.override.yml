@@ -21,6 +21,15 @@ services:
     networks:
       - default
       - model_gateway_private
+  watchdog:
+    # 只加网络、不给 caller token:用量导出器要读网关的 GET /health/ready 拿
+    # effective_limits(当前有效额度),那是免鉴权的只读端点,它不发任何付费请求。
+    # 2026-09-07 预检发现 watchdog 原本只有 kg-hub_default,读不到私网里的网关,
+    # 于是看板只能显示「当前额度未知」。此前这条增量靠 NAS 私有目录里的一次性
+    # override.json 表达,生产因此依赖 git 之外的文件;挪到这里统一管理。
+    networks:
+      - default
+      - model_gateway_private
 
 networks:
   model_gateway_private:

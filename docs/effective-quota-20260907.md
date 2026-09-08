@@ -152,3 +152,21 @@ StartedAt `2026-09-07T13:34:53.265806983Z`。
 已CAS同步本地/NAS canonical helper，并更新永久release overlay到最终镜像。
 该overlay SHA `a14872e258182066dbf4b7051ba7d08305e9938ab3f2ecc2c5e48f9f5dc0988c`。
 最终文案阶段备份在原private stage的 `history-wording/` 子目录，未清理任何旧阶段/备份。
+
+## 2026-09-08 收敛:退役镜像钉,回到 git 统一管理
+
+上线当晚的发布用「镜像摘要钉死 + NAS 私有目录里的一次性 candidate.json」表达配置,
+生产因此引用了 4 个**不在 git 里**的文件:那个私有目录一旦被清理,生产就无法重建。
+
+已收敛:
+- `deploy/effective-quota.override.yml`(钉 kg_hub_server=8940eb2f、watchdog=b8caf1ec)**删除**。
+  两个镜像的全部修复(topology.py、dashboard_status.py、tools/export_gateway_usage.py)
+  都已在 canonical 源码与 git 里,重建基底镜像逐文件校验一致,不存在回退。
+  本文上方的验收记录保留了当时的精确镜像 ID 作为审计留痕。
+- 唯一无法由基础 compose 表达的东西是「watchdog 需要私网才能读 readiness」,
+  已挪进 `deploy/model-gateway-network.override.yml`(git 管理)。
+- 生产 compose 文件集因此收敛为:
+  `docker-compose.yml` + `deploy/model-gateway-network.override.yml`。
+
+代价与取舍:放弃了「镜像摘要不可漂移」这层保证,改由 git + canonical 源码 + 逐文件
+校验来保证。换来的是生产配置可复现——这在私有 stage 目录随时可能被清理的前提下更重要。
