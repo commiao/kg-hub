@@ -31,6 +31,7 @@ Exit codes:
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import subprocess
 import sys
@@ -38,6 +39,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -299,6 +301,61 @@ class CaptureDecision(NamedTuple):
     stale: list[str] | None
     source_errors: tuple[str, ...] = ()
     blocker_ids: tuple[str, ...] = ()
+
+
+GATEWAY_ALERTS = {
+    'not_ready': ('gateway_not_ready', '网关 readiness 未通过；不代表全部业务停止。'),
+    'outcome_unresolved': ('gateway_outcome_unresolved', '存在结果未决记录；禁止自动重放，需操作者核实。'),
+    'persistence_failed': ('gateway_persistence_failed', '网关报告实际状态写入失败；不据此断言磁盘损坏。'),
+    'authentication_failed': ('gateway_authentication_failed', '当前配置最近自然业务调用鉴权失败；请核实凭据。'),
+    'provider_failed': ('gateway_provider_failed', '当前配置最近自然业务调用被拒绝或供应商失败。'),
+}
+
+
+def check_gateway_monitor() -> dict | None:
+    """Only the existing private topology GET; never /messages or a probe prompt.
+
+    Server-side gateway health is cached for 60s. Do not consume caller-supplied
+    URLs or notification config as request destinations; do not follow redirects.
+    """
+    try:
+        url = urlsplit(KG_HUB_URL)
+        if (url.scheme != 'http' or url.username or url.password or url.query or url.fragment
+                or url.path not in ('', '/') or url.port not in (8080, 17171)):
+            return None
+        if url.hostname not in {'localhost', '127.0.0.1', '::1', 'kg_hub_server'}:
+            address = ipaddress.ip_address(url.hostname or '')
+            if address.version != 4 or address not in ipaddress.ip_network('100.64.0.0/10'):
+                return None
+        response = httpx.get(f"{KG_HUB_URL.rstrip('/')}/api/topology/latest",
+            headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"} if KG_HUB_TOKEN else {},
+            timeout=5.0, follow_redirects=False, trust_env=False)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        sample = payload.get('gateway_monitor') if isinstance(payload, dict) and payload.get('ok') is True else None
+        if not isinstance(sample, dict) or sample.get('version') != 1 or sample.get('source_ok') is not True:
+            return None
+        if type(sample.get('external_calls')) is not int or sample['external_calls'] != 0:
+            return None
+        at = datetime.fromisoformat(sample['checked_at'].replace('Z', '+00:00'))
+        age = (datetime.now(timezone.utc) - at).total_seconds()
+        if not -60 <= age <= 180 or any(type(sample.get(name)) is not bool for name in GATEWAY_ALERTS):
+            return None
+        return {name: sample[name] for name in GATEWAY_ALERTS}
+    except Exception:
+        # No raw response/exception can enter the notification channel.
+        return None
+
+
+def apply_gateway_monitor(sample, previous, anomalies, details):
+    """Unknown holds prior business verdicts; source failure is separate."""
+    anomalies['gateway_monitor_unhealthy'] = sample is None
+    details['gateway_monitor_unhealthy'] = '网关监控证据不可读/过期；不据此判断 Key 失效或业务已恢复。'
+    for field, (kind, message) in GATEWAY_ALERTS.items():
+        anomalies[kind] = bool(previous.get(kind, False)) if sample is None else sample[field]
+        details[kind] = message
+        details[kind + ':clear'] = '当前网关本地/自然业务证据不再报告该异常；未进行额外模型调用。'
 
 
 def check_capture_chain(_notify_cfg: dict) -> CaptureDecision:
@@ -748,6 +805,10 @@ def main() -> int:
         decision = check_capture_chain(cfg) if alive else CaptureDecision(None, None)
         apply_capture_decision(
             decision, prev_anomalies, new_anomalies, details, prev_counters, new_counters)
+
+    # Independent from capture decisions: readiness 503 must not erase capture
+    # monitoring, and missing/idle business traffic is not an invalid API key.
+    apply_gateway_monitor(check_gateway_monitor(), prev_anomalies, new_anomalies, details)
 
     pending, blocker_ids = deliver_alerts(
         state, new_anomalies, details,

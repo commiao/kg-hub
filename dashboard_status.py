@@ -14,6 +14,87 @@ import httpx
 _health_cache: tuple[float, dict] | None = None
 _health_lock = asyncio.Lock()
 
+_MONITOR_CHECKS = {'process', 'state_manifest', 'routes', 'credentials', 'callers',
+                   'idempotency', 'historical_outcomes', 'rollback_witness',
+                   'cost_state', 'passive_provider'}
+
+
+def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> dict:
+    """Fixed metadata only; no response text, credential, prompt or exception.
+
+    The old gateway called all armed markers write_failed. Only positive local
+    write evidence proves persistence failure; an unresolved outcome is neither
+    an invalid key nor proof that all business requests stopped.
+    """
+    result = {'version': 1, 'checked_at': sampled, 'external_calls': 0,
+              'source_ok': False, 'not_ready': None, 'outcome_unresolved': None,
+              'persistence_failed': None, 'authentication_failed': None,
+              'provider_failed': None}
+    if not isinstance(body, dict) or type(body.get('external_calls')) is not int or body['external_calls'] != 0:
+        return result
+    checks = body.get('checks')
+    if (http_status not in (200, 503) or body.get('status') not in ('ok', 'error')
+            or not isinstance(checks, dict) or set(checks) != _MONITOR_CHECKS):
+        return result
+    for name, check in checks.items():
+        if (not isinstance(check, dict) or check.get('status') not in ('ok', 'error', 'degraded')
+                or not isinstance(check.get('issues', [] if name == 'process' else None), list)
+                or not all(isinstance(v, str) for v in check.get('issues', []))):
+            return result
+    passive = checks['passive_provider']
+    businesses = passive.get('business_keys')
+    if not isinstance(businesses, dict):
+        return result
+    for key, entry in businesses.items():
+        if (not isinstance(key, str) or not key or not isinstance(entry, dict)
+                or set(entry) != {'status', 'at'} or entry['status'] not in
+                {'success', 'authentication_failed', 'request_rejected', 'degraded', 'provider_failed'}
+                or not isinstance(entry['at'], str)):
+            return result
+        try:
+            if datetime.fromisoformat(entry['at'].replace('Z', '+00:00')).tzinfo is None:
+                return result
+        except ValueError:
+            return result
+    metrics = passive.get('degraded_metrics', {})
+    if not isinstance(metrics, dict):
+        return result
+    for name in ('provider_state_write_failed_business_keys', 'provider_outcome_unresolved_business_keys',
+                 'provider_state_write_degraded_business_keys'):
+        if name in metrics and (not isinstance(metrics[name], list) or
+                not all(isinstance(key, str) and key for key in metrics[name])):
+            return result
+    for name in ('provider_state_degradation_marker_issue', 'provider_state_write_degraded'):
+        if name in metrics and type(metrics[name]) is not bool:
+            return result
+    issues = {issue for check in checks.values() for issue in check.get('issues', [])}
+    if issues & {'provider_state_unavailable', 'provider_pending_state_unavailable'}:
+        # An unreadable passive ledger cannot clear a previously observed 401.
+        return result
+    local_failures = metrics.get('provider_state_write_failures_total', 0)
+    if type(local_failures) is not int or local_failures < 0:
+        return result
+    write_issue = 'provider_state_write_failed' in issues
+    if write_issue and local_failures > 0 and 'provider_state_write_failed_business_keys' not in metrics:
+        # Legacy total is cumulative: a recovered old write error followed by
+        # an armed unknown cannot prove a current persistence failure.
+        return result
+    persistence = write_issue and bool(metrics.get('provider_state_write_failed_business_keys'))
+    # Compatibility for the pre-diagnostic generation: count zero + readable
+    # armed marker keys is unresolved outcome evidence, not an I/O failure.
+    legacy_unknown = (write_issue and not persistence and
+                      bool(metrics.get('provider_state_write_degraded_business_keys')) and
+                      metrics.get('provider_state_degradation_marker_issue') is False)
+    result.update(source_ok=True,
+        not_ready=(http_status != 200 or body['status'] != 'ok' or
+                   any(c['status'] != 'ok' or c.get('issues', []) for c in checks.values())),
+        outcome_unresolved=(legacy_unknown or bool(issues & {'provider_outcome_unresolved',
+            'idempotency_outcome_unresolved', 'rollback_witness_preflight_unresolved'})),
+        persistence_failed=persistence,
+        authentication_failed=any(e['status'] == 'authentication_failed' for e in businesses.values()),
+        provider_failed=any(e['status'] in {'request_rejected', 'provider_failed'} for e in businesses.values()))
+    return result
+
 
 async def gateway_health() -> dict:
     global _health_cache
@@ -39,6 +120,7 @@ async def gateway_health() -> dict:
             historical_warning = bool(quarantined or historical.get("idempotency_count", 0)
                                       or historical.get("provider_marker_count", 0))
             result = {"state": ("amber" if historical_warning else "green") if healthy else "red",
+                      "monitor": gateway_monitor_projection(body, response.status_code, sampled),
                       "http_status": response.status_code, "checked_at": sampled,
                       "issues": issues,
                       "quarantined_count": quarantined,

@@ -326,7 +326,15 @@ async def topology_latest(request: Request) -> JSONResponse:
         snaps = await _load_snapshots(device_cfg)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+    try:
+        monitor = (await gateway_health()).get("monitor")
+    except Exception:
+        monitor = None  # Gateway monitor failure cannot erase capture evidence.
     return JSONResponse({"ok": True,
+                         # Independent of snapshot count/device idle state; the
+                         # cached GET cannot call a provider. A gateway 503 does
+                         # not turn this capture endpoint into an error.
+                         "gateway_monitor": monitor,
                          "stale_after_s": capture_stale_after_s(device_cfg),
                          "snapshots": snaps})
 

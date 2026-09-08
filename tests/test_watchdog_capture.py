@@ -388,6 +388,8 @@ def _run_main(*, alive, stats, prev_anomalies, prev_counters=None, cfg=None):
                 return_value=(alive, "ok" if alive else "ConnectError: refused")),
           patch("tools.watchdog.check_queue", return_value=(stats, "ok")),
           patch("tools.watchdog.check_search_probe", return_value=("skip", 0.0, "")),
+          patch("tools.watchdog.check_gateway_monitor", return_value={
+              name: False for name in W.GATEWAY_ALERTS}),
           patch("tools.watchdog.emit_alert",
                 side_effect=lambda sev, kind, msg: alerts.append((sev, kind, msg)))):
         W.main()
