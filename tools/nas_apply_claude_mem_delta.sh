@@ -28,6 +28,12 @@
 # (2026-08-24 时 backlog_remaining=9383)。NAS 这份必须是完整存量。
 set -e
 
+# Guard before touching shared files, including cleanup traps.
+if [ "${1:-}" != "--guarded" ]; then
+  exec python3 "$(dirname "$0")/sync_guard.py" "/volume2/4T/kg-hub-data/claude-mem/apply.flock" 300 /bin/sh "$0" --guarded "$@"
+fi
+shift
+
 D="/volume2/4T/kg-hub-data/claude-mem"
 DB="$D/claude-mem.db"
 DELTA="$D/.delta.db"
@@ -53,7 +59,9 @@ cleanup() {
   find "$INBOX" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null
   return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 143' TERM HUP
+trap 'exit 130' INT
 
 [ -n "$EXPECT" ] || { echo "usage: $0 <expected_max_id> [file bytes sha256]" >&2; exit 2; }
 # merge 需要现有副本当底;replace 是整份换掉,副本缺失/损坏都不影响。

@@ -115,7 +115,9 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
 
 
 def write_alert_log(line: str) -> None:
@@ -134,7 +136,12 @@ def send_feishu(text: str) -> bool:
             json={"msg_type": "text", "content": {"text": text}},
             timeout=10.0,
         )
-        return r.status_code < 400
+        if not 200 <= r.status_code < 300:
+            return False
+        payload = r.json()
+        # Feishu can return HTTP 200 for a rejected webhook request.
+        code = payload.get("code", payload.get("StatusCode"))
+        return type(code) is int and code == 0
     except Exception:
         return False
 
@@ -145,7 +152,7 @@ def send_macos_notification(title: str, message: str) -> bool:
         # escape double quotes / backslashes for AppleScript
         safe_title = title.replace('"', '\\"')
         safe_msg = message.replace('"', '\\"').replace("\n", " ")
-        subprocess.run(
+        result = subprocess.run(
             [
                 "osascript",
                 "-e",
@@ -154,24 +161,57 @@ def send_macos_notification(title: str, message: str) -> bool:
             check=False,
             timeout=5,
         )
-        return True
+        return result.returncode == 0
     except Exception:
         return False
 
 
-def emit_alert(severity: str, kind: str, message: str) -> None:
+def emit_alert(severity: str, kind: str, message: str) -> bool:
     """severity: 'fire' (BAD-state-entered) or 'clear' (BAD-state-resolved)."""
     emoji = "🔴" if severity == "fire" else "✅"
     title = f"{emoji} kg-hub {kind}"
     line = f"[{severity.upper()}] {kind}: {message}"
     write_alert_log(line)
     body = f"{title}\n{message}"
-    sent_via = "log"
-    if FEISHU_WEBHOOK and send_feishu(body):
-        sent_via = "feishu"
-    elif send_macos_notification(title, message):
-        sent_via = "macos"
+    # A local fallback must not acknowledge an undelivered Feishu alert.
+    if FEISHU_WEBHOOK:
+        delivered = send_feishu(body)
+        sent_via = "feishu" if delivered else "pending"
+    else:
+        delivered = send_macos_notification(title, message)
+        sent_via = "macos" if delivered else "pending"
     print(f"{title} | {message} (via {sent_via})")
+    return delivered
+
+
+def deliver_alerts(state, anomalies, details, blocker_ids):
+    """Persist unacknowledged deliveries separately from observed health.
+
+    Retry once per watchdog cycle. Supersede obsolete pending messages with the
+    latest state; identities, not changing row counts/ages, detect new blockers.
+    """
+    previous = state.get("anomalies", {})
+    pending = dict(state.get("pending_alerts", {}))
+    old_ids = set(state.get("capture_blocker_ids", []))
+    new_ids = old_ids if blocker_ids is None else set(blocker_ids)
+    for kind, bad in anomalies.items():
+        changed = bad != bool(previous.get(kind, False))
+        added = kind == "capture_blocked" and bad and bool(new_ids - old_ids)
+        if changed or added:
+            pending[kind] = {
+                "severity": "fire" if bad else "clear",
+                "message": details.get(kind, "anomaly detected") if bad else
+                           details.get(f"{kind}:clear", "resolved"),
+            }
+    # Checkpoint BEFORE any network call: a crash can duplicate, never lose, it.
+    checkpoint = dict(state, anomalies=anomalies, pending_alerts=pending,
+                      capture_blocker_ids=sorted(new_ids))
+    save_state(checkpoint)
+    for kind, event in list(pending.items()):
+        if emit_alert(event["severity"], kind, event["message"]) is True:
+            del pending[kind]
+            save_state(dict(checkpoint, pending_alerts=pending))
+    return pending, sorted(new_ids)
 
 
 DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
@@ -258,6 +298,7 @@ class CaptureDecision(NamedTuple):
     blocked: list[str] | None
     stale: list[str] | None
     source_errors: tuple[str, ...] = ()
+    blocker_ids: tuple[str, ...] = ()
 
 
 def check_capture_chain(_notify_cfg: dict) -> CaptureDecision:
@@ -341,6 +382,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         cfg.get("capture_stale_after_min"),
         DEFAULT_CAPTURE_STALE_AFTER_S // 60) * 60
     blocked, stale = [], []
+    blocker_ids = []
     source_errors: list[str] = []
     if isinstance(liveness, dict) and liveness.get("source_state") != "fresh":
         source_errors.append(str(
@@ -409,6 +451,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
             # host 才 HOLD。fresh blocker 会在其它 host 分支重新把聚合态判为 BAD。
             continue
         for b in (sn.get("blockers") or []):
+            blocker_ids.append(f"{key}:{b.get('id') or b.get('label', '?')}")
             blocked.append(f"{host} · {b.get('label', '?')}: {b.get('detail', '')}")
 
     # 任一明确坏态足以 FIRE；没有坏态时，只要还有旧/不可判 host 就必须 HOLD。
@@ -416,7 +459,8 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
     stale_decision = stale if stale else (None if stale_unknown else [])
     return CaptureDecision(
         blocked_decision, stale_decision,
-        tuple(dict.fromkeys(error for error in source_errors if error)))
+        tuple(dict.fromkeys(error for error in source_errors if error)),
+        tuple(sorted(set(blocker_ids))))
 
 
 # unknown 最多沿用几轮。
@@ -698,25 +742,20 @@ def main() -> int:
             new_anomalies["falkordb_slow"] = True
             details["falkordb_slow"] = pmsg
 
-    # 2c. 采集链路（各设备/工具 → claude-mem → SQLite → NAS → kg-hub）
+    # 2c. Capture-chain judgment and stable blocker identities.
+    decision = CaptureDecision(None, None)
     if cfg.get("capture_chain_enabled", True):
+        decision = check_capture_chain(cfg) if alive else CaptureDecision(None, None)
         apply_capture_decision(
-            check_capture_chain(cfg) if alive else CaptureDecision(None, None),
-            prev_anomalies, new_anomalies, details, prev_counters, new_counters)
+            decision, prev_anomalies, new_anomalies, details, prev_counters, new_counters)
 
-    # 3. edge-triggered alerts (only on state transitions)
-    for kind, is_bad_now in new_anomalies.items():
-        was_bad = bool(prev_anomalies.get(kind, False))
-        if is_bad_now and not was_bad:
-            emit_alert("fire", kind, details.get(kind, "anomaly detected"))
-        elif was_bad and not is_bad_now:
-            # CLEAR 默认"resolved"，但"停止沿用未经验证的结论"不是恢复，
-            # 必须用各判据自己给的文案，否则发出的是一条假恢复。
-            emit_alert("clear", kind, details.get(f"{kind}:clear", "resolved"))
-
-    # 4. persist state
+    pending, blocker_ids = deliver_alerts(
+        state, new_anomalies, details,
+        decision.blocker_ids if decision.blocked is not None else None)
     save_state({
         "anomalies": new_anomalies,
+        "pending_alerts": pending,
+        "capture_blocker_ids": blocker_ids,
         "counters": new_counters,
         "last_run": now_iso(),
         "last_stats": stats,

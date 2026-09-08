@@ -49,37 +49,18 @@ SSHOPT="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o Serve
 # --rebuild:强制走兜底重建。兜底本来只在副本损坏/格式不符时触发,属于罕用路径
 # —— 而罕用路径的通病是"用到时才发现早就坏了"。给它一个能随时手动走一遍的入口,
 # 既方便给新 NAS 播种,也让这条路可以被定期演练。
-FORCE_REBUILD=""
-[ "$1" = "--rebuild" ] && FORCE_REBUILD=1
-
-# ── 并发锁 ─────────────────────────────────────────────────────────────
-# launchd 的 StartInterval **不会**在上一轮还活着时另起一轮,所以一次卡死
-# 会让同步无限期冻结。这里自己判定并接管,不把活性交给 launchd。
-LOCK="$STATE/sync.lock"
-if [ -f "$LOCK" ]; then
-  lpid=$(cat "$LOCK" 2>/dev/null)
-  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then
-    # 跑了多久 = 现在 - 锁文件 mtime(锁是开工那刻写的)。不用 `ps -o etimes=`
-    # —— 那是 GNU/procps 关键字,macOS 的 BSD ps 不认,会把关键字清单当成
-    # $age,于是比较直接报错、永远落到 else,**接管逻辑等于从没生效过**。
-    lmt=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null)
-    now=$(date +%s)
-    if [ -n "$lmt" ]; then age=$((now - lmt)); else age=0; fi
-    if [ "$age" -gt 600 ]; then
-      echo "$(ts) 上一轮 pid=$lpid 已卡 ${age}s,杀掉重来"
-      pkill -9 -P "$lpid" 2>/dev/null
-      kill -9 "$lpid" 2>/dev/null
-    else
-      echo "$(ts) 上一轮 pid=$lpid 仍在跑 (${age}s),本轮跳过"
-      exit 0
-    fi
-  fi
+# Kernel lock + independent supervisor: launchd need not start a second run.
+if [ "${1:-}" != "--guarded" ]; then
+  exec python3 "$(dirname "$0")/sync_guard.py" "$STATE/sync.flock" 600 /bin/sh "$0" --guarded "$@"
 fi
-echo $$ > "$LOCK"
-
+shift
+FORCE_REBUILD=""
+[ "${1:-}" = "--rebuild" ] && FORCE_REBUILD=1
 TMP=""
-cleanup() { rm -f "$LOCK" "$TMP" "$TMP-wal" "$TMP-shm"; }
-trap cleanup EXIT INT TERM
+cleanup() { [ -z "$TMP" ] || rm -f "$TMP" "$TMP-wal" "$TMP-shm"; }
+trap cleanup EXIT
+trap 'exit 143' TERM HUP
+trap 'exit 130' INT
 
 # 被 SIGKILL 打断时 trap 不会跑,临时库会留在 /tmp。开工先扫。
 find /tmp -maxdepth 1 \( -name 'cm-snap.*' -o -name 'cm-delta.*' \) -type f -mmin +30 -delete 2>/dev/null
@@ -245,11 +226,19 @@ nas_fts=$(echo "$probe"     | sed -n 's/^fts=//p')
 # ── applier 保鲜:哈希不一致就重推(3KB,可忽略),杜绝版本漂移 ────────────
 # **必须在下面任何 full_rebuild 之前** —— 兜底重建现在也经由 applier(replace
 # 模式),NAS 上若还是不认识 replace 的旧版,重建会直接失败。
+# The remote supervisor must be installed before the applier that calls it.
+GUARD_LOCAL="$(dirname "$APPLIER_LOCAL")/sync_guard.py"
+GUARD_REMOTE="$(dirname "$APPLIER_REMOTE")/sync_guard.py"
+guard_sha=$(shasum -a 256 "$GUARD_LOCAL" | cut -d' ' -f1)
+remote_guard=$(ssh $SSHOPT "$NAS" "sha256sum '$GUARD_REMOTE' 2>/dev/null" | cut -d' ' -f1)
+if [ "$guard_sha" != "$remote_guard" ]; then
+  ssh $SSHOPT "$NAS" "cat > '$GUARD_REMOTE.$$.tmp' && test \"\$(sha256sum '$GUARD_REMOTE.$$.tmp' | cut -d' ' -f1)\" = '$guard_sha' && mv -f '$GUARD_REMOTE.$$.tmp' '$GUARD_REMOTE'" < "$GUARD_LOCAL" || exit 1
+fi
 want=$(shasum -a 256 "$APPLIER_LOCAL" | cut -c1-16)
 if [ "$nas_applier" != "$want" ]; then
   echo "$(ts) 推送 applier ($nas_applier → $want)"
   ssh $SSHOPT "$NAS" \
-    "cat > '$APPLIER_REMOTE.tmp' && mv -f '$APPLIER_REMOTE.tmp' '$APPLIER_REMOTE'" \
+    "cat > '$APPLIER_REMOTE.$$.tmp' && test \"\$(sha256sum '$APPLIER_REMOTE.$$.tmp' | cut -c1-16)\" = '$want' && mv -f '$APPLIER_REMOTE.$$.tmp' '$APPLIER_REMOTE'" \
     < "$APPLIER_LOCAL" \
     || { echo "$(ts) applier 推送失败,本轮跳过"; exit 0; }
 fi
