@@ -38,6 +38,8 @@ CLIENT_TIMEOUT_MARGIN_SEC = float(
 MIN_CLIENT_TIMEOUT_SEC = GATEWAY_ROUTE_TIMEOUT_SEC + CLIENT_TIMEOUT_MARGIN_SEC
 _timeout_floor_noted = False
 
+import breakers
+
 DEFAULT_BUSINESS_MODEL = "kg_hub.entity_extract"
 DEFAULT_GATEWAY_URL = "http://model-gateway:39000"
 BUSINESS_MODEL_PATTERN = re.compile(r"kg_hub\.[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
@@ -183,6 +185,14 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
     inflight: dict[str, asyncio.Future] = {}
 
     async def create_with_gateway_contract(*args, **kwargs):
+        # 人工断路器。判定放在这里而不是各个业务调用点,是因为这里是 kg-hub
+        # 唯一的模型出口:调用方不看开关、看错了、或者压根不知道有这回事,请求
+        # 也出不去。放在业务侧就只是个建议,挡不住跑飞的调用方——而断路器存在的
+        # 全部意义就是挡住跑飞的调用方。
+        #
+        # 必须在 inflight 合并**之前**判:合并之后再判,已经在飞的那一个仍会把钱
+        # 花掉,而扳开关的人以为已经断了。
+        breakers.assert_closed(str(kwargs.get("model") or gateway_model()))
         headers = dict(kwargs.get("extra_headers") or {})
         # Business callers cannot supply or preserve their own paid-operation
         # identity. Remove every casing variant before digesting and forwarding;

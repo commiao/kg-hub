@@ -46,9 +46,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import breakers  # noqa: E402
 from utils.ingest_filter import (  # noqa: E402
     QuotaTracker, evaluate, load_config, log_decision,
 )
+
+# 这条线调模型用的 business key —— 拓扑图上「refinery」那个节点的开关就是它。
+BREAKER_KEY = "kg_hub.entity_extract"
 
 
 # A Docker log driver can still stall when its sink is unavailable.  The refinery
@@ -710,11 +714,32 @@ async def main() -> int:
     decided: dict[int, bool] = {}  # 进程内决策缓存(防 deferred 重评的配额幻影消耗)
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
     quota_pause: dict = {}               # 网关配额耗尽 → {"until_cycle", "hits"}
+    breaker_held = False                 # 只在状态翻转时打日志,不每轮刷屏
     cycle = 0
 
     while True:
         cycle += 1
         try:
+            # —— 人工断路器:排在所有门控最前面 ——
+            # 这是**停流**,不是拒绝。开关一关本轮一条都不选、一条都不提交,所以
+            # 既不产生请求也不产生错误——不会出现"关了开关却一直撞墙报错、把
+            # backoff 和 24h 错误键刷满"的局面。观测原样留在积压里,开关一开
+            # 下一轮自动接着跑。
+            # (model_gateway_client 里还有一层硬挡,那层是兜底,正常永不触发。)
+            tripped, reason = breakers.is_tripped(BREAKER_KEY)
+            if tripped:
+                if not breaker_held:
+                    log.warning("[breaker] %s 已人工断开,停止提交:%s",
+                                BREAKER_KEY, reason or "(未填原因)")
+                    breaker_held = True
+                write_status(breaker_open=True, breaker_reason=reason,
+                             backlog_window_open=in_backlog_window(),
+                             last_error=None)
+                await asyncio.sleep(INTERVAL)
+                continue
+            if breaker_held:
+                log.info("[breaker] %s 已恢复,继续提交", BREAKER_KEY)
+                breaker_held = False
             if datetime.now(tz=CST).date() != quota_day:  # 日配额按天重置
                 quotas = QuotaTracker()
                 quota_day = datetime.now(tz=CST).date()
@@ -762,6 +787,7 @@ async def main() -> int:
                     quota_paused=False,
                     quota_paused_until_cycle=quota_pause.get("until_cycle"),
                     quota_hits=quota_pause.get("hits", 0),
+                    breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
                                "failed": len(wm["failed"])},

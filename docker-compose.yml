@@ -138,6 +138,9 @@ services:
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/models:/models
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/ingest-backup:/backup
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/refinery-state:/refinery-state:ro
+      # 人工断路器状态。服务端**可写**:拓扑页上的开关按钮就落在这里。
+      # 其余容器只读挂载——能扳开关的只有那一个页面。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/breakers:/breakers
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/gateway-usage:/gateway-usage:ro
       # 动态快照目录与可信配置分别只读挂载；producer 无法改告警策略。
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/runtime:/device-liveness:ro
@@ -296,4 +299,6 @@ services:
       - /run/synostorage/disks:/disktemp:ro
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/claude-mem:/data/claude-mem:ro
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/refinery-state:/state
+      # 只读:refinery 每轮开头读它决定这一轮提不提交,自己不改。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/breakers:/breakers:ro
     command: ["sh", "-c", "sleep 40; python -m kg_refinery"]

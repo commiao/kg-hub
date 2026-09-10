@@ -63,7 +63,10 @@ from graphiti_client import (  # noqa: E402
     build_graphiti,
 )
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
-from topology import dashboard_topology, topology_report, topology_latest  # noqa: E402
+from topology import (  # noqa: E402
+    breakers_set, breakers_state, dashboard_topology, topology_latest,
+    topology_report,
+)
 from dashboard_status import pipeline_signal
 from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
@@ -230,7 +233,10 @@ async def cleanup_stuck_jobs(graphiti) -> int:
     qrows, _, _ = await graphiti.driver.execute_query(
         "MATCH (k:IngestedKey) "
         "WHERE k.status = 'error' AND k.created_at < $t "
-        "  AND (k.error_kind IN ['quota_exhausted', 'gateway_unavailable'] "
+        # breaker_open 同属"没到供应商、与观测内容无关"这一类:人工断开期间万一
+        # 有键漏下来,不该让观测为一次运维动作白锁 24h。
+        "  AND (k.error_kind IN ['quota_exhausted', 'gateway_unavailable', "
+        "                        'breaker_open'] "
         "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
         "       OR k.error_message CONTAINS '网关本地配置不可用' "
         "       OR k.error_message STARTS WITH 'APIConnectionError' "
@@ -295,6 +301,12 @@ def classify_extract_error(exc: BaseException) -> str | None:
     错误会被网关收敛成 503,所以 429 = 请求没出网关、没计费、与观测内容无关。
     「网关本地配置不可用」是网关自身状态校验失败(如改完费用策略未重启),同样没到
     供应商——2026-09-07 一次改配额留下 62 个这种键,不该让观测白等 24h。"""
+    # 人工断路器:这是运维**主动**切断,不是故障。它必须先于所有判断,而且绝不能
+    # 落成一次"抽取失败"——否则关开关就等于给每条观测记一次失败、扣一次重试、
+    # 留一个 24h 错误键,开关一开还得人工捞回来。停流的主闸在 refinery 循环开头
+    # (根本不提交);走到这里说明有别的路径漏过来了,兜底挡住并如实归类。
+    if type(exc).__name__ == "BreakerOpen":
+        return "breaker_open"
     if getattr(exc, "status_code", None) == 429:
         return "quota_exhausted"
     text = str(exc)
@@ -4358,6 +4370,8 @@ app = Starlette(
         Route("/dashboard/usage_feedback_resolve", usage_feedback_resolve, methods=["POST"]),
         Route("/dashboard/usage_feedback_undo", usage_feedback_undo, methods=["POST"]),
         Route("/dashboard/topology", dashboard_topology, methods=["GET"]),
+        Route("/dashboard/breakers", breakers_state, methods=["GET"]),
+        Route("/dashboard/breaker", breakers_set, methods=["POST"]),
         Route("/api/topology/report", topology_report, methods=["POST"]),
         Route("/api/topology/latest", topology_latest, methods=["GET"]),
         Route("/dashboard/monitor", dashboard_monitor, methods=["GET"]),
