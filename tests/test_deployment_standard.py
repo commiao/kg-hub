@@ -100,6 +100,10 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertIn('KG_HUB_COMPOSE_PROJECT:-kg-hub', self.code)
         self.assertIn("-p $PROJECT", self.code)
 
+    def test_release_keeps_model_callers_on_the_private_gateway_network(self):
+        self.assertIn("deploy/model-gateway-network.override.yml", self.code)
+        self.assertIn("ensure_model_gateway_private_network", self.code)
+
 
 class GuardrailTests(unittest.TestCase):
     def test_the_unsafe_script_stays_disabled(self):

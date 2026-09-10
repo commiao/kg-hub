@@ -34,4 +34,4 @@ services:
 networks:
   model_gateway_private:
     external: true
-    name: ${MODEL_GATEWAY_PRIVATE_NETWORK:?set an existing reviewed private network}
+    name: ${MODEL_GATEWAY_PRIVATE_NETWORK:-model-gateway-private}

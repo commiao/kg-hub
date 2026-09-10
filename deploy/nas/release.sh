@@ -39,6 +39,8 @@ DK="${KG_HUB_DOCKER:-sudo -n /var/packages/ContainerManager/target/usr/bin/docke
 PROJECT="${KG_HUB_COMPOSE_PROJECT:-kg-hub}"
 HEALTH="${KG_HUB_HEALTH_URL:-http://127.0.0.1:17171/health}"
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+COMPOSE_BASE="docker-compose.yml"
+COMPOSE_GATEWAY_OVERRIDE="deploy/model-gateway-network.override.yml"
 # 共用同一个镜像的全部服务。falkordb 不在其中：它是数据面，发布不碰它。
 SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
@@ -179,6 +181,31 @@ ensure_compose_model_gateway_token() {
   " || die "KG_HUB_MODEL_GATEWAY_TOKEN 缺失、重复或与运行中服务不一致"
 }
 
+# server/ingester/watchdog 和 model-gateway 属于两个 Compose 项目。默认网络隔离
+# 是正确的；只有这三个调用者通过已存在的 private network 相连，refinery 不接入。
+# 漏掉 override 会在容器重建时静默断开 DNS，所有抽取都变成 deferred。必须在
+# 停生产者前验证 override、网络与 gateway 的实际成员关系。
+ensure_model_gateway_private_network() {
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会校验 model-gateway private network 与现有网关成员关系"
+    return 0
+  fi
+
+  on_nas "set -eu
+    cd '$SRC'
+    test -f '$COMPOSE_GATEWAY_OVERRIDE'
+    count=\$(grep -c '^MODEL_GATEWAY_PRIVATE_NETWORK=' .env || true)
+    case \"\$count\" in
+      0) network='model-gateway-private' ;;
+      1) network=\$(sed -n 's/^MODEL_GATEWAY_PRIVATE_NETWORK=//p' .env) ;;
+      *) exit 1 ;;
+    esac
+    case \"\$network\" in ''|*[!A-Za-z0-9_.-]*) exit 1 ;; esac
+    $DK network inspect \"\$network\" >/dev/null
+    $DK inspect -f '{{range \$name, \$net := .NetworkSettings.Networks}}{{println \$name}}{{end}}' model-gateway | grep -qx \"\$network\"
+  " || die "model-gateway private network 不存在、网关未接入或配置不合法"
+}
+
 prepare_refinery_window_change() {
   [ "$window_change_requested" = 1 ] || return 0
   if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -250,7 +277,7 @@ rollback_to_previous_image() {
     grep -v '^KG_HUB_IMAGE_TAG=' .env > \"\$tmp\" 2>/dev/null || true
     printf 'KG_HUB_IMAGE_TAG=%s\\n' '$PREV' >> \"\$tmp\"
     chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
-    $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES" \
+    $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT up -d --no-deps --no-build $SERVICES" \
     || die "回滚也失败了；线上需要人工介入（旧镜像 kg-hub-server:$PREV 仍在盘上）"
 }
 
@@ -326,6 +353,7 @@ recover_pending_refinery_window_transaction || die "无法恢复上一次未完�
 # 被拒绝，反而破坏发布的恢复保证。
 ensure_compose_data_root
 ensure_compose_model_gateway_token
+ensure_model_gateway_private_network
 
 # 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
 # release_exit 复原这份完整旧配置。
@@ -410,11 +438,11 @@ producers_stopped=0
 restore_producers() {
   [ "$producers_stopped" = 1 ] || return 0
   say "  恢复生产者 refinery / ingester"
-  on_nas "cd $SRC && $DK compose -p $PROJECT start refinery ingester" \
-    || say "  ⚠ 生产者没起回来，需要人工：docker compose -p $PROJECT start refinery ingester"
+  on_nas "cd $SRC && $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT start refinery ingester" \
+    || say "  ⚠ 生产者没起回来，需要人工：docker compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT start refinery ingester"
   producers_stopped=0
 }
-if on_nas "cd $SRC && $DK compose -p $PROJECT stop -t 30 refinery ingester"; then
+if on_nas "cd $SRC && $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT stop -t 30 refinery ingester"; then
   producers_stopped=1
 else
   say "  （生产者没停成，继续——最坏是多等一会儿）"
@@ -454,7 +482,7 @@ if ! on_nas "set -eu
   grep -v '^KG_HUB_IMAGE_TAG' .env > \"\$tmp\" 2>/dev/null || true
   printf 'KG_HUB_IMAGE_TAG=%s\nKG_HUB_IMAGE_TAG_PREV=%s\n' '$SHA' '$PREV' >> \"\$tmp\"
   chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
-  $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES"; then
+  $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT up -d --no-deps --no-build $SERVICES"; then
   rollback_to_previous_image "候选容器启动失败"
   die "发布失败，已回到 $PREV"
 fi

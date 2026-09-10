@@ -33,24 +33,34 @@ write_env() {
     'KG_HUB_IMAGE_TAG=old-image' \
     'KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data' \
     'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' \
+    'MODEL_GATEWAY_PRIVATE_NETWORK=model-gateway-private' \
     'KG_HUB_REFINERY_WINDOW_START=22' \
     'KG_HUB_REFINERY_WINDOW_END=10' \
     'KG_HUB_REFINERY_MAX_DISK_TEMP=52' \
     'KG_HUB_REFINERY_INGEST_CONCURRENCY=2' \
     'UNRELATED_SECRET=fixture-only' > "$FIXTURE/.env"
   chmod 600 "$FIXTURE/.env"
+  mkdir -p "$FIXTURE/deploy"
+  cp "$ROOT/deploy/model-gateway-network.override.yml" "$FIXTURE/deploy/model-gateway-network.override.yml"
   configure_fake_docker
 }
 
 data_root() { sed -n 's/^KG_HUB_DATA_ROOT=//p' "$FIXTURE/.env"; }
 model_gateway_token() { sed -n 's/^KG_HUB_MODEL_GATEWAY_TOKEN=//p' "$FIXTURE/.env"; }
+private_network() { sed -n 's/^MODEL_GATEWAY_PRIVATE_NETWORK=//p' "$FIXTURE/.env"; }
 
 configure_fake_docker() {
   cat > "$FIXTURE/docker" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 case "$1" in
-  inspect) printf '%s\n' 'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' ;;
+  inspect)
+    if [ "${!#}" = model-gateway ]; then
+      printf '%s\n' 'model-gateway-private'
+    else
+      printf '%s\n' 'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token'
+    fi
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -111,6 +121,33 @@ test_compose_model_gateway_token_contract() {
     fail 'duplicate gateway tokens were accepted'
   fi
   assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate gateway token rejection changed .env'
+}
+
+test_model_gateway_private_network_contract() {
+  write_env
+  ensure_model_gateway_private_network
+  assert_eq 'model-gateway-private' "$(private_network)" 'known private network was rejected'
+
+  sed -i.bak '/^MODEL_GATEWAY_PRIVATE_NETWORK=/d' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  ensure_model_gateway_private_network
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'default private network check changed .env'
+
+  printf '%s\n' 'MODEL_GATEWAY_PRIVATE_NETWORK=wrong-network' >> "$FIXTURE/.env"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_model_gateway_private_network >/dev/null 2>&1); then
+    fail 'a private network without the gateway was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'rejected private network changed .env'
+
+  write_env
+  printf '%s\n' 'MODEL_GATEWAY_PRIVATE_NETWORK=model-gateway-private' >> "$FIXTURE/.env"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_model_gateway_private_network >/dev/null 2>&1); then
+    fail 'duplicate private network keys were accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate private network rejection changed .env'
 }
 
 test_rejects_all_other_windows() {
@@ -252,7 +289,7 @@ test_health_failure_restores_env_before_old_image_compose() {
   PREV=old-image
 
   on_nas() {
-    if [[ "$1" == *'compose -p '* ]]; then
+    if [[ "$1" == *'compose '* && "$1" == *' -p '* ]]; then
       assert_eq "10" "$(end_hour)" 'old-image compose was reached before .env restoration'
       return 0
     fi
@@ -277,12 +314,12 @@ test_candidate_compose_failure_main_path_restores_before_old_image() {
       printf '%s\n' '{"active_extractions": 0}'
       return 0
     fi
-    if [[ "$command" == *"KG_HUB_IMAGE_TAG_PREV="* && "$command" == *"compose -p"* ]]; then
+    if [[ "$command" == *"KG_HUB_IMAGE_TAG_PREV="* && "$command" == *"compose "* && "$command" == *" -p "* ]]; then
       : > "$FIXTURE/candidate-compose"
       assert_eq "8" "$(end_hour)" 'candidate compose did not receive the requested window'
       return 1
     fi
-    if [[ "$command" == *"grep -v '^KG_HUB_IMAGE_TAG='"* && "$command" == *"compose -p"* ]]; then
+    if [[ "$command" == *"grep -v '^KG_HUB_IMAGE_TAG='"* && "$command" == *"compose "* && "$command" == *" -p "* ]]; then
       : > "$FIXTURE/rollback-compose"
       assert_eq "10" "$(end_hour)" 'old-image compose started before .env restoration'
       assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'old-image compose did not receive the complete original .env'
@@ -337,6 +374,7 @@ test_without_flag_does_not_touch_window_env() {
 test_rejects_all_other_windows
 test_compose_data_root_contract
 test_compose_model_gateway_token_contract
+test_model_gateway_private_network_contract
 test_build_failure_restores_complete_env
 test_interruption_restores_complete_env
 test_repeated_interrupt_does_not_skip_cleanup
