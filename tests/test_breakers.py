@@ -283,11 +283,11 @@ class TopologyAnnotationTests(unittest.TestCase):
         self.assertTrue(node["breaker"]["corrupt"])
         self.assertTrue(node["breaker"]["tripped"])
         self.assertEqual(node["sub"], "断路状态不可读")
-        # 没有执行方的那一路,损坏也不许显示成「已断开」——它并没有断。
+        # 两路都接线了,所以损坏对两路一视同仁:都按已断开。
         other = next(n for n in snap["nodes"] if n["id"] == "claude-mem")
         self.assertTrue(other["breaker"]["corrupt"])
-        self.assertFalse(other["breaker"]["tripped"])
-        self.assertEqual(other["state"], "green")
+        self.assertTrue(other["breaker"]["tripped"])
+        self.assertEqual(other["sub"], "断路状态不可读")
 
     def test_missing_node_is_not_an_error(self):
         # 某台设备上没有 refinery 很正常，不该因此炸掉整张图。
@@ -341,12 +341,13 @@ class EnforcementHonestyTests(unittest.TestCase):
         self.assertEqual(set(breakers.ENFORCED), set(breakers.KNOWN_KEYS))
 
     def test_unenforced_key_never_claims_to_have_cut_anything(self):
-        # claude-mem 的 worker 不在本仓库，目前没有执行方。
-        self.assertFalse(breakers.ENFORCED[CM])
+        # 现在两路都接线了，所以用一个临时的「未接线」来钉这条规则本身：
+        # 只要 ENFORCED 是假，图上就不许显示成已断。
         breakers.set_tripped(CM, True, by="tester", path=self.path)
         snap = {"nodes": [{"id": "claude-mem", "layer": "worker",
                            "label": "claude-mem", "state": "green"}]}
-        self.T.annotate_breakers(snap, breakers.read_state(self.path))
+        with mock.patch.dict(breakers.ENFORCED, {CM: False}):
+            self.T.annotate_breakers(snap, breakers.read_state(self.path))
         node = snap["nodes"][0]
         self.assertFalse(node["breaker"]["enforced"])
         # 状态里写着已断，但图上不许显示成已断——因为它并没有真的断。
@@ -361,6 +362,46 @@ class EnforcementHonestyTests(unittest.TestCase):
         self.assertIn("未接线", source)
         handler = source.split("document.addEventListener('click'", 1)[1][:700]
         self.assertIn("dataset.enforced !== '1'", handler)
+
+
+
+class ClaudeMemSideTests(unittest.TestCase):
+    """claude-mem 那一路：断开不影响采集、不丢数据，恢复后从断点接着跑。"""
+
+    RELAY = Path("/Users/mac/workspace_claudeCode/credvault/session_forwarder.py")
+
+    def setUp(self):
+        if not self.RELAY.exists():
+            self.skipTest("credvault 不在这台机器上")
+        self.source = self.RELAY.read_text("utf-8")
+
+    def test_relay_refuses_before_dialling_so_nothing_reaches_the_gateway(self):
+        # 断开期间连一个 TCP 都不朝 NAS 发 ⇒ 不花钱,也不可能留下未决记录。
+        body = self.source.split("class SessionForwarderHandler", 1)[1]
+        gate = body.index("breaker_gate.tripped()")
+        dial = body.index("socket.create_connection")
+        self.assertLess(gate, dial)
+
+    def test_relay_breaker_is_three_state_like_the_kg_hub_side(self):
+        gate = self.source.split("class BreakerGate", 1)[1][:2000]
+        self.assertIn("except FileNotFoundError:\n            return False", gate)
+        self.assertIn("except OSError:\n            return True", gate)
+
+    def test_guard_keeps_the_last_known_value_when_kg_hub_is_unreachable(self):
+        guard = Path(__file__).resolve().parent.parent.joinpath(
+            "tools/claude_mem_guard.sh").read_text("utf-8")
+        # 拉不到就保持原样：绝不因为读不到 kg-hub 就自己合上闸。
+        self.assertIn('if [ -n "$STATE" ]; then', guard)
+        self.assertIn("claude_mem.observation", guard)
+
+    def test_lag_is_declared_for_every_key_and_shown_to_the_operator(self):
+        self.assertEqual(set(breakers.LAG_SECONDS), set(breakers.KNOWN_KEYS))
+        self.assertEqual(breakers.LAG_SECONDS[KG], 0)      # 同机同卷直读
+        self.assertGreater(breakers.LAG_SECONDS[CM], 0)    # 经 guard 同步
+        ui = Path(__file__).resolve().parent.parent.joinpath(
+            "topology.py").read_text("utf-8")
+        self.assertIn("data-lag=", ui)
+        self.assertIn("生效延迟", ui)
 
 
 if __name__ == "__main__":

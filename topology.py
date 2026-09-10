@@ -28,6 +28,8 @@ from utils.device_liveness import (DEFAULT_CAPTURE_STALE_AFTER_S,
                                    load_config, load_status, positive_int)
 
 # 链路分层：从左到右就是数据流向
+import breakers  # noqa: E402  —— 与本模块同级,放在常量前便于阅读
+
 LAYERS = [
     ("device", "设备"),
     ("tool", "工具"),
@@ -174,6 +176,39 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     return node, edge
 
 
+def annotate_breakers(snap: dict, state: dict) -> None:
+    """把断路器状态挂到它管的那个节点上。
+
+    只挂 `breakers.KEY_NODES` 里列出的节点。挂不上（快照里没有那个节点）就算了：
+    拓扑是按设备快照拼的，某台机器上没有 refinery 很正常，不该因此报错。
+    """
+    by_id = {n.get("id"): n for n in snap.get("nodes", []) if isinstance(n, dict)}
+    for key, node_id in breakers.KEY_NODES.items():
+        node = by_id.get(node_id)
+        if node is None:
+            continue
+        entry = state["breakers"][key]
+        node["breaker"] = {
+            "key": key, "tripped": bool(entry["tripped"]),
+            "reason": entry.get("reason") or "",
+            "at": entry.get("at"), "by": entry.get("by"),
+            # 损坏要在图上说出来。否则整条管线静悄悄停住,而看图的人只看到
+            # 「已断开」,会以为是别人手动关的,去查半天。
+            "corrupt": bool(state["corrupt"]),
+            "enforced": bool(breakers.ENFORCED.get(key)),
+            "lag_s": int(breakers.LAG_SECONDS.get(key, 0)),
+        }
+        if not breakers.ENFORCED.get(key):
+            # 没有执行方就不许它改节点颜色:图上显示「已断开」而实际还在跑,
+            # 是比没有开关更坏的谎。
+            node["breaker"]["tripped"] = False
+            continue
+        if entry["tripped"]:
+            # 断路是人为的,不是故障:用 amber 而不是 red,别和真出事的红混在一起。
+            node["state"] = "amber"
+            node["sub"] = "已人工断开" if not state["corrupt"] else "断路状态不可读"
+
+
 def annotate_gateway(snap: dict, node: dict, edge: dict) -> dict:
     """只在含 kg-hub 节点的快照上挂网关节点(NAS 侧那一段只画一份)。"""
     nodes = snap.get("nodes")
@@ -266,6 +301,8 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
     aliases = device_cfg.get("capture_device_aliases")
     stale_after_s = capture_stale_after_s(device_cfg)
     now = datetime.now(tz=timezone.utc)
+    # read_state 永不抛:读不动就返回「全部按断开」,这是花钱闸门唯一安全的假设。
+    breaker_state = breakers.read_state()
     try:
         refinery_status = _read_json(REFINERY_STATUS_PATH) or {}
         gw_node, gw_edge = gateway_quota_node(
@@ -288,6 +325,7 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         snap["_recv"] = recv
         snap["_age_s"] = age
         annotate_liveness(snap, liveness, aliases, stale_after_s=stale_after_s)
+        annotate_breakers(snap, breaker_state)
         if gw_node is not None:
             annotate_gateway(snap, gw_node, gw_edge)
             activity = refinery_activity(refinery_status, now)
@@ -305,6 +343,43 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
                             edge["state"] = node["state"]
         snaps.append(snap)
     return snaps
+
+
+async def breakers_state(request: Request) -> JSONResponse:
+    """GET /dashboard/breakers — 当前断路器状态（拓扑页与运维脚本共用）。"""
+    return JSONResponse({"ok": True, **breakers.read_state()})
+
+
+async def breakers_set(request: Request) -> JSONResponse:
+    """POST /dashboard/breaker — 扳一个开关。
+
+    与 `/dashboard/tag`、`/dashboard/capsule_requeue` 同一条既有的免鉴权面板写
+    通道（17171 只绑 NAS 回环 + tailscale，不上局域网）。**这是控制面动作，不是
+    只读**，信任边界就是 tailnet 本身——值得单独复核，但本次沿用既有先例，不在
+    这里单独发明一套鉴权。
+    """
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "请求不是合法 JSON"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "请求体必须是对象"}, status_code=400)
+    key = payload.get("key")
+    tripped = payload.get("tripped")
+    if key not in breakers.KNOWN_KEYS:
+        return JSONResponse({"ok": False, "error": "未知业务 key"}, status_code=400)
+    if type(tripped) is not bool:
+        return JSONResponse({"ok": False, "error": "tripped 必须是布尔"}, status_code=400)
+    reason = payload.get("reason")
+    reason = reason if isinstance(reason, str) else ""
+    try:
+        breakers.set_tripped(key, tripped, by="dashboard", reason=reason)
+    except OSError as exc:
+        # 写不进去必须如实说。谎报成功比不做更危险:操作员会以为已经断了。
+        return JSONResponse(
+            {"ok": False, "error": f"断路器状态写入失败：{type(exc).__name__}"},
+            status_code=503)
+    return JSONResponse({"ok": True, **breakers.read_state()})
 
 
 async def dashboard_topology(request: Request) -> HTMLResponse:
@@ -389,6 +464,17 @@ svg{display:block;width:100%;height:auto;max-width:1180px}
 .edge.amber{stroke:var(--amber);opacity:.9;stroke-dasharray:5 3}
 .edge.red{stroke:var(--red);opacity:1;stroke-width:2.5;stroke-dasharray:4 3}
 g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
+/* 断路器开关。刻意做成"闸刀"而不是普通状态点:它是控制面,点下去会改变系统
+   行为,必须一眼看出可点、且和旁边只读的状态圆点区分开。 */
+g.brk{cursor:pointer}
+g.brk:hover .brkbox{filter:brightness(1.25)}
+.brkbox{stroke-width:1}
+.brkbox.on{fill:color-mix(in srgb,var(--green) 22%,transparent);stroke:var(--green)}
+.brkbox.off{fill:color-mix(in srgb,var(--red) 26%,transparent);stroke:var(--red)}
+.brkbox.bad{fill:color-mix(in srgb,var(--amber) 26%,transparent);stroke:var(--amber)}
+.brktext{font-size:9.5px;font-weight:600;text-anchor:middle;pointer-events:none}
+.brktext.on{fill:var(--green)} .brktext.off{fill:var(--red)}
+.brktext.bad{fill:var(--amber)}
 .blockers{margin-top:12px;border-left:3px solid var(--red);padding:8px 12px;
   background:color-mix(in srgb,var(--red) 8%,transparent);border-radius:0 6px 6px 0}
 .blockers div{font-size:12.5px;margin:3px 0}
@@ -807,7 +893,7 @@ function renderHost(s, hi){
       + `<circle class="dot ${esc(n.state)}" cx="${p.x+13}" cy="${p.y+15}" r="4.5"/>`
       + `<text class=nlabel x="${p.x+24}" y="${p.y+19}">${esc(n.label)}</text>`
       + `<text class=nidle x="${p.x+24}" y="${p.y+34}">${idle}</text>`
-      + `</g>`;
+      + `</g>` + breakerSwitch(n, p);
   }).join('')).join('');
 
   const ds = s._device_state||'unknown';
@@ -841,6 +927,72 @@ function fmt(sec){
   if(sec<90) return sec+'秒'; if(sec<5400) return Math.floor(sec/60)+'分钟';
   if(sec<172800) return Math.floor(sec/3600)+'小时'; return Math.floor(sec/86400)+'天';
 }
+
+// ---- 人工断路器 ----------------------------------------------------------
+// 采集链路上只有两个节点会调用模型(claude-mem / refinery)。这两个开关是在
+// 「一边跑一边烧钱、却只能干看着」时唯一能立刻按下去的东西 —— 2026-09-10 那次
+// 六小时攒了 171 条**永远清不掉**的悬账记录,当时没有任何手段单独切断一路。
+//
+// 关掉 = 源头停止提交(不是让请求撞墙报错):不产生请求,也不产生错误、不扣重试、
+// 不留错误键。开关一开,原样接着跑。
+function breakerSwitch(n, p){
+  const b = n.breaker;
+  if (!b) return '';
+  // 没有执行方的开关不画成可按的样子。假开关比没开关更危险。
+  const cls = !b.enforced ? 'bad'
+    : (b.corrupt ? 'bad' : (b.tripped ? 'off' : 'on'));
+  const text = !b.enforced ? '未接线'
+    : (b.corrupt ? '不可读' : (b.tripped ? '已断开' : '通'));
+  // 生效延迟必须说出来:操作员按下之后要知道该等多久,不能以为是瞬时的。
+  const lag = b.lag_s > 0 ? `\n生效延迟最多 ${b.lag_s} 秒（经守护脚本同步）` : '';
+  const w = 46, h = 16, x = p.x + BW - w - 6, y = p.y + BH - h - 5;
+  const tip = !b.enforced
+    ? '这一路还没有执行方：开关存得下但不会生效，先别指望它（见 T-0066）'
+    : b.corrupt
+    ? '断路器状态读不动，已按断开处理；点此重写一份干净状态'
+    : (b.tripped
+        ? `已人工断开${b.reason?'：'+b.reason:''}${b.at?'\n'+b.at:''}${b.by?' by '+b.by:''}${lag}\n点此恢复`
+        : '切断后：源头停止取数，队列原样保留，恢复后从断点接着跑' + lag + '\n点此切断');
+  return `<g class=brk data-key="${esc(b.key)}" data-tripped="${b.tripped?1:0}"`
+    + ` data-enforced="${b.enforced?1:0}" data-lag="${b.lag_s|0}"`
+    + ` data-label="${esc(n.label)}">`
+    + `<title>${esc(tip)}</title>`
+    + `<rect class="brkbox ${cls}" x="${x}" y="${y}" width="${w}" height="${h}" rx="8"/>`
+    + `<text class="brktext ${cls}" x="${x+w/2}" y="${y+11.5}">${esc(text)}</text>`
+    + `</g>`;
+}
+
+document.addEventListener('click', async ev => {
+  const g = ev.target.closest && ev.target.closest('g.brk');
+  if (!g) return;
+  if (g.dataset.enforced !== '1') {
+    ev.stopPropagation();
+    alert('这一路还没有执行方，扳了也不会生效。见 T-0066。');
+    return;
+  }
+  ev.stopPropagation();          // 别顺手把节点详情也展开
+  const key = g.dataset.key, label = g.dataset.label;
+  const wasTripped = g.dataset.tripped === '1';
+  let reason = '';
+  if (!wasTripped) {
+    // 切断要写一句为什么。事后回看「谁在什么时候为什么把它关了」全靠这一行。
+    const lagNote = (g.dataset.lag|0) > 0
+      ? `\n注意：这一路生效最多要等 ${g.dataset.lag} 秒。` : '';
+    reason = prompt(`切断【${label}】的模型调用？\n`
+      + `队列原样保留、不丢数据，恢复后从断点接着跑。${lagNote}\n\n原因：`, '');
+    if (reason === null) return;
+  } else if (!confirm(`恢复【${label}】的模型调用？`)) {
+    return;
+  }
+  try {
+    const r = await fetch('/dashboard/breaker', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({key, tripped: !wasTripped, reason})});
+    const d = await r.json();
+    if (!d.ok) { alert('操作失败：' + (d.error||r.status)); return; }
+  } catch (e) { alert('操作失败：' + e); return; }
+  location.reload();
+});
 
 render();
 setTimeout(()=>location.reload(), 60000);

@@ -22,6 +22,43 @@ ts() { date '+%F %T'; }
 
 WEBHOOK=$(grep '^KG_HUB_FEISHU_WEBHOOK=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"')
 
+# ---- 人工断路器同步 -------------------------------------------------------
+# 拓扑图上 claude-mem 那个开关的执行链条:kg-hub(权威) → 这里(每 300s 拉一次)
+# → Mac 本地文件 → session_forwarder 出门前读它。
+#
+# 为什么不是「停 worker」:要求是断开时 claude-mem 不受影响、不丢数据。worker 是
+# 队列消费者,pending_messages 只有 pending/processing 两态、没有 failed,成功消费
+# 才删行。拦在它出门那一步,hook 照常收、队列照常积、一条不丢,开关一开下一轮自己
+# 接着处理——队列本身就是断点。停掉 worker 则会把采集一起停,那才叫受影响。
+#
+# 拉不到就**保持上次已知值**:绝不因为读不到 kg-hub 就自己合上闸。
+BREAKER_FILE="$HOME/.claude-mem/.model-gateway/activation-$(
+  ls "$HOME/.claude-mem/.model-gateway" 2>/dev/null \
+    | sed -n 's/^activation-\([0-9a-f]\{32\}\)\.json$/\1/p' | head -1
+).breaker.json"
+KG_URL=$(grep '^KG_HUB_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"')
+case "$BREAKER_FILE" in
+  *"activation-.breaker.json") ;;                 # 没找到激活记录:不动
+  *)
+    STATE=$(curl -s -m 8 "${KG_URL:-http://127.0.0.1:17171}/dashboard/breakers" 2>/dev/null \
+      | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)["breakers"]["claude_mem.observation"]
+except Exception:
+    sys.exit(1)                      # 拉不到:退出码非零,下面保持原样
+print(json.dumps({"version": 1, "tripped": bool(d["tripped"]),
+                  "reason": d.get("reason") or ""}, ensure_ascii=False))' 2>/dev/null)
+    if [ -n "$STATE" ]; then
+      TMP="$BREAKER_FILE.tmp.$$"
+      printf '%s' "$STATE" > "$TMP" 2>/dev/null \
+        && chmod 600 "$TMP" 2>/dev/null \
+        && mv -f "$TMP" "$BREAKER_FILE" 2>/dev/null
+      rm -f "$TMP" 2>/dev/null
+    fi
+    ;;
+esac
+
 # 找出累计 CPU 时间超阈值的 claude-mem hook 进程(tosec 解析 [hh:]mm:ss.ss)
 CANDIDATES=$(ps -axo pid=,cputime=,command= 2>/dev/null | awk -v lim="$CPU_TIME_THRESHOLD" '
   function tosec(t,  a,n,s,i){ n=split(t,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; return s }

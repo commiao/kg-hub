@@ -50,12 +50,21 @@ KEY_NODES: dict[str, str] = {
 #
 # kg_hub.entity_extract：refinery 每轮开头读它决定提不提交（停流），
 #   model_gateway_client 里另有一层硬挡（兜底）。已接线。
-# claude_mem.observation：状态存得下，但 claude-mem 的 worker 不在本仓库，
-#   目前**没有任何执行方**。接线方案见 T-0066：由 Mac 探针据此停/起 launchd
-#   worker（进程停 = 队列在 SQLite 里等，不撞墙）。在那之前 UI 必须显示「未接线」。
+# claude_mem.observation：tools/claude_mem_guard.sh 每 300s 把这里的状态同步成
+#   Mac 本地文件，session_forwarder 出门前读它（拨号之前就拦，连 TCP 都不发）。
+#   worker 照常跑、hook 照常收、队列照常积——pending_messages 只有
+#   pending/processing 两态、没有 failed，成功消费才删行，所以一条都不丢，
+#   开关一开下一轮自己接着处理。已接线，但生效有最多 300s 延迟。
 ENFORCED: dict[str, bool] = {
-    "claude_mem.observation": False,
+    "claude_mem.observation": True,
     "kg_hub.entity_extract": True,
+}
+
+# 这一路从扳开关到真正生效的最大延迟（秒）。UI 必须如实显示：操作员按下之后
+# 要知道该等多久，不能以为是瞬时的。0 = 同机直读，立即生效。
+LAG_SECONDS: dict[str, int] = {
+    "claude_mem.observation": 300,   # 经 claude_mem_guard.sh 每 300s 同步一次
+    "kg_hub.entity_extract": 0,      # refinery 同机同卷直读
 }
 
 DEFAULT_PATH = Path(os.environ.get("KG_HUB_BREAKERS", "/breakers/breakers.json"))
