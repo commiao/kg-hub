@@ -75,6 +75,69 @@ test_build_failure_restores_complete_env() {
   assert_eq "0" "$(backup_count)" 'restored backup was not cleaned up'
 }
 
+test_interruption_restores_complete_env() {
+  write_env
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  reset_state
+  window_change_requested=1
+
+  # The real release installs this pair after it owns the NAS lock.  A TERM
+  # from its caller must take the same EXIT path as an ordinary build failure.
+  if (
+    export KG_HUB_NAS_SRC="$FIXTURE"
+    export RELEASE_WINDOW_SCRIPT="$ROOT/deploy/nas/release.sh"
+    /bin/bash -c '
+      set -euo pipefail
+      source "$RELEASE_WINDOW_SCRIPT"
+      DRY_RUN=0
+      say() { :; }
+      on_nas() { /bin/bash -c "$1"; }
+      window_change_requested=1
+      lock_acquired=0
+      prepare_refinery_window_change
+      install_release_exit_traps
+      kill -TERM "$$"
+      sleep 1
+    '
+  ); then
+    fail 'an interrupted release returned success'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'interrupt restoration did not restore full .env'
+  assert_eq "0" "$(backup_count)" 'interrupt restoration retained transaction state'
+}
+
+test_repeated_interrupt_does_not_skip_cleanup() {
+  write_env
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  reset_state
+
+  if (
+    export KG_HUB_NAS_SRC="$FIXTURE"
+    export RELEASE_WINDOW_SCRIPT="$ROOT/deploy/nas/release.sh"
+    /bin/bash -c '
+      set -euo pipefail
+      source "$RELEASE_WINDOW_SCRIPT"
+      DRY_RUN=0
+      say() { :; }
+      on_nas() { /bin/bash -c "$1"; }
+      window_change_requested=1
+      lock_acquired=0
+      prepare_refinery_window_change
+      # Stretch the cleanup command so a second TERM lands while release_exit
+      # is restoring the transaction, rather than after it has finished.
+      on_nas() { sleep 2; /bin/bash -c "$1"; }
+      install_release_exit_traps
+      (sleep 1; kill -TERM "$$") &
+      kill -TERM "$$"
+      sleep 3
+    '
+  ); then
+    fail 'a repeatedly interrupted release returned success'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'repeated interrupt skipped full .env restoration'
+  assert_eq "0" "$(backup_count)" 'repeated interrupt retained transaction state'
+}
+
 test_lost_prepare_reply_recovers_from_remote_transaction_record() {
   write_env
   cp "$FIXTURE/.env" "$FIXTURE/before"
@@ -200,6 +263,8 @@ test_without_flag_does_not_touch_window_env() {
 
 test_rejects_all_other_windows
 test_build_failure_restores_complete_env
+test_interruption_restores_complete_env
+test_repeated_interrupt_does_not_skip_cleanup
 test_lost_prepare_reply_recovers_from_remote_transaction_record
 test_health_failure_restores_env_before_old_image_compose
 test_candidate_compose_failure_main_path_restores_before_old_image

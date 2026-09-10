@@ -76,7 +76,7 @@ acquire_lock() {
   lock_acquired=1
   # 退出时释放锁；生产者若还停着也一并起回来（die 会走到这里）。
   # release_exit 还负责在失败时先恢复受控的 refinery 窗口配置。
-  trap 'release_exit' EXIT
+  install_release_exit_traps
 }
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 on_nas() {
@@ -192,6 +192,9 @@ rollback_to_previous_image() {
 
 release_exit() {
   local rc=$?
+  # 清理途中再次收到中断时不能跳过恢复步骤。先忽略这三种信号，再撤销 EXIT
+  # 本身，确保完整旧 .env、生产者和锁有机会按顺序收束。
+  trap '' HUP INT TERM
   trap - EXIT
   if [ "$rc" -ne 0 ]; then
     restore_refinery_window_env || say "  ⚠ 未能自动恢复 .env 备份"
@@ -201,6 +204,14 @@ release_exit() {
     ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '$LOCK'" >/dev/null 2>&1 || true
   fi
   exit "$rc"
+}
+
+# 调用端（终端、SSH、自动化执行器）中断时也必须走同一条失败收束路径。
+# 单独依赖 EXIT trap 不能处理被转发的 HUP/INT/TERM：那些信号会在子 ssh 退出后
+# 直接结束 shell，留下尚未恢复的 .env 事务和发布锁。
+install_release_exit_traps() {
+  trap 'release_exit' EXIT
+  trap 'die "发布被中断；正在恢复配置和生产者"' HUP INT TERM
 }
 
 # ---- 1. 确定要发布的 commit，并要求它在仓库里可追溯 ----------------------
