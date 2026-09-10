@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__HOME__/.bun/bin:__HOME__/.npm-global/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Applications/Tailscale.app/Contents/MacOS</string>
+	</dict>
+	<key>Label</key>
+	<string>com.kg-hub.capture-probe</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__REPO__/spike-graphiti/.venv/bin/python</string>
+		<string>__REPO__/tools/capture_probe.py</string>
+		<string>--report</string>
+		<string>--out</string>
+		<string>__HOME__/.kg-hub/state/topology-latest.json</string>
+		<string>--html</string>
+		<string>__HOME__/.kg-hub/state/topology.html</string>
+		<string>--exit-zero</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.kg-hub/logs/capture-probe.err.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.kg-hub/logs/capture-probe.out.log</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>WorkingDirectory</key>
+	<string>__REPO__</string>
+</dict>
+</plist>
