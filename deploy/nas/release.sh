@@ -146,6 +146,39 @@ ensure_compose_data_root() {
   " || die "KG_HUB_DATA_ROOT 缺失或与已验证的数据目录不一致"
 }
 
+# 旧容器创建时携带了独立的网关调用令牌，但历史 .env 未必记录它。Compose 把该
+# 令牌设为必填，故在停生产者前从当前健康服务的容器配置中原地恢复；令牌不经本机
+# stdout、日志或命令插值传递。已有 .env 值必须与运行中的服务一致，拒绝静默轮换。
+ensure_compose_model_gateway_token() {
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会校验 KG_HUB_MODEL_GATEWAY_TOKEN；缺失时从现有服务容器安全恢复"
+    return 0
+  fi
+
+  on_nas "set -eu
+    cd '$SRC'
+    test -f .env
+    live_token=\$($DK inspect -f '{{range .Config.Env}}{{println .}}{{end}}' kg-hub-server | sed -n 's/^KG_HUB_MODEL_GATEWAY_TOKEN=//p')
+    live_count=\$(printf '%s\\n' \"\$live_token\" | sed '/^\$/d' | wc -l | tr -d ' ')
+    test \"\$live_count\" = 1
+    count=\$(grep -c '^KG_HUB_MODEL_GATEWAY_TOKEN=' .env || true)
+    case \"\$count\" in
+      0)
+        tmp=\$(mktemp '$SRC/.env.XXXXXX')
+        cat .env > \"\$tmp\"
+        printf 'KG_HUB_MODEL_GATEWAY_TOKEN=%s\\n' \"\$live_token\" >> \"\$tmp\"
+        chmod 600 \"\$tmp\"
+        mv -f \"\$tmp\" .env
+        ;;
+      1)
+        value=\$(sed -n 's/^KG_HUB_MODEL_GATEWAY_TOKEN=//p' .env)
+        test \"\$value\" = \"\$live_token\"
+        ;;
+      *) exit 1 ;;
+    esac
+  " || die "KG_HUB_MODEL_GATEWAY_TOKEN 缺失、重复或与运行中服务不一致"
+}
+
 prepare_refinery_window_change() {
   [ "$window_change_requested" = 1 ] || return 0
   if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -292,6 +325,7 @@ recover_pending_refinery_window_transaction || die "无法恢复上一次未完�
 # Compose 解析的必填运行时配置必须先就绪；否则候选容器和回滚都会在生产者已停后
 # 被拒绝，反而破坏发布的恢复保证。
 ensure_compose_data_root
+ensure_compose_model_gateway_token
 
 # 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
 # release_exit 复原这份完整旧配置。

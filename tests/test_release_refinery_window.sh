@@ -32,15 +32,31 @@ write_env() {
   printf '%s\n' \
     'KG_HUB_IMAGE_TAG=old-image' \
     'KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data' \
+    'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' \
     'KG_HUB_REFINERY_WINDOW_START=22' \
     'KG_HUB_REFINERY_WINDOW_END=10' \
     'KG_HUB_REFINERY_MAX_DISK_TEMP=52' \
     'KG_HUB_REFINERY_INGEST_CONCURRENCY=2' \
     'UNRELATED_SECRET=fixture-only' > "$FIXTURE/.env"
   chmod 600 "$FIXTURE/.env"
+  configure_fake_docker
 }
 
 data_root() { sed -n 's/^KG_HUB_DATA_ROOT=//p' "$FIXTURE/.env"; }
+model_gateway_token() { sed -n 's/^KG_HUB_MODEL_GATEWAY_TOKEN=//p' "$FIXTURE/.env"; }
+
+configure_fake_docker() {
+  cat > "$FIXTURE/docker" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+case "$1" in
+  inspect) printf '%s\n' 'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod 700 "$FIXTURE/docker"
+  DK="$FIXTURE/docker"
+}
 
 test_compose_data_root_contract() {
   write_env
@@ -68,6 +84,33 @@ test_compose_data_root_contract() {
     fail 'duplicate data roots were accepted'
   fi
   assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate data root rejection changed .env'
+}
+
+test_compose_model_gateway_token_contract() {
+  write_env
+  ensure_compose_model_gateway_token
+  assert_eq 'fixture-only-token' "$(model_gateway_token)" 'known gateway token was rejected'
+
+  sed -i.bak '/^KG_HUB_MODEL_GATEWAY_TOKEN=/d' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  ensure_compose_model_gateway_token
+  assert_eq 'fixture-only-token' "$(model_gateway_token)" 'missing gateway token was not recovered'
+
+  sed -i.bak 's/^KG_HUB_MODEL_GATEWAY_TOKEN=.*$/KG_HUB_MODEL_GATEWAY_TOKEN=wrong/' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_model_gateway_token >/dev/null 2>&1); then
+    fail 'a mismatched gateway token was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'mismatched gateway token changed .env'
+
+  write_env
+  printf '%s\n' 'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' >> "$FIXTURE/.env"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_model_gateway_token >/dev/null 2>&1); then
+    fail 'duplicate gateway tokens were accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate gateway token rejection changed .env'
 }
 
 test_rejects_all_other_windows() {
@@ -225,7 +268,6 @@ test_candidate_compose_failure_main_path_restores_before_old_image() {
   write_env
   cp "$FIXTURE/.env" "$FIXTURE/before"
   reset_state
-  DK=:
   SERVICES='kg_hub_server device_liveness watchdog ingester refinery'
   sleep() { :; }
   on_nas() { ssh "$@"; }
@@ -294,6 +336,7 @@ test_without_flag_does_not_touch_window_env() {
 
 test_rejects_all_other_windows
 test_compose_data_root_contract
+test_compose_model_gateway_token_contract
 test_build_failure_restores_complete_env
 test_interruption_restores_complete_env
 test_repeated_interrupt_does_not_skip_cleanup
