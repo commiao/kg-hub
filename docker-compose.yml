@@ -1,3 +1,8 @@
+# 镜像标签必须是 git commit（见 deploy/nas/release.sh）。
+# 以前五个服务都用 kg-hub-server:latest —— 可变标签，一 build 就把旧镜像
+# 覆盖掉，于是回滚时根本没有旧版本可回。2026-09-08 的通用部署之所以被
+# 禁用（T-0046），根子就在这里：坏掉的容器备份机制只是症状。
+# 现在按 commit 打标签，旧镜像永远留在盘上，回滚 = 把标签指回去再 up。
 # kg-hub on Synology NAS (Container Manager "Project" — Plan B / GUI deploy).
 #
 # This file lives at the REPO ROOT so Container Manager can use the repo as both
@@ -38,7 +43,7 @@ services:
   # validated snapshot. DSM on this host has no user crontab, so this dedicated
   # least-privilege container owns scheduling; server/watchdog remain read-only.
   device_liveness:
-    image: kg-hub-server:latest
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
     container_name: kg-hub-device-liveness
     restart: unless-stopped
     user: "${KG_HUB_DEVICE_LIVENESS_USER:-1027:100}"
@@ -84,7 +89,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nas/Dockerfile
-    image: kg-hub-server:latest
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
     container_name: kg-hub-server
     restart: unless-stopped
     # Preserve service liveness under Docker log backpressure: after the bounded
@@ -160,7 +165,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nas/Dockerfile
-    image: kg-hub-server:latest        # same image as kg_hub_server (code + httpx)
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}        # same image as kg_hub_server (code + httpx)
     container_name: kg-hub-watchdog
     restart: unless-stopped
     # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
@@ -215,7 +220,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nas/Dockerfile
-    image: kg-hub-server:latest
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
     container_name: kg-hub-ingester
     restart: unless-stopped
     # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
@@ -263,7 +268,7 @@ services:
     build:
       context: .
       dockerfile: deploy/nas/Dockerfile
-    image: kg-hub-server:latest
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
     container_name: kg-hub-refinery
     restart: unless-stopped
     # Same bounded, loss-tolerant delivery policy as kg_hub_server above.
