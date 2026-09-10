@@ -27,6 +27,8 @@
 #   deploy/nas/release.sh                 # 发布 HEAD
 #   deploy/nas/release.sh <commit>        # 发布指定 commit
 #   deploy/nas/release.sh --rollback      # 回到上一次发布的标签
+#   deploy/nas/release.sh --refinery-window-22-08 [<commit>]
+#                                         # 发布时仅把已验证的 22:00–10:00 改为 22:00–08:00
 #   DRY_RUN=1 deploy/nas/release.sh       # 只打印要做什么，不碰 NAS
 set -euo pipefail
 
@@ -36,7 +38,7 @@ DATA="${KG_HUB_DATA_ROOT_NAS:-/volume2/4T/kg-hub-data}"
 DK="${KG_HUB_DOCKER:-sudo -n /var/packages/ContainerManager/target/usr/bin/docker}"
 PROJECT="${KG_HUB_COMPOSE_PROJECT:-kg-hub}"
 HEALTH="${KG_HUB_HEALTH_URL:-http://127.0.0.1:17171/health}"
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # 共用同一个镜像的全部服务。falkordb 不在其中：它是数据面，发布不碰它。
 SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
@@ -47,6 +49,14 @@ say() { printf '%s\n' "$*" >&2; }
 # 跑会互相覆盖 .env、抢同一批容器。mkdir 在同一文件系统上是原子的，够用。
 LOCK="$SRC/.release.lock"
 producers_stopped=0
+lock_acquired=0
+window_change_requested=0
+# 受控窗口变更的事务记录和备份都固定在 NAS 源码目录内。不要把备份路径通过
+# SSH stdout 回传给调用端：网络可能在远端已原子写完 .env 后才断开，那时本地变量
+# 为空，反而找不到唯一能恢复的旧配置。锁保证这组固定名字同一时刻只属于一个发布。
+REFINERY_WINDOW_TXN_DIR="$SRC/.release-window-transaction"
+REFINERY_WINDOW_TXN_RECORD="$REFINERY_WINDOW_TXN_DIR/active"
+REFINERY_WINDOW_TXN_BACKUP="$REFINERY_WINDOW_TXN_DIR/.env.before"
 restore_producers() { :; }   # 真正的实现在排空那一步覆盖它；trap 早于它设置
 acquire_lock() {
   [ "${DRY_RUN:-0}" = 1 ] && return 0
@@ -63,9 +73,10 @@ acquire_lock() {
     fi
     echo \"另一个发布正在进行：\$(cat '$LOCK/owner' 2>/dev/null)\" >&2
     exit 75" || die "拿不到部署锁"
+  lock_acquired=1
   # 退出时释放锁；生产者若还停着也一并起回来（die 会走到这里）。
-  trap 'restore_producers 2>/dev/null || true
-        ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '"'$LOCK'"'" >/dev/null 2>&1 || true' EXIT
+  # release_exit 还负责在失败时先恢复受控的 refinery 窗口配置。
+  trap 'release_exit' EXIT
 }
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 on_nas() {
@@ -73,14 +84,151 @@ on_nas() {
   ssh "${SSH_OPTS[@]}" "$NAS" "$@"
 }
 
+# `--refinery-window-22-08` 是一个很窄的、随发布提交的配置变更。普通发布绝不
+# 触碰这两个键；也不接受“顺手改成别的窗口”。备份的是整个 .env，因为同一发布还会
+# 写镜像标签，失败时只有恢复完整旧文件才能让旧镜像按原配置启动。
+#
+# 事务记录内容是固定备份位置；它必须在 .env 被替换前落盘。若 SSH 在远端提交后
+# 才断开，后续连接不依赖调用端内存，仍能按这个记录恢复。
+recover_pending_refinery_window_transaction() {
+  [ "${DRY_RUN:-0}" = 1 ] && return 0
+  on_nas "set -eu
+    cd '$SRC'
+    txn='$REFINERY_WINDOW_TXN_DIR'
+    record='$REFINERY_WINDOW_TXN_RECORD'
+    backup='$REFINERY_WINDOW_TXN_BACKUP'
+    if [ ! -e \"\$record\" ]; then
+      # 备份写完、记录尚未落盘时进程可能崩溃；按本协议此时 .env 还没有被替换，
+      # 所以仅清掉这个未激活的孤儿目录是安全的。
+      if [ -e \"\$backup\" ]; then rm -f \"\$backup\"; fi
+      rmdir \"\$txn\" 2>/dev/null || true
+      exit 0
+    fi
+    test \"\$(cat \"\$record\")\" = \"\$backup\"
+    test -f \"\$backup\"
+    tmp=\$(mktemp '$SRC/.env.XXXXXX')
+    cat \"\$backup\" > \"\$tmp\"
+    chmod 600 \"\$tmp\"
+    mv -f \"\$tmp\" .env
+    rm -f \"\$record\" \"\$backup\"
+    rmdir \"\$txn\"
+  "
+}
+
+prepare_refinery_window_change() {
+  [ "$window_change_requested" = 1 ] || return 0
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会在锁内校验并把 REFINERY_END_HOUR 从 10 原子改为 8"
+    return 0
+  fi
+
+  on_nas "set -eu
+    cd '$SRC'
+    test -f .env
+    start_count=\$(grep -c '^REFINERY_START_HOUR=' .env || true)
+    end_count=\$(grep -c '^REFINERY_END_HOUR=' .env || true)
+    start=\$(sed -n 's/^REFINERY_START_HOUR=//p' .env)
+    end=\$(sed -n 's/^REFINERY_END_HOUR=//p' .env)
+    test \"\$start_count\" = 1
+    test \"\$end_count\" = 1
+    test \"\$start\" = 22
+    test \"\$end\" = 10
+    txn='$REFINERY_WINDOW_TXN_DIR'
+    record='$REFINERY_WINDOW_TXN_RECORD'
+    backup='$REFINERY_WINDOW_TXN_BACKUP'
+    test ! -e \"\$txn\"
+    mkdir \"\$txn\"
+    chmod 700 \"\$txn\"
+    backup_tmp=\$(mktemp \"\$txn/.env.before.XXXXXX\")
+    cat .env > \"\$backup_tmp\"
+    chmod 600 \"\$backup_tmp\"
+    mv -f \"\$backup_tmp\" \"\$backup\"
+    record_tmp=\$(mktemp \"\$txn/.active.XXXXXX\")
+    printf '%s\\n' \"\$backup\" > \"\$record_tmp\"
+    chmod 600 \"\$record_tmp\"
+    mv -f \"\$record_tmp\" \"\$record\"
+    tmp=\$(mktemp '$SRC/.env.XXXXXX')
+    sed 's/^REFINERY_END_HOUR=10\$/REFINERY_END_HOUR=8/' .env > \"\$tmp\"
+    chmod 600 \"\$tmp\"
+    mv -f \"\$tmp\" .env
+  " || die "只允许既有 REFINERY_START_HOUR=22、REFINERY_END_HOUR=10 的窗口切换"
+  say "已在发布锁内暂存 refinery 窗口 22:00–08:00；失败会恢复旧 .env"
+}
+
+# 必须在任何旧镜像 compose 回滚前调用。成功恢复后才丢弃备份；失败则保留，避免把
+# 唯一的旧配置删掉。
+restore_refinery_window_env() {
+  say "  先恢复窗口变更前的 .env"
+  recover_pending_refinery_window_transaction
+}
+
+discard_refinery_window_backup() {
+  [ "$window_change_requested" = 1 ] || return 0
+  on_nas "set -eu
+    record='$REFINERY_WINDOW_TXN_RECORD'
+    backup='$REFINERY_WINDOW_TXN_BACKUP'
+    txn='$REFINERY_WINDOW_TXN_DIR'
+    test \"\$(cat \"\$record\")\" = \"\$backup\"
+    test -f \"\$backup\"
+    rm -f \"\$record\" \"\$backup\"
+    rmdir \"\$txn\"
+  " || die "发布成功但无法安全清理 .env 备份"
+}
+
+rollback_to_previous_image() {
+  local reason="$1"
+  say "$reason —— 自动回到 $PREV"
+  # 这是刻意排在 compose 前面的：窗口变更和镜像切换是同一事务。
+  restore_refinery_window_env || die "无法在镜像回滚前恢复旧 .env；停止自动回滚"
+  on_nas "set -eu
+    cd $SRC
+    tmp=\$(mktemp '$SRC/.env.XXXXXX')
+    grep -v '^KG_HUB_IMAGE_TAG=' .env > \"\$tmp\" 2>/dev/null || true
+    printf 'KG_HUB_IMAGE_TAG=%s\\n' '$PREV' >> \"\$tmp\"
+    chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
+    $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES" \
+    || die "回滚也失败了；线上需要人工介入（旧镜像 kg-hub-server:$PREV 仍在盘上）"
+}
+
+release_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$rc" -ne 0 ]; then
+    restore_refinery_window_env || say "  ⚠ 未能自动恢复 .env 备份"
+  fi
+  restore_producers 2>/dev/null || true
+  if [ "$lock_acquired" = 1 ]; then
+    ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '$LOCK'" >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+}
+
 # ---- 1. 确定要发布的 commit，并要求它在仓库里可追溯 ----------------------
+main() {
 mode=release
 target=HEAD
-case "${1:-}" in
-  --rollback) mode=rollback ;;
-  "") ;;
-  *) target=$1 ;;
-esac
+target_set=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rollback)
+      [ "$mode" = release ] && [ "$target_set" = 0 ] || die "--rollback 不能和 commit 一起使用"
+      mode=rollback
+      ;;
+    --refinery-window-22-08)
+      [ "$window_change_requested" = 0 ] || die "--refinery-window-22-08 只能指定一次"
+      window_change_requested=1
+      ;;
+    --*) die "未知参数：$1" ;;
+    *)
+      [ "$mode" = release ] && [ "$target_set" = 0 ] || die "只能指定一个发布 commit"
+      target=$1
+      target_set=1
+      ;;
+  esac
+  shift
+done
+[ "$mode" = release ] || [ "$window_change_requested" = 0 ] \
+  || die "窗口变更只能随正常发布执行，不能和 --rollback 一起使用"
 
 if [ "$mode" = release ]; then
   cd "$REPO"
@@ -94,6 +242,14 @@ if [ "$mode" = release ]; then
 fi
 
 acquire_lock
+
+# 崩溃在完成窗口变更之后、清理备份之前时，下一次拿到锁的连接先收束那一笔旧事务。
+# 这一步只读取固定事务记录，不打印 .env 或其中任何秘密。
+recover_pending_refinery_window_transaction || die "无法恢复上一次未完成的 refinery 窗口事务"
+
+# 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
+# release_exit 复原这份完整旧配置。
+prepare_refinery_window_change
 
 # ---- 2. 记下当前标签，作为回滚点 ------------------------------------------
 PREV=$(on_nas "grep '^KG_HUB_IMAGE_TAG=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
@@ -206,21 +362,22 @@ if [ "$drained" != 1 ]; then
   # 那正是这一步要避免的东西，为了赶一次发布去制造它不划算。此刻源码已同步、
   # 镜像已构建，但容器还没换，中止是干净的：过会儿重跑即可。
   restore_producers
-  [ "${KG_HUB_FORCE_SWAP:-0}" = 1 ] \
-    || die "5 分钟没排空干净，已中止（生产者已恢复）。确认可以掐断就 KG_HUB_FORCE_SWAP=1 重跑"
-  say "  ⚠ KG_HUB_FORCE_SWAP=1：明知会掐断仍继续"
+  die "5 分钟没排空干净，已中止（生产者已恢复）"
 fi
 
 # ---- 5. 切标签 + 起容器 ----------------------------------------------------
 say "[5/6] 切到 $SHA 并启动 $SERVICES"
-on_nas "set -eu
+if ! on_nas "set -eu
   cd $SRC
   # .env 里同时记住上一次的标签：回滚不需要人去翻历史。
   tmp=\$(mktemp '$SRC/.env.XXXXXX')
   grep -v '^KG_HUB_IMAGE_TAG' .env > \"\$tmp\" 2>/dev/null || true
   printf 'KG_HUB_IMAGE_TAG=%s\nKG_HUB_IMAGE_TAG_PREV=%s\n' '$SHA' '$PREV' >> \"\$tmp\"
   chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
-  $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES"
+  $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES"; then
+  rollback_to_previous_image "候选容器启动失败"
+  die "发布失败，已回到 $PREV"
+fi
 
 # ---- 6. 验收；不合格自动回到上一个标签 ------------------------------------
 # curl /health 只能证明"有个东西在听"，证明不了跑的是我们刚建的那个镜像
@@ -246,17 +403,17 @@ for _ in $(seq 1 30); do
 done
 
 if [ "$ok" != 1 ]; then
-  say "健康检查未通过 —— 自动回到 $PREV"
-  on_nas "set -eu
-    cd $SRC
-    tmp=\$(mktemp '$SRC/.env.XXXXXX')
-    grep -v '^KG_HUB_IMAGE_TAG=' .env > \"\$tmp\" 2>/dev/null || true
-    printf 'KG_HUB_IMAGE_TAG=%s\n' '$PREV' >> \"\$tmp\"
-    chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
-    $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES" \
-    || die "回滚也失败了；线上需要人工介入（旧镜像 kg-hub-server:$PREV 仍在盘上）"
+  rollback_to_previous_image "健康检查未通过"
   die "发布失败，已回到 $PREV"
 fi
 
 producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
+discard_refinery_window_backup
 say "✅ 发布完成：kg-hub-server:$SHA（上一个 $PREV 仍在盘上，可 --rollback）"
+}
+
+# 允许 shell 测试 source 本文件、替换 on_nas 后直接覆盖 .env 事务的失败分支；正常
+# 执行时才运行完整发布流程。
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

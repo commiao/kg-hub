@@ -143,7 +143,10 @@ class ConcurrencyAndDrainTests(unittest.TestCase):
         # 直接换容器会掐断在飞的流式抽取，而那会在网关留下永不过期的 unknown
         # 记录 —— 发布本身就制造了挡住下次发布的东西。
         drain = self.code.index("active_extractions")
-        swap = self.code.index("up -d --no-deps --no-build")
+        # `rollback_to_previous_image` also contains compose up, but it is a
+        # failure helper.  The candidate cutover is the up after step [5/6].
+        cutover = self.code.index('say "[5/6]')
+        swap = self.code.index("up -d --no-deps --no-build", cutover)
         self.assertLess(drain, swap, "排空必须在换容器之前")
         self.assertIn("stop -t 30 refinery ingester", self.code)
 
@@ -236,24 +239,25 @@ class DrainFailureTests(unittest.TestCase):
         self.assertIn("die ", branch)
         self.assertIn("restore_producers", branch)
 
-    def test_cutting_anyway_requires_an_explicit_operator_override(self):
-        # 默认安全、要掐断必须明说：卡死的抽取不能永久堵死发布，但也不能默默掐。
-        self.assertIn("KG_HUB_FORCE_SWAP", self.code)
+    def test_drain_failure_has_no_force_swap_escape_hatch(self):
+        # 即使操作者环境里设了同名变量，发布器也必须中止，不能掐断在飞请求。
+        self.assertNotIn("KG_HUB_FORCE_SWAP", self.code)
 
     def test_producers_are_always_restarted_if_the_release_stops_early(self):
         # 生产者停下之后任何一步失败而没人管，整条采集就静悄悄停了——比发布
         # 失败本身严重得多。
         self.assertIn("restore_producers", self.code)
         self.assertIn("start refinery ingester", self.code)
-        # trap 里也要兜一道，die 才有人管。
-        trap = self.code.split("trap '", 1)[1][:200]
-        self.assertIn("restore_producers", trap)
+        # trap 交给统一出口；该出口同时会恢复受控的 .env 事务。
+        self.assertIn("trap 'release_exit'", self.code)
+        exit_handler = self.code.split("release_exit()", 1)[1][:500]
+        self.assertIn("restore_producers", exit_handler)
 
     def test_restore_producers_is_defined_before_the_trap_installs_it(self):
         # trap 在拿锁时就装好，而真正的实现在排空那一步才出现：中间任何一次 die
         # 都会调到它，所以必须先有一个占位定义。
         placeholder = self.code.index("restore_producers() { :; }")
-        trap_at = self.code.index("trap 'restore_producers")
+        trap_at = self.code.index("trap 'release_exit")
         self.assertLess(placeholder, trap_at)
 
     def test_the_drain_waits_for_in_flight_not_for_the_backlog(self):
