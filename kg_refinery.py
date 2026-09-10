@@ -577,7 +577,16 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     积压批 8 条要等最后一条(可能在 timeout 重试)才刷一次 status,于是
     backlog_remaining 明明已经降了却还显示旧值(2026-09-07 夜实测到这一幕)。
     """
-    stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0}
+    # 对外状态只能给出类别聚合，绝不携带 observation 文本、提示词或令牌。
+    # 仅有 deferred 总数无法判断卡在本地过滤、幂等键、网络还是服务端，运维会
+    # 被迫猜测；这两个小计让下一轮状态直接说明哪一层作出了决定。
+    stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0,
+             "filter_counts": {}, "result_counts": {}}
+
+    def count(bucket: str, label: str) -> None:
+        values = stats[bucket]
+        values[label] = values.get(label, 0) + 1
+
     to_ingest: list[dict] = []
     for obs in rows:
         oid = obs["id"]
@@ -587,11 +596,13 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
         bo = backoff.get(oid)
         if bo and cycle < bo[1]:
             stats["backoff_skipped"] += 1
+            count("result_counts", "backoff")
             continue
         if oid in decided:
             accept = decided[oid]
         else:
             d = evaluate(obs, cfg, quotas)
+            count("filter_counts", d.layer or "unknown")
             try:
                 log_decision(d, log_path=DECISIONS_LOG)
             except Exception:  # noqa: BLE001
@@ -624,6 +635,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 
     def settle(obs: dict, st: str) -> None:
         oid = obs["id"]
+        count("result_counts", st or "unknown")
         if st in ("ok", "skipped"):
             wm["ingested"].add(oid)
             stats["ingested"] += 1
@@ -687,10 +699,12 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
         async def run(obs: dict) -> None:
             if halt["stop"]:
                 stats["deferred"] += 1      # 没发出去,下轮重试
+                count("result_counts", "halted")
                 return
             async with gate:
                 if halt["stop"]:
                     stats["deferred"] += 1
+                    count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs)
             if st in ("quota", "rate_limited", "net"):

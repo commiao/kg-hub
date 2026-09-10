@@ -110,6 +110,8 @@ check(f"配额耗尽后本批立即停发(3 条最多发 {R.INGEST_CONCURRENCY} 
 check("记录停发到期轮次", qp.get("until_cycle") == 7 + R.QUOTA_PAUSE_CYCLES and qp.get("hits") == 1)
 check("不落水印(到期后照常重试)", 201 not in wmq["ingested"] and 201 not in wmq["failed"])
 check("stats 暴露 quota_paused", stats_q.get("quota_paused") == 1)
+check("stats 区分 quota 与同批停发", stats_q["result_counts"].get("quota") == 1
+      and stats_q["result_counts"].get("halted", 0) >= 1)
 
 # SDK 的 RateLimitError 由服务端按一小时释放；恢复探测不得早于这个阈值。
 async def rate_limit_verdict(obs):
@@ -124,6 +126,7 @@ check("上游限流后本批立即停发", len(rate_limit_calls) <= R.INGEST_CON
 check("上游限流等待超过一小时", R.RATE_LIMIT_PAUSE_CYCLES * R.INTERVAL > 3600)
 check("记录上游限流到期轮次", rlp.get("until_cycle") == 7 + R.RATE_LIMIT_PAUSE_CYCLES and rlp.get("reason") == "rate_limited")
 check("stats 暴露 rate_limited", stats_rl.get("rate_limited") == 1)
+check("stats 暴露 rate_limited 类别", stats_rl["result_counts"].get("rate_limited") == 1)
 
 # 已在飞的第二条可在限流结果之后才完成；较短的 quota 暂停绝不能覆盖 1 小时暂停。
 async def run_mixed_limits():
