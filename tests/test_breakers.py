@@ -326,6 +326,14 @@ class RefineryGateTests(unittest.TestCase):
         # 归到与 quota/gateway 同一类的 1h 快清，不让观测为一次运维动作白锁 24h。
         self.assertIn("'breaker_open'", server)
 
+    def test_sdk_rate_limit_without_status_code_is_retryable(self):
+        server = Path(__file__).resolve().parent.parent.joinpath(
+            "kg_hub_server.py").read_text("utf-8")
+        classifier = server.split("def classify_extract_error", 1)[1][:1400]
+        self.assertIn('"RateLimitError"', classifier)
+        self.assertIn('"rate_limited"', classifier)
+        self.assertIn("'rate_limited'", server)
+
 
 class EnforcementHonestyTests(unittest.TestCase):
     """按下去没效果的开关，比没有开关更危险——UI 必须如实说它没接线。"""

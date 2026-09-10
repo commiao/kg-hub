@@ -111,6 +111,40 @@ check("记录停发到期轮次", qp.get("until_cycle") == 7 + R.QUOTA_PAUSE_CYC
 check("不落水印(到期后照常重试)", 201 not in wmq["ingested"] and 201 not in wmq["failed"])
 check("stats 暴露 quota_paused", stats_q.get("quota_paused") == 1)
 
+# SDK 的 RateLimitError 由服务端按一小时释放；恢复探测不得早于这个阈值。
+async def rate_limit_verdict(obs):
+    rate_limit_calls.append(obs["id"]); return "rate_limited"
+rate_limit_calls = []
+R.ingest_via_api = rate_limit_verdict
+wmrl, rlp = fresh_wm(), {}
+stats_rl = asyncio.run(R.process_batch(rows2, wmrl, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                                        R.QuotaTracker(), {r["id"]: True for r in rows2}, {}, 7, "test",
+                                        quota_pause=rlp))
+check("上游限流后本批立即停发", len(rate_limit_calls) <= R.INGEST_CONCURRENCY and 203 not in rate_limit_calls)
+check("上游限流等待超过一小时", R.RATE_LIMIT_PAUSE_CYCLES * R.INTERVAL > 3600)
+check("记录上游限流到期轮次", rlp.get("until_cycle") == 7 + R.RATE_LIMIT_PAUSE_CYCLES and rlp.get("reason") == "rate_limited")
+check("stats 暴露 rate_limited", stats_rl.get("rate_limited") == 1)
+
+# 已在飞的第二条可在限流结果之后才完成；较短的 quota 暂停绝不能覆盖 1 小时暂停。
+async def run_mixed_limits():
+    mixed_ready = asyncio.Event()
+    async def mixed_limit_verdict(obs):
+        if obs["id"] == 201:
+            await mixed_ready.wait()
+            return "rate_limited"
+        mixed_ready.set()
+        await asyncio.sleep(0)
+        return "quota"
+    R.ingest_via_api = mixed_limit_verdict
+    wmm, mixed_pause = fresh_wm(), {}
+    await R.process_batch(rows2[:2], wmm, {"shadow_mode": True, "global": {}, "scoring": {}, "platforms": {"_default": {}}},
+                          R.QuotaTracker(), {r["id"]: True for r in rows2[:2]}, {}, 7, "test",
+                          quota_pause=mixed_pause)
+    return mixed_pause
+mixed_pause = asyncio.run(run_mixed_limits())
+check("并发短暂停不停覆盖长暂停", mixed_pause.get("until_cycle") == 7 + R.RATE_LIMIT_PAUSE_CYCLES
+      and mixed_pause.get("reason") == "rate_limited")
+
 # 轮询节奏:先密后疏。固定 8s 让"1 秒内就失败"的条目白等一整周期(实测中位 8.1s)
 slept = []
 async def fake_sleep(d): slept.append(d)
@@ -153,6 +187,8 @@ st_ok, n_ok = poll_with([(200, {"status": "in_progress"}), (200, {"status": "ok"
 check("200 in_progress → 继续轮询 → ok", st_ok == "ok" and n_ok == 2)
 st_q, _ = poll_with([(200, {"status": "error", "error_kind": "quota_exhausted"})])
 check("200 + quota_exhausted → quota", st_q == "quota")
+st_rl, _ = poll_with([(200, {"status": "error", "error_kind": "rate_limited"})])
+check("200 + rate_limited → 独立限流暂停", st_rl == "rate_limited")
 st_net, n_net = poll_with([(0, {"error": "net"}), (200, {"status": "ok"})])
 check("网络层失败不当终态,继续轮询", st_net == "ok" and n_net == 2)
 st_5xx, _ = poll_with([(503, {"status": "error"})])

@@ -227,7 +227,8 @@ async def cleanup_stuck_jobs(graphiti) -> int:
     if ecleaned:
         logger.warning("[ingest:cleanup] removed %d error keys (>24h, 允许重试): %s",
                        ecleaned, erows[0].get("removed", []))
-    # 配额类 error 键 1h 即清:网关日/分上限拒绝的请求没到供应商,失败不属于观测本身;
+    # 限流类 error 键 1h 即清:网关日/分上限或上游限流都在抽取前拒绝,
+    # 失败不属于观测本身;
     # refinery 已按 error_kind 整窗停发,不需要 24h 防抖。按原文兜住新版之前留下的键
     # (2026-09-06 夜一次打满上限留下 208 个,否则要白等 24h)。
     quota_threshold = (datetime.now(tz=timezone.utc) - timedelta(hours=1)).isoformat()
@@ -236,10 +237,11 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         "WHERE k.status = 'error' AND k.created_at < $t "
         # breaker_open 同属"没到供应商、与观测内容无关"这一类:人工断开期间万一
         # 有键漏下来,不该让观测为一次运维动作白锁 24h。
-        "  AND (k.error_kind IN ['quota_exhausted', 'gateway_unavailable', "
-        "                        'breaker_open'] "
+        "  AND (k.error_kind IN ['quota_exhausted', 'rate_limited', "
+        "                        'gateway_unavailable', 'breaker_open'] "
         "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
         "       OR k.error_message CONTAINS '网关本地配置不可用' "
+        "       OR k.error_message STARTS WITH 'RateLimitError' "
         "       OR k.error_message STARTS WITH 'APIConnectionError' "
         "       OR k.error_message STARTS WITH 'ConnectError') "
         "WITH k DELETE k RETURN count(*) AS c",
@@ -298,10 +300,10 @@ async def merge_or_get_ingested_key(
 
 
 def classify_extract_error(exc: BaseException) -> str | None:
-    """机器可读的失败类别。429 只可能来自网关自己的配额(日/分上限):供应商侧的
-    错误会被网关收敛成 503,所以 429 = 请求没出网关、没计费、与观测内容无关。
-    「网关本地配置不可用」是网关自身状态校验失败(如改完费用策略未重启),同样没到
-    供应商——2026-09-07 一次改配额留下 62 个这种键,不该让观测白等 24h。"""
+    """机器可读的失败类别。
+
+    网关配额和上游限流都会在抽取前拒绝；两者都与观察内容无关，但保持不同
+    error_kind 以便运行状态如实说明限流来自哪里。"""
     # 人工断路器:这是运维**主动**切断,不是故障。它必须先于所有判断,而且绝不能
     # 落成一次"抽取失败"——否则关开关就等于给每条观测记一次失败、扣一次重试、
     # 留一个 24h 错误键,开关一开还得人工捞回来。停流的主闸在 refinery 循环开头
@@ -310,6 +312,11 @@ def classify_extract_error(exc: BaseException) -> str | None:
         return "breaker_open"
     if getattr(exc, "status_code", None) == 429:
         return "quota_exhausted"
+    # Some Anthropic SDK versions expose a 429 as RateLimitError without a
+    # status_code attribute. It is still a transient pre-extraction rejection,
+    # so refinery must pause and retry rather than preserve a 24-hour failure.
+    if type(exc).__name__ == "RateLimitError":
+        return "rate_limited"
     text = str(exc)
     if "网关本地配置不可用" in text:
         return "gateway_unavailable"

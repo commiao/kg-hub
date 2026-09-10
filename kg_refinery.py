@@ -261,8 +261,14 @@ INGEST_CONCURRENCY = max(1, int(os.environ.get("KG_HUB_REFINERY_INGEST_CONCURREN
 # 轮询节奏:先密后疏。实测决策间隔中位数 8.1s == 固定轮询周期,说明**过半条目在 1s 内
 # 就有终态**(多为 409/error 快速失败),却要白等一个整周期(2026-09-07 实测)。
 POLL_STEPS_S = (1, 1, 2, 4, 8)
-# 网关回「配额耗尽」(日/分上限)时整窗停发的轮数;到期后再探一条,仍耗尽则再停。
+# 网关回「配额耗尽」(日/分上限)时暂停的轮数;到期后再探一条,仍耗尽则再停。
 QUOTA_PAUSE_CYCLES = int(os.environ.get("KG_HUB_REFINERY_QUOTA_PAUSE_CYCLES", "20"))
+# 上游 SDK 的 RateLimitError 没有 status_code 时，服务端会把错误键按 1 小时
+# 释放。多等一轮，避免刚好在阈值前探测又撞到 409 并进入指数退避。
+RATE_LIMIT_PAUSE_CYCLES = int(os.environ.get(
+    "KG_HUB_REFINERY_RATE_LIMIT_PAUSE_CYCLES",
+    str((3600 + INTERVAL - 1) // INTERVAL + 1),
+))
 
 # 温度门控(2026-08 过热事件:空闲盘温 58/59°C,DSM 强制关机线 ~61°C,余量仅
 # 2-3°C——持续写盘曾连续两周把 NAS 压关机)。群晖盘温免 sudo 直读
@@ -482,7 +488,9 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
             return "error"      # 参数问题:重试也不会变好
         if code == 200:
             if st == "error" and d.get("error_kind") == "quota_exhausted":
-                return "quota"  # 网关配额耗尽:请求没到供应商,与这条观测无关
+                return "quota"  # 网关配额拒绝:暂停后再探
+            if st == "error" and d.get("error_kind") == "rate_limited":
+                return "rate_limited"  # 上游限流:等服务端释放错误键后再探
             if st in ("ok", "skipped", "error"):
                 return st
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
@@ -635,15 +643,34 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                 kind, oid, n, wait, wait * INTERVAL // 60)
         elif st == "quota":
             # 网关日/分上限:请求根本没到供应商,失败与这条观测无关。继续逐条撞只会白烧
-            # 每篇前面的调用并堆 error 键(2026-09-06 夜 218 篇败/127 篇成),整窗停发,
+            # 每篇前面的调用并堆 error 键(2026-09-06 夜 218 篇败/127 篇成),暂停,
             # QUOTA_PAUSE_CYCLES 轮后再探一条。
             if quota_pause is not None:
-                quota_pause["until_cycle"] = cycle + QUOTA_PAUSE_CYCLES
                 quota_pause["hits"] = quota_pause.get("hits", 0) + 1
+                candidate_until = cycle + QUOTA_PAUSE_CYCLES
+                # 一批最多两条已在飞。较短的配额暂停不能覆盖同批刚落下的
+                # 更长上游限流暂停，否则会在错误键释放前又撞上 409。
+                if candidate_until >= quota_pause.get("until_cycle", 0):
+                    quota_pause["until_cycle"] = candidate_until
+                    quota_pause["reason"] = "quota_exhausted"
             stats["quota_paused"] = 1
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → 网关配额耗尽,停发 %d 轮(≈%dmin)后再探",
                         kind, oid, QUOTA_PAUSE_CYCLES, QUOTA_PAUSE_CYCLES * INTERVAL // 60)
+        elif st == "rate_limited":
+            # 服务端对这类键按 1 小时快清；暂停必须长于该阈值，否则下一次探测
+            # 仍是同一把 error 键的 409，反而将无关的限流变成单条指数退避。
+            if quota_pause is not None:
+                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
+                candidate_until = cycle + RATE_LIMIT_PAUSE_CYCLES
+                if candidate_until >= quota_pause.get("until_cycle", 0):
+                    quota_pause["until_cycle"] = candidate_until
+                    quota_pause["reason"] = "rate_limited"
+            stats["rate_limited"] = 1
+            stats["deferred"] += 1
+            log.warning("[%s] obs-%d → 上游限流,停发 %d 轮(≈%dmin)后再探",
+                        kind, oid, RATE_LIMIT_PAUSE_CYCLES,
+                        RATE_LIMIT_PAUSE_CYCLES * INTERVAL // 60)
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
@@ -666,7 +693,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     stats["deferred"] += 1
                     return
                 st = await ingest_via_api(obs)
-            if st in ("quota", "net"):
+            if st in ("quota", "rate_limited", "net"):
                 halt["stop"] = True         # 尚未拿到令牌的条目不再发
             settle(obs, st)
 
@@ -763,7 +790,11 @@ async def main() -> int:
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
             if cycle < quota_pause.get("until_cycle", 0):
-                write_status(quota_paused=True,
+                pause_reason = quota_pause.get("reason", "quota_exhausted")
+                write_status(quota_paused=pause_reason == "quota_exhausted",
+                             rate_limited=pause_reason == "rate_limited",
+                             rate_limit_paused_until_cycle=quota_pause["until_cycle"],
+                             rate_limit_hits=quota_pause.get("hits", 0),
                              quota_paused_until_cycle=quota_pause["until_cycle"],
                              quota_hits=quota_pause.get("hits", 0), last_error=None)
                 await asyncio.sleep(INTERVAL)
@@ -786,6 +817,9 @@ async def main() -> int:
                     per_cycle=BACKLOG_PER_CYCLE,
                     backoff_pending=len(backoff),
                     quota_paused=False,
+                    rate_limited=False,
+                    rate_limit_paused_until_cycle=quota_pause.get("until_cycle"),
+                    rate_limit_hits=quota_pause.get("hits", 0),
                     quota_paused_until_cycle=quota_pause.get("until_cycle"),
                     quota_hits=quota_pause.get("hits", 0),
                     breaker_open=False, breaker_reason="",
