@@ -31,12 +31,43 @@ reset_state() {
 write_env() {
   printf '%s\n' \
     'KG_HUB_IMAGE_TAG=old-image' \
+    'KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data' \
     'KG_HUB_REFINERY_WINDOW_START=22' \
     'KG_HUB_REFINERY_WINDOW_END=10' \
     'KG_HUB_REFINERY_MAX_DISK_TEMP=52' \
     'KG_HUB_REFINERY_INGEST_CONCURRENCY=2' \
     'UNRELATED_SECRET=fixture-only' > "$FIXTURE/.env"
   chmod 600 "$FIXTURE/.env"
+}
+
+data_root() { sed -n 's/^KG_HUB_DATA_ROOT=//p' "$FIXTURE/.env"; }
+
+test_compose_data_root_contract() {
+  write_env
+  ensure_compose_data_root
+  assert_eq '/volume2/4T/kg-hub-data' "$(data_root)" 'known data root was rejected'
+
+  # A legacy .env without this key is upgraded before any producer stop.
+  sed -i.bak '/^KG_HUB_DATA_ROOT=/d' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  ensure_compose_data_root
+  assert_eq '/volume2/4T/kg-hub-data' "$(data_root)" 'missing data root was not added'
+
+  sed -i.bak 's#^KG_HUB_DATA_ROOT=.*$#KG_HUB_DATA_ROOT=/wrong#' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_data_root >/dev/null 2>&1); then
+    fail 'an unverified data root was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'rejected data root changed .env'
+
+  write_env
+  printf '%s\n' 'KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data' >> "$FIXTURE/.env"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_data_root >/dev/null 2>&1); then
+    fail 'duplicate data roots were accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate data root rejection changed .env'
 }
 
 test_rejects_all_other_windows() {
@@ -262,6 +293,7 @@ test_without_flag_does_not_touch_window_env() {
 }
 
 test_rejects_all_other_windows
+test_compose_data_root_contract
 test_build_failure_restores_complete_env
 test_interruption_restores_complete_env
 test_repeated_interrupt_does_not_skip_cleanup

@@ -115,6 +115,37 @@ recover_pending_refinery_window_transaction() {
   "
 }
 
+# 生产 compose 把数据根目录设为必填变量。旧容器在变量成为必填前已创建，因而
+# 运行正常也不能证明 .env 具备下一次 `compose up/start` 所需的完整配置。只接受
+# 本发布脚本已验证的数据目录；缺失时在任何生产者停机、窗口事务备份之前补齐，
+# 这样后续失败回滚的完整 .env 也仍可被 Compose 解析。
+ensure_compose_data_root() {
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会校验 KG_HUB_DATA_ROOT；缺失时补为 $DATA"
+    return 0
+  fi
+
+  on_nas "set -eu
+    cd '$SRC'
+    test -f .env
+    count=\$(grep -c '^KG_HUB_DATA_ROOT=' .env || true)
+    case \"\$count\" in
+      0)
+        tmp=\$(mktemp '$SRC/.env.XXXXXX')
+        cat .env > \"\$tmp\"
+        printf 'KG_HUB_DATA_ROOT=%s\\n' '$DATA' >> \"\$tmp\"
+        chmod 600 \"\$tmp\"
+        mv -f \"\$tmp\" .env
+        ;;
+      1)
+        value=\$(sed -n 's/^KG_HUB_DATA_ROOT=//p' .env)
+        test \"\$value\" = '$DATA'
+        ;;
+      *) exit 1 ;;
+    esac
+  " || die "KG_HUB_DATA_ROOT 缺失或与已验证的数据目录不一致"
+}
+
 prepare_refinery_window_change() {
   [ "$window_change_requested" = 1 ] || return 0
   if [ "${DRY_RUN:-0}" = 1 ]; then
@@ -257,6 +288,10 @@ acquire_lock
 # 崩溃在完成窗口变更之后、清理备份之前时，下一次拿到锁的连接先收束那一笔旧事务。
 # 这一步只读取固定事务记录，不打印 .env 或其中任何秘密。
 recover_pending_refinery_window_transaction || die "无法恢复上一次未完成的 refinery 窗口事务"
+
+# Compose 解析的必填运行时配置必须先就绪；否则候选容器和回滚都会在生产者已停后
+# 被拒绝，反而破坏发布的恢复保证。
+ensure_compose_data_root
 
 # 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
 # release_exit 复原这份完整旧配置。
