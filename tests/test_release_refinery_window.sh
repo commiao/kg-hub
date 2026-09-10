@@ -21,8 +21,8 @@ on_nas() { /bin/bash -c "$1"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq() { [ "$1" = "$2" ] || fail "$3"; }
 assert_file_unchanged() { cmp -s "$1" "$2" || fail "$3"; }
-end_hour() { sed -n 's/^REFINERY_END_HOUR=//p' "$FIXTURE/.env"; }
-start_hour() { sed -n 's/^REFINERY_START_HOUR=//p' "$FIXTURE/.env"; }
+end_hour() { sed -n 's/^KG_HUB_REFINERY_WINDOW_END=//p' "$FIXTURE/.env"; }
+start_hour() { sed -n 's/^KG_HUB_REFINERY_WINDOW_START=//p' "$FIXTURE/.env"; }
 backup_count() { find "$FIXTURE" -maxdepth 1 -name '.release-window-transaction' -type d | wc -l | tr -d ' '; }
 reset_state() {
   window_change_requested=0
@@ -31,10 +31,10 @@ reset_state() {
 write_env() {
   printf '%s\n' \
     'KG_HUB_IMAGE_TAG=old-image' \
-    'REFINERY_START_HOUR=22' \
-    'REFINERY_END_HOUR=10' \
-    'REFINERY_MAX_TEMPERATURE=52' \
-    'INGEST_CONCURRENCY=2' \
+    'KG_HUB_REFINERY_WINDOW_START=22' \
+    'KG_HUB_REFINERY_WINDOW_END=10' \
+    'KG_HUB_REFINERY_MAX_DISK_TEMP=52' \
+    'KG_HUB_REFINERY_INGEST_CONCURRENCY=2' \
     'UNRELATED_SECRET=fixture-only' > "$FIXTURE/.env"
   chmod 600 "$FIXTURE/.env"
 }
@@ -49,7 +49,7 @@ test_rejects_all_other_windows() {
   assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'unrecognised window changed .env'
 
   # The accepted flag is still exact: a drifted live end hour is rejected.
-  sed -i.bak 's/^REFINERY_END_HOUR=10$/REFINERY_END_HOUR=9/' "$FIXTURE/.env"
+  sed -i.bak 's/^KG_HUB_REFINERY_WINDOW_END=10$/KG_HUB_REFINERY_WINDOW_END=9/' "$FIXTURE/.env"
   rm -f "$FIXTURE/.env.bak"
   if (window_change_requested=1; prepare_refinery_window_change >/dev/null 2>&1); then
     fail 'a live 22-09 window was accepted'
@@ -181,8 +181,8 @@ test_success_keeps_only_end_8_and_discards_backup() {
   prepare_refinery_window_change
   assert_eq "22" "$(start_hour)" 'start hour changed'
   assert_eq "8" "$(end_hour)" 'end hour was not changed to 8'
-  grep -qx 'REFINERY_MAX_TEMPERATURE=52' "$FIXTURE/.env" || fail 'temperature breaker changed'
-  grep -qx 'INGEST_CONCURRENCY=2' "$FIXTURE/.env" || fail 'concurrency changed'
+  grep -qx 'KG_HUB_REFINERY_MAX_DISK_TEMP=52' "$FIXTURE/.env" || fail 'temperature breaker changed'
+  grep -qx 'KG_HUB_REFINERY_INGEST_CONCURRENCY=2' "$FIXTURE/.env" || fail 'concurrency changed'
   grep -qx 'UNRELATED_SECRET=fixture-only' "$FIXTURE/.env" || fail 'an unrelated key changed'
   assert_eq "600" "$(stat -f '%Lp' "$FIXTURE/.env")" '.env mode is not 0600'
   discard_refinery_window_backup

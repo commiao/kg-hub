@@ -118,17 +118,17 @@ recover_pending_refinery_window_transaction() {
 prepare_refinery_window_change() {
   [ "$window_change_requested" = 1 ] || return 0
   if [ "${DRY_RUN:-0}" = 1 ]; then
-    say "  [dry-run] 会在锁内校验并把 REFINERY_END_HOUR 从 10 原子改为 8"
+    say "  [dry-run] 会在锁内校验并把 KG_HUB_REFINERY_WINDOW_END 从 10 原子改为 8"
     return 0
   fi
 
   on_nas "set -eu
     cd '$SRC'
     test -f .env
-    start_count=\$(grep -c '^REFINERY_START_HOUR=' .env || true)
-    end_count=\$(grep -c '^REFINERY_END_HOUR=' .env || true)
-    start=\$(sed -n 's/^REFINERY_START_HOUR=//p' .env)
-    end=\$(sed -n 's/^REFINERY_END_HOUR=//p' .env)
+    start_count=\$(grep -c '^KG_HUB_REFINERY_WINDOW_START=' .env || true)
+    end_count=\$(grep -c '^KG_HUB_REFINERY_WINDOW_END=' .env || true)
+    start=\$(sed -n 's/^KG_HUB_REFINERY_WINDOW_START=//p' .env)
+    end=\$(sed -n 's/^KG_HUB_REFINERY_WINDOW_END=//p' .env)
     test \"\$start_count\" = 1
     test \"\$end_count\" = 1
     test \"\$start\" = 22
@@ -148,10 +148,10 @@ prepare_refinery_window_change() {
     chmod 600 \"\$record_tmp\"
     mv -f \"\$record_tmp\" \"\$record\"
     tmp=\$(mktemp '$SRC/.env.XXXXXX')
-    sed 's/^REFINERY_END_HOUR=10\$/REFINERY_END_HOUR=8/' .env > \"\$tmp\"
+    sed 's/^KG_HUB_REFINERY_WINDOW_END=10\$/KG_HUB_REFINERY_WINDOW_END=8/' .env > \"\$tmp\"
     chmod 600 \"\$tmp\"
     mv -f \"\$tmp\" .env
-  " || die "只允许既有 REFINERY_START_HOUR=22、REFINERY_END_HOUR=10 的窗口切换"
+  " || die "只允许既有 KG_HUB_REFINERY_WINDOW_START=22、KG_HUB_REFINERY_WINDOW_END=10 的窗口切换"
   say "已在发布锁内暂存 refinery 窗口 22:00–08:00；失败会恢复旧 .env"
 }
 
