@@ -515,6 +515,8 @@ async def ingest_via_api(obs: dict) -> str:
         diagnostic = str(d.get("diagnostic") or "")
         if (0 < len(diagnostic) <= 80
                 and all(ch.isascii() and (ch.isalnum() or ch == "_") for ch in diagnostic)):
+            if d.get("code") == "graphiti_unavailable":
+                return f"graphiti_unavailable_{diagnostic}"
             return f"http_{code}_{diagnostic}"
         return f"http_{code}"
     st = d.get("status", "")
@@ -715,7 +717,8 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs)
-            if st in ("quota", "rate_limited", "net"):
+            if (st in ("quota", "rate_limited", "net")
+                    or st.startswith("graphiti_unavailable_")):
                 halt["stop"] = True         # 尚未拿到令牌的条目不再发
             settle(obs, st)
 

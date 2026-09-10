@@ -952,7 +952,17 @@ async def ingest(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    g = await get_graphiti()
+    try:
+        g = await get_graphiti()
+    except Exception as exc:  # noqa: BLE001 — readiness must not become opaque 500
+        # Graphiti construction also ensures FalkorDB indices/constraints.  Keep
+        # that write-path readiness distinct from the liveness-only /health,
+        # and expose only an exception class — never driver message/details.
+        return JSONResponse(
+            {"status": "error", "code": "graphiti_unavailable",
+             "diagnostic": type(exc).__name__},
+            status_code=503,
+        )
 
     # 0. 格式门(仅 openclaw 知识胶囊):没有可识别的 **来源** 元数据 → 不入图,
     #    进隔离区,由「反馈待办」人工补标或丢弃。把 fail-open 变 fail-closed:
