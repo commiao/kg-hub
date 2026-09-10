@@ -188,7 +188,11 @@ full_rebuild() {
   why="$1"
   echo "$(ts) 全量重建($why)"
   TMP=$(mktemp /tmp/cm-snap.XXXXXX) && rm -f "$TMP" && TMP="$TMP.db"
-  make_subset_db "$TMP" "1=1" \
+  # 上界同样是 $local_max,不是 1=1 —— 见下方增量处的说明。兜底这条更要命:
+  # 它跑在增量失败之后,离取 watermark 又远了十几秒,窗口比稳态还宽。
+  # 2026-09-11 实测两次(14:19 / 00:00),增量撞上竞态、回退重建**也必然**
+  # 撞上同一个竞态,于是唯一的兜底在它唯一被触发的场景里 100% 失败。
+  make_subset_db "$TMP" "id <= $local_max" \
     || { echo "$(ts) ERROR 构造全量副本失败"; return 1; }
   # 走与稳态同一条推送路径(同步盘为主)、同一个 applier、同一套校验 ——
   # 只是模式为 replace。以前这里内联了一份自己的远端命令,等于第二套实现,
@@ -258,8 +262,16 @@ if [ "$nas_max" -eq "$local_max" ]; then
 fi
 
 # ── 生成增量库 ─────────────────────────────────────────────────────────
+# **必须有上界 $local_max**。applier 校验的是「合并后 MAX(id) 严格等于 expect」,
+# 而 expect 是本轮开头那一刻读到的 $local_max。若这里只写 `id > $nas_max`,
+# 取 watermark 之后新落库的行会被一并带走 → 合并后 MAX 比 expect 大 → FAIL。
+# 这不是理论风险:2026-09-11 00:00 实测,读到 23163(00:00:03 写入),造增量前
+# 23164 落库(00:00:21),远端判 `23164 != 23163` 直接拒收,一整轮同步作废。
+# 缩短「读 watermark → 造增量」的窗口只能降低概率、压不到零;加上界才是让
+# payload 的 MAX(id) **由构造恒等于** expect。超出的行留给下一轮,语义不变。
+# 这样那条严格相等的校验就只在**真正的数据分叉**时报警 —— 那才是它该守的。
 TMP=$(mktemp /tmp/cm-delta.XXXXXX) && rm -f "$TMP" && TMP="$TMP.db"
-make_subset_db "$TMP" "id > $nas_max" \
+make_subset_db "$TMP" "id > $nas_max AND id <= $local_max" \
   || { echo "$(ts) ERROR 生成增量库失败"; exit 1; }
 
 nrow=$(sqlite3 -readonly "$TMP" 'SELECT COUNT(*) FROM observations;' 2>/dev/null)

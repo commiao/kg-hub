@@ -125,20 +125,17 @@ class SyncSafety(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(), before)
         self.assertEqual(self.apply().returncode, 0)
 
-    def test_local_sync_drive_fallback_and_next_cycle(self):
-        # Run the real Mac script with an isolated source and a local SSH stand-in.
-        source = self.root / 'source.db'
-        self.make_db(source, 2)
+    def mac_script(self, source, local_inbox, ssh_body=''):
+        """The real Mac-side script, wired to temp paths with a local SSH stand-in."""
         bindir = self.root / 'bin'
-        bindir.mkdir()
+        bindir.mkdir(exist_ok=True)
         ssh = bindir / 'ssh'
-        ssh.write_text('#!/bin/sh\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\nexec /bin/sh -c "$1"\n')
+        ssh.write_text('#!/bin/sh\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\n'
+                       + ssh_body + 'exec /bin/sh -c "$1"\n')
         ssh.chmod(0o755)
         sha = bindir / 'sha256sum'
         sha.write_text('#!/bin/sh\nexec shasum -a 256 "$@"\n')
         sha.chmod(0o755)
-        # Distinct local/remote inboxes simulate Drive not delivering its file.
-        local_inbox = self.root / 'local-inbox'
         script = (ROOT / 'tools/sync_claude_mem_to_nas.sh').read_text()
         script = script.replace('/Users/mac/.claude-mem/claude-mem.db', str(source))
         script = script.replace('/volume2/4T/kg-hub-data/claude-mem', str(self.dbdir))
@@ -152,7 +149,44 @@ class SyncSafety(unittest.TestCase):
         shutil.copy(self.script, remote)
         local = self.root / 'sync.sh'
         local.write_text(script)
-        env = dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'])
+        return local, dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'])
+
+    def nas_max(self):
+        with sqlite3.connect(self.db) as c:
+            return c.execute('SELECT MAX(id) FROM observations').fetchone()[0]
+
+    def test_row_written_after_watermark_waits_for_next_cycle(self):
+        # The bug this pins (2026-09-11): the delta was built with `id > nas_max`
+        # and no upper bound, so rows landing after the watermark read rode along
+        # and the applier's strict `MAX(id) == expect` rejected the whole round --
+        # and full_rebuild, sharing the stale watermark, was rejected right after.
+        # The stand-in writes id=3 while answering the probe, i.e. exactly between
+        # the watermark read and the delta build. No sleeps, no flakiness.
+        source = self.root / 'source.db'
+        self.make_db(source, 2)
+        once = self.root / 'injected'
+        inject = (f'if [ ! -e "{once}" ]; then case "$1" in *integ=*) : > "{once}";'
+                  f' sqlite3 "{source}" "INSERT INTO observations VALUES(3,\'3\');'
+                  f' INSERT INTO sdk_sessions VALUES(\'3\');";; esac; fi\n')
+        local, env = self.mac_script(source, self.inbox, inject)
+
+        first = subprocess.run(['/bin/sh', str(local)], env=env, capture_output=True, timeout=20)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(once.exists(), 'fixture never injected the racing row')
+        self.assertNotIn(b'FAIL', first.stdout + first.stderr)
+        self.assertIn(b'synced +1', first.stdout)
+        self.assertEqual(self.nas_max(), 2, 'row written after the watermark must not ride along')
+
+        second = subprocess.run(['/bin/sh', str(local)], env=env, capture_output=True, timeout=20)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn(b'synced +1', second.stdout)
+        self.assertEqual(self.nas_max(), 3, 'the deferred row must arrive next cycle')
+
+    def test_local_sync_drive_fallback_and_next_cycle(self):
+        source = self.root / 'source.db'
+        self.make_db(source, 2)
+        # Distinct local/remote inboxes simulate Drive not delivering its file.
+        local, env = self.mac_script(source, self.root / 'local-inbox')
         result = subprocess.run(['/bin/sh', str(local)], env=env, capture_output=True, timeout=12)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(b'synced +1', result.stdout)
