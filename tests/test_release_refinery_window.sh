@@ -33,6 +33,8 @@ write_env() {
     'KG_HUB_IMAGE_TAG=old-image' \
     'KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data' \
     'KG_HUB_MODEL_GATEWAY_TOKEN=fixture-only-token' \
+    'ANTHROPIC_BASE_URL=http://model-gateway:39000' \
+    'ANTHROPIC_MODEL=kg_hub.entity_extract' \
     'MODEL_GATEWAY_PRIVATE_NETWORK=model-gateway-private' \
     'KG_HUB_REFINERY_WINDOW_START=22' \
     'KG_HUB_REFINERY_WINDOW_END=10' \
@@ -121,6 +123,38 @@ test_compose_model_gateway_token_contract() {
     fail 'duplicate gateway tokens were accepted'
   fi
   assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate gateway token rejection changed .env'
+}
+
+test_compose_gateway_route_contract() {
+  write_env
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  ensure_compose_gateway_route
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'known gateway route was changed'
+
+  sed -i.bak 's#^ANTHROPIC_BASE_URL=.*$#ANTHROPIC_BASE_URL=https://legacy-provider.invalid/v1#' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_gateway_route >/dev/null 2>&1); then
+    fail 'a provider-style gateway URL was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'rejected gateway URL changed .env'
+
+  write_env
+  sed -i.bak 's/^ANTHROPIC_MODEL=.*$/ANTHROPIC_MODEL=legacy-provider-model/' "$FIXTURE/.env"
+  rm -f "$FIXTURE/.env.bak"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_gateway_route >/dev/null 2>&1); then
+    fail 'a provider model name was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'rejected model key changed .env'
+
+  write_env
+  printf '%s\n' 'ANTHROPIC_MODEL=kg_hub.entity_extract' >> "$FIXTURE/.env"
+  cp "$FIXTURE/.env" "$FIXTURE/before"
+  if (ensure_compose_gateway_route >/dev/null 2>&1); then
+    fail 'a duplicate model key was accepted'
+  fi
+  assert_file_unchanged "$FIXTURE/before" "$FIXTURE/.env" 'duplicate model key changed .env'
 }
 
 test_model_gateway_private_network_contract() {
@@ -374,6 +408,7 @@ test_without_flag_does_not_touch_window_env() {
 test_rejects_all_other_windows
 test_compose_data_root_contract
 test_compose_model_gateway_token_contract
+test_compose_gateway_route_contract
 test_model_gateway_private_network_contract
 test_build_failure_restores_complete_env
 test_interruption_restores_complete_env

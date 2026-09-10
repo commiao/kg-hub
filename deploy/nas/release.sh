@@ -181,6 +181,30 @@ ensure_compose_model_gateway_token() {
   " || die "KG_HUB_MODEL_GATEWAY_TOKEN 缺失、重复或与运行中服务不一致"
 }
 
+# The model-gateway client deliberately accepts only the local gateway origin
+# and a kg-hub business key.  A legacy direct-provider value can keep /health
+# green while every ingest fails during lazy Graphiti construction, so reject
+# it before stopping either producer or building a candidate image.
+ensure_compose_gateway_route() {
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会校验 ANTHROPIC_BASE_URL 与 ANTHROPIC_MODEL 的受控网关路由"
+    return 0
+  fi
+
+  on_nas "set -eu
+    cd '$SRC'
+    test -f .env
+    base_count=\$(grep -c '^ANTHROPIC_BASE_URL=' .env || true)
+    model_count=\$(grep -c '^ANTHROPIC_MODEL=' .env || true)
+    test \"\$base_count\" = 1
+    test \"\$model_count\" = 1
+    base=\$(sed -n 's/^ANTHROPIC_BASE_URL=//p' .env)
+    model=\$(sed -n 's/^ANTHROPIC_MODEL=//p' .env)
+    test \"\$base\" = 'http://model-gateway:39000'
+    test \"\$model\" = 'kg_hub.entity_extract'
+  " || die "模型网关路由缺失、重复或不是受控的本地业务路由"
+}
+
 # server/ingester/watchdog 和 model-gateway 属于两个 Compose 项目。默认网络隔离
 # 是正确的；只有这三个调用者通过已存在的 private network 相连，refinery 不接入。
 # 漏掉 override 会在容器重建时静默断开 DNS，所有抽取都变成 deferred。必须在
@@ -353,6 +377,7 @@ recover_pending_refinery_window_transaction || die "无法恢复上一次未完�
 # 被拒绝，反而破坏发布的恢复保证。
 ensure_compose_data_root
 ensure_compose_model_gateway_token
+ensure_compose_gateway_route
 ensure_model_gateway_private_network
 
 # 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
