@@ -91,7 +91,7 @@ class ReleaseScriptTests(unittest.TestCase):
 
     def test_health_check_runs_after_the_swap_and_auto_reverts(self):
         swap = self.code.index("up -d --no-deps --no-build")
-        check = self.code.index("健康验收")
+        check = self.code.index("验收：镜像 ID 比对")
         self.assertLess(swap, check, "验收必须在切换之后，否则验的是旧的")
         self.assertIn("自动回到", self.code)
 
@@ -116,6 +116,68 @@ class GuardrailTests(unittest.TestCase):
         text = STANDARD.read_text("utf-8")
         for rule in (":latest", "git archive", "--rollback", "项目名"):
             self.assertIn(rule, text)
+
+
+
+class ConcurrencyAndDrainTests(unittest.TestCase):
+    """从 credvault 借来的三条：部署锁、排空、换完校验镜像 ID。
+
+    credvault 的 cutover 有约 60 个函数，这里只借这三条。其余（人工确认口令、
+    配置快照事务、精确容器身份记录）是为「管钱、且必须恢复到同一个容器实例」设计
+    的；kg-hub 的容器不持有状态，套过来只是负担。这套测试钉住借的这三条别被删掉。
+    """
+
+    def setUp(self):
+        self.raw = RELEASE.read_text("utf-8")
+        self.code = "\n".join(line for line in self.raw.splitlines()
+                               if not line.lstrip().startswith("#"))
+
+    def test_a_deploy_lock_prevents_two_actors_releasing_at_once(self):
+        # 这个工作区是多 actor 的：两个发布同时跑会互相覆盖 .env、抢同一批容器。
+        self.assertIn("acquire_lock", self.code)
+        self.assertIn("mkdir '$LOCK'", self.code)   # mkdir 在同一文件系统上是原子的
+        self.assertIn("trap ", self.code)           # 退出时释放
+        self.assertIn("-mmin +40", self.code)       # 崩溃留下的死锁能被抢占
+
+    def test_release_drains_in_flight_extractions_before_swapping(self):
+        # 直接换容器会掐断在飞的流式抽取，而那会在网关留下永不过期的 unknown
+        # 记录 —— 发布本身就制造了挡住下次发布的东西。
+        drain = self.code.index("active_extractions")
+        swap = self.code.index("up -d --no-deps --no-build")
+        self.assertLess(drain, swap, "排空必须在换容器之前")
+        self.assertIn("stop -t 30 refinery ingester", self.code)
+
+    def test_drain_distinguishes_a_missing_field_from_zero(self):
+        # 字段缺失 = 线上还是旧版本（只能盲等）；值为 0 = 真的排空了。用 sed 抠
+        # 字符串分不清这两者，会把「旧版本」当成「已排空」直接换掉。
+        self.assertIn("json.load", self.code)
+        self.assertIn("盲等", self.raw)
+
+    def test_acceptance_proves_the_new_image_is_actually_running(self):
+        # curl /health 只证明「有个东西在听」。compose 完全可能压根没重建容器。
+        self.assertIn("image inspect -f '{{.Id}}'", self.code)
+        self.assertIn("inspect -f '{{.Image}}'", self.code)
+
+
+class ServerDrainSignalTests(unittest.TestCase):
+    """服务端要能说出「现在有几条抽取在飞」，否则发布只能盲等。"""
+
+    def setUp(self):
+        self.server = (ROOT / "kg_hub_server.py").read_text("utf-8")
+
+    def test_health_exposes_the_in_flight_count(self):
+        self.assertIn('"active_extractions": active_extractions()', self.server)
+
+    def test_the_counter_is_incremented_outside_the_never_raise_body(self):
+        # do_extract 是 never-raise 契约、出口很多；加减写在函数体里迟早漏一条，
+        # 计数只增不减，发布就永远等不到归零。所以套薄壳 + finally。
+        shim = self.server.split("async def do_extract(", 1)[1][:700]
+        self.assertIn("_extraction_started()", shim)
+        self.assertIn("finally:", shim)
+        self.assertIn("_extraction_finished()", shim)
+
+    def test_the_counter_cannot_go_negative(self):
+        self.assertIn("max(0, _active_extractions - 1)", self.server)
 
 
 if __name__ == "__main__":

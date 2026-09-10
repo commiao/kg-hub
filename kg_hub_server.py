@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import re
+import threading
 import sys
 import time
 import unicodedata
@@ -409,8 +410,35 @@ class IngestBody(BaseModel):
 
 
 # ---------- Route handlers ----------
+# 正在跑的抽取数。发布要**排空**：直接 `compose up -d` 会把在飞的抽取连容器一起
+# 换掉，而流式请求中途断开会在网关留下 `unknown` 记录——那种记录永远不会过期
+# （网关只删 completed/error，因为过期不能证明供应商没扣过钱），每一条都挡住下一次
+# 发布。2026-09-10 六小时攒了 171 条就是这么来的。没有这个数，发布只能盲等；
+# 有了它，release.sh 能等到真的归零再换。
+_active_extractions = 0
+_active_extractions_lock = threading.Lock()
+
+
+def _extraction_started() -> None:
+    global _active_extractions
+    with _active_extractions_lock:
+        _active_extractions += 1
+
+
+def _extraction_finished() -> None:
+    global _active_extractions
+    with _active_extractions_lock:
+        _active_extractions = max(0, _active_extractions - 1)
+
+
+def active_extractions() -> int:
+    with _active_extractions_lock:
+        return _active_extractions
+
+
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "kg_hub_server"})
+    return JSONResponse({"status": "ok", "service": "kg_hub_server",
+                         "active_extractions": active_extractions()})
 
 
 def bounded_search_episode_uuids(candidate: dict, limit: int = 8) -> list[str]:
@@ -696,7 +724,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
     return True
 
 
-async def do_extract(
+async def _do_extract_inner(
     graphiti,
     body: IngestBody,
     ref_time: datetime,
@@ -849,6 +877,23 @@ async def do_extract(
             pass
         elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
         logger.exception("[ingest:error] sd=%s sid=%s elapsed=%.1fs", sd, sid, elapsed)
+
+
+async def do_extract(*args, **kwargs) -> None:
+    """给 do_extract 套一层在飞计数。
+
+    发布必须能等到抽取真的归零再换容器：直接换会把在飞的流式请求掐断，而那会在
+    网关留下永不过期的 `unknown` 记录，每一条都挡住下一次发布（2026-09-10 六小时
+    171 条就是这么来的）。计数暴露在 /health 的 active_extractions。
+
+    加减放在薄壳而不是函数体里：内层是 never-raise 契约、出口很多，写在里面迟早
+    漏一条，计数只增不减，发布就永远等不到归零。
+    """
+    _extraction_started()
+    try:
+        return await _do_extract_inner(*args, **kwargs)
+    finally:
+        _extraction_finished()
 
 
 async def ingest(request: Request) -> JSONResponse:

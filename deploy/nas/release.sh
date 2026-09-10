@@ -43,6 +43,26 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
 [ "${KG_HUB_SSH_ALLOW_PROXYJUMP:-0}" = 1 ] || SSH_OPTS+=(-o ProxyJump=none)
 
 say() { printf '%s\n' "$*" >&2; }
+# 部署锁。这个工作区是多 actor 的（claude-code / codex / 用户本人），两个发布同时
+# 跑会互相覆盖 .env、抢同一批容器。mkdir 在同一文件系统上是原子的，够用。
+LOCK="$SRC/.release.lock"
+acquire_lock() {
+  [ "${DRY_RUN:-0}" = 1 ] && return 0
+  ssh "${SSH_OPTS[@]}" "$NAS" "set -eu
+    if mkdir '$LOCK' 2>/dev/null; then
+      printf '%s %s %s\n' \"\$(date -Iseconds)\" '$(hostname -s)' \"\$\$\" > '$LOCK/owner'
+      exit 0
+    fi
+    # 超过 40 分钟的锁判为上一次发布崩了留下的：构建最长也就十几分钟。
+    if [ -n \"\$(find '$LOCK' -maxdepth 0 -mmin +40 2>/dev/null)\" ]; then
+      rm -rf '$LOCK'; mkdir '$LOCK'
+      printf '%s %s %s (抢占了超时的旧锁)\n' \"\$(date -Iseconds)\" '$(hostname -s)' \"\$\$\" > '$LOCK/owner'
+      exit 0
+    fi
+    echo \"另一个发布正在进行：\$(cat '$LOCK/owner' 2>/dev/null)\" >&2
+    exit 75" || die "拿不到部署锁"
+  trap 'ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '"'$LOCK'"'" >/dev/null 2>&1 || true' EXIT
+}
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 on_nas() {
   if [ "${DRY_RUN:-0}" = 1 ]; then say "  [dry-run] ssh: $*"; return 0; fi
@@ -69,6 +89,8 @@ if [ "$mode" = release ]; then
   say "发布 commit $SHA（$(git log -1 --format=%s "$SHA")）"
 fi
 
+acquire_lock
+
 # ---- 2. 记下当前标签，作为回滚点 ------------------------------------------
 PREV=$(on_nas "grep '^KG_HUB_IMAGE_TAG=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
 PREV=${PREV:-latest}
@@ -83,7 +105,7 @@ fi
 
 # ---- 3. 源码：git archive → NAS（发布物严格等于那个 commit）---------------
 if [ "$mode" = release ]; then
-  say "[1/5] git archive $SHA → $SRC"
+  say "[1/6] git archive $SHA → $SRC"
   if [ "${DRY_RUN:-0}" = 1 ]; then
     say "  [dry-run] 会传 $(cd "$REPO" && git archive "$SHA" | tar -t | wc -l | tr -d ' ') 个条目"
   else
@@ -109,7 +131,7 @@ fi
 # 段时间里跑 docker compose 都会因为变量缺失而失败。构建要几分钟，窗口不能这么长。
 # 所以源码落地后立刻把当前正在跑的标签补进 .env —— 值不变、行为不变，只是把窗口
 # 关掉。真正的切换仍在第 4 步。
-say "[2/5] 兜住 .env（关掉「变量缺失」窗口）+ 准备数据目录"
+say "[2/6] 兜住 .env（关掉「变量缺失」窗口）+ 准备数据目录"
 on_nas "set -eu
   cd $SRC
   grep -q '^KG_HUB_IMAGE_TAG=' .env 2>/dev/null || {
@@ -124,17 +146,45 @@ on_nas "set -eu
 on_nas "mkdir -p '$DATA/breakers' && chmod 700 '$DATA/breakers'"
 
 if [ "$mode" = release ]; then
-  say "[3/5] 构建 kg-hub-server:$SHA（不动 latest）"
+  say "[3/6] 构建 kg-hub-server:$SHA（不动 latest）"
   on_nas "cd $SRC && $DK build -t kg-hub-server:$SHA -f deploy/nas/Dockerfile ." \
     || die "构建失败；线上未改动"
 else
-  say "[3/5] 回滚不重建，直接用盘上已有的 kg-hub-server:$SHA"
+  say "[3/6] 回滚不重建，直接用盘上已有的 kg-hub-server:$SHA"
   on_nas "$DK image inspect kg-hub-server:$SHA >/dev/null" \
     || die "回滚目标镜像 kg-hub-server:$SHA 已不在盘上"
 fi
 
+# ---- 4.5 排空：先停生产者，等在飞的抽取跑完 -------------------------------
+# 直接 `up -d` 会把正在跑的抽取连容器一起换掉。抽取是流式的，中途断开会在网关
+# 留下 `unknown` 记录——那种记录**永远不会过期**（网关只删 completed/error，因为
+# 过期不能证明供应商没扣过钱），每一条都挡住下一次发布。2026-09-10 六小时攒了
+# 171 条正是这么来的：发布本身会制造挡住下次发布的东西。
+say "[4/6] 排空：停生产者，等在飞的抽取归零"
+on_nas "cd $SRC && $DK compose -p $PROJECT stop -t 30 refinery ingester" \
+  || say "  （生产者没停成，继续——最坏是多等一会儿）"
+drained=0
+for _ in $(seq 1 60); do
+  [ "${DRY_RUN:-0}" = 1 ] && { drained=1; break; }
+  # 用 python 解 JSON 而不是 sed 抠字符串：字段缺失和值为 0 必须能分清，
+  # 前者说明线上还是旧版本（要盲等），后者才是真的排空了。
+  n=$(on_nas "curl -fsS -m 5 '$HEALTH' 2>/dev/null" 2>/dev/null | python3 -c '
+import json,sys
+try: print(json.load(sys.stdin)["active_extractions"])
+except Exception: pass' 2>/dev/null || true)
+  if [ -z "$n" ]; then
+    # 线上还是旧版本，没有这个字段。只能盲等一个路由超时（150s）+ 余量。
+    say "  线上版本还没有 active_extractions，改为盲等 180s（下次发布起就精确了）"
+    sleep 180; drained=1; break
+  fi
+  if [ "$n" = 0 ]; then say "  在飞抽取已归零"; drained=1; break; fi
+  say "  还有 $n 条在飞，等…"
+  sleep 5
+done
+[ "$drained" = 1 ] || say "  ⚠ 等了 5 分钟仍未归零，继续换容器（会有请求被掐断）"
+
 # ---- 5. 切标签 + 起容器 ----------------------------------------------------
-say "[4/5] 切到 $SHA 并启动 $SERVICES"
+say "[5/6] 切到 $SHA 并启动 $SERVICES"
 on_nas "set -eu
   cd $SRC
   # .env 里同时记住上一次的标签：回滚不需要人去翻历史。
@@ -145,9 +195,23 @@ on_nas "set -eu
   $DK compose -p $PROJECT up -d --no-deps --no-build $SERVICES"
 
 # ---- 6. 验收；不合格自动回到上一个标签 ------------------------------------
-say "[5/5] 健康验收"
+# curl /health 只能证明"有个东西在听"，证明不了跑的是我们刚建的那个镜像
+# （compose 可能压根没重建容器）。所以先比对镜像 ID。
+say "[6/6] 验收：镜像 ID 比对 + 健康检查"
+if [ "${DRY_RUN:-0}" != 1 ]; then
+  want=$(on_nas "$DK image inspect -f '{{.Id}}' kg-hub-server:$SHA" 2>/dev/null || true)
+  got=$(on_nas "$DK inspect -f '{{.Image}}' kg-hub-server" 2>/dev/null || true)
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    say "  ⚠ 容器跑的不是 kg-hub-server:$SHA（want=$want got=$got）"
+    ok=0
+  fi
+fi
+# 镜像 ID 不符时上面已把 ok 置 0；这里不要覆盖掉那个判决。
+image_ok=${ok:-1}
 ok=0
+[ "$image_ok" = 0 ] && say "  镜像 ID 不符，跳过健康检查直接回滚"
 for _ in $(seq 1 30); do
+  [ "$image_ok" = 0 ] && break
   if [ "${DRY_RUN:-0}" = 1 ]; then ok=1; break; fi
   if on_nas "curl -fsS -m 5 '$HEALTH' >/dev/null 2>&1"; then ok=1; break; fi
   sleep 2
