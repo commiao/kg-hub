@@ -180,5 +180,43 @@ class ServerDrainSignalTests(unittest.TestCase):
         self.assertIn("max(0, _active_extractions - 1)", self.server)
 
 
+
+class ScopeCoverageTests(unittest.TestCase):
+    """准则要覆盖全部落地形态，且对没做的部分保持诚实。
+
+    一份说谎的准则比没有准则更糟：别人会照着它假设「已经统一了」，然后在没收口的
+    地方踩坑。所以「还没收口」那张表必须一直如实列着。
+    """
+
+    def setUp(self):
+        self.text = STANDARD.read_text("utf-8")
+
+    def test_covers_every_machine_and_both_forms(self):
+        for topic in ("NAS", "Mac", "Windows", "Docker", "本机"):
+            self.assertIn(topic, self.text, f"准则没覆盖 {topic}")
+
+    def test_each_form_says_where_things_land_and_how_to_roll_back(self):
+        for section in ("部署位置", "部署流程", "git 管理", "落地位置速查"):
+            self.assertIn(section, self.text, f"缺少「{section}」")
+
+    def test_native_services_are_forbidden_from_running_the_working_tree(self):
+        # Mac 上 11 个 launchd 服务当前全部直接跑工作区：改一个文件就是上线，
+        # 没提交的半成品也会上线。这条禁令是 B 章存在的全部理由。
+        self.assertIn("常驻服务不许指向 git 工作区", self.text)
+        self.assertIn("current", self.text)
+
+    def test_unfinished_work_is_still_listed_as_unfinished(self):
+        tail = self.text.split("还没收口", 1)
+        self.assertEqual(len(tail), 2, "必须保留「还没收口」一节")
+        # 这三处确实还没改；哪天真改完了，是删表项，不是删这条测试。
+        for pending in ("task-hub", "report-portal", "launchd"):
+            self.assertIn(pending, tail[1], f"{pending} 的现状不许从表里消失")
+
+    def test_credvault_is_explicitly_carved_out(self):
+        # 它必须恢复到同一个容器实例，套用本准则反而是错的。
+        self.assertIn("credvault", self.text)
+        self.assertIn("不套用本准则", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()
