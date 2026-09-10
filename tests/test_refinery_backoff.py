@@ -206,6 +206,12 @@ try:
 finally:
     R._http = _orig_http
 check("POST 500 → 无内容 http_500 类别", st_post_500 == "http_500")
+R._http = lambda method, url, body=None, timeout=30: (500, {"status": "error", "diagnostic": "ResponseError"})
+try:
+    st_post_diagnostic = asyncio.run(REAL_INGEST_VIA_API(ROWS[0]))
+finally:
+    R._http = _orig_http
+check("POST 500 → 受限异常类别", st_post_diagnostic == "http_500_ResponseError")
 
 # 并发:批内两条同时在飞 → 一条慢抽取不再堵住身后的快速失败
 order = []

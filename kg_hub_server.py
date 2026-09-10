@@ -1019,6 +1019,9 @@ async def ingest(request: Request) -> JSONResponse:
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "code": "ingest_failed",
+             # 仅暴露异常类名供消费端状态归因；原始 message 可能含驱动/查询细节，
+             # 不应进入 refinery 的持久化运行状态。
+             "diagnostic": type(exc).__name__,
              "message": f"idempotency merge failed: {exc}"},
             status_code=500,
         )

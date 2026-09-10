@@ -512,6 +512,10 @@ async def ingest_via_api(obs: dict) -> str:
     if code >= 400:
         # 不把响应 message 写进状态：它可能含上游细节。状态码已足够区分
         # 参数/认证/服务端失败，且与原有 generic error 一样会在下一轮重试。
+        diagnostic = str(d.get("diagnostic") or "")
+        if (0 < len(diagnostic) <= 80
+                and all(ch.isascii() and (ch.isalnum() or ch == "_") for ch in diagnostic)):
+            return f"http_{code}_{diagnostic}"
         return f"http_{code}"
     st = d.get("status", "")
     if st in ("ok", "skipped"):
