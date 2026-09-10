@@ -502,13 +502,17 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
 
 
 async def ingest_via_api(obs: dict) -> str:
-    """返回终态: ok|skipped|error|timeout|net|409"""
+    """返回终态或无内容的 HTTP 类别，供状态页诊断 deferred。"""
     p = to_payload(obs)
     code, d = _http("POST", f"{KG_HUB_URL}/api/ingest", p, timeout=60)
     if code == 0:
         return "net"
     if code == 409:
         return "409"
+    if code >= 400:
+        # 不把响应 message 写进状态：它可能含上游细节。状态码已足够区分
+        # 参数/认证/服务端失败，且与原有 generic error 一样会在下一轮重试。
+        return f"http_{code}"
     st = d.get("status", "")
     if st in ("ok", "skipped"):
         return st

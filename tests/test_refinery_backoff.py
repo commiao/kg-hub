@@ -11,6 +11,7 @@ import asyncio, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kg_refinery as R
+REAL_INGEST_VIA_API = R.ingest_via_api
 
 
 def run(rows, wm, backoff, cycle, verdict="409"):
@@ -196,6 +197,15 @@ st_net, n_net = poll_with([(0, {"error": "net"}), (200, {"status": "ok"})])
 check("网络层失败不当终态,继续轮询", st_net == "ok" and n_net == 2)
 st_5xx, _ = poll_with([(503, {"status": "error"})])
 check("5xx 视为瞬时:轮询到上限而非误判失败", st_5xx == "timeout")
+
+# POST 的非成功响应只外露状态码类别，绝不把服务端 message 写入 refinery 状态。
+_orig_http = R._http
+R._http = lambda method, url, body=None, timeout=30: (500, {"status": "error", "message": "private"})
+try:
+    st_post_500 = asyncio.run(REAL_INGEST_VIA_API(ROWS[0]))
+finally:
+    R._http = _orig_http
+check("POST 500 → 无内容 http_500 类别", st_post_500 == "http_500")
 
 # 并发:批内两条同时在飞 → 一条慢抽取不再堵住身后的快速失败
 order = []
