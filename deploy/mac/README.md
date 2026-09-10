@@ -49,11 +49,16 @@ deploy/mac/install.sh com.kg-hub.weekly-report   # 只装指定的
 
 ## 依赖
 
-`requirements.txt` 是这台 Mac 上 venv 的 freeze（73 个，全部钉版本）。
+**只有一份清单：`deploy/nas/requirements.txt`**（73 个，全部钉版本）。Mac 的 venv
+用的就是它，`tests/test_mac_agents.py` 每次跑都会比对一遍，漂了就报。
 
-⚠️ 与容器的 `deploy/nas/requirements.txt` 是**两份**，不保证一致——2026-09-10 实
-测两边已经有 5 个包对不上。同一份代码在 Mac 和 NAS 跑着不同的依赖，目前没有任何
-东西会发现这件事。收敛是独立待办。
+> 目录名叫 `nas/` 但两边共用，是历史遗留。**没有第二份 mac/requirements.txt**：
+> 2026-09-10 我一度加过一份 freeze，随后核实两边逐包逐版本完全一致——两份内容
+> 相同的清单不会带来任何好处，只会给真正的漂移留一个藏身处。删掉了。
+>
+> （同一次我还误报过「两边有 5 个包对不上」。那是比对脚本的 bug：venv 那侧把
+> 下划线规范成了连字符，清单那侧没有，于是 `docstring_parser` 和
+> `docstring-parser` 被当成两个包。实际差异为零。）
 
 ## 没有备份目录
 

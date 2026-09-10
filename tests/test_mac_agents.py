@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS = ROOT / "deploy" / "mac" / "agents"
 INSTALL = ROOT / "deploy" / "mac" / "install.sh"
-REQUIREMENTS = ROOT / "deploy" / "mac" / "requirements.txt"
+SHARED_REQUIREMENTS = ROOT / "deploy" / "nas" / "requirements.txt"
 README = ROOT / "deploy" / "mac" / "README.md"
 
 EXPECTED = {
@@ -101,18 +101,50 @@ class InstallScriptTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
-    def test_mac_dependencies_are_pinned(self):
-        lines = [l for l in REQUIREMENTS.read_text("utf-8").splitlines()
-                 if l.strip() and not l.startswith("#")]
-        self.assertTrue(lines)
-        unpinned = [l for l in lines if "==" not in l]
-        self.assertEqual(unpinned, [], "不钉版本就不叫清单")
+    """依赖只有一份清单，Mac 的 venv 必须与它一致。
 
-    def test_readme_is_honest_about_the_drift_from_the_container(self):
-        # Mac venv 与容器 requirements 已经有 5 个包对不上。装作一致比不写更糟。
-        text = README.read_text("utf-8")
-        self.assertIn("deploy/nas/requirements.txt", text)
-        self.assertIn("不保证一致", text)
+    2026-09-10 一度加过第二份 `deploy/mac/requirements.txt`，理由是「Mac 与容器
+    已经漂了 5 个包」。核实后发现那 5 个是比对脚本的 bug（venv 那侧把下划线规范
+    成了连字符，清单那侧没有），实际差异为零。两份内容相同的清单没有任何好处，
+    只会给真正的漂移留一个藏身处，所以删掉了，改成在这里真的比一遍。
+    """
+
+    @staticmethod
+    def normalise(name):
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    def declared(self):
+        out = {}
+        for line in SHARED_REQUIREMENTS.read_text("utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = re.match(r"([A-Za-z0-9._-]+)\s*==\s*([^\s;]+)", line)
+            self.assertIsNotNone(match, f"不钉版本就不叫清单：{line}")
+            out[self.normalise(match.group(1))] = match.group(2)
+        return out
+
+    def test_the_only_manifest_is_fully_pinned(self):
+        self.assertTrue(self.declared())
+        self.assertFalse((ROOT / "deploy" / "mac" / "requirements.txt").exists(),
+                         "不要第二份清单：内容相同则无用，内容不同则是事故")
+
+    def test_the_mac_venv_matches_the_manifest(self):
+        venv = list((ROOT / "spike-graphiti" / ".venv" / "lib").glob("python*/site-packages"))
+        if not venv:
+            self.skipTest("这台机器上没有 kg-hub 的 venv")
+        installed = {}
+        for item in venv[0].iterdir():
+            if item.name.endswith(".dist-info"):
+                stem = item.name[: -len(".dist-info")]
+                name, _, version = stem.rpartition("-")
+                installed[self.normalise(name)] = version
+        declared = self.declared()
+        missing = sorted(k for k in declared if k not in installed)
+        wrong = sorted(f"{k}: 清单 {declared[k]} / 实装 {installed[k]}"
+                       for k in declared if k in installed and declared[k] != installed[k])
+        self.assertEqual(missing, [], "清单里有、venv 里没装")
+        self.assertEqual(wrong, [], "版本对不上")
 
 
 if __name__ == "__main__":
