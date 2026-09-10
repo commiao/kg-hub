@@ -24,6 +24,10 @@ Unrelated business quota exhaustion does not claim kg-hub quota is exhausted.
   preflight dated 2026-09-07T03:32:58+00:00. Other readiness checks pass.
 - The actual refinery environment uses 22:00–10:00 Asia/Shanghai. Older
   comments claiming 22:00–05:00 are not the deployed configuration.
+- Follow-up (2026-09-10): this remains historical deployment evidence. The
+  production environment explicitly remains 22:00–10:00; the user requested
+  22:00–08:00, so a safe release should change only
+  `KG_HUB_REFINERY_WINDOW_END` to `8`.
 
 ## Deployment
 

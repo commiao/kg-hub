@@ -13,7 +13,7 @@ NAS(sync_claude_mem_to_nas.sh),此前无消费者(4555 条积压)。本进程:
 
 新旧数据分流:
   live    — id > boundary_id(首轮启动时的 db 最大 id):每轮全量处理,分钟级
-  backlog — id ≤ boundary_id 的历史积压:仅在夜间窗口(23:00-07:00 Asia/Shanghai)
+  backlog — id ≤ boundary_id 的历史积压:仅在夜间窗口(22:00-08:00 Asia/Shanghai)
             每轮限量烧,不与白天真实使用抢 LLM 串行额度
 
 状态外露:/state/status.json(server 挂同卷 ro,门户「精炼层」卡读它)。
@@ -229,9 +229,10 @@ HEARTBEAT_INTERVAL = bounded_heartbeat_interval(
     os.environ.get("KG_HUB_REFINERY_HEARTBEAT_SEC"))
 BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "15"))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
-# 夜间回填窗口(CST 小时,含头不含尾;跨午夜写成 start>end)。2026-08-13 用户定 22-5。
+# 夜间回填窗口(北京时间 / Asia/Shanghai, UTC+8;含头不含尾;跨午夜写成 start>end)。
+# 默认 22:00-08:00，由环境变量显式覆盖时以覆盖值为准。
 BACKLOG_START = int(os.environ.get("KG_HUB_REFINERY_WINDOW_START", "22"))
-BACKLOG_END = int(os.environ.get("KG_HUB_REFINERY_WINDOW_END", "5"))
+BACKLOG_END = int(os.environ.get("KG_HUB_REFINERY_WINDOW_END", "8"))
 # 旧直连线水印(526 ingested + 2471 rejected)。repo 的 data/ 被 .dockerignore 排除,
 # 容器里拿不到 → 部署时必须把该 json 预置到 refinery-state 卷(见 REFINERY-DESIGN
 # 部署步骤);这里两个位置都找:先 STATE 卷(生产),再 repo(Mac 本地调试)。
@@ -243,7 +244,7 @@ _LEGACY_CANDIDATES = (
 WATERMARK = STATE_DIR / "watermark.json"
 STATUS = STATE_DIR / "status.json"
 DECISIONS_LOG = STATE_DIR / "ingest_decisions.jsonl"
-CST = timezone(timedelta(hours=8))  # Asia/Shanghai,夜间窗口按此判
+CST = timezone(timedelta(hours=8))  # 北京时间 / Asia/Shanghai (UTC+8),夜间窗口按此判
 # 409 退避(2026-08-25 修活锁):服务端 error 键存在时 POST 必回 409。原实现把
 # 409 当"下轮重试",于是 LLM 供应商失效期间每 90s 重试全部积压 —— 一夜刷了
 # **6864 条 409 日志**、白烧 CPU/IO,而 backlog_remaining 一动不动、last_error
@@ -533,7 +534,7 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
 
 def in_backlog_window() -> bool:
     """工作窗口:refinery 的全部摄入(新 obs + 积压回填)只在此窗口内跑,窗口外
-    完全静默(白天不与真实使用抢 LLM/IO,也避开室温峰值)。默认 22:00-05:00 CST,
+    完全静默(白天不与真实使用抢 LLM/IO,也避开室温峰值)。默认北京时间 22:00-08:00,
     可经 env 调(跨午夜按 start>end 处理)。"""
     h = datetime.now(tz=CST).hour
     if BACKLOG_START == BACKLOG_END:
@@ -752,7 +753,7 @@ async def main() -> int:
                              backlog_window_open=in_backlog_window(), last_error=None)
                 await asyncio.sleep(INTERVAL)
                 continue
-            # —— 工作窗口门控(用户 2026-08-13 定 22:00-05:00):窗口外新 obs 与
+            # —— 工作窗口门控(默认北京时间 22:00-08:00):窗口外新 obs 与
             # 积压一律不动,只留心跳。数据在 db/水印里等着,窗口一开自动追平。
             if not in_backlog_window():
                 write_status(disk_temp=dtemp, thermal_hold=False,

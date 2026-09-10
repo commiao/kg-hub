@@ -263,7 +263,7 @@ services:
   # kg-refinery Phase A(REFINERY-DESIGN):Level-1 claude-mem 消费者。
   # 复活休眠线:读已在同步的 db 副本 → ingest_filter 质量闸 → POST /api/ingest
   # (全治理:幂等/备份/kind链/预拆),poll-drain 串行尊重单写者。
-  # 积压(boundary_id 前)只在 23:00-07:00 夜间窗口烧,白天只处理新增。
+  # 所有 refinery 处理默认只在北京时间 22:00-08:00 窗口运行；窗口外全部暂停。
   refinery:
     build:
       context: .
@@ -292,10 +292,9 @@ services:
       # 只消除批内队头阻塞(一条 p90 180s 的慢抽取此前会堵住身后的快速失败条目)。
       - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-2}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
-      # 工作窗口(CST)。2026-08-18 按 857 条温度采样重定为 01:00-08:00:
-      # 实测 22-23 点是全天最热(盘温<60 的可开工比例仅 25%/40%),01-08 才是凉窗
-      # (80-100%)。原 22-05 有近一半时间被温度门控空转。
-      - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-1}
+      # 工作窗口(北京时间 / Asia/Shanghai, UTC+8): 默认 22:00-08:00，
+      # 跨午夜；温度门控仍可独立暂停整轮处理。
+      - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-22}
       - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
       - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-52}

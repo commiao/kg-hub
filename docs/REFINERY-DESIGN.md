@@ -61,7 +61,7 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 - 质量闸:**原样复用 `utils/ingest_filter.py`**(Layer1 硬门/Layer2 平台阈值/Layer3 配额);修补两个已知缺口:QuotaTracker 状态落 refinery-state 文件(日配额变真的)、决策日志继续写 `.ingest_decisions.jsonl`
 - 规范化后 POST `/api/ingest`:`name=claude-mem-obs-<id>`(沿用现有命名)、`source_obs_id=content_hash`(表内天然幂等锚)、`sd` 携带 `type=/project=/platform=`(现有 origin 派生正则直接可用)
 - **水印迁移**:导入旧 `data/.ingested.claude_mem.json`(526 ingested + 2471 rejected)为初始状态,防止重复入图
-- **积压回填**(决策④):同一消费者、加 `--backlog` 节流模式(仅 23:00-07:00 跑,LLM 串行限速已有 SEMAPHORE=1+4s 间隔),预计 ~800 条入图,烧数个夜间;进度进日报
+- **积压回填**(决策④):同一消费者、加 `--backlog` 节流模式(默认仅北京时间 22:00-08:00 跑,LLM 串行限速已有 SEMAPHORE=1+4s 间隔),预计 ~800 条入图,烧数个夜间;进度进日报
 
 ### 3. Level-0 原始会话摄入(新工具 + OpenClaw)
 - **契约**(刻意最小,两个端点):

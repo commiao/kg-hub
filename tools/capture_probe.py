@@ -1063,7 +1063,7 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
             rf["detail"] = f"温度门控歇工（盘温 {dt}°C 超阈）· {base}"
         elif js.get("idle_outside_window"):
             rf["state"] = AMBER
-            rf["detail"] = f"工作窗口外待命（凉窗 01:00-08:00 才开工）· {base}"
+            rf["detail"] = f"工作窗口外待命（北京时间 22:00-08:00 才开工）· {base}"
         else:
             rf["state"] = GREEN
             rf["detail"] = f"[home-nas] 处理中 · {base}"
