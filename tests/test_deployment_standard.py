@@ -218,5 +218,51 @@ class ScopeCoverageTests(unittest.TestCase):
         self.assertIn("不套用本准则", self.text)
 
 
+
+class DrainFailureTests(unittest.TestCase):
+    """排空失败时的处置：宁可不发，也不能掐断；而且生产者必须起回来。"""
+
+    def setUp(self):
+        self.raw = RELEASE.read_text("utf-8")
+        self.code = "\n".join(line for line in self.raw.splitlines()
+                               if not line.lstrip().startswith("#"))
+
+    def test_a_failed_drain_aborts_instead_of_cutting_requests(self):
+        # 硬换会掐断在飞的流式抽取，在网关留下永不过期的记录——那正是这一步要
+        # 避免的东西。此刻容器还没换，中止是干净的。
+        tail = self.code.split('[ "$drained" != 1 ]', 1)
+        self.assertEqual(len(tail), 2, "必须有排空失败分支")
+        branch = tail[1][:600]
+        self.assertIn("die ", branch)
+        self.assertIn("restore_producers", branch)
+
+    def test_cutting_anyway_requires_an_explicit_operator_override(self):
+        # 默认安全、要掐断必须明说：卡死的抽取不能永久堵死发布，但也不能默默掐。
+        self.assertIn("KG_HUB_FORCE_SWAP", self.code)
+
+    def test_producers_are_always_restarted_if_the_release_stops_early(self):
+        # 生产者停下之后任何一步失败而没人管，整条采集就静悄悄停了——比发布
+        # 失败本身严重得多。
+        self.assertIn("restore_producers", self.code)
+        self.assertIn("start refinery ingester", self.code)
+        # trap 里也要兜一道，die 才有人管。
+        trap = self.code.split("trap '", 1)[1][:200]
+        self.assertIn("restore_producers", trap)
+
+    def test_restore_producers_is_defined_before_the_trap_installs_it(self):
+        # trap 在拿锁时就装好，而真正的实现在排空那一步才出现：中间任何一次 die
+        # 都会调到它，所以必须先有一个占位定义。
+        placeholder = self.code.index("restore_producers() { :; }")
+        trap_at = self.code.index("trap 'restore_producers")
+        self.assertLess(placeholder, trap_at)
+
+    def test_the_drain_waits_for_in_flight_not_for_the_backlog(self):
+        # 积压有几千条、要跑几个月；等积压等于永远发不了。这条必须写死在文档里，
+        # 免得以后有人「顺手」把等待条件改成积压清零。
+        self.assertIn("等的是在飞，不是积压", self.raw)
+        standard = STANDARD.read_text("utf-8")
+        self.assertIn("active_extractions", standard)
+
+
 if __name__ == "__main__":
     unittest.main()

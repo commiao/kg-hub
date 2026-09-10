@@ -46,6 +46,8 @@ say() { printf '%s\n' "$*" >&2; }
 # 部署锁。这个工作区是多 actor 的（claude-code / codex / 用户本人），两个发布同时
 # 跑会互相覆盖 .env、抢同一批容器。mkdir 在同一文件系统上是原子的，够用。
 LOCK="$SRC/.release.lock"
+producers_stopped=0
+restore_producers() { :; }   # 真正的实现在排空那一步覆盖它；trap 早于它设置
 acquire_lock() {
   [ "${DRY_RUN:-0}" = 1 ] && return 0
   ssh "${SSH_OPTS[@]}" "$NAS" "set -eu
@@ -61,7 +63,9 @@ acquire_lock() {
     fi
     echo \"另一个发布正在进行：\$(cat '$LOCK/owner' 2>/dev/null)\" >&2
     exit 75" || die "拿不到部署锁"
-  trap 'ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '"'$LOCK'"'" >/dev/null 2>&1 || true' EXIT
+  # 退出时释放锁；生产者若还停着也一并起回来（die 会走到这里）。
+  trap 'restore_producers 2>/dev/null || true
+        ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '"'$LOCK'"'" >/dev/null 2>&1 || true' EXIT
 }
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 on_nas() {
@@ -160,9 +164,25 @@ fi
 # 留下 `unknown` 记录——那种记录**永远不会过期**（网关只删 completed/error，因为
 # 过期不能证明供应商没扣过钱），每一条都挡住下一次发布。2026-09-10 六小时攒了
 # 171 条正是这么来的：发布本身会制造挡住下次发布的东西。
-say "[4/6] 排空：停生产者，等在飞的抽取归零"
-on_nas "cd $SRC && $DK compose -p $PROJECT stop -t 30 refinery ingester" \
-  || say "  （生产者没停成，继续——最坏是多等一会儿）"
+# 排空等的是**在飞的抽取**，不是积压。积压躺在库里和水印里，refinery 停了就停，
+# 回来接着跑，一条不丢。在飞的条数由 INGEST_CONCURRENCY 封顶（现为 2），每条约
+# 3 分钟，所以正常情况下最坏等 3 分钟左右。
+say "[4/6] 排空：停生产者，等在飞的抽取归零（等的是在飞，不是积压）"
+producers_stopped=0
+# 生产者一旦停下，就必须保证它们能起回来：发布在这之后任何一步失败而没人管，
+# 整条采集就静悄悄停了，比发布失败本身严重得多。
+restore_producers() {
+  [ "$producers_stopped" = 1 ] || return 0
+  say "  恢复生产者 refinery / ingester"
+  on_nas "cd $SRC && $DK compose -p $PROJECT start refinery ingester" \
+    || say "  ⚠ 生产者没起回来，需要人工：docker compose -p $PROJECT start refinery ingester"
+  producers_stopped=0
+}
+if on_nas "cd $SRC && $DK compose -p $PROJECT stop -t 30 refinery ingester"; then
+  producers_stopped=1
+else
+  say "  （生产者没停成，继续——最坏是多等一会儿）"
+fi
 drained=0
 for _ in $(seq 1 60); do
   [ "${DRY_RUN:-0}" = 1 ] && { drained=1; break; }
@@ -181,7 +201,15 @@ except Exception: pass' 2>/dev/null || true)
   say "  还有 $n 条在飞，等…"
   sleep 5
 done
-[ "$drained" = 1 ] || say "  ⚠ 等了 5 分钟仍未归零，继续换容器（会有请求被掐断）"
+if [ "$drained" != 1 ]; then
+  # 排空不掉就**别发**。硬换会掐断在飞的流式抽取，在网关留下永不过期的记录 ——
+  # 那正是这一步要避免的东西，为了赶一次发布去制造它不划算。此刻源码已同步、
+  # 镜像已构建，但容器还没换，中止是干净的：过会儿重跑即可。
+  restore_producers
+  [ "${KG_HUB_FORCE_SWAP:-0}" = 1 ] \
+    || die "5 分钟没排空干净，已中止（生产者已恢复）。确认可以掐断就 KG_HUB_FORCE_SWAP=1 重跑"
+  say "  ⚠ KG_HUB_FORCE_SWAP=1：明知会掐断仍继续"
+fi
 
 # ---- 5. 切标签 + 起容器 ----------------------------------------------------
 say "[5/6] 切到 $SHA 并启动 $SERVICES"
@@ -230,4 +258,5 @@ if [ "$ok" != 1 ]; then
   die "发布失败，已回到 $PREV"
 fi
 
+producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
 say "✅ 发布完成：kg-hub-server:$SHA（上一个 $PREV 仍在盘上，可 --rollback）"
