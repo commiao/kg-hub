@@ -7,6 +7,14 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+import sys
+from pathlib import Path
+
+# 没有这一行，本文件连 import 都过不去，于是它测的东西一次都没被跑过 ——
+# 「写失败 / 未知 / 认证失败要分得开」「密文不得外发」这些告警正确性守卫
+# 形同虚设。同仓其它测试都有这一行。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import dashboard_status as D
 from tools import watchdog as W
 
