@@ -220,6 +220,25 @@ DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
 DISK_TEMP_WARN = int(os.environ.get("KG_HUB_DISK_TEMP_WARN", "59"))
 
 
+def check_refinery_halt() -> dict | None:
+    """服务端算好的「该干活却没干」判决；读不到就返回 None（不猜、不报警）。"""
+    if not KG_HUB_URL:
+        return None
+    try:
+        r = httpx.get(f"{KG_HUB_URL.rstrip('/')}/api/topology/latest",
+                      headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"} if KG_HUB_TOKEN else {},
+                      timeout=5.0, follow_redirects=False, trust_env=False)
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+    except Exception:  # noqa: BLE001 — 取不到判决不能把 watchdog 本身拖垮
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    halt = payload.get("refinery")
+    return halt if isinstance(halt, dict) else None
+
+
 def check_disk_temp() -> tuple[int | None, str]:
     """群晖盘温预警(2026-08 过热事件后加)。DSM 到 61°C 直接强制关机、且**没有任何
     通知**——8/16 就这样停了 24 小时无人知。这里在触线前一步喊人,让"开机"这个
@@ -655,6 +674,7 @@ def main() -> int:
         "falkordb_unreachable": False,
         "falkordb_slow": False,
         "disk_temp_high": False,
+        "refinery_stalled": False,
         "capture_blocked": False,
         "capture_probe_stale": False,
         "capture_monitor_unhealthy": False,
@@ -668,6 +688,22 @@ def main() -> int:
     new_counters: dict = {}
 
     # 0. 盘温(优先级最高:硬件保护,且与 server 存活无关)
+    # 「该干活却没干」独立于温度告警。2026-09-16 实测：盘温稳态 58°C，refinery 的
+    # 歇工线 ≥58、本文件的温度告警线 ≥59，中间一度的盲区正好卡住 —— 积压 7509 条
+    # **六天一条没动，零告警**。温度只是代理指标，停工才是后果，所以对后果报警。
+    # 判决由服务端算好（topology.refinery_halt），这里只负责报。
+    halt = check_refinery_halt()
+    if halt and halt.get("halted"):
+        gates = "、".join(halt.get("gates") or []) or "未知原因"
+        backlog = halt.get("backlog_remaining")
+        temp = halt.get("disk_temp")
+        extra = f"，盘温 {temp}°C" if temp is not None else ""
+        new_anomalies["refinery_stalled"] = True
+        details["refinery_stalled"] = (
+            f"⏸ refinery 在工作窗口内停工：{gates}{extra}"
+            f"｜积压 {backlog if backlog is not None else '?'} 条不再下降"
+            "｜看 /dashboard/refinery")
+
     hottest, temp_msg = check_disk_temp()
     if hottest is not None and hottest >= DISK_TEMP_WARN:
         new_anomalies["disk_temp_high"] = True

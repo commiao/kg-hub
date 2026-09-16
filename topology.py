@@ -394,6 +394,40 @@ async def dashboard_topology(request: Request) -> HTMLResponse:
     return HTMLResponse(_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)))
 
 
+# 「该干活却没干」必须能被看见。2026-09-16 实测：盘温稳态 58°C，而 refinery 的
+# 歇工线是 ≥58、watchdog 的告警线是 ≥59 —— 中间一度的盲区正好卡住，积压 7509 条
+# **六天一条没动，零告警**。教训不是调温度，是告警对象错了：温度只是代理指标，
+# 「活没干」才是后果。这里把后果算清楚，交给 watchdog 去报。
+#
+# 只在**窗口开着**时才算停工：窗口外不干活是设计，不是故障。
+_HALT_GATES = (
+    ("thermal_hold", "盘温门控"),
+    ("quota_paused", "配额耗尽停发"),
+    ("rate_limited", "被限速"),
+)
+
+
+def refinery_halt(status: dict | None) -> dict:
+    """refinery 是否「该干活却没干」，以及被什么挡的。"""
+    status = status if isinstance(status, dict) else {}
+    result: dict = {
+        "window_open": bool(status.get("backlog_window_open")),
+        "backlog_remaining": status.get("backlog_remaining"),
+        "disk_temp": status.get("disk_temp"),
+        "ts": status.get("ts"),
+        "halted": False, "gates": [], "deliberate": False,
+    }
+    gates = [label for key, label in _HALT_GATES if status.get(key)]
+    # 人工断路是运维**主动**动作，不是故障：单独标出来，别和环境门控混在一起报警。
+    if status.get("breaker_open"):
+        result["deliberate"] = True
+        reason = str(status.get("breaker_reason") or "").strip()
+        gates.append("人工断路" + (f"（{reason}）" if reason else ""))
+    result["gates"] = gates
+    result["halted"] = bool(result["window_open"] and gates)
+    return result
+
+
 async def topology_latest(request: Request) -> JSONResponse:
     """GET /api/topology/latest — 快照 JSON，给 watchdog 告警用。"""
     try:
@@ -411,6 +445,8 @@ async def topology_latest(request: Request) -> JSONResponse:
                          # not turn this capture endpoint into an error.
                          "gateway_monitor": monitor,
                          "stale_after_s": capture_stale_after_s(device_cfg),
+                         # 机器可读的「该干活却没干」判决，见 refinery_halt。
+                         "refinery": refinery_halt(_read_json(REFINERY_STATUS_PATH)),
                          "snapshots": snaps})
 
 
