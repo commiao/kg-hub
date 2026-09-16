@@ -7,8 +7,14 @@ if [ "$#" -ne 1 ]; then
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-"${PYTHON:-python3}" - "$1" "$script_dir/.env.example" "$script_dir/.env" \
-  "$script_dir/../../.env" <<'PY'
+# release.sh and the running Compose project consume the repository-root .env.
+# Keep that as the one active source; deploy/nas/.env is accepted only as a
+# one-time legacy import so documentation cannot point operators at a shadow
+# file that Compose does not load.
+"${PYTHON:-python3}" - "$1" "$script_dir/.env.example" "$script_dir/../../.env" \
+  "$script_dir/.env" <<'PY'
+import hmac
+import json
 import os
 import re
 import secrets
@@ -50,6 +56,24 @@ if (raw not in {token.encode("ascii"), (token + "\n").encode("ascii")}
         or len(set(token)) < 12
         or token.lower().startswith(("replace", "example", "changeme"))):
     raise SystemExit("caller token file has invalid format")
+
+# The token file is a delivery artifact, never the authority for the business
+# mapping. Confirm it against the gateway's caller registry and derive the one
+# permitted logical key. This reads central NAS files only; no provider request
+# and no secret leave the process.
+try:
+    callers_raw = read_private(source.with_name("callers.json"), 128 * 1024)
+    callers = json.loads(callers_raw.decode("utf-8"))
+    caller = callers["callers"]["kg-hub"]
+    scopes = caller["business_keys"]
+except (FileNotFoundError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError):
+    raise SystemExit("central callers.json is missing, unsafe or invalid")
+if (not isinstance(caller, dict) or set(caller) != {"token", "business_keys"}
+        or not isinstance(caller.get("token"), str)
+        or not hmac.compare_digest(caller["token"], token)
+        or scopes != ["kg_hub.entity_extract"]):
+    raise SystemExit("central kg-hub caller scope does not match the supplied token")
+business_key = scopes[0]
 
 using_legacy = False
 using_destination = destination.exists() or destination.is_symlink()
@@ -139,6 +163,14 @@ selected = {"KG_HUB_MODEL_GATEWAY_TOKEN": token}
 for key in config_keys:
     values = found[key]
     distinct = set(values)
+    if key == "ANTHROPIC_BASE_URL":
+        # Endpoint/model are consumer identity, not operator-tuned provider
+        # settings. Provider switching stays entirely in model-gateway routes.
+        selected[key] = template[key]
+        continue
+    if key == "ANTHROPIC_MODEL":
+        selected[key] = business_key
+        continue
     # deploy/nas/.env is operator-owned after first creation. Preserve every
     # explicit non-placeholder routing/data/network value. The template only
     # supplies an absent first-deploy value; reruns must never reset custom NAS
@@ -227,7 +259,7 @@ except BaseException:
     except FileNotFoundError:
         pass
     raise
-print("updated deploy/nas/.env with the kg-hub gateway caller token")
+print("updated the active root .env from the central kg-hub caller scope")
 for key in sorted(preserved_legacy_weak):
     print(f"warning: preserved legacy {key}; rotate it in a separate reviewed change")
 PY

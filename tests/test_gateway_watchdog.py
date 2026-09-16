@@ -109,6 +109,41 @@ class GatewayWatchdogTests(unittest.TestCase):
         self.assertFalse(get.call_args.kwargs['follow_redirects'])
         self.assertFalse(get.call_args.kwargs['trust_env'])
 
+    def test_consumer_contract_reconciliation_is_authenticated_and_zero_cost(self):
+        response = type('Response', (), {
+            'status_code': 200,
+            'json': lambda self: {
+                'version': 1,
+                'caller': 'kg-hub',
+                'business_keys': ['kg_hub.entity_extract'],
+                'external_calls': 0,
+            },
+        })()
+        token = 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789_-token'
+        with patch.object(W, 'MODEL_GATEWAY_TOKEN', token), \
+             patch.object(W.httpx, 'get', return_value=response) as get, \
+             patch.object(W.httpx, 'post', side_effect=AssertionError('provider forbidden')):
+            self.assertEqual(W.check_model_gateway_consumer_contract(), 'ok')
+        self.assertEqual(get.call_args.args,
+                         ('http://model-gateway:39000/v1/consumer-contract',))
+        self.assertEqual(get.call_args.kwargs['headers'], {'x-api-key': token})
+        self.assertFalse(get.call_args.kwargs['follow_redirects'])
+        self.assertFalse(get.call_args.kwargs['trust_env'])
+
+    def test_consumer_contract_separates_drift_from_unavailable_proof(self):
+        token = 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789_-token'
+        unauthorized = type('Response', (), {'status_code': 401})()
+        with patch.object(W, 'MODEL_GATEWAY_TOKEN', token), \
+             patch.object(W.httpx, 'get', return_value=unauthorized):
+            self.assertEqual(W.check_model_gateway_consumer_contract(), 'mismatch')
+        anomalies, details = {}, {}
+        W.apply_model_gateway_consumer_contract('mismatch', anomalies, details)
+        self.assertTrue(anomalies['gateway_consumer_config_drift'])
+        self.assertFalse(anomalies['gateway_consumer_contract_unhealthy'])
+        W.apply_model_gateway_consumer_contract('unavailable', anomalies, details)
+        self.assertFalse(anomalies['gateway_consumer_config_drift'])
+        self.assertTrue(anomalies['gateway_consumer_contract_unhealthy'])
+
     def test_untrusted_urls_stale_and_failed_sources_never_clear(self):
         for url in ('https://public.example', 'http://evil.invalid:8080',
                     'http://token@127.0.0.1:8080', 'http://127.0.0.1:8080/messages'):
@@ -192,7 +227,8 @@ class GatewayWatchdogTests(unittest.TestCase):
         # check, mocking only this new independent sampler (no network).
         module = importlib.import_module('tests.test_watchdog_capture')
         healthy = {name: False for name in W.GATEWAY_ALERTS}
-        with patch.object(W, 'check_gateway_monitor', return_value=healthy):
+        with patch.object(W, 'check_gateway_monitor', return_value=healthy), \
+             patch.object(W, 'check_model_gateway_consumer_contract', return_value='ok'):
             for name in sorted(vars(module)):
                 if name.startswith('test_'):
                     with self.subTest(name=name): getattr(module, name)()

@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
+import re
 import subprocess
 import sys
 import time
@@ -57,6 +58,13 @@ load_kg_hub_env(override=True)
 KG_HUB_URL = os.environ.get("KG_HUB_URL", "http://127.0.0.1:8080")
 KG_HUB_TOKEN = os.environ.get("KG_HUB_API_TOKEN", "")
 FEISHU_WEBHOOK = os.environ.get("KG_HUB_FEISHU_WEBHOOK", "").strip()
+MODEL_GATEWAY_URL = os.environ.get(
+    "ANTHROPIC_BASE_URL", "http://model-gateway:39000"
+).strip().rstrip("/")
+MODEL_GATEWAY_TOKEN = os.environ.get("KG_HUB_MODEL_GATEWAY_TOKEN", "").strip()
+MODEL_GATEWAY_BUSINESS_KEY = os.environ.get(
+    "ANTHROPIC_MODEL", "kg_hub.entity_extract"
+).strip()
 
 STATE_DIR = Path.home() / ".kg-hub" / "state"
 STATE_FILE = STATE_DIR / "watchdog.json"
@@ -329,6 +337,69 @@ GATEWAY_ALERTS = {
     'authentication_failed': ('gateway_authentication_failed', '当前配置最近自然业务调用鉴权失败；请核实凭据。'),
     'provider_failed': ('gateway_provider_failed', '当前配置最近自然业务调用被拒绝或供应商失败。'),
 }
+
+
+def check_model_gateway_consumer_contract() -> str:
+    """Reconcile the running kg-hub consumer against the central caller registry.
+
+    This endpoint authenticates with kg-hub's existing *caller* token and only
+    returns that caller's allowed logical business keys.  It does not probe a
+    model, retrieve a provider credential, or echo the caller token.  Keeping
+    the expected host fixed to the private Docker alias also makes a hand-edited
+    public provider URL a deterministic drift alert rather than a silent route.
+    """
+    try:
+        parsed = urlsplit(MODEL_GATEWAY_URL)
+        if (parsed.scheme != "http" or parsed.hostname != "model-gateway"
+                or parsed.port != 39000 or parsed.username or parsed.password
+                or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+                or not re.fullmatch(r"kg_hub\.[A-Za-z0-9][A-Za-z0-9._-]{0,119}",
+                                    MODEL_GATEWAY_BUSINESS_KEY)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", MODEL_GATEWAY_TOKEN)):
+            return "mismatch"
+        response = httpx.get(
+            MODEL_GATEWAY_URL + "/v1/consumer-contract",
+            headers={"x-api-key": MODEL_GATEWAY_TOKEN}, timeout=5.0,
+            follow_redirects=False, trust_env=False,
+        )
+        if response.status_code in {401, 403}:
+            return "mismatch"
+        if response.status_code != 200:
+            return "unavailable"
+        payload = response.json()
+        if (not isinstance(payload, dict) or set(payload) != {
+                    "version", "caller", "business_keys", "external_calls"}
+                or payload.get("version") != 1
+                or payload.get("caller") != "kg-hub"
+                or payload.get("business_keys") != [MODEL_GATEWAY_BUSINESS_KEY]
+                or payload.get("external_calls") != 0):
+            return "mismatch"
+        return "ok"
+    except Exception:
+        # Never put response bodies, exception text, URLs or headers into the
+        # alert channel: a misconfigured proxy may contain a credential.
+        return "unavailable"
+
+
+def apply_model_gateway_consumer_contract(
+        verdict: str, anomalies: dict, details: dict
+) -> None:
+    """Keep configuration drift distinct from an unreachable proof endpoint."""
+    anomalies["gateway_consumer_config_drift"] = verdict == "mismatch"
+    anomalies["gateway_consumer_contract_unhealthy"] = verdict == "unavailable"
+    details["gateway_consumer_config_drift"] = (
+        "kg-hub 的网关地址、业务 key 或调用方令牌与中央授权不一致；"
+        "已拒绝将其误判为模型额度或供应商故障。"
+    )
+    details["gateway_consumer_contract_unhealthy"] = (
+        "无法读取零付费的网关调用方授权契约；本轮不推断凭据失效或配置已恢复。"
+    )
+    details["gateway_consumer_config_drift:clear"] = (
+        "kg-hub 运行时三元组已与中央调用方授权一致；未发起模型请求。"
+    )
+    details["gateway_consumer_contract_unhealthy:clear"] = (
+        "网关调用方授权契约已恢复可读；未发起模型请求。"
+    )
 
 
 def check_gateway_monitor() -> dict | None:
@@ -845,6 +916,9 @@ def main() -> int:
     # Independent from capture decisions: readiness 503 must not erase capture
     # monitoring, and missing/idle business traffic is not an invalid API key.
     apply_gateway_monitor(check_gateway_monitor(), prev_anomalies, new_anomalies, details)
+    apply_model_gateway_consumer_contract(
+        check_model_gateway_consumer_contract(), new_anomalies, details,
+    )
 
     pending, blocker_ids = deliver_alerts(
         state, new_anomalies, details,

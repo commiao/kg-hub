@@ -33,9 +33,31 @@ class ModelGatewayTokenHelperTests(unittest.TestCase):
             (ROOT / "deploy/nas/.env.example").read_text("utf-8"),
             encoding="utf-8",
         )
-        return root, helper, nas / ".env"
+        (root / ".env.example").write_text(
+            (ROOT / "deploy/nas/.env.example").read_text("utf-8"),
+            encoding="utf-8",
+        )
+        # The release controller and production Compose resolve this root file;
+        # deploy/nas/.env is only a legacy import source.
+        return root, helper, root / ".env"
 
     def run_helper(self, helper: Path, token_path: Path):
+        # Mirror the centrally managed caller registry beside its 0600 delivery
+        # token. The helper must derive kg-hub's logical route from this source
+        # rather than retaining a hand-edited ANTHROPIC_MODEL in the consumer.
+        try:
+            token = token_path.read_text("ascii").strip()
+            if token_path.is_file() and not token_path.is_symlink():
+                callers = token_path.with_name("callers.json")
+                callers.write_text(json.dumps({"callers": {
+                    "kg-hub": {
+                        "token": token,
+                        "business_keys": ["kg_hub.entity_extract"],
+                    },
+                }}), encoding="utf-8")
+                callers.chmod(0o600)
+        except OSError:
+            pass
         env = {**os.environ, "PYTHON": sys.executable}
         return subprocess.run(
             ["sh", str(helper), str(token_path)], env=env,
@@ -147,7 +169,7 @@ class ModelGatewayTokenHelperTests(unittest.TestCase):
         token_path = root / "caller-token-kg-hub"
         token_path.write_text(caller_token + "\n", encoding="ascii")
         token_path.chmod(0o600)
-        legacy = root / ".env"
+        legacy = root / "deploy/nas/.env"
         legacy_document = "\n".join([
             "FALKORDB_PASSWORD=" + falkor_password,
             "KG_HUB_API_TOKEN=" + api_token,
@@ -222,7 +244,11 @@ class ModelGatewayTokenHelperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         values = self.dotenv(env_path)
         for key, value in custom.items():
-            expected = caller_token if key == "KG_HUB_MODEL_GATEWAY_TOKEN" else value
+            expected = {
+                "KG_HUB_MODEL_GATEWAY_TOKEN": caller_token,
+                "ANTHROPIC_BASE_URL": "http://model-gateway:39000",
+                "ANTHROPIC_MODEL": "kg_hub.entity_extract",
+            }.get(key, value)
             self.assertEqual(values[key], expected, key)
         migrated = env_path.read_text("utf-8")
         for key, value in provider_tokens.items():
@@ -334,6 +360,11 @@ class ModelGatewayTokenHelperTests(unittest.TestCase):
         token_path = root / "caller-token-kg-hub"
         token_path.write_text(caller_token + "\n", encoding="ascii")
         token_path.chmod(0o600)
+        (root / "callers.json").write_text(json.dumps({"callers": {
+            "kg-hub": {"token": caller_token,
+                       "business_keys": ["kg_hub.entity_extract"]},
+        }}), encoding="utf-8")
+        (root / "callers.json").chmod(0o600)
         command = documented.replace(
             "/absolute/path/to/caller-token-kg-hub", str(token_path)
         ).split()
@@ -415,8 +446,11 @@ class ComposeDataRootTests(unittest.TestCase):
             "/absolute/path/to/caller-token-kg-hub",
             migration,
         )
+        self.assertIn("--env-file .env", migration)
+        # This retired script never runs (it exits before its legacy body), so
+        # it is not an active configuration authority.
+        self.assertIn("--env-file deploy/nas/.env", redeploy)
         for source in (migration, redeploy):
-            self.assertIn("--env-file deploy/nas/.env", source)
             self.assertIn("-f docker-compose.yml", source)
             self.assertIn("-f deploy/model-gateway-network.override.yml", source)
             self.assertIn("-p kg-hub", source)
@@ -428,7 +462,7 @@ class ComposeDataRootTests(unittest.TestCase):
             "/absolute/path/to/caller-token-kg-hub",
             guide,
         )
-        self.assertIn("--env-file deploy/nas/.env", guide)
+        self.assertIn("--env-file .env", guide)
         self.assertIn("-f deploy/model-gateway-network.override.yml", guide)
         self.assertIn("KG_HUB_MODEL_GATEWAY_TOKEN", guide)
         self.assertIn("KG_HUB_API_TOKEN", guide)

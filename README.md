@@ -132,7 +132,7 @@ docker network create model-gateway-private
 export MODEL_GATEWAY_PRIVATE_NETWORK=model-gateway-private
 docker compose -f /path/to/credvault/deploy/docker-compose.example.yml \
   -f /path/to/credvault/deploy/docker-compose.private-network.yml up -d
-docker compose --env-file deploy/nas/.env -f docker-compose.yml \
+docker compose --env-file .env -f docker-compose.yml \
   -f deploy/model-gateway-network.override.yml up -d
 ```
 

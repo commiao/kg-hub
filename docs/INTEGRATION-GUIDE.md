@@ -35,11 +35,11 @@
    ```sh
    sh deploy/nas/configure-model-gateway-token.sh /absolute/path/to/caller-token-kg-hub
    ```
-   helper 会原子创建 `deploy/nas/.env`（0600），自动生成独立的
+   helper 会原子创建仓库根目录 `.env`（0600），自动生成独立的
    `FALKORDB_PASSWORD` 与 `KG_HUB_API_TOKEN`，并写入 gateway caller token。
 3. 从仓库根目录用固定 env、compose 文件和 project name 启动：
    ```sh
-   docker compose --env-file deploy/nas/.env \
+   docker compose --env-file .env \
      -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
      -p kg-hub up -d
    ```
@@ -62,7 +62,7 @@ KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
 ```
 
 这里的 `KG_HUB_API_TOKEN` 是**客户端 → kg-hub server** 的 Bearer token；服务端
-`deploy/nas/.env` 中的 `KG_HUB_MODEL_GATEWAY_TOKEN` 是**kg-hub → model-gateway** 的 caller token。两者用途不同，不能混用；provider 凭证只在 credvault，kg-hub 与客户端都不保存。
+根目录 `.env` 中的 `KG_HUB_MODEL_GATEWAY_TOKEN` 是**kg-hub → model-gateway** 的 caller token。两者用途不同，不能混用；provider 凭证只在 credvault，kg-hub 与客户端都不保存。
 
 **muxcp 网关**(各工具 MCP 都连它):确认 `~/.config/muxcp/run-muxcp.sh` 存在且其上游含 `kg_hub`(指向本机 `mcp_server.py`,纯 HTTP 客户端)。
 

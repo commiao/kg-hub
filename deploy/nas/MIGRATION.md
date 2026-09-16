@@ -37,9 +37,9 @@
 ### 2. 配置 .env
 ```sh
 cd /volume1/docker/kg-hub-src
-# 不要先 cp .env.example；helper 会用 0600 临时文件原子创建 deploy/nas/.env。
+# 不要先 cp .env.example；helper 会用 0600 临时文件原子创建仓库根目录 .env。
 sh deploy/nas/configure-model-gateway-token.sh /absolute/path/to/caller-token-kg-hub
-# 然后核对 KG_HUB_DATA_ROOT；保持 deploy/nas/.env 权限为 0600。
+# 然后核对 KG_HUB_DATA_ROOT；保持根目录 .env 权限为 0600。
 # ANTHROPIC_BASE_URL 只保留 model-gateway 服务 DNS，MODEL 必须是 kg_hub.* 业务 key。
 # 禁止从 ~/.claude-mem/.env 复制任何模型/provider token。
 ```
@@ -47,26 +47,25 @@ sh deploy/nas/configure-model-gateway-token.sh /absolute/path/to/caller-token-kg
 helper 从 `.env.example` 初始化时会用系统 CSPRNG 自动生成彼此独立的
 `FALKORDB_PASSWORD` 与 `KG_HUB_API_TOKEN`，并从给定的 0600 文件写入
 `KG_HUB_MODEL_GATEWAY_TOKEN`。已有的强自定义密码/token 会原样保留；弱的非占位自定义值会让 helper 拒绝修改，需操作者明确更换后重跑。helper 不打印任何 secret。
-若旧部署只有仓库根目录的 0600 `.env`，helper 会只迁移既有的
-`FALKORDB_PASSWORD`、`KG_HUB_API_TOKEN` 和其他非 provider 配置；任何 provider API key
-都会被删除。首次从旧根目录 `.env` 迁移时，旧的直连
-`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` 会改成模板网关值；一旦
-`deploy/nas/.env` 建立，helper 仅补缺失/占位配置，已有的数据根、网关地址、
-业务 Key、私网名及其他非 provider 配置均原样保留。
+发布和 Compose 的唯一配置源是仓库根目录的 0600 `.env`。若旧部署还只有
+`deploy/nas/.env`，helper 会把其中的服务密码与非 provider 配置一次性迁移到根目录；
+任何 provider API key 都会被删除。网关地址与业务 key 不再接受手工覆盖，而是由中央
+`callers.json` 中的 `kg-hub` scope 固定生成：`model-gateway:39000` 与
+`kg_hub.entity_extract`。模型、provider 与真实 API Key 不会进入 kg-hub 配置。
 为避免未同步轮换导致现有 FalkorDB 立即失联，首次迁移允许原样保留旧 `.env` 中可打印、
 非占位但未达到新强度标准的既有服务密码，并只输出不含值的轮换提醒；一旦
-`deploy/nas/.env` 建立，后续重跑仍严格拒绝弱值。旧 `.env` 本身保持不变，确认新部署
-稳定后再单独安排密码轮换及归档/删除。
+根目录 `.env` 建立，后续重跑仍严格拒绝弱值。旧 `deploy/nas/.env` 不再是运行配置源；
+确认根目录 `.env` 与运行态一致后，可另行归档它。
 
 ### 3. 构建并启动
 ```sh
 cd /volume1/docker/kg-hub-src
 # 该 external network 必须由操作者预先创建；Compose 不会自动创建或发布 model-gateway。
 docker network create model-gateway-private
-docker compose --env-file deploy/nas/.env \
+docker compose --env-file .env \
   -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
   -p kg-hub build
-docker compose --env-file deploy/nas/.env \
+docker compose --env-file .env \
   -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
   -p kg-hub up -d falkordb # 先只起 DB,准备导入数据(见步骤 4)
 ```
@@ -88,7 +87,7 @@ rsync -av /Users/mac/workspace_claudeCode/kg-hub/data/falkordb/ \
 ```
 **在 NAS 上:** 确保拷入后,重启 falkordb 让其加载:
 ```sh
-docker compose --env-file deploy/nas/.env \
+docker compose --env-file .env \
   -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
   -p kg-hub restart falkordb
 # 校验节点数应与本机一致
@@ -98,7 +97,7 @@ docker exec kg-hub-falkordb redis-cli --no-auth-warning -a "$FALKORDB_PASSWORD" 
 
 ### 5. 起 server
 ```sh
-docker compose --env-file deploy/nas/.env \
+docker compose --env-file .env \
   -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
   -p kg-hub up -d
 curl -s http://localhost:17171/health
