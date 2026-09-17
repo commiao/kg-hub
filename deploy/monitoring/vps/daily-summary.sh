@@ -44,6 +44,7 @@ ING=$(printf '%s' "$OUT" | cut -f2);  REJ=$(printf '%s' "$OUT" | cut -f3)
 LAG=$(printf '%s' "$OUT" | cut -f4);  BACK=$(printf '%s' "$OUT" | cut -f5)
 NODES=$(printf '%s' "$OUT" | cut -f6); AGE=$(printf '%s' "$OUT" | cut -f7)
 HALT=$(printf '%s' "$OUT" | cut -f8); FLAGS=$(printf '%s' "$OUT" | cut -f9)
+QUOTA=$(printf '%s' "$OUT" | cut -f10)
 
 # 计数字段缺失也要报警,别拿空值去算差 —— 那正是旧版把"文件没了"算成
 # "今天没新增"的同一个坑,只不过换了个位置。
@@ -63,6 +64,10 @@ prev=$(cat "$BASEF" 2>/dev/null)
 printf '%s %s\n' "$ING" "$REJ" > "$BASEF"
 tail="落后 $LAG 条、积压 $BACK、图节点 $NODES"
 [ "$FLAGS" = "-" ] || tail="$tail｜$FLAGS"
+# 配额天天带上,不是只在撞线时才说。09-16 kg_hub 曾用满 5000/5000 而没人知道,
+# 就是因为它从没出现在任何一条日常汇报里。
+[ "$QUOTA" = "-" ] || tail="$tail
+   网关今日用量：$QUOTA"
 
 if [ -z "$prev" ]; then
   send "📊 kg-hub 日报（首次基线）：累计入图 $ING、拒 $REJ。$tail"

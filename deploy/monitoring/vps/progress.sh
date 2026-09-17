@@ -46,7 +46,23 @@ esac
 ING=$(printf '%s' "$OUT" | cut -f2);  LAG=$(printf '%s' "$OUT" | cut -f4)
 BACK=$(printf '%s' "$OUT" | cut -f5); AGE=$(printf '%s' "$OUT" | cut -f7)
 HALT=$(printf '%s' "$OUT" | cut -f8); FLAGS=$(printf '%s' "$OUT" | cut -f9)
+QUOTA=$(printf '%s' "$OUT" | cut -f10)
 case "$ING" in ''|*[!0-9]*) exit 0 ;; esac   # 计数读不出 -> 交给日报去报,这里不重复喊
+
+# 配额逼近上限:边沿触发喊一次。只在分母确实拿得到时判 —— 上限取不到时不猜,
+# 那种情况由日报如实带出"配额上限取不到",不在这里制造一条假警报。
+QHOT=$(printf '%s' "$QUOTA" | awk '{
+  for (i = 1; i <= NF; i++) {
+    if (split($i, a, "=") == 2 && split(a[2], b, "/") == 2 && b[2] ~ /^[0-9]+$/) {
+      if (b[2] > 0 && b[1] * 100 / b[2] >= 90) printf "%s ", $i
+    }
+  }
+}')
+if [ -n "$QHOT" ] && [ "$palarm" != "quota" ]; then
+  send "⚠️ kg-hub：网关配额逼近上限（$QHOT）。今日用量：$QUOTA"
+  printf '%s %s quota\n' "$ING" "$psince" > "$STATEF"
+  exit 0
+fi
 
 # 计数涨了 = 管线在干活。刷新"上次前进时刻",并在刚从告警里出来时报一次恢复。
 if [ "$ING" -gt "$ping" ]; then
