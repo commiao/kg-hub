@@ -277,18 +277,69 @@ DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
 MAX_DISK_TEMP = int(os.environ.get("KG_HUB_REFINERY_MAX_DISK_TEMP", "52"))
 
 
-def max_disk_temp() -> int | None:
-    """全部盘温取最大。读不到(非群晖/未挂载)返回 None = 不拦,但会记进 status。"""
-    temps = []
+# 承载 KG_HUB_DATA_ROOT 的那块盘的名字(如 "sata3")。**只用于记录,不参与判定。**
+#
+# 2026-09-17 实测:闸门取全盘最大值,当时 sata1=57 sata2=58(都属 /volume1)、
+# 而 kg-hub 的数据根 /volume2/4T 落在 sata3=47。也就是说管线被两块自己根本不写
+# 的盘停掉,白白浪费 11 度余量 —— 当天只处理了 208 条,而配额够 5000 条。
+#
+# 但**不能**就这么把判定换成只看这一块:同机箱有热耦合,kg-hub 自己干活会不会
+# 把 sata1/2 带热是个实证问题,不是推理问题;而 DSM 强制关机线只有 ~61°C,
+# 判断错的代价是整台 NAS 停机(2026-08 已经发生过一次,持续两周)。
+# 所以先记几天真实数据,再拿数据决定要不要改判定依据。
+DATA_DISK = os.environ.get("KG_HUB_REFINERY_DATA_DISK", "").strip()
+
+
+def disk_temps() -> dict[str, int]:
+    """每块盘各记一个,{"sata1": 57, ...}。读不到的盘跳过,读不到任何盘返回 {}。
+
+    原来只回一个最大值,于是"是哪块盘热"这个问题在状态里根本没有答案 ——
+    而它恰恰是判断闸门有没有拦错盘的唯一依据。
+    """
+    temps: dict[str, int] = {}
     try:
-        for f in DISKTEMP_DIR.glob("*/temperature"):
+        for f in sorted(DISKTEMP_DIR.glob("*/temperature")):
             try:
-                temps.append(int(f.read_text().strip()))
+                temps[f.parent.name] = int(f.read_text().strip())
             except Exception:  # noqa: BLE001
                 pass
     except Exception:  # noqa: BLE001
         pass
-    return max(temps) if temps else None
+    return temps
+
+
+def max_disk_temp() -> int | None:
+    """全部盘温取最大。读不到(非群晖/未挂载)返回 None = 不拦,但会记进 status。"""
+    temps = disk_temps()
+    return max(temps.values()) if temps else None
+
+
+# 当日歇工累计。歇工是"什么都没发生",在状态里和"今天很闲"长得一模一样 ——
+# 不把它累计出来,就永远说不清 208 条/天里有多少是被温度挡掉的。
+_thermal_today: dict[str, object] = {"day": "", "holds": 0, "seconds": 0}
+
+
+def note_thermal(held: bool, temps: dict[str, int]) -> dict[str, object]:
+    """累计当日歇工次数/秒数(UTC 日切清零),返回可直接写进 status 的一段。"""
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    if _thermal_today["day"] != today:
+        _thermal_today.update(day=today, holds=0, seconds=0)
+    if held:
+        _thermal_today["holds"] = int(_thermal_today["holds"]) + 1
+        # 歇工一轮 = 整整一个 INTERVAL 没干活。
+        _thermal_today["seconds"] = int(_thermal_today["seconds"]) + INTERVAL
+    out: dict[str, object] = {
+        "day": today,
+        "holds": _thermal_today["holds"],
+        "minutes": round(int(_thermal_today["seconds"]) / 60, 1),
+        "threshold": MAX_DISK_TEMP,
+        "disks": dict(temps),
+    }
+    # 承载盘单列一栏:闸门拦的是 max(全部),这一栏是"本来只看自己那块会是多少"。
+    if DATA_DISK:
+        out["data_disk"] = DATA_DISK
+        out["data_disk_temp"] = temps.get(DATA_DISK)
+    return out
 
 
 # ---------- 水印 ----------
@@ -798,17 +849,26 @@ async def main() -> int:
                 quota_day = datetime.now(tz=CST).date()
                 decided.clear()
             # —— 温度门控:盘温超阈值本轮完全歇工(只写状态心跳),保硬件 ——
-            dtemp = max_disk_temp()
-            if dtemp is not None and dtemp >= MAX_DISK_TEMP:
-                log.warning("[thermal] 盘温 %d°C ≥ 阈值 %d°C,本轮歇工", dtemp, MAX_DISK_TEMP)
-                write_status(disk_temp=dtemp, thermal_hold=True,
+            # 判定依据仍是 max(全部盘),一个字没改。变的只是记录:每块盘各记一格、
+            # 当日歇工累计成时长。歇工在状态里跟"今天很闲"长得一模一样,不累计
+            # 出来就永远说不清 208 条/天里有多少是被温度挡掉的。
+            temps = disk_temps()
+            dtemp = max(temps.values()) if temps else None
+            held = dtemp is not None and dtemp >= MAX_DISK_TEMP
+            thermal = note_thermal(held, temps)
+            if held:
+                log.warning("[thermal] 盘温 %d°C ≥ 阈值 %d°C,本轮歇工"
+                            "(今日已歇 %s 次/%s 分钟;各盘 %s)",
+                            dtemp, MAX_DISK_TEMP, thermal["holds"],
+                            thermal["minutes"], temps)
+                write_status(disk_temp=dtemp, thermal_hold=True, thermal=thermal,
                              backlog_window_open=in_backlog_window(), last_error=None)
                 await asyncio.sleep(INTERVAL)
                 continue
             # —— 工作窗口门控(默认北京时间 22:00-08:00):窗口外新 obs 与
             # 积压一律不动,只留心跳。数据在 db/水印里等着,窗口一开自动追平。
             if not in_backlog_window():
-                write_status(disk_temp=dtemp, thermal_hold=False,
+                write_status(disk_temp=dtemp, thermal_hold=False, thermal=thermal,
                              backlog_window_open=False, idle_outside_window=True,
                              last_error=None)
                 await asyncio.sleep(INTERVAL)
@@ -836,7 +896,8 @@ async def main() -> int:
                 但**进度**必须增量可见 —— 与今天修的"200 条一批才落一次账"同一类。
                 """
                 write_status(
-                    disk_temp=dtemp, thermal_hold=False, idle_outside_window=False,
+                    disk_temp=dtemp, thermal_hold=False, thermal=thermal,
+                    idle_outside_window=False,
                     boundary_id=boundary, live_cursor=wm.get("live_cursor"),
                     backlog_window_open=in_backlog_window(),
                     per_cycle=BACKLOG_PER_CYCLE,

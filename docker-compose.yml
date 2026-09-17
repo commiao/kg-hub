@@ -298,6 +298,13 @@ services:
       - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
       - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-52}
+      # 承载 KG_HUB_DATA_ROOT 的那块盘(如 sata3)。**只用于记录,不参与判定** ——
+      # 闸门仍取 max(全部盘)。填了它,status.json 才会单列"本来只看自己那块
+      # 会是多少",否则"闸门是不是拦错盘"只能靠人 ssh 上去翻。
+      # 怎么查:`df -P $KG_HUB_DATA_ROOT` 拿到 cachedev_N,
+      #        再 `ls -l /sys/block/dm-*/slaves/` 找到对应 mdN,
+      #        最后 `cat /proc/mdstat` 看 mdN 由哪块 sata 组成。
+      - KG_HUB_REFINERY_DATA_DISK=${KG_HUB_REFINERY_DATA_DISK:-}
     volumes:
       # 群晖盘温直读(免sudo),温度门控数据源
       - /run/synostorage/disks:/disktemp:ro
