@@ -234,9 +234,27 @@ nas_fts=$(echo "$probe"     | sed -n 's/^fts=//p')
 GUARD_LOCAL="$(dirname "$APPLIER_LOCAL")/sync_guard.py"
 GUARD_REMOTE="$(dirname "$APPLIER_REMOTE")/sync_guard.py"
 guard_sha=$(shasum -a 256 "$GUARD_LOCAL" | cut -d' ' -f1)
-remote_guard=$(ssh $SSHOPT "$NAS" "sha256sum '$GUARD_REMOTE' 2>/dev/null" | cut -d' ' -f1)
+# ssh 自身的连接报错要吞掉:tailnet 抖一下就往 err 日志里塞一行裸的
+# "Connection closed by <ip>",事后分不清是网络问题还是校验没过。
+remote_guard=$(ssh $SSHOPT "$NAS" "sha256sum '$GUARD_REMOTE' 2>/dev/null" 2>/dev/null | cut -d' ' -f1)
 if [ "$guard_sha" != "$remote_guard" ]; then
-  ssh $SSHOPT "$NAS" "cat > '$GUARD_REMOTE.$$.tmp' && test \"\$(sha256sum '$GUARD_REMOTE.$$.tmp' | cut -d' ' -f1)\" = '$guard_sha' && mv -f '$GUARD_REMOTE.$$.tmp' '$GUARD_REMOTE'" < "$GUARD_LOCAL" || exit 1
+  ssh $SSHOPT "$NAS" "cat > '$GUARD_REMOTE.$$.tmp' && test \"\$(sha256sum '$GUARD_REMOTE.$$.tmp' | cut -d' ' -f1)\" = '$guard_sha' && mv -f '$GUARD_REMOTE.$$.tmp' '$GUARD_REMOTE'" < "$GUARD_LOCAL" 2>/dev/null
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    # 255 是 ssh 自己没连上,不是远端校验失败。上面第一处探测通过**不代表这一刻
+    # 还通** —— 2026-09-17 23:13 就是探测过了几秒后链路抖了,于是这里以 exit 1
+    # 收场,而且一个字都没写进日志,只在 stderr 留下一行裸的 ssh 报错。查起来只能
+    # 靠猜。
+    #
+    # 同一个脚本里推 applier 的那处早就是这么处理的(「本轮跳过」+ exit 0),
+    # 这里是漏网的一处。跳过是安全的:水位取的是 NAS 侧 MAX(id),本地什么都没改,
+    # 下个周期自己会重来。
+    if [ "$rc" = 255 ]; then
+      echo "$(ts) NAS 不可达(推 sync_guard 时),本轮跳过"; exit 0
+    fi
+    # 非 255 才是真问题(远端校验对不上、磁盘满等)。保留非零退出码,但必须留话。
+    echo "$(ts) sync_guard 推送失败(rc=$rc),需人工看一眼"; exit 1
+  fi
 fi
 want=$(shasum -a 256 "$APPLIER_LOCAL" | cut -c1-16)
 if [ "$nas_applier" != "$want" ]; then

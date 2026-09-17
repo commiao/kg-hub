@@ -197,3 +197,82 @@ class SyncSafety(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GuardPushTransportTests(unittest.TestCase):
+    """链路抖一下不该被记成失败。
+
+    2026-09-17 23:13 现场：launchd 记下 com.kg-hub.claude-mem-ingest 退出码 1，
+    而 out 日志里**一个字都没有** —— 因为推 sync_guard.py 那处写的是光秃秃的
+    `|| exit 1`，不留话。只能从 err 日志里一行裸的 "Connection closed by <ip>"
+    反推。
+
+    根子是：脚本开头探一次 NAS 是否可达，但那之后每一次 ssh 都可能再抖一次。
+    同一个脚本里推 applier 的那处早就按「本轮跳过」处理了，这里是漏网的一处。
+    跳过是安全的：水位取的是 NAS 侧 MAX(id)，本地没有任何状态被推进。
+    """
+
+    SCRIPT = ROOT / 'tools/sync_claude_mem_to_nas.sh'
+    # 探测放行；读远端 guard 哈希时给一个对不上的值，逼它走推送；推送按参数失败。
+    SSH = (
+        '#!/bin/sh\n'
+        'for a in "$@"; do cmd="$a"; done\n'
+        'case "$cmd" in\n'
+        "  *integ=*)    printf 'max=1\\ninteg=ok\\nfts=1\\napplier=deadbeefdeadbeef\\n'; exit 0 ;;\n"
+        '  *"cat > "*)  echo "%s" >&2; exit %s ;;\n'
+        '  *sha256sum*) echo "0000000000000000  guard"; exit 0 ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+
+    def _stage(self, ssh_body):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        for name in ('state', 'inbox', 'bin'):
+            (root / name).mkdir()
+        source = root / 'claude-mem.db'
+        with sqlite3.connect(source) as db:
+            db.execute('CREATE TABLE observations (id INTEGER PRIMARY KEY, body TEXT)')
+            db.execute("INSERT INTO observations VALUES (1, 'x')")
+        shutil.copy(ROOT / 'tools/sync_guard.py', root)
+        shutil.copy(ROOT / 'tools/nas_apply_claude_mem_delta.sh', root)
+        text = (self.SCRIPT.read_text()
+                .replace('/Users/mac/.claude-mem/claude-mem.db', str(source))
+                .replace('/Users/mac/public-sync/kg-hub-inbox', str(root / 'inbox'))
+                .replace('/Users/mac/.kg-hub/state', str(root / 'state')))
+        script = root / 'sync.sh'
+        script.write_text(text)
+        fake = root / 'bin' / 'ssh'
+        fake.write_text(ssh_body)
+        fake.chmod(0o755)
+        return root, script
+
+    def _run(self, root, script):
+        env = dict(os.environ, PATH=f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}")
+        return subprocess.run(['/bin/sh', str(script), '--guarded'],
+                              capture_output=True, text=True, timeout=120, env=env)
+
+    def test_a_transport_blip_while_pushing_the_guard_is_a_skip_not_a_failure(self):
+        root, script = self._stage(
+            self.SSH % ('ssh: connect to host 1.2.3.4 port 22: Operation timed out', 255))
+        done = self._run(root, script)
+        self.assertEqual(done.returncode, 0,
+                         f'链路抖动不该记成失败\nstdout={done.stdout}\nstderr={done.stderr}')
+        self.assertIn('本轮跳过', done.stdout,
+                      '每一条退出路径都必须留话，否则只能靠 stderr 碎片反推')
+        self.assertNotIn('Connection closed', done.stderr,
+                         'ssh 自己的连接报错不该漏进 err 日志')
+
+    def test_a_real_remote_failure_still_exits_non_zero_and_says_so(self):
+        # 非 255 = 远端真的没通过校验（哈希对不上、盘满…）。这种必须留下非零
+        # 退出码，否则「跳过」就成了万能挡箭牌，真故障永远没人知道。
+        root, script = self._stage(self.SSH % ('checksum mismatch', 1))
+        done = self._run(root, script)
+        self.assertEqual(done.returncode, 1, f'真失败必须非零\nstdout={done.stdout}')
+        self.assertIn('需人工看一眼', done.stdout)
+
+
+
+if __name__ == "__main__":
+    unittest.main()
