@@ -1,7 +1,10 @@
 # Mac 本机服务定义
 
-kg-hub 在这台 Mac 上的 6 个 launchd 服务。**这里是唯一真源**，机器上
+这台 Mac 上由本仓库管的 7 个 launchd 服务。**这里是唯一真源**，机器上
 `~/Library/LaunchAgents/` 里的那份是渲染出来的副本。
+
+其中 6 个姓 `com.kg-hub.*`，还有一个是 `com.claude-mem.worker`——它不姓 kg-hub，
+但同样归这里管，理由见下表那一行。
 
 ## 为什么存在
 
@@ -12,7 +15,7 @@ kg-hub 在这台 Mac 上的 6 个 launchd 服务。**这里是唯一真源**，�
 后果：这台 Mac 挂了要凭记忆重建；改调度没有历史也没人 review；另一个 actor 不
 知道你动过。
 
-## 6 个服务
+## 7 个服务
 
 | Label | 频率 | 干什么 | 挂了会怎样 |
 |---|---|---|---|
@@ -22,8 +25,35 @@ kg-hub 在这台 Mac 上的 6 个 launchd 服务。**这里是唯一真源**，�
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |
 | `weekly-report` | 周日 9:00 | 周报 | 少一封周报 |
+| `com.claude-mem.worker` | 常驻 | claude-mem 采集 worker 的**兜底看门人** | 见下 |
 
-前三个是链路的一部分，后三个是报表。
+前三个是链路的一部分，中间三个是报表，最后一个见下。
+
+### 为什么 `com.claude-mem.worker` 在这里
+
+它是 claude-mem 的服务、不是 kg-hub 的，label 也保持 claude-mem 自己的名字——
+**必须保持**，这样装上去是替换插件那份，而不是与它并存（并存会有两个 job 各起
+一份 worker）。放进来是因为它原本的监管是名存实亡的，而 kg-hub 的采集完全依赖
+它产出的数据。
+
+两个独立的根因（2026-09-17 查实）：
+
+1. 旧 plist 写死版本号路径 `13.24.5/…`。插件升到 13.24.23、旧 cache 被回收后，
+   program 路径彻底不存在。
+2. 更隐蔽：旧 plist 指向的 `worker-wrapper.cjs` 在内层 worker 崩溃时走
+   `process.exit(0)`；被 SIGKILL 时退出码是 `null` → 转成 0，正好落进
+   `KeepAlive={Crashed:true, SuccessfulExit:false}` 的「不重启」那一档——
+   **崩溃反而是唯一不会被拉起的情形**。9-11 15:54 那次 SIGKILL 之后 worker 死了
+   10 小时，直到 9-12 01:51 下一个会话的 hook 才把它拉起来。
+
+现在由 `tools/claude_mem_worker_launchd.sh` 现查版本后直接前台 exec
+`worker-service.cjs`，`KeepAlive` 改成无条件 `true`。
+
+**它是待机而不是抢占。** worker 靠一个固定端口做单例（`~/.claude-mem/settings.json`
+的 `CLAUDE_MEM_WORKER_PORT`）。端口被占就每 5s 重查、原地等，不抢也不空转重启。
+有会话在跑时 hook 6 秒就能拉起 worker，比 launchd 的 `ThrottleInterval` 快，常常
+抢先——这没关系，有人拉起就行。**launchd 的价值在 hook 够不着的地方：没有任何
+会话在跑的时候。** 那正是上面那 10 小时的缺口。
 
 ## 用法
 

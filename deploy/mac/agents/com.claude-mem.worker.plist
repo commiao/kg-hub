@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-mem.worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>__REPO__/tools/claude_mem_worker_launchd.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ANTHROPIC_DEFAULT_HAIKU_MODEL</key>
+        <string>claude_mem.observation</string>
+        <key>ANTHROPIC_DEFAULT_OPUS_MODEL</key>
+        <string>claude_mem.observation</string>
+        <key>ANTHROPIC_DEFAULT_SONNET_MODEL</key>
+        <string>claude_mem.observation</string>
+        <key>CLAUDE_MEM_CHROMA_ENABLED</key>
+        <string>false</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.bun/bin:__HOME__/.npm-global/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude-mem/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude-mem/logs/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
