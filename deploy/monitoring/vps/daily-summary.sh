@@ -65,7 +65,10 @@ PY
 
 OUT=""
 for i in 1 2 3; do
-  OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$NAS" "$READ" 2>/dev/null)
+  # -n 是必须的：不带它,这个 ssh 会继承脚本自己的 stdin。cron 下无所谓,
+  # 但只要有人用管道喂脚本（调试时很自然）,它就会把剩下的脚本正文当
+  # 输入吃掉,表现为"整个脚本一声不吭地什么都没干"。实测踩过。
+  OUT=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NAS" "$READ" 2>/dev/null)
   [ -n "$OUT" ] && break
   sleep 8
 done
