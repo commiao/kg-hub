@@ -52,6 +52,10 @@ class Decision:
     platform: str = ""
     project: str = ""
     shadow_mode: bool = False
+    # 原始 type 写法,仅当它与归一化结果不同才填(例如 '[ discovery ]')。
+    # 归一化一上线,带方括号的变体就不会再出现在 obs_type 里,没有这一栏就
+    # 再也回答不了"这个修救回了多少条"。
+    raw_type: Optional[str] = None
 
 
 # ---------- Config loader (re-read every run so edits hot-reload) ----------
@@ -80,11 +84,30 @@ def _today_utc() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+# ---------- 类型归一化 ----------
+
+# obs.type 是上游模型写出来的自由文本,不是枚举。实测 ingest_decisions.jsonl 里
+# 出现过 '[ discovery ]'、'[discovery]'、'[decision]'、'[feature]' —— 跟白名单里的
+# 'discovery'/'decision'/'feature' 是同一个类型,只因为模型顺手加了方括号就被
+# hard_gate 拒掉。这类拒绝没有任何判断含义,纯属格式事故。
+#
+# 只剥外层的包裹符和空白、再转小写。不做同义词映射 —— 'sensitive'、'gotcha'
+# 这些确实不在白名单里的,该拒还是拒,那是类型策略问题,不归这里管。
+_TYPE_WRAPPERS = " \t\r\n[](){}<>「」【】《》\"'"
+
+
+def normalize_type(raw: object) -> str:
+    """把 obs.type 收敛到白名单的写法。非字符串/空值一律归成空串。"""
+    return str(raw or "").strip().strip(_TYPE_WRAPPERS).strip().lower()
+
+
 # ---------- Scoring ----------
 
 def compute_score(obs: dict, scoring_cfg: dict) -> tuple[float, dict]:
     """Pure scoring. Returns (score, breakdown_dict)."""
-    type_ = obs.get("type") or ""
+    # 必须和 decide() 用同一个归一化,否则 '[ discovery ]' 就算放行了,
+    # type_weight 也会查不到而按 0 分算 —— 换个地方再死一次。
+    type_ = normalize_type(obs.get("type"))
     type_weight = scoring_cfg["type_weight"].get(type_, 0)
 
     narrative = obs.get("narrative") or ""
@@ -149,7 +172,7 @@ def evaluate(
       - relevance_count (int)
       - generated_by_model (str or None)
     """
-    type_ = obs.get("type") or ""
+    type_ = normalize_type(obs.get("type"))
     platform = (obs.get("platform_source") or "_default") or "_default"
     project = obs.get("project") or "(unknown)"
     shadow = bool(cfg.get("shadow_mode", True))
@@ -282,6 +305,11 @@ def _build(
         layer=layer,
         obs_id=int(obs.get("id") or 0),
         obs_type=type_,
+        # 原始写法与归一化后不同时记下来。否则归一化一上线,那些带方括号的
+        # 变体就从日志里彻底消失,再也没法回答"这个修救回了多少条"。
+        raw_type=(str(obs.get("type") or "")
+                  if normalize_type(obs.get("type")) != (obs.get("type") or "")
+                  else None),
         platform=platform,
         project=project,
         shadow_mode=shadow,
@@ -300,6 +328,9 @@ def log_decision(decision: Decision, log_path: Path = DECISIONS_LOG) -> None:
         "ts": datetime.now(tz=timezone.utc).isoformat(),
         **asdict(decision),
     }
+    # 绝大多数 obs 的写法本来就规范,不必每行都背一个 "raw_type": null。
+    if record.get("raw_type") is None:
+        record.pop("raw_type", None)
     breakdown = getattr(decision, "_breakdown", None)
     if breakdown:
         record["score_breakdown"] = breakdown
