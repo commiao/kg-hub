@@ -23,55 +23,10 @@ BASEF="/root/uptime/state/daily-baseline.txt"
 STALE=1800          # 心跳超过这么久(秒)就当 refinery 停了
 mkdir -p /root/uptime/state
 
-READ='
-ENVF=/volume1/docker/kg-hub-src/.env
-ROOT=$(sed -n "s/^KG_HUB_DATA_ROOT=//p" "$ENVF" 2>/dev/null)
-if [ -z "$ROOT" ]; then printf "ERR\t读不到 KG_HUB_DATA_ROOT（%s）\n" "$ENVF"; exit 0; fi
-ST="$ROOT/refinery-state/status.json"
-if [ ! -f "$ST" ]; then printf "ERR\trefinery 状态文件不存在：%s\n" "$ST"; exit 0; fi
-DBMAX=$(sqlite3 -readonly "$ROOT/claude-mem/claude-mem.db" "SELECT MAX(id) FROM observations;" 2>/dev/null)
-NODES=$(redis-cli -h 127.0.0.1 -a "$(cat "$ROOT/dbpass.conf" 2>/dev/null)" --no-auth-warning GRAPH.QUERY kg_hub "MATCH (n) RETURN count(n)" 2>/dev/null | sed -n 2p)
-python3 - "$ST" "$DBMAX" "$NODES" <<PY
-import json, sys, datetime
-st, dbmax, nodes = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    d = json.load(open(st))
-except Exception as e:
-    print("ERR\trefinery 状态读不动：%s" % type(e).__name__); raise SystemExit
-wm = d.get("watermark") or {}
-hb = d.get("heartbeat_at") or d.get("ts")
-age = ""
-if hb:
-    try:
-        t = datetime.datetime.fromisoformat(hb.replace("Z", "+00:00"))
-        age = int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds())
-    except Exception:
-        age = ""
-lag = ""
-try:
-    lag = int(dbmax) - int(d.get("live_cursor") or 0)
-except Exception:
-    pass
-halted = (d.get("live_processed") or {}).get("result_counts", {}).get("halted", 0)
-flags = [n for n, v in (("断路器开", d.get("breaker_open")),
-                        ("温控暂停", d.get("thermal_hold")),
-                        ("配额暂停", d.get("quota_paused")),
-                        ("被限流", d.get("rate_limited"))) if v]
-print("\t".join(str(x) for x in (
-    "OK", wm.get("ingested", ""), wm.get("rejected", ""), lag,
-    d.get("backlog_remaining", ""), nodes, age, halted, ",".join(flags) or "-")))
-PY
-'
+# 取数逻辑是三个监控脚本共用的,见 lib-nas-read.sh 里为什么必须共用。
+. "$(dirname "$0")/lib-nas-read.sh"
+OUT=$(nas_read 3)
 
-OUT=""
-for i in 1 2 3; do
-  # -n 是必须的：不带它,这个 ssh 会继承脚本自己的 stdin。cron 下无所谓,
-  # 但只要有人用管道喂脚本（调试时很自然）,它就会把剩下的脚本正文当
-  # 输入吃掉,表现为"整个脚本一声不吭地什么都没干"。实测踩过。
-  OUT=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$NAS" "$READ" 2>/dev/null)
-  [ -n "$OUT" ] && break
-  sleep 8
-done
 send() { curl -s -m 10 -X POST "$WH" -H 'Content-Type: application/json' \
   -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"$1\"}}" >/dev/null 2>&1; }
 
