@@ -118,5 +118,87 @@ class StatusTests(unittest.TestCase):
         asyncio.run(run())
 
 
+class GatewayHealthFlapTests(unittest.TestCase):
+    """网关健康探测的抖动不该变成告警，真正的失联必须变成告警。
+
+    2026-09-17 现场：飞书上 `gateway_monitor_unhealthy` 在红和 resolved 之间反复
+    横跳。实测网关 /health/ready 的耗时分布是
+    `0.045 0.045 0.046 0.076 0.994 1.038 1.071 2.839` 秒，而当时超时写的是 3.0s
+    —— 阈值压在正常范围的上沿，偶尔超时是必然的。代价被两件事放大：异常分支返回
+    的 dict 没有 `monitor` 键，且这个失败结果照样缓存 60s。于是一次 3 秒抖动变成
+    整整一分钟的"证据不可读"。更糟的是 watchdog 在 sample 为 None 时会**冻结所有
+    业务判决**，等于网关慢一下就把真信号一起盖住。
+    """
+
+    @staticmethod
+    def _client(result):
+        client = AsyncMock()
+        if isinstance(result, Exception):
+            client.get.side_effect = result
+        else:
+            client.get.return_value = result
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        return context
+
+    def _run(self, cache, result, now=None):
+        async def run():
+            patches = [
+                patch.object(D, "_health_cache", cache),
+                patch.object(D, "_health_lock", asyncio.Lock()),
+                patch.object(D.httpx, "AsyncClient", return_value=self._client(result)),
+                patch("model_gateway_client.gateway_base_url",
+                      return_value="http://model-gateway:39000"),
+            ]
+            if now is not None:
+                patches.append(patch.object(D.time, "monotonic", return_value=now))
+            for item in patches:
+                item.start()
+            try:
+                return await D.gateway_health()
+            finally:
+                for item in reversed(patches):
+                    item.stop()
+        return asyncio.run(run())
+
+    def test_timeout_clears_the_measured_latency_by_a_real_margin(self):
+        # 阈值必须落在实测分布之外，否则它就是个噪音源而不是故障检测器。
+        slowest_observed = 2.84
+        self.assertGreaterEqual(
+            D._HEALTH_TIMEOUT, slowest_observed * 2,
+            "超时阈值要留出倍数余量；这个检查随 idempotency 账本增长只会更慢")
+
+    def test_a_blip_does_not_erase_evidence_that_was_readable_a_moment_ago(self):
+        good = {"http_status": 503, "checked_at": "2026-09-17T15:00:00+00:00",
+                "monitor": {"version": 1, "source_ok": True,
+                            "checked_at": "2026-09-17T15:00:00+00:00"}}
+        health = self._run((0.0, good), httpx.ReadTimeout("slow"))
+        self.assertEqual(health["state"], "grey")
+        self.assertIn("monitor", health,
+                      "丢掉 monitor 键会让 watchdog 连业务判决一起冻结")
+        self.assertEqual(health["monitor"]["checked_at"], "2026-09-17T15:00:00+00:00",
+                         "必须沿用原来的 checked_at —— 真失联时它才会自然过期")
+
+    def test_evidence_is_not_invented_when_there_never_was_any(self):
+        # 没有旧证据就不能凭空造一个：这时候"不可读"是实话。
+        health = self._run(None, httpx.ConnectError("down"))
+        self.assertEqual(health["state"], "grey")
+        self.assertNotIn("monitor", health)
+
+    def test_a_failure_is_not_cached_as_long_as_a_success(self):
+        # 缓存失败只会把一次抖动的影响拉满一分钟，而重试一次很便宜。
+        self.assertLess(D._HEALTH_TTL_FAIL, D._HEALTH_TTL_OK)
+        failed = {"http_status": None, "checked_at": "x", "issues": ["ReadTimeout"]}
+        ok = httpx.Response(200, json={"status": "ok", "checks": {}})
+        # 失败缓存刚过 TTL_FAIL、远未到 TTL_OK：必须重新去取，而不是接着返回失败。
+        health = self._run((0.0, failed), ok, now=D._HEALTH_TTL_FAIL + 1)
+        self.assertEqual(health["http_status"], 200, "失败不该被按成功的 TTL 留着")
+        # 而成功的结果在 TTL_OK 之内要真的命中缓存，别把网关打穿。
+        good = {"http_status": 200, "checked_at": "y"}
+        cached = self._run((0.0, good), httpx.ConnectError("不该被调用"),
+                           now=D._HEALTH_TTL_OK - 1)
+        self.assertEqual(cached["checked_at"], "y")
+
+
 if __name__ == "__main__":
     unittest.main()

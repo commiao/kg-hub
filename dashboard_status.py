@@ -14,6 +14,18 @@ import httpx
 _health_cache: tuple[float, dict] | None = None
 _health_lock = asyncio.Lock()
 
+# 2026-09-17 实测网关 /health/ready 的耗时分布（NAS 上连打 8 次）：
+#   0.045 0.045 0.046 0.076 0.994 1.038 1.071 2.839  秒
+# 原来的超时是 3.0s —— 阈值就压在正常范围的上沿，偶尔超一下纯属必然。
+# 而超时的代价被下面两个机制放大：异常分支丢掉 monitor 键、失败结果照样缓存
+# 60s，于是一次 3 秒抖动变成整整一分钟的「证据不可读」告警，红绿反复横跳。
+# 这个检查要读 idempotency sqlite、状态清单和回滚见证，随账本增长只会更慢。
+_HEALTH_TIMEOUT = 8.0
+# 成功的结果值得缓存久一点；失败的不值得——缓存失败只会把一次抖动的影响拉长
+# 到一分钟，而重试一次很便宜。
+_HEALTH_TTL_OK = 60
+_HEALTH_TTL_FAIL = 5
+
 _MONITOR_CHECKS = {'process', 'state_manifest', 'routes', 'credentials', 'callers',
                    'idempotency', 'historical_outcomes', 'rollback_witness',
                    'cost_state', 'passive_provider'}
@@ -99,12 +111,16 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
 async def gateway_health() -> dict:
     global _health_cache
     async with _health_lock:
-        if _health_cache and time.monotonic() - _health_cache[0] < 60:
-            return copy.deepcopy(_health_cache[1])
+        if _health_cache:
+            # http_status 为 None 即上一次是异常分支：失败不按成功的 TTL 缓存。
+            ttl = (_HEALTH_TTL_OK if _health_cache[1].get("http_status") is not None
+                   else _HEALTH_TTL_FAIL)
+            if time.monotonic() - _health_cache[0] < ttl:
+                return copy.deepcopy(_health_cache[1])
         from model_gateway_client import gateway_base_url
         sampled = datetime.now(timezone.utc).isoformat()
         try:
-            async with httpx.AsyncClient(timeout=3, trust_env=False,
+            async with httpx.AsyncClient(timeout=_HEALTH_TIMEOUT, trust_env=False,
                                          follow_redirects=False) as client:
                 response = await client.get(gateway_base_url() + "/health/ready")
             body = response.json()
@@ -130,6 +146,16 @@ async def gateway_health() -> dict:
         except Exception as exc:
             result = {"state": "grey", "http_status": None,
                       "checked_at": sampled, "issues": [type(exc).__name__]}
+            # 取不到这一次，不等于上一次的证据作废。把上一份 monitor 原样带上
+            # （连同它自己的 checked_at），让 watchdog 的新鲜度窗口去裁决：真的
+            # 连不上就会自然过期并如实告警，一次抖动则不该惊动任何人。
+            #
+            # 不这么做的后果是实打实的：monitor 键一旦缺失，watchdog 不仅报
+            # gateway_monitor_unhealthy，还会**冻结所有业务判决**（sample 为
+            # None 时沿用旧结论）——网关慢一秒就把真信号一起盖住了。
+            carried = _health_cache[1].get("monitor") if _health_cache else None
+            if carried is not None:
+                result["monitor"] = carried
         _health_cache = (time.monotonic(), result)
         return copy.deepcopy(result)
 
