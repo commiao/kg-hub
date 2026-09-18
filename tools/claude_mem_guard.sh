@@ -32,6 +32,20 @@ WEBHOOK=$(grep '^KG_HUB_FEISHU_WEBHOOK=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- 
 # 接着处理——队列本身就是断点。停掉 worker 则会把采集一起停,那才叫受影响。
 #
 # 拉不到就**保持上次已知值**:绝不因为读不到 kg-hub 就自己合上闸。
+#
+# 但「保持上次已知值」有个前提:得真有过上次。2026-09-18 查出这条链路从 09-10
+# 接线那天起就没通过一次 —— 回落地址写的是 127.0.0.1:17171,而 kg-hub 只跑在
+# NAS 上,Mac 这边压根没有这个端口。于是每轮 curl 都失败、STATE 恒为空、文件
+# 从未被创建;中继读不到文件按「从没配过=通行」放行(三态设计里对的那一档)。
+# 结果:拓扑页显示「已接线」、ENFORCED=True、guard 跑了 2784 轮退出码全 0,而
+# 那个开关按下去什么都不会发生。整整八天没人看得出来。
+#
+# 所以两处改:
+#   1) 回落地址对齐全仓库 Mac 侧工具的写法(weekly_report.py / feedback_digest.py
+#      都是 100.123.208.32:17171)。kg-hub 在 NAS,loopback 从来就不对。
+#   2) **区分「抖了一下」和「从没通过」**。前者保持原样是对的;后者没有任何
+#      已知值可保持,沉默就是在撒谎。文件不存在时必须出声 —— 每轮进日志,并按天
+#      去重发一次飞书,免得再烂八天。
 BREAKER_FILE="$HOME/.claude-mem/.model-gateway/activation-$(
   ls "$HOME/.claude-mem/.model-gateway" 2>/dev/null \
     | sed -n 's/^activation-\([0-9a-f]\{32\}\)\.json$/\1/p' | head -1
@@ -40,7 +54,7 @@ KG_URL=$(grep '^KG_HUB_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"')
 case "$BREAKER_FILE" in
   *"activation-.breaker.json") ;;                 # 没找到激活记录:不动
   *)
-    STATE=$(curl -s -m 8 "${KG_URL:-http://127.0.0.1:17171}/dashboard/breakers" 2>/dev/null \
+    STATE=$(curl -s -m 8 "${KG_URL:-http://100.123.208.32:17171}/dashboard/breakers" 2>/dev/null \
       | python3 -c '
 import json,sys
 try:
@@ -55,6 +69,16 @@ print(json.dumps({"version": 1, "tripped": bool(d["tripped"]),
         && chmod 600 "$TMP" 2>/dev/null \
         && mv -f "$TMP" "$BREAKER_FILE" 2>/dev/null
       rm -f "$TMP" 2>/dev/null
+    elif [ ! -f "$BREAKER_FILE" ]; then
+      # 没拿到新值、也没有旧值 = 这个开关根本没接上。这是故障,不是静默档。
+      echo "$(ts) [断路器] 同步失败且本地无任何已知状态 —— claude-mem 那路开关当前不生效(KG_URL=${KG_URL:-默认})" >> "$LOG"
+      MARK="$HOME/.kg-hub/state/breaker-unwired-$(date '+%Y%m%d')"
+      if [ -n "$WEBHOOK" ] && [ ! -f "$MARK" ]; then
+        mkdir -p "$(dirname "$MARK")" 2>/dev/null && : > "$MARK"
+        curl -s -m 10 -X POST "$WEBHOOK" -H 'Content-Type: application/json' \
+          -d '{"msg_type":"text","content":{"text":"🔴 kg-hub:claude-mem 断路器未接通 —— guard 拉不到 /dashboard/breakers 且本地无已知状态,拓扑页上那个开关按下去不会生效。"}}' \
+          >/dev/null 2>&1
+      fi
     fi
     ;;
 esac

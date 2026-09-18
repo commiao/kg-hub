@@ -305,8 +305,14 @@ class RefineryGateTests(unittest.TestCase):
         body = source.split("    while True:\n        cycle += 1", 1)[1]
         gate = body.index("breakers.is_tripped(BREAKER_KEY)")
         # 人工闸门排在温度门控、窗口门控、配额停发之前：人按的开关最优先。
-        for later in ("max_disk_temp()", "in_backlog_window()",
+        #
+        # 锚点找不到要当场说人话。这条断言 2026-09-17 起一直红着没人管——温控
+        # 改造(fb49f41)把循环里的 max_disk_temp() 换成了内联的 disk_temps()，
+        # body.index() 抛 ValueError，报出来只有"substring not found"，看不出
+        # 是顺序坏了还是名字变了。红着的断言等于没有断言。
+        for later in ("temps = disk_temps()", "in_backlog_window()",
                       'quota_pause.get("until_cycle"'):
+            self.assertIn(later, body, f"循环里找不到 {later}——改过名就同步改这里")
             self.assertLess(gate, body.index(later), later)
 
     def test_gate_skips_the_cycle_instead_of_submitting(self):
@@ -401,6 +407,35 @@ class ClaudeMemSideTests(unittest.TestCase):
         # 拉不到就保持原样：绝不因为读不到 kg-hub 就自己合上闸。
         self.assertIn('if [ -n "$STATE" ]; then', guard)
         self.assertIn("claude_mem.observation", guard)
+
+    def test_guard_talks_to_the_nas_not_to_loopback(self):
+        """回落地址必须指向 NAS。
+
+        2026-09-18 查出的真实故障：回落写的是 127.0.0.1:17171，而 kg-hub 只跑在
+        NAS 上。guard 在 Mac 上跑，每轮 curl 必然失败 → 状态文件从未被创建 →
+        中继按「从没配过=通行」放行。ENFORCED=True、拓扑页显示已接线、guard
+        退出码 0，而开关按下去八天里一次都没生效过。
+        """
+        guard = Path(__file__).resolve().parent.parent.joinpath(
+            "tools/claude_mem_guard.sh").read_text("utf-8")
+        fallback = guard.split("${KG_URL:-", 1)[1].split("}", 1)[0]
+        self.assertNotIn("127.0.0.1", fallback)
+        self.assertNotIn("localhost", fallback)
+        self.assertIn("17171", fallback)
+
+    def test_guard_shouts_when_it_has_never_synced_once(self):
+        """「保持上次已知值」得真有过上次，否则沉默就是在撒谎。
+
+        抖一下保持原样是对的；从没成功过、本地一个文件都没有，那是故障 ——
+        必须进日志并发得出声，不能像 09-10 到 09-18 那样静静烂八天。
+        """
+        guard = Path(__file__).resolve().parent.parent.joinpath(
+            "tools/claude_mem_guard.sh").read_text("utf-8")
+        branch = guard.split('elif [ ! -f "$BREAKER_FILE" ]; then', 1)
+        self.assertEqual(len(branch), 2, "缺少「从没同步过」的分支")
+        body = branch[1].split("esac", 1)[0]
+        self.assertIn('>> "$LOG"', body)          # 每轮留痕
+        self.assertIn("$WEBHOOK", body)           # 且喊得出来
 
     def test_lag_is_declared_for_every_key_and_shown_to_the_operator(self):
         self.assertEqual(set(breakers.LAG_SECONDS), set(breakers.KNOWN_KEYS))
