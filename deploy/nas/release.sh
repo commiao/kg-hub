@@ -542,7 +542,32 @@ fi
 
 producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
 discard_refinery_window_backup
+refresh_drift_verdict
 say "✅ 发布完成：kg-hub-server:$SHA（上一个 $PREV 仍在盘上，可 --rollback）"
+}
+
+# 发完顺手刷新漂移巡检的判决。
+#
+# 那个判决是缓存：任一侧变了它就过期，而巡检是**每天**跑一次。一次发布恰好改的就是
+# 「线上」那一侧 —— 于是发完之后，SessionStart 会继续拿发布前那条结论当现状显示，
+# 最长可达一天。2026-09-18 在网关那边实测踩到过：部署成功后巡检仍在报「deploy/ 有
+# 8 个文件漂了」，而那 8 个正是刚被这次发布对齐掉的。
+#
+# 年龄阈值救不了这一种：文件是一天之内写的，看起来就是新鲜的。**能改变判决的动作
+# 自己负责刷新它**，比把巡检调密更准，也不会多打一次 NAS。
+#
+# 刷新失败不该让发布失败 —— 发布本身已经成功，巡检下一轮自会跟上。
+refresh_drift_verdict() {
+  [ "${DRY_RUN:-0}" != 1 ] || return 0
+  checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
+  [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
+  if python3 "$checker" --status-file "$HOME/.cache/kg-hub/source-drift.status" \
+       >/dev/null 2>&1; then
+    say "  巡检判决已刷新"
+  else
+    # 非零也可能只是「确实有漂移」——那是真话，照样算刷新成功。
+    say "  巡检判决已刷新（有待处理项，见 $HOME/.cache/kg-hub/source-drift.status）"
+  fi
 }
 
 # 允许 shell 测试 source 本文件、替换 on_nas 后直接覆盖 .env 事务的失败分支；正常

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kg-hub.source-drift</string>
+
+    <!-- NAS 上跑的源码是不是等于 git 里的某个 commit。要 ssh 打 NAS，所以放在
+         launchd 里日更，SessionStart 只读它留下的那一行判决 —— 别把网络调用塞进
+         每次会话启动（「别在 Mac 上轮询打 NAS」有前车之鉴）。
+         09:25 错开网关那份（09:20），免得两个巡检同时压 NAS。 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__REPO__/deploy/nas/check_source_drift.py</string>
+        <string>--status-file</string>
+        <string>__HOME__/.cache/kg-hub/source-drift.status</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>25</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.kg-hub/logs/source-drift.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.kg-hub/logs/source-drift.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -26,6 +26,8 @@ EXPECTED = {
     "com.kg-hub.capsule-watch", "com.kg-hub.capture-probe",
     "com.kg-hub.claude-mem-guard", "com.kg-hub.claude-mem-ingest",
     "com.kg-hub.feedback-digest", "com.kg-hub.weekly-report",
+    # 日更的源码漂移巡检：查 NAS 上跑的源码是不是等于 git 里的某个 commit。
+    "com.kg-hub.source-drift",
     # 不姓 kg-hub 但同样由本仓库管：保留 claude-mem 自己的 label，这样装上去是
     # **替换**插件那份、而不是与它并存（并存会有两个 job 各起一份 worker）。
     "com.claude-mem.worker",
