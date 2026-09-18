@@ -88,7 +88,14 @@ esac
 # 而覆盖之后不会有任何报错 —— 只是重复付费悄悄回来了。挂在这里，沾这条 launchd
 # 每 300s 一次的现成节拍，不另开一个定时器。
 # 它自己内部有三态（版本变了绝不盖回去），细节见那个脚本的抬头。
-WEBHOOK="$WEBHOOK" sh "$SCRIPT_DIR/claude_mem_patch_guard.sh" 2>/dev/null || true
+#
+# **不加 `2>/dev/null`。** 那会把守护脚本自己的报错吞掉，而 stderr 落进
+# claude-mem-guard.err.log 恰恰是唯一能看出「守护自己挂了」的地方 —— 它内部的
+# 三态只覆盖它预料到的情形，预料之外的（语法错、python 不在、权限）只会写 stderr。
+# 这套东西已经在「沉默地失效」上栽过一次：断路器那条链路空跑 2784 轮、退出码全 0、
+# 八天没人看得出来。
+# 也不加 `|| true`：本脚本没有 set -e，非零退出本来就不会中断后面的清理逻辑。
+WEBHOOK="$WEBHOOK" sh "$SCRIPT_DIR/claude_mem_patch_guard.sh"
 
 # 找出累计 CPU 时间超阈值的 claude-mem hook 进程(tosec 解析 [hh:]mm:ss.ss)
 CANDIDATES=$(ps -axo pid=,cputime=,command= 2>/dev/null | awk -v lim="$CPU_TIME_THRESHOLD" '

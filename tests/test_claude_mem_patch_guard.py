@@ -132,5 +132,48 @@ class PatchGuardTests(unittest.TestCase):
         self.assertIn("读不出版本", log)
 
 
+class WiringTests(unittest.TestCase):
+    """守护挂没挂上 300s 那条节拍 —— 以及挂上之后会不会**沉默地**失效。
+
+    这一类不是洁癖：断路器那条链路 2026-09-10 接线、退出码全 0 跑了 2784 轮，
+    而那个开关按下去什么都不会发生，八天没人看得出来。「看起来接上了」和
+    「真的通了」是两回事，而前者不会自己变成后者。
+    """
+
+    def setUp(self):
+        self.guard = (ROOT / "tools" / "claude_mem_guard.sh").read_text("utf-8")
+        self.line = next(
+            (line for line in self.guard.splitlines()
+             if "claude_mem_patch_guard.sh" in line and not line.lstrip().startswith("#")),
+            None,
+        )
+
+    def test_the_300s_guard_actually_invokes_the_patch_guard(self):
+        self.assertIsNotNone(self.line, "补丁守护没有被 300s 那条 guard 调用")
+
+    def test_the_invocation_does_not_swallow_stderr(self):
+        """预料之外的失败（语法错、python 不在、权限）只会写 stderr。
+
+        把它丢进 /dev/null，claude-mem-guard.err.log 就永远是空的 —— 而那是
+        唯一能看出「守护自己挂了」的地方。守护内部那三态只覆盖它预料到的情形。
+        """
+        self.assertNotIn("2>/dev/null", self.line)
+
+    def test_the_patch_guard_runs_before_the_early_exit(self):
+        """那条 guard 在没有空转进程时 `exit 0`。调用排在它后面就等于从不执行。
+
+        而且**不会有任何症状**：退出码照样是 0。
+        """
+        call = self.guard.index("claude_mem_patch_guard.sh")
+        early_exit = self.guard.index('[ -z "$CANDIDATES" ] && exit 0')
+        self.assertLess(call, early_exit, "补丁守护排在了提前 exit 后面，永远跑不到")
+
+    def test_the_plist_template_points_at_the_guard_we_edited(self):
+        """线上跑的必须就是仓库里这个文件，不是某份副本。"""
+        template = (ROOT / "deploy" / "mac" / "agents"
+                    / "com.kg-hub.claude-mem-guard.plist").read_text("utf-8")
+        self.assertIn("tools/claude_mem_guard.sh", template)
+
+
 if __name__ == "__main__":
     unittest.main()
