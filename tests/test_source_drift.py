@@ -82,6 +82,19 @@ class ExclusionTests(unittest.TestCase):
                      "tools/capture_probe.py", "deploy/mac/agents/x.plist"):
             self.assertFalse(D.is_allowed_untracked(name), name)
 
+    def test_no_tracked_file_is_ever_exempt(self):
+        """最强的一条：豁免不许吞掉任何 git 真正跟踪的文件。
+
+        写死几个名字的测试挡不住这类错 —— 2026-09-18 实测：`.env` 那条豁免用了
+        子串匹配，把仓库真正跟踪的 `deploy/nas/.env.example` 一起吞了，而当时的
+        测试全绿。豁免是这套检测里唯一能藏住漂移的地方，所以拿**全量清单**来验。
+        """
+        out = subprocess.run(["git", "-C", str(ROOT), "ls-files"],
+                             capture_output=True, text=True, check=True).stdout
+        swallowed = [n for n in out.splitlines()
+                     if n.strip() and D.is_allowed_untracked(n)]
+        self.assertEqual(swallowed, [], "这些被跟踪的文件永远查不出漂移")
+
     def test_tracked_dot_files_match_what_git_actually_tracks(self):
         # 上面那条测试写死了两个名字。如果哪天仓库开始跟踪点目录里的东西
         # （比如 .github/），豁免规则就不再精确 —— 这里让它当场失败。

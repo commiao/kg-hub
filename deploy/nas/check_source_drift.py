@@ -58,13 +58,14 @@ RELEASE = REPO / "deploy" / "nas" / "release.sh"
 # 刻意**没有**排除的：`*.pre-*-<日期>` 这类手工备份留在仓库根上（实测有一个
 # `kg_hub_server.py.pre-boundaries-20260820-1544` 就躺在真文件旁边）。多报一个
 # 让人来删，比给它一条永久豁免好。
-ALLOWED_UNTRACKED = (
-    ".env",                 # 按设计不入 git（含机密），准则文档写明
-    "._",                   # macOS 资源叉：经 SMB 写入产生的噪音，不是代码
-    ".DS_Store",
-    "__pycache__",          # 运行产物
-    ".pyc",
-)
+# 三类分开写，不用一把「子串匹配」糊过去。
+# 2026-09-18 实测教训：原来写成 `pattern in name`，`.env` 那条把**仓库真正跟踪
+# 的** `deploy/nas/.env.example` 一起吞了 —— 它要是在 NAS 上漂了，永远看不见。
+# 豁免是这套检测里唯一能藏住漂移的地方，宁可写长也要精确。
+EXACT_BASENAMES = (".env", ".DS_Store")          # 整个文件名恰好是这个
+BASENAME_PREFIXES = ("._",)                      # macOS 资源叉，SMB 写入的噪音
+BASENAME_SUFFIXES = (".pyc", ".pyo")             # 运行产物
+PATH_COMPONENTS = ("__pycache__",)               # 整个目录都是运行产物
 
 
 def release_config(path: Path = RELEASE) -> dict[str, str]:
@@ -104,8 +105,11 @@ def is_allowed_untracked(name: str) -> bool:
     if rest and head.startswith("."):
         return True
     base = name.rsplit("/", 1)[-1]
-    return any(base.startswith(pattern) or base.endswith(pattern) or pattern in name
-               for pattern in ALLOWED_UNTRACKED)
+    parts = name.split("/")
+    return (base in EXACT_BASENAMES
+            or base.startswith(BASENAME_PREFIXES)
+            or base.endswith(BASENAME_SUFFIXES)
+            or any(component in PATH_COMPONENTS for component in parts))
 
 
 # 一眼能认出是备份的后缀。这些**照样要报**，只是排在后面 —— 它们是旧部署脚本
