@@ -144,6 +144,38 @@ class GatewayWatchdogTests(unittest.TestCase):
         self.assertFalse(anomalies['gateway_consumer_config_drift'])
         self.assertTrue(anomalies['gateway_consumer_contract_unhealthy'])
 
+    def test_a_check_we_do_not_know_about_does_not_blind_the_monitor(self):
+        """网关那边多一个检查项，不该把这边打瞎。
+
+        2026-09-18 现场：网关新增了 `reconciliation` 检查项，而这里原来写的是
+        `set(checks) != _MONITOR_CHECKS` —— 严格相等。结果 source_ok 恒为 False，
+        `gateway_monitor_unhealthy` 持续报警，**并且冻结所有业务判决**（sample 为
+        None 时 watchdog 沿用旧结论），真的鉴权失败/供应商故障一概发现不了。
+
+        checks 的构成由网关那边说了算，这边只是读它。
+        """
+        body = health()
+        # 用线上的真实形状：没有 issues 键，带着每个业务的未决计数。
+        body['checks']['reconciliation'] = {
+            'status': 'warning',
+            'business_keys': {'claude_mem.observation':
+                              {'idempotency': 1, 'provider': 1, 'replay_blocked': True}},
+        }
+        sample = project(body)
+        self.assertTrue(sample['source_ok'], '多一个检查项就判证据不可读')
+        self.assertFalse(sample['not_ready'],
+                         'warning 不是 error；当成红会让告警长期常亮')
+        self.assertFalse(any(sample[name] for name in W.GATEWAY_ALERTS))
+
+    def test_a_check_that_disappeared_still_counts_as_unreadable(self):
+        """另一端同样要钉：少了我认识的检查项，说明真出了事，不能放行。
+
+        只钉「多的要容忍」的话，下一步就会有人把校验整个删掉。
+        """
+        body = health()
+        del body['checks']['idempotency']
+        self.assertFalse(project(body)['source_ok'], '少了已知检查项必须判不可读')
+
     def test_an_open_provider_circuit_reaches_the_alert_channel(self):
         """网关自动断路必须能走到飞书，而且要和「最近一次调用失败」分开。
 

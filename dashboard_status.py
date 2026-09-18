@@ -45,11 +45,25 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
     if not isinstance(body, dict) or type(body.get('external_calls')) is not int or body['external_calls'] != 0:
         return result
     checks = body.get('checks')
+    # 子集，不是相等。2026-09-18 现场：网关侧新增了一个 `reconciliation` 检查项，
+    # 于是这里的严格相等不成立 → source_ok=False → 监控持续报「证据不可读」，
+    # **并且冻结所有业务判决**（sample 为 None 时 watchdog 沿用旧结论），真的鉴权
+    # 失败/供应商故障一概发现不了。
+    #
+    # checks 的构成由网关那边说了算，这边只是读它。要求「我认识的一个都不能少」
+    # 是对的（少了说明出了事），但要求「一个都不能多」只会让对面每加一项就把监控
+    # 打瞎一次。
     if (http_status not in (200, 503) or body.get('status') not in ('ok', 'error')
-            or not isinstance(checks, dict) or set(checks) != _MONITOR_CHECKS):
+            or not isinstance(checks, dict) or not _MONITOR_CHECKS <= set(checks)):
         return result
     for name, check in checks.items():
-        if (not isinstance(check, dict) or check.get('status') not in ('ok', 'error', 'degraded')
+        if not isinstance(check, dict) or not isinstance(check.get('status'), str):
+            return result
+        if name not in _MONITOR_CHECKS:
+            # 不认识的检查项无法解读，也就不该由它来判定证据可读与否。它仍会参与
+            # 下面的 not_ready（error/degraded 一样要如实反映），但不做结构校验。
+            continue
+        if (check.get('status') not in ('ok', 'error', 'degraded', 'warning')
                 or not isinstance(check.get('issues', [] if name == 'process' else None), list)
                 or not all(isinstance(v, str) for v in check.get('issues', []))):
             return result
@@ -79,7 +93,9 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
     for name in ('provider_state_degradation_marker_issue', 'provider_state_write_degraded'):
         if name in metrics and type(metrics[name]) is not bool:
             return result
-    issues = {issue for check in checks.values() for issue in check.get('issues', [])}
+    # `or []`：不认识的检查项（以及 process）本来就没有 issues 键，网关也可能
+    # 显式给 None。写成 .get('issues', []) 时，键存在且为 None 会直接抛。
+    issues = {issue for check in checks.values() for issue in (check.get('issues') or [])}
     if issues & {'provider_state_unavailable', 'provider_pending_state_unavailable'}:
         # An unreadable passive ledger cannot clear a previously observed 401.
         return result
@@ -98,8 +114,11 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
                       bool(metrics.get('provider_state_write_degraded_business_keys')) and
                       metrics.get('provider_state_degradation_marker_issue') is False)
     result.update(source_ok=True,
+        # warning 不算「没就绪」：网关用它表示「有登记在案的历史情况，但服务正常」。
+        # 把 warning 当红会让告警长期常亮 —— 常亮的告警等于没有告警。
         not_ready=(http_status != 200 or body['status'] != 'ok' or
-                   any(c['status'] != 'ok' or c.get('issues', []) for c in checks.values())),
+                   any(c['status'] not in ('ok', 'warning') or c.get('issues')
+                       for c in checks.values())),
         outcome_unresolved=(legacy_unknown or bool(issues & {'provider_outcome_unresolved',
             'idempotency_outcome_unresolved', 'rollback_witness_preflight_unresolved'})),
         persistence_failed=persistence,
