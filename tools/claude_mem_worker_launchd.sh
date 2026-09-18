@@ -57,10 +57,36 @@ find_service() {
     done
   done
   # 第三个位置：marketplace 目录。它没有版本号子目录，是插件的「当前」那一份，
-  # hook 的版本发现把它当最后兜底 —— 这里必须一致，否则两个 cache 都缺席时
-  # hook 还能起而 launchd 起不来。给一个最低的版本键，只有前面都没有才轮到它。
+  # marketplace 目录：插件的「当前」那一份，hook 起 worker 时用的就是它。
+  #
+  # 2026-09-19 改：以前给它写死最低版本键，于是只要 cache 里还剩任何一个版本，
+  # launchd 就永远选 cache。实测当时 cache=13.24.23 而 marketplace=13.25.1，
+  # **hook 起的是 13.25.1、launchd 起的是 13.24.23 —— 谁先起谁说了算**。
+  # 单例端口只保证「只有一个」，不保证「是哪一个」。
+  # 改成读它 package.json 里的真实版本一起参与排序：两条拉起路径这才收敛到
+  # 同一个版本。优先级仍然排在 cache 之后，所以同版本时让插件自己管的那份赢。
   fallback="$HOME/.claude/plugins/marketplaces/thedotmack/plugin/scripts/worker-service.cjs"
-  [ -f "$fallback" ] && printf '%s %d %s %s\n' "000000000000000000000000" 9 "marketplace" "$fallback"
+  if [ -f "$fallback" ]; then
+    mver=$(/usr/bin/python3 -c "
+import json
+try:
+    v = json.load(open('$HOME/.claude/plugins/marketplaces/thedotmack/plugin/package.json'))['version']
+    maj, minor, patch = (v.split('.') + ['0', '0'])[:3]
+    patch = ''.join(c for c in patch if c.isdigit()) or '0'
+    print('%08d%08d%08d %s' % (int(maj), int(minor), int(patch), v))
+except Exception:
+    raise SystemExit(1)
+" 2>/dev/null || echo "000000000000000000000000 marketplace")
+    # 版本读不出来（package.json 坏了/没有）不等于这份不存在。退回最低版本键，
+    # 让它仍然排在最后一位候选 —— 原来那条「cache 全缺席时还起得来」的兜底语义
+    # 不许因为读版本失败就丢掉。
+    #
+    # 2026-09-19 变异验证发现：这里曾经在 python 的 except 里**也**打印一次同样
+    # 的兜底，而上面那个 `|| echo` 已经覆盖了它 —— 把 except 改成直接退出，测试
+    # 依旧全绿，说明那一份是空转的。留一个。
+    # 字段顺序必须与上面那个循环一致：<版本键> <根优先级> <版本> <路径>。
+    printf '%s %d %s %s\n' "${mver% *}" 9 "${mver#* }" "$fallback"
+  fi
 }
 
 pick() { sort -k1,1r -k2,2n | head -1; }
