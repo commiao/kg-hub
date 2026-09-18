@@ -144,6 +144,43 @@ class GatewayWatchdogTests(unittest.TestCase):
         self.assertFalse(anomalies['gateway_consumer_config_drift'])
         self.assertTrue(anomalies['gateway_consumer_contract_unhealthy'])
 
+    def test_an_open_provider_circuit_reaches_the_alert_channel(self):
+        """网关自动断路必须能走到飞书，而且要和「最近一次调用失败」分开。
+
+        两者说的是不同的事，运维要做的也不同：
+        - provider_failed  = 最近一次调用失败了，链路还在照常打
+        - circuit_open     = 已经不再打它了，正在退避重试（期间不产生费用）
+
+        混成一个位的话，看到告警的人分不清「还在烧钱」还是「已经止血」。
+        """
+        body = health()
+        body['status'] = 'error'
+        body['checks']['passive_provider'].update(
+            status='error', issues=['provider_circuit_open'],
+            open_circuits=[{'provider': 'bailian', 'model': 'qwen3.6-plus',
+                            'open_seconds': 12.0, 'backoff_seconds': 30.0}],
+        )
+        sample = project(body, 503)
+
+        self.assertTrue(sample['source_ok'], '多一个 open_circuits 字段不该让证据判成不可读')
+        self.assertTrue(sample['circuit_open'])
+        self.assertFalse(sample['provider_failed'],
+                         '没有任何一路业务报失败时，不该顺带点亮 provider_failed')
+
+        anomalies, details = {}, {}
+        W.apply_gateway_monitor(sample, {}, anomalies, details)
+        self.assertTrue(anomalies['gateway_provider_circuit_open'])
+        self.assertIn('断开', details['gateway_provider_circuit_open'])
+
+    def test_a_healthy_gateway_does_not_report_an_open_circuit(self):
+        # 少了这条，上面那条用一个恒为 True 的实现也能通过。
+        sample = project()
+        self.assertTrue(sample['source_ok'])
+        self.assertFalse(sample['circuit_open'])
+        anomalies, details = {}, {}
+        W.apply_gateway_monitor(sample, {}, anomalies, details)
+        self.assertFalse(anomalies['gateway_provider_circuit_open'])
+
     def test_untrusted_urls_stale_and_failed_sources_never_clear(self):
         for url in ('https://public.example', 'http://evil.invalid:8080',
                     'http://token@127.0.0.1:8080', 'http://127.0.0.1:8080/messages'):

@@ -336,6 +336,10 @@ GATEWAY_ALERTS = {
     'persistence_failed': ('gateway_persistence_failed', '网关报告实际状态写入失败；不据此断言磁盘损坏。'),
     'authentication_failed': ('gateway_authentication_failed', '当前配置最近自然业务调用鉴权失败；请核实凭据。'),
     'provider_failed': ('gateway_provider_failed', '当前配置最近自然业务调用被拒绝或供应商失败。'),
+    'circuit_open': ('gateway_provider_circuit_open',
+                     '某供应商/模型连续失败已被网关自动断开，正在退避重试；'
+                     '期间该路请求在网关直接拒绝，不产生费用。'
+                     '当前所有业务共用同一供应商，断开即全停。'),
 }
 
 

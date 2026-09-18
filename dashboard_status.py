@@ -41,7 +41,7 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
     result = {'version': 1, 'checked_at': sampled, 'external_calls': 0,
               'source_ok': False, 'not_ready': None, 'outcome_unresolved': None,
               'persistence_failed': None, 'authentication_failed': None,
-              'provider_failed': None}
+              'provider_failed': None, 'circuit_open': None}
     if not isinstance(body, dict) or type(body.get('external_calls')) is not int or body['external_calls'] != 0:
         return result
     checks = body.get('checks')
@@ -104,7 +104,11 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
             'idempotency_outcome_unresolved', 'rollback_witness_preflight_unresolved'})),
         persistence_failed=persistence,
         authentication_failed=any(e['status'] == 'authentication_failed' for e in businesses.values()),
-        provider_failed=any(e['status'] in {'request_rejected', 'provider_failed'} for e in businesses.values()))
+        provider_failed=any(e['status'] in {'request_rejected', 'provider_failed'} for e in businesses.values()),
+        # 网关自动断路：某个 provider+model 连续失败已被断开。与 provider_failed
+        # 不同 —— 那条说的是「最近一次调用失败了」，这条说的是「已经不再打它了」，
+        # 是两种不同的处置状态，运维要做的事也不同。
+        circuit_open='provider_circuit_open' in issues)
     return result
 
 
