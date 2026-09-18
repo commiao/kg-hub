@@ -83,6 +83,13 @@ print(json.dumps({"version": 1, "tripped": bool(d["tripped"]),
     ;;
 esac
 
+# ---- worker 补丁守护 -------------------------------------------------------
+# T-0077 的幂等补丁装在第三方插件的构建产物里，`claude plugin update` 会覆盖它，
+# 而覆盖之后不会有任何报错 —— 只是重复付费悄悄回来了。挂在这里，沾这条 launchd
+# 每 300s 一次的现成节拍，不另开一个定时器。
+# 它自己内部有三态（版本变了绝不盖回去），细节见那个脚本的抬头。
+WEBHOOK="$WEBHOOK" sh "$SCRIPT_DIR/claude_mem_patch_guard.sh" 2>/dev/null || true
+
 # 找出累计 CPU 时间超阈值的 claude-mem hook 进程(tosec 解析 [hh:]mm:ss.ss)
 CANDIDATES=$(ps -axo pid=,cputime=,command= 2>/dev/null | awk -v lim="$CPU_TIME_THRESHOLD" '
   function tosec(t,  a,n,s,i){ n=split(t,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; return s }

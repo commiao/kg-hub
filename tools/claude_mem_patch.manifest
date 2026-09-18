@@ -1,0 +1,16 @@
+# claude-mem worker 补丁清单（T-0077 B 项）
+#
+# 补丁内容：观测提示带上队列行 id，让下游 forwarder 能证明「字节相同 = 同一条
+# 观测的重投」，从而复用同一把幂等键、不再重复付费。
+# 源码：commiao/claude-mem 分支 t0077/stable-operation-id，提交 6ad616ea
+#       （从生产提交 d8bc975 / 13.25.1 开的薄分支）
+#
+# version 必须与目标安装的 package.json 对得上。对不上说明插件升级了：
+# **那时绝不能把这份盖回去** —— 那是静默降级。要在新版本上重做补丁。
+version=13.25.1
+sha256=e41988df152ba31503199d73895cfd8c2b4e00cc73af8e43d47767236cc3654b
+marker=cm-op
+# 相对 kg-hub 仓库根的上一级（两个仓库是同级目录）
+source=../claude-mem-fork/plugin/scripts/worker-service.cjs
+target=.claude/plugins/marketplaces/thedotmack/plugin
+target=.codex/plugins/cache/claude-mem-local/claude-mem/13.25.1
