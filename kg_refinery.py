@@ -333,6 +333,47 @@ def max_disk_temp() -> int | None:
 _thermal_today: dict[str, object] = {"day": "", "holds": 0, "seconds": 0}
 
 
+# 当日配额去向累计。`live_processed` / `backlog_processed` 是**本轮**读数,每轮被
+# 覆盖 —— 看板上只能看到最后一轮,看不出整天的钱烧到哪去了。2026-09-19 那晚正是
+# 这样:事后靠 `watermark` 差值 + 网关日计数反推才拼出"5000 次调用换 245 条终态、
+# 积压只分到 15 条"。这段把它变成实时可读的。
+#
+# 注意口径:这里数的是**观测条数**,网关那边数的是**模型调用次数**。两者不是一回事
+# (每条观测要抽实体/关系/去重/摘要,实测约 20 次调用)。把两边并排放才说得清去向,
+# 所以两个数都要如实标明单位,绝不混算。
+_budget_today: dict[str, object] = {"day": "", "lines": {}}
+
+_BUDGET_TALLIES = ("ingested", "rejected", "deferred", "backoff_skipped")
+
+
+def note_budget(kind: str, stats: dict) -> dict[str, object]:
+    """把一轮某条线的 stats 累进当日账(UTC 日切清零),返回可写进 status 的一段。
+
+    每轮每条线只调一次,传的是那一批的合计 —— 不要在 on_progress 里调,那是按条
+    回调的,会把同一批重复累加。
+    """
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    if _budget_today["day"] != today:
+        _budget_today.update(day=today, lines={})
+    lines = _budget_today["lines"]          # type: ignore[assignment]
+    line = lines.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
+    line.setdefault("result_counts", {})
+    line.setdefault("filter_counts", {})
+    for t in _BUDGET_TALLIES:
+        line[t] = int(line.get(t, 0)) + int(stats.get(t, 0) or 0)
+    for bucket in ("result_counts", "filter_counts"):
+        for name, n in (stats.get(bucket) or {}).items():
+            line[bucket][name] = int(line[bucket].get(name, 0)) + int(n)
+    total = sum(int(v.get("ingested", 0)) + int(v.get("rejected", 0))
+                for v in lines.values())
+    return {
+        "day": today,
+        "unit": "observations",     # 不是模型调用次数,别和网关日计数混算
+        "terminal_total": total,
+        "lines": {k: dict(v) for k, v in lines.items()},
+    }
+
+
 def note_thermal(held: bool, temps: dict[str, int]) -> dict[str, object]:
     """累计当日歇工次数/秒数(UTC 日切清零),返回可直接写进 status 的一段。"""
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
@@ -978,8 +1019,12 @@ async def main() -> int:
                 wm["live_cursor"] = new_cursor
                 save_watermark(wm)
 
+            # 当日去向累计:每轮每条线只累一次,传的是整批合计。
+            # 放在这里而不是 on_progress 里 —— 那个是按条回调的,会重复累加。
+            note_budget("backlog", s_back)
+            budget = note_budget("live", s_live)
             snapshot(live_processed=s_live, backlog_processed=s_back,
-                     backlog_remaining=backlog_remaining)
+                     backlog_remaining=backlog_remaining, budget_today=budget)
         except Exception as exc:  # noqa: BLE001 — 单轮失败不倒进程
             log.exception("[cycle] failed")
             write_status(last_error=f"{type(exc).__name__}: {exc}")

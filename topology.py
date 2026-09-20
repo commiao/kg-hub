@@ -90,6 +90,40 @@ def _read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def budget_detail(status: dict, calls_today: int | None) -> tuple[list[str], dict]:
+    """把 refinery 的当日去向账翻译成看板文案。
+
+    **两个口径绝不能混算**:网关日计数的单位是"模型调用次数",refinery 记的是
+    "观测条数"。一条观测要抽实体/关系/去重/摘要,2026-09-19 实测约 20 次调用。
+    所以这里只在两边都拿得到、且日期对得上时才给出"每条约几次",其余情况如实留空
+    —— 宁可少说一句,也不要给一个看起来精确的假比例。
+
+    这段存在的理由:`live_processed` / `backlog_processed` 是**本轮**读数,每轮被
+    覆盖。09-19 那晚"5000 次调用换 245 条终态、积压只分到 15 条"是事后靠 watermark
+    差值反推出来的 —— 当时看板上看不到,所以没人在窗口里发现它。
+    """
+    budget = status.get("budget_today")
+    if not isinstance(budget, dict) or not budget.get("lines"):
+        return [], {}
+    lines_raw = budget.get("lines") or {}
+    terminal = int(budget.get("terminal_total") or 0)
+    out = ["—— 今日去向(单位:观测条数,与上面的调用次数不是一回事) ——"]
+    for name in sorted(lines_raw):
+        v = lines_raw[name] or {}
+        ing, rej = int(v.get("ingested") or 0), int(v.get("rejected") or 0)
+        dfr = int(v.get("deferred") or 0)
+        share = f" · 占终态 {(ing + rej) * 100 // terminal}%" if terminal else ""
+        out.append(f"  {name}: 入图 {ing}、拒 {rej}、推迟 {dfr}{share}")
+        rc = v.get("result_counts") or {}
+        if rc:
+            out.append("      推迟原因:" + "、".join(
+                f"{k} {n}" for k, n in sorted(rc.items(), key=lambda kv: -kv[1])))
+    if isinstance(calls_today, int) and terminal > 0 and budget.get("day"):
+        out.append(f"  调用/观测 ≈ {calls_today / terminal:.1f}"
+                   f"（{calls_today} 次调用 ÷ {terminal} 条终态）")
+    return out, {"budget_today": budget}
+
+
 def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
                        now: datetime, stale_after_s: int = GATEWAY_USAGE_STALE_S
                        ) -> tuple[dict, dict]:
@@ -140,6 +174,9 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     hits = int(status.get("quota_hits") or 0)
     node["metrics"] = {"generated_at": generated, "age_s": age_s, "day": today,
                        "keys": per_key, "quota_paused": paused, "quota_hits": hits}
+    budget_lines, budget_metrics = budget_detail(
+        status, (per_key.get(GATEWAY_PRIMARY_KEY) or {}).get("today"))
+    node["metrics"].update(budget_metrics)
 
     primary = per_key.get(GATEWAY_PRIMARY_KEY)
     if primary and isinstance(primary["daily_requests"], int):
@@ -171,7 +208,7 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
         lines.insert(0, f"🟡 已用 {worst * 100:.0f}%,窗口尾可能打满")
     else:
         node["state"] = "green"
-    node["detail"] = "\n".join(lines)
+    node["detail"] = "\n".join(lines + budget_lines)
     edge["state"] = node["state"]
     return node, edge
 
