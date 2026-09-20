@@ -19,6 +19,32 @@ kg-hub 此前完全没有这个检测：它不知道 NAS 上跑的是不是 git 
 kg-hub 没有这个洞：`release.sh` 用 `git archive <sha>` 发**整棵树**，运维脚本
 天然在内。所以这里的清单就是那个 commit 的全部跟踪文件。
 
+## `ok` 断言的是什么（只有一个答案）
+
+**ok = NAS 上的文件等于某个 commit，且那个 commit 在 `origin/main` 这条线上。**
+
+两个条件缺一不可。2026-09-21 实测四个兄弟服务的 `ok` 有三种含义，而 fleet-ops
+的巡检把它们渲染成同一条绿（T-0099）：
+
+    report-portal / task-hub   ok = 等于 origin/main
+    kg-hub（补这段之前）        ok = 等于它自称的那个 commit —— 任何分支都行
+    credvault                  ok = 等于最近 60 提交里某一个（git log --all）
+
+后两种漏掉的正是准则 18：线上跑着一个不在主干上的版本。那种情况下下一个人从
+主干出发做的任何事（发布、回滚、比对漂移）都会把它悄悄抹掉，**而且不会有冲突
+提示，因为 main 从来就不知道它存在**。这条闸本来只活在 `release.sh` 里，而
+**绕过发布脚本改生产**恰恰是这套检测存在的全部理由（credvault 实测被绕过两次，
+准则 21）。闸和检测同时只剩一个的时候，剩下的那个是检测。
+
+用 `merge-base --is-ancestor` 而不是「等于 origin/main」：回滚到一个更早的
+commit 是正当操作，只要它确实在主干这条线上。
+
+## 三态，不是两态
+
+`ok` / `drift` / `error`。补这段之前 kg-hub 只有前两个：失败路径全是 `SystemExit`，
+在写状态之前就退了，于是 ssh 一挂，状态文件就停在上一条判决 —— 消费侧要等 36 小时
+年龄阈值才发现。**最长 36 小时的陈旧绿灯**，而那正是消费侧注释里写着要防的事。
+
 ## 两条必须保留的设计（照抄容易丢）
 
 **一、清单和路径都从 `release.sh` 解析，不在这里抄第二份。**
@@ -148,6 +174,33 @@ def live_commit(ssh_target: str, src: str) -> str:
     return value
 
 
+def fetch_origin() -> bool:
+    """把 origin 拉新。失败返回 False。
+
+    判「在不在主干上」之前必须拉一次：本地 origin/main 陈旧的话，一个已经合进
+    主干的 commit 会被判成「不在主干上」—— 那是这条检测里最响的一档警报，
+    拿它去报一件不存在的事，等于把警报变成噪音（准则 28）。
+    """
+    proc = subprocess.run(["git", "-C", str(REPO), "fetch", "origin", "--quiet"],
+                          capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def on_trunk(ref: str, trunk: str = "origin/main") -> bool | None:
+    """ref 在不在主干这条线上。本地没有这个 commit 时返回 None。
+
+    用 `merge-base --is-ancestor` 而不是「等于 trunk」：**回滚到一个更早的
+    commit 是正当操作**，只要它确实在主干这条线上（准则 18 原话）。
+    写成相等的话，每一次正当回滚都会被报成漂移。
+    """
+    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
+                      capture_output=True).returncode != 0:
+        return None
+    return subprocess.run(
+        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", ref, trunk],
+        capture_output=True).returncode == 0
+
+
 def tracked_at(ref: str) -> list[str]:
     """该 commit 的全部跟踪文件 —— 就是 git archive 会发出去的那些。"""
     proc = subprocess.run(
@@ -264,6 +317,9 @@ def main(argv: list[str] | None = None) -> int:
                          "作业跑发布产物时必须显式给出——产物里没有 .git。")
     ap.add_argument("--status-file", help="把一行判决写到这里，供 SessionStart hook 读")
     ap.add_argument("--ref", help="指定要比对的 commit（默认取线上 .env 的镜像标签）")
+    ap.add_argument("--skip-trunk", action="store_true",
+                    help="跳过「线上 commit 在不在主干上」这一判。只给离线/测试用——"
+                         "常规巡检不要带，带上就退回补这段之前的语义")
     ap.add_argument("--list-extra", action="store_true",
                     help="只列「NAS 上有、git 里没有」的文件，每行一个，供 release.sh "
                          "在发布时打印（观察期只打印不删）。清单与漂移报告取自同一处"
@@ -278,6 +334,38 @@ def main(argv: list[str] | None = None) -> int:
     ref = args.ref or live_commit(ssh_target, src)
     short = ref[:12]
 
+    # 「ok」断言的是什么，必须只有一个答案 —— 而且必须是「等于主干这条线上的某个
+    # commit」。补这段之前，这里的 ok 只说明「NAS 上的文件等于它自称的那个 commit」，
+    # 那个 commit 可以在任何分支上、甚至从没推上来过。于是准则 18（只发主干）在这条
+    # 检测里查不出来，它只活在 release.sh 的闸上 —— 而**绕过发布脚本改生产**正是这套
+    # 检测存在的全部理由（credvault 实测被绕过两次，准则 21：绕过一次，正式发布路径
+    # 本身也会失效）。闸和检测同时只剩一个的时候，剩下的那个是检测。
+    #
+    # 2026-09-21 实测四个服务的 ok 有三种含义，而巡检把它们渲染成同一条绿（T-0099）。
+    # --list-extra 是纯列举模式：它给 release.sh 提供机器可读的清单，不出判决
+    # （既有用例钉着「--list-extra 永远不写 verdict」）。主干这一判属于判决，
+    # 不该挡住一个只读清单的调用。
+    trunk_checked = not args.skip_trunk and not args.list_extra
+    on_main = None
+    if trunk_checked:
+        if not fetch_origin():
+            # 拉不到 origin 就判不了「在不在主干上」。此时**不许出 ok**：
+            # 拿陈旧的主干去判，一个已经合进主干的 commit 会被报成不在主干上。
+            detail = f"{short} 拉不到 origin，判不了在不在主干上，本次不作判决"
+            print(f"🟠 {detail}")
+            write_status(args.status_file, "error", detail)
+            return 2
+        on_main = on_trunk(ref)
+        if on_main is None:
+            # 拉过 origin 之后本地仍然没有这个 commit —— 线上跑的东西在远端**根本
+            # 不存在**。这是最严重的一档：连"它漂没漂"都无从谈起，因为没有对照物。
+            detail = f"{short} 在 origin 上根本不存在（线上跑着一个没推上来的版本）"
+            print(f"❌ {detail}")
+            print("   先把线上那份取回来建快照分支，再决定怎么合 —— "
+                  "在那之前任何比对都是对着空气比。")
+            write_status(args.status_file, "drift", detail)
+            return 1
+
     try:
         subject = subprocess.run(
             ["git", "-C", str(REPO), "log", "-1", "--format=%ad %s",
@@ -287,6 +375,18 @@ def main(argv: list[str] | None = None) -> int:
         subject = "(本地仓库里没有这个 commit)"
 
     bad = compare(ssh_target, src, ref)
+
+    if trunk_checked and on_main is False and not args.list_extra:
+        # 文件对不对得上它，在这里是次要的。主干上没有这个版本，意味着下一个人
+        # 从 main 出发做的任何事（发布、回滚、比对漂移）都会把它悄悄抹掉，
+        # **而且不会有冲突提示，因为 main 从来就不知道它存在**（准则 18 原话）。
+        detail = (f"{short} 不在 origin/main 这条线上"
+                  + (f"；另有 {len(bad)} 处文件差异" if bad else "，文件本身与它一致"))
+        print(f"❌ 线上跑的 commit 不在主干上：{short} {subject}")
+        print(f"   {detail}")
+        print("   处置：把它合回主干，或从主干重新发一次。")
+        write_status(args.status_file, "drift", detail)
+        return 1
 
     if args.list_extra:
         # 机器可读、只此一样东西：不写状态文件、不打判决。观察期的唯一产物就是这份

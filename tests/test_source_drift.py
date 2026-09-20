@@ -337,5 +337,143 @@ class PostReleaseRefreshTests(unittest.TestCase):
         self.assertIn('DRY_RUN', body)
 
 
+def _git(*args, cwd):
+    return subprocess.run(["git", "-C", str(cwd), *args],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+class TrunkTests(unittest.TestCase):
+    """「ok」只有一个含义：等于**主干这条线上**的某个 commit。
+
+    补这段之前，kg-hub 的 ok 只说明「NAS 上的文件等于它自称的那个 commit」——
+    那个 commit 可以在任何分支上、甚至从没推上来过。于是准则 18（只发主干）在
+    这条检测里查不出来，只活在 release.sh 的闸上。而绕过发布脚本改生产正是这套
+    检测存在的理由（credvault 实测被绕过两次，准则 21）。闸和检测同时只剩一个时，
+    剩下的那个是检测。
+
+    2026-09-21 实测四个服务的 ok 有三种含义，而巡检把它们渲染成同一条绿（T-0099）。
+    """
+
+    def run_main(self, *, on_main, bad=(), fetched=True, argv=()):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with mock.patch.object(D, "compare", return_value=list(bad)), \
+             mock.patch.object(D, "release_config",
+                               return_value={"ssh": "x@y", "src": "/src"}), \
+             mock.patch.object(D, "live_commit", return_value="d" * 40), \
+             mock.patch.object(D, "fetch_origin", return_value=fetched), \
+             mock.patch.object(D, "on_trunk", return_value=on_main), \
+             mock.patch.object(D, "write_status") as ws, \
+             redirect_stdout(buf):
+            rc = D.main(list(argv))
+        verdict = ws.call_args[0][1] if ws.call_args else None
+        detail = ws.call_args[0][2] if ws.call_args else ""
+        return rc, verdict, detail, buf.getvalue()
+
+    def test_不在主干上时_即使文件全对也不许出_ok(self):
+        """最要害的一条：文件与它自称的 commit 完全一致，但那个 commit 不在主干上。
+
+        补这段之前这里出的是 ok —— 一条看不出任何问题的绿灯，而线上正跑着
+        主干上不存在的代码。
+        """
+        rc, verdict, detail, out = self.run_main(on_main=False, bad=[])
+        self.assertEqual(verdict, "drift")
+        self.assertEqual(rc, 1)
+        self.assertIn("不在 origin/main", detail)
+        self.assertIn("文件本身与它一致", detail)   # 别让人以为是文件问题
+
+    def test_不在主干上且文件也有差异时_两件事都说(self):
+        rc, verdict, detail, out = self.run_main(
+            on_main=False, bad=[("a.py", "内容不一致"), ("b.py", "NAS 上没有")])
+        self.assertEqual(verdict, "drift")
+        self.assertIn("不在 origin/main", detail)
+        self.assertIn("2 处文件差异", detail)
+
+    def test_在主干上且文件干净_才是_ok(self):
+        rc, verdict, _, _ = self.run_main(on_main=True, bad=[])
+        self.assertEqual(verdict, "ok")
+        self.assertEqual(rc, 0)
+
+    def test_拉不到_origin_时出第三态_不出_ok_也不出_drift(self):
+        """kg-hub 此前**根本没有第三态**（词表只有 ok/drift），失败路径全是
+        SystemExit、写状态之前就退了 —— 状态文件停在上一条判决，消费侧要等
+        36 小时年龄阈值才发现。最长 36 小时的陈旧绿灯，而那正是消费侧注释里
+        写着要防的事。
+        """
+        rc, verdict, detail, _ = self.run_main(on_main=True, fetched=False)
+        self.assertEqual(verdict, "error")
+        self.assertEqual(rc, 2)
+        self.assertIn("判不了", detail)
+
+    def test_线上跑着一个_origin_上不存在的_commit_是最严重的一档(self):
+        rc, verdict, detail, _ = self.run_main(on_main=None)
+        self.assertEqual(verdict, "drift")
+        self.assertIn("根本不存在", detail)
+
+    def test_list_extra_不受主干判影响(self):
+        """纯列举模式给 release.sh 提供清单，不出判决。主干判属于判决。"""
+        rc, verdict, _, out = self.run_main(
+            on_main=False, bad=[("ghost.py", D.EXTRA_REASONS[0])],
+            argv=["--list-extra"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(verdict)            # 一个字都不许写
+        self.assertEqual(out.split(), ["ghost.py"])
+
+
+class OnTrunkTests(unittest.TestCase):
+    """`on_trunk` 本身：必须是 is-ancestor，不能是「等于主干 tip」。
+
+    准则 18 的原话：「用 is-ancestor 而不是『等于 origin/main』—— 回滚到一个
+    更早的 commit 是正当操作，只要它确实在主干这条线上。」
+    写成相等的话，每一次正当回滚都会被报成漂移；而回滚恰恰是最不需要一条
+    看不懂的红灯的时刻。
+
+    这里用真 git 仓库而不是 mock：要钉的是 git 的行为，mock 掉就什么也没钉。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "r"
+        self.repo.mkdir()
+        _git("init", "-q", "-b", "main", ".", cwd=self.repo)
+        for k, v in (("user.email", "t@e.com"), ("user.name", "t"),
+                     ("commit.gpgsign", "false")):
+            _git("config", k, v, cwd=self.repo)
+        self.shas = []
+        for i in range(3):
+            (self.repo / "f.txt").write_text(str(i))
+            _git("add", "f.txt", cwd=self.repo)
+            _git("commit", "-q", "-m", f"c{i}", cwd=self.repo)
+            self.shas.append(_git("rev-parse", "HEAD", cwd=self.repo))
+        # 造一条旁支
+        _git("checkout", "-q", "-b", "side", self.shas[1], cwd=self.repo)
+        (self.repo / "g.txt").write_text("x")
+        _git("add", "g.txt", cwd=self.repo)
+        _git("commit", "-q", "-m", "side", cwd=self.repo)
+        self.side = _git("rev-parse", "HEAD", cwd=self.repo)
+        _git("checkout", "-q", "main", cwd=self.repo)
+        self._old_repo = D.REPO
+        D.set_repo(self.repo)
+        self.addCleanup(D.set_repo, self._old_repo)
+
+    def test_主干_tip_在主干上(self):
+        self.assertIs(D.on_trunk(self.shas[2], "main"), True)
+
+    def test_更早的主干_commit_也在主干上_回滚是正当操作(self):
+        # 这一条就是 is-ancestor 与「等于 tip」的分界。写成相等，它会转红。
+        self.assertIs(D.on_trunk(self.shas[0], "main"), True)
+
+    def test_旁支上的_commit_不在主干上(self):
+        self.assertIs(D.on_trunk(self.side, "main"), False)
+
+    def test_仓库里没有的_commit_返回_None_而不是_False(self):
+        """「查不了」和「不在主干上」是两回事。混成一类，一次 fetch 没跟上
+        就会报成发布纪律违规 —— 最响的警报用来报一件不存在的事（准则 28）。
+        """
+        self.assertIsNone(D.on_trunk("0" * 40, "main"))
+
+
 if __name__ == "__main__":
     unittest.main()
