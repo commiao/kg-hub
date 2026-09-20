@@ -108,7 +108,7 @@ while /usr/bin/nc -z -G 1 127.0.0.1 "$PORT" >/dev/null 2>&1; do
   sleep 5
 done
 
-log "接管：版本 $version，$service"
+log "接管：版本 ${version}，$service"
 cd "$(dirname "$service")"
 # CLAUDE_MEM_MANAGED 沿用 worker-wrapper 给 inner 设的同一个值，让 worker 知道
 # 自己有人管。不加 start/--daemon：那条路径会自行 daemonize 脱离，launchd 会

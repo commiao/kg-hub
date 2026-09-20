@@ -58,13 +58,13 @@ esac
 if [ ! -f "$SOURCE" ]; then
   # 有清单、没源 —— 还原能力不存在。这是故障，不是静默档：不出声的话，
   # 下一次插件升级会把补丁抹掉而没有任何人知道。
-  note "补丁源不存在：$SOURCE（升级一旦发生就无法还原）"
-  alert_once missing-source "🔴 kg-hub：claude-mem 补丁源不在（$SOURCE）。插件一升级补丁就没了，且不会有任何报错。"
+  note "补丁源不存在：${SOURCE}（升级一旦发生就无法还原）"
+  alert_once missing-source "🔴 kg-hub：claude-mem 补丁源不在（${SOURCE}）。插件一升级补丁就没了，且不会有任何报错。"
   exit 0
 fi
 have_sha=$(shasum -a 256 "$SOURCE" 2>/dev/null | cut -d' ' -f1)
 if [ "$have_sha" != "$want_sha" ]; then
-  note "补丁源与清单指纹不符（源 ${have_sha:-空} / 清单 $want_sha），拒绝用它还原"
+  note "补丁源与清单指纹不符（源 ${have_sha:-空} / 清单 ${want_sha}），拒绝用它还原"
   alert_once source-drift "🔴 kg-hub：claude-mem 补丁源与清单指纹不符，守护已停手。重新构建后请同步更新 tools/claude_mem_patch.manifest。"
   exit 0
 fi
@@ -152,7 +152,7 @@ check_running_worker() {
   got=$(shasum -a 256 "$bundle" 2>/dev/null | cut -d' ' -f1)
   [ "$got" = "$want_sha" ] && return 0
   note "在位 worker 跑的不是打过补丁的那份：$bundle"
-  alert_once running-unpatched "⚠️ kg-hub：claude-mem 在位 worker 跑的 bundle 未打补丁（$bundle）。重复付费的防护当前失效。"
+  alert_once running-unpatched "⚠️ kg-hub：claude-mem 在位 worker 跑的 bundle 未打补丁（${bundle}）。重复付费的防护当前失效。"
 }
 
 restored=0
@@ -176,8 +176,8 @@ except Exception:
   if [ "$got_version" != "$want_version" ]; then
     # 这才是最该出声的一档：插件升级了，补丁已经不适用于新版本。
     # 把旧 bundle 盖回去会静默降级 —— 比丢补丁糟得多。
-    note "版本已变（$got_version ≠ $want_version），不还原：$bundle"
-    alert_once version-moved "⚠️ kg-hub：claude-mem 已升级到 $got_version，T-0077 的幂等补丁（基于 $want_version）不再适用，**未**还原。重复付费的防护当前失效，需要在新版本上重做补丁。"
+    note "版本已变（$got_version ≠ ${want_version}），不还原：$bundle"
+    alert_once version-moved "⚠️ kg-hub：claude-mem 已升级到 ${got_version}，T-0077 的幂等补丁（基于 ${want_version}）不再适用，**未**还原。重复付费的防护当前失效，需要在新版本上重做补丁。"
     continue
   fi
 
@@ -185,7 +185,7 @@ except Exception:
   [ "$now_sha" = "$want_sha" ] && continue      # 绝大多数轮次走到这里，静默
 
   if cp "$SOURCE" "$bundle" 2>/dev/null; then
-    note "补丁被覆盖，已还原：$bundle（原 ${now_sha:-空}）"
+    note "补丁被覆盖，已还原：${bundle}（原 ${now_sha:-空}）"
     alert_once restored "🔧 kg-hub：claude-mem worker 补丁曾被覆盖（多半是插件升级），已自动还原并重启 worker。"
     # 只记一笔，**不在这里重启** —— 循环还没走完，后面的目标还是旧的。
     # 2026-09-20 第一版就在这里直接重启了：worker 起来时恰好可能加载到那些

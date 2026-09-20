@@ -56,21 +56,21 @@ done
 
 # 心跳停了 = refinery 没在跑。这一条比任何计数都优先。
 if [ -n "$AGE" ] && [ "$AGE" -gt "$STALE" ]; then
-  send "🔴 kg-hub 日报：refinery 心跳已停 $((AGE / 60)) 分钟（阈值 $((STALE / 60)) 分）。积压 $BACK、落后 $LAG 条。"
+  send "🔴 kg-hub 日报：refinery 心跳已停 $((AGE / 60)) 分钟（阈值 $((STALE / 60)) 分）。积压 ${BACK}、落后 $LAG 条。"
   exit 0
 fi
 
 prev=$(cat "$BASEF" 2>/dev/null)
 printf '%s %s\n' "$ING" "$REJ" > "$BASEF"
-tail="落后 $LAG 条、积压 $BACK、图节点 $NODES"
-[ "$FLAGS" = "-" ] || tail="$tail｜$FLAGS"
+tail="落后 $LAG 条、积压 ${BACK}、图节点 $NODES"
+[ "$FLAGS" = "-" ] || tail="${tail}｜$FLAGS"
 # 配额天天带上,不是只在撞线时才说。09-16 kg_hub 曾用满 5000/5000 而没人知道,
 # 就是因为它从没出现在任何一条日常汇报里。
 [ "$QUOTA" = "-" ] || tail="$tail
    网关今日用量：$QUOTA"
 
 if [ -z "$prev" ]; then
-  send "📊 kg-hub 日报（首次基线）：累计入图 $ING、拒 $REJ。$tail"
+  send "📊 kg-hub 日报（首次基线）：累计入图 ${ING}、拒 ${REJ}。$tail"
   exit 0
 fi
 ping=$(echo "$prev" | awk '{print $1+0}'); prej=$(echo "$prev" | awk '{print $2+0}')
@@ -78,8 +78,8 @@ ding=$((ING - ping)); drej=$((REJ - prej))
 
 # 今日入图 0 是告警,不是"正常"。旧版把这个当正常,于是三个月没人发现管线停了。
 if [ "$ding" -le 0 ]; then
-  send "🔴 kg-hub 日报：今日入图 0（拒 +$drej、本轮 halted $HALT）。$tail"
+  send "🔴 kg-hub 日报：今日入图 0（拒 +${drej}、本轮 halted ${HALT}）。$tail"
 else
-  send "📊 kg-hub 日报：今日入图 +$ding、拒 +$drej。$tail"
+  send "📊 kg-hub 日报：今日入图 +${ding}、拒 +${drej}。$tail"
 fi
 exit 0

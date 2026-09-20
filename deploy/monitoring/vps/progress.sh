@@ -59,14 +59,14 @@ QHOT=$(printf '%s' "$QUOTA" | awk '{
   }
 }')
 if [ -n "$QHOT" ] && [ "$palarm" != "quota" ]; then
-  send "⚠️ kg-hub：网关配额逼近上限（$QHOT）。今日用量：$QUOTA"
+  send "⚠️ kg-hub：网关配额逼近上限（${QHOT}）。今日用量：$QUOTA"
   printf '%s %s quota\n' "$ING" "$psince" > "$STATEF"
   exit 0
 fi
 
 # 计数涨了 = 管线在干活。刷新"上次前进时刻",并在刚从告警里出来时报一次恢复。
 if [ "$ING" -gt "$ping" ]; then
-  [ "$palarm" = "none" ] || send "✅ kg-hub：管线恢复推进（累计入图 $ING、积压 $BACK）。"
+  [ "$palarm" = "none" ] || send "✅ kg-hub：管线恢复推进（累计入图 ${ING}、积压 ${BACK}）。"
   printf '%s %s none\n' "$ING" "$now" > "$STATEF"
   exit 0
 fi
@@ -74,7 +74,7 @@ fi
 # 没涨。够久了就喊一次停摆,喊过就闭嘴,等它恢复时再说。
 stalled=$((now - psince))
 if [ "$stalled" -gt "$STALL" ] && [ "$palarm" != "stall" ]; then
-  send "🔴 kg-hub：管线已 $((stalled / 3600)) 小时没有新入图（累计 $ING、落后 $LAG 条、积压 $BACK、本轮 halted $HALT、标志 $FLAGS）。"
+  send "🔴 kg-hub：管线已 $((stalled / 3600)) 小时没有新入图（累计 ${ING}、落后 $LAG 条、积压 ${BACK}、本轮 halted ${HALT}、标志 ${FLAGS}）。"
   printf '%s %s stall\n' "$ING" "$psince" > "$STATEF"
   exit 0
 fi

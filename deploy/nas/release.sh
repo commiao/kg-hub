@@ -389,7 +389,7 @@ if [ "$mode" = release ]; then
   # 出事时无从对账，也无法从别的机器复现。
   git merge-base --is-ancestor "$SHA" origin/main 2>/dev/null \
     || die "$SHA 还没推到 origin/main；先 git push 再发布"
-  say "发布 commit $SHA（$(git log -1 --format=%s "$SHA")）"
+  say "发布 commit ${SHA}（$(git log -1 --format=%s "$SHA")）"
 fi
 
 acquire_lock
@@ -465,7 +465,7 @@ on_nas "set -eu
 on_nas "mkdir -p '$DATA/breakers' && chmod 700 '$DATA/breakers'"
 
 if [ "$mode" = release ]; then
-  say "[3/6] 构建 kg-hub-server:$SHA（不动 latest）"
+  say "[3/6] 构建 kg-hub-server:${SHA}（不动 latest）"
   on_nas "cd $SRC && $DK build -t kg-hub-server:$SHA -f deploy/nas/Dockerfile ." \
     || die "构建失败；线上未改动"
 else
@@ -546,7 +546,7 @@ if [ "${DRY_RUN:-0}" != 1 ]; then
   want=$(on_nas "$DK image inspect -f '{{.Id}}' kg-hub-server:$SHA" 2>/dev/null || true)
   got=$(on_nas "$DK inspect -f '{{.Image}}' kg-hub-server" 2>/dev/null || true)
   if [ -z "$want" ] || [ "$want" != "$got" ]; then
-    say "  ⚠ 容器跑的不是 kg-hub-server:$SHA（want=$want got=$got）"
+    say "  ⚠ 容器跑的不是 kg-hub-server:${SHA}（want=$want got=${got}）"
     ok=0
   fi
 fi
@@ -569,7 +569,7 @@ fi
 producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
 discard_refinery_window_backup
 refresh_drift_verdict
-say "✅ 发布完成：kg-hub-server:$SHA（上一个 $PREV 仍在盘上，可 --rollback）"
+say "✅ 发布完成：kg-hub-server:${SHA}（上一个 $PREV 仍在盘上，可 --rollback）"
 }
 
 # 发完顺手刷新漂移巡检的判决。
