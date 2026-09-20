@@ -50,7 +50,11 @@ source_rel=$(sed -n 's/^source=//p' "$MANIFEST" | head -1)
 [ -n "$want_version" ] && [ -n "$want_sha" ] && [ -n "$source_rel" ] || {
   note "清单缺字段，什么都不做"; exit 0; }
 
-SOURCE="$REPO/$source_rel"
+case "$source_rel" in
+  "~/"*) SOURCE="$HOME/${source_rel#\~/}" ;;   # 稳定产物位置（准则 20：别指工作树）
+  /*)    SOURCE="$source_rel" ;;
+  *)     SOURCE="$REPO/$source_rel" ;;          # 仍支持相对仓库根，向后兼容
+esac
 if [ ! -f "$SOURCE" ]; then
   # 有清单、没源 —— 还原能力不存在。这是故障，不是静默档：不出声的话，
   # 下一次插件升级会把补丁抹掉而没有任何人知道。
@@ -64,6 +68,54 @@ if [ "$have_sha" != "$want_sha" ]; then
   alert_once source-drift "🔴 kg-hub：claude-mem 补丁源与清单指纹不符，守护已停手。重新构建后请同步更新 tools/claude_mem_patch.manifest。"
   exit 0
 fi
+
+# ---- 还原文件不等于生效 ----------------------------------------------------
+#
+# 2026-09-19 的教训，代价是一天半：守护在 01:42:50 把补丁按回文件里，而 worker
+# 01:41:03 就已经起来了。bun 在启动时把 bundle 读进内存 —— **进程跑的一直是补丁
+# 写入之前那一份**。盘上是对的，跑的是错的，34 小时没人知道。
+#
+# 我当时在告警文案里写了「worker 需重启才生效」，然后从没执行那一步。
+# **写在文字里的后续动作等于没有后续动作。**
+#
+# 一个 sha 只重启一次：标记按 sha 命名。否则万一判据算错，会每 5 分钟重启一次。
+# 重启走 worker 自己的 stop（优雅），之后 launchd 待命那份或下一个 hook 接管。
+# 不怕丢数据：队列只有 pending/processing 两态、成功消费才删行，
+# 下一轮 resetProcessingToPending 会把没确认的重新发出来。
+restart_worker_once() {
+  sha=$1
+  mark="$STATE_DIR/patch-worker-restarted-$sha"
+  [ -f "$mark" ] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  : > "$mark" 2>/dev/null
+  runner=$(command -v bun || echo "$HOME/.bun/bin/bun")
+  if [ -x "$runner" ] && "$runner" "$SOURCE" stop >/dev/null 2>&1; then
+    note "已重启 worker，让它加载新补丁"
+  else
+    note "重启 worker 失败 —— 补丁在盘上但进程可能仍是旧的"
+    alert_once restart-failed "🔴 kg-hub：claude-mem 补丁已还原但 worker 重启失败。进程仍可能跑着未打补丁的代码（盘上对、跑的错），需手动重启 worker。"
+  fi
+}
+
+# ---- 在位的那个 worker 跑的是不是打过补丁的那份 ----------------------------
+#
+# 上面那条管「文件被覆盖」，这条管「文件没被覆盖，但在跑的进程根本不在这些目标
+# 里」—— 2026-09-19 实测 hook 从一个未打补丁的旧版本目录拉起过 worker。
+# 这里只出声不自动重启：这种情况的正解通常是「版本变了，补丁要重做」，
+# 而不是把在跑的那个打断。
+check_running_worker() {
+  # 地址可覆盖：测试必须能把它指到别处，否则用例会打到真机上的 worker
+  # （2026-09-20 第一版就是这样，一条「静默」用例被真机的实况弄红了）。
+  pid=$(curl -s -m 3 "${CLAUDE_MEM_WORKER_HEALTH:-http://127.0.0.1:37701/health}" 2>/dev/null \
+        | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')
+  [ -n "$pid" ] || return 0                      # 没在跑：不是本脚本的事
+  bundle=$(ps -o command= -p "$pid" 2>/dev/null | tr ' ' '\n' | grep 'worker-service\.cjs$' | head -1)
+  [ -n "$bundle" ] || return 0
+  got=$(shasum -a 256 "$bundle" 2>/dev/null | cut -d' ' -f1)
+  [ "$got" = "$want_sha" ] && return 0
+  note "在位 worker 跑的不是打过补丁的那份：$bundle"
+  alert_once running-unpatched "⚠️ kg-hub：claude-mem 在位 worker 跑的 bundle 未打补丁（$bundle）。重复付费的防护当前失效。"
+}
 
 restored=0
 sed -n 's/^target=//p' "$MANIFEST" | while IFS= read -r rel; do
@@ -96,10 +148,13 @@ except Exception:
 
   if cp "$SOURCE" "$bundle" 2>/dev/null; then
     note "补丁被覆盖，已还原：$bundle（原 ${now_sha:-空}）"
-    alert_once restored "🔧 kg-hub：claude-mem worker 补丁曾被覆盖（多半是插件升级），已自动还原。worker 需重启才生效。"
+    alert_once restored "🔧 kg-hub：claude-mem worker 补丁曾被覆盖（多半是插件升级），已自动还原并重启 worker。"
+    restart_worker_once "$want_sha"
   else
     note "还原失败（写不进去）：$bundle"
     alert_once restore-failed "🔴 kg-hub：claude-mem worker 补丁被覆盖且还原失败（$bundle 写不进去）。"
   fi
 done
+
+check_running_worker
 exit 0

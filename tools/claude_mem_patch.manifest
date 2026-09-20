@@ -2,15 +2,21 @@
 #
 # 补丁内容：观测提示带上队列行 id，让下游 forwarder 能证明「字节相同 = 同一条
 # 观测的重投」，从而复用同一把幂等键、不再重复付费。
-# 源码：commiao/claude-mem 分支 t0077/stable-operation-id，提交 6ad616ea
-#       （从生产提交 d8bc975 / 13.25.1 开的薄分支）
+# 源码：commiao/claude-mem 主干 b9f9263a（= upstream adce0fd / 13.25.2 + 补丁）
+#       准则 18：生产跑的提交必须在 origin/main 上 —— 2026-09-20 已收口
 #
 # version 必须与目标安装的 package.json 对得上。对不上说明插件升级了：
 # **那时绝不能把这份盖回去** —— 那是静默降级。要在新版本上重做补丁。
-version=13.25.1
-sha256=e41988df152ba31503199d73895cfd8c2b4e00cc73af8e43d47767236cc3654b
+version=13.25.2
+sha256=219b813c292dcad11e7e28af900ac3de432f293a3f6ccd1b1f49f7962deb26ac
 marker=cm-op
-# 相对 kg-hub 仓库根的上一级（两个仓库是同级目录）
-source=../claude-mem-fork/plugin/scripts/worker-service.cjs
+# 补丁产物的稳定位置。**不指向开发工作树** —— 准则 20。
+# 2026-09-20：原来写的是 `../claude-mem-fork/plugin/scripts/worker-service.cjs`
+# （相对仓库根）。kg-hub 改成从 ~/.local/share/kg-hub/current 跑产物之后，这个
+# 相对路径解析到产物目录的上一级，那里没有 fork —— 守护当场报「补丁源不存在」。
+# 我自己写的清单就犯了准则 20 的毛病：**指向一棵开发树**。
+# 现在指向同样形态的不可变产物：releases/<fork commit> + current 符号链接。
+source=~/.local/share/claude-mem-patch/current/worker-service.cjs
 target=.claude/plugins/marketplaces/thedotmack/plugin
-target=.codex/plugins/cache/claude-mem-local/claude-mem/13.25.1
+target=.claude/plugins/cache/thedotmack/claude-mem/13.25.2
+target=.codex/plugins/cache/claude-mem-local/claude-mem/13.25.2

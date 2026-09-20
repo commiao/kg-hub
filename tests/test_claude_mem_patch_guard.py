@@ -51,6 +51,7 @@ class PatchGuardTests(unittest.TestCase):
         (self.target / "scripts").mkdir(parents=True)
         self.bundle = self.target / "scripts" / "worker-service.cjs"
         self.log = Path(self.tmp.name) / "guard.log"
+        self.worker_health = "http://127.0.0.1:1/health"   # 必然连不上
         self.write_manifest(sha(PATCHED), VERSION)
         self.write_target(STOCK, VERSION)
 
@@ -70,7 +71,11 @@ class PatchGuardTests(unittest.TestCase):
             capture_output=True, text=True,
             env={"HOME": str(self.home), "PATH": "/usr/bin:/bin",
                  "CLAUDE_MEM_PATCH_LOG": str(self.log),
-                 "CLAUDE_MEM_PATCH_STATE": str(Path(self.tmp.name) / "state")},
+                 "CLAUDE_MEM_PATCH_STATE": str(Path(self.tmp.name) / "state"),
+                 # 指到一个必然连不上的地址：用例绝不能打到真机上在跑的 worker。
+                 # 2026-09-20 第一版没有这一行，「静默」那条被真机实况弄红了 ——
+                 # 它报得没错，只是那不是用例该看的东西。
+                 "CLAUDE_MEM_WORKER_HEALTH": self.worker_health},
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         return self.log.read_text("utf-8") if self.log.exists() else ""
@@ -130,6 +135,106 @@ class PatchGuardTests(unittest.TestCase):
         log = self.run_guard()
         self.assertEqual(self.bundle.read_bytes(), STOCK)
         self.assertIn("读不出版本", log)
+
+
+class RestartAfterRestoreTests(PatchGuardTests):
+    """还原文件不等于生效 —— 必须把 worker 也重启。
+
+    2026-09-19 的教训，代价是一天半：守护 01:42:50 把补丁按回文件里，而 worker
+    01:41:03 就已经起来了。bun 启动时把 bundle 读进内存，**进程跑的一直是补丁
+    写入之前那一份**。盘上对、跑的错，34 小时没人知道。
+
+    当时我在告警文案里写了「worker 需重启才生效」，然后从没执行那一步。
+    **写在文字里的后续动作等于没有后续动作** —— 所以它必须变成代码。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 假 bun：把「被要求 stop」记进文件，不真的动任何进程。
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        self.stopped = Path(self.tmp.name) / "stopped"
+        (self.bin / "bun").write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "$*" >> {self.stopped}\nexit 0\n', "utf-8")
+        (self.bin / "bun").chmod(0o755)
+
+    def run_guard(self) -> str:
+        import subprocess
+        done = subprocess.run(
+            ["/bin/sh", str(self.repo / "tools" / "claude_mem_patch_guard.sh")],
+            capture_output=True, text=True,
+            env={"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
+                 "CLAUDE_MEM_PATCH_LOG": str(self.log),
+                 "CLAUDE_MEM_PATCH_STATE": str(Path(self.tmp.name) / "state"),
+                 "CLAUDE_MEM_WORKER_HEALTH": self.worker_health},
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return self.log.read_text("utf-8") if self.log.exists() else ""
+
+    def test_restoring_the_patch_also_restarts_the_worker(self):
+        log = self.run_guard()
+        self.assertEqual(self.bundle.read_bytes(), PATCHED)
+        self.assertTrue(self.stopped.exists(), "还原了文件却没重启 worker")
+        self.assertIn("stop", self.stopped.read_text("utf-8"))
+        self.assertIn("已重启 worker", log)
+
+    def test_an_intact_patch_does_not_restart_anything(self):
+        """没还原就别动在跑的进程。"""
+        self.write_target(PATCHED, VERSION)
+        self.run_guard()
+        self.assertFalse(self.stopped.exists(), "什么都没改却重启了 worker")
+
+    def test_one_restart_per_patch_version_not_every_five_minutes(self):
+        """一个 sha 只重启一次。判据万一算错，不能变成每 5 分钟打断一次采集。"""
+        self.run_guard()
+        self.write_target(STOCK, VERSION)          # 再次被覆盖
+        self.run_guard()
+        self.assertEqual(self.bundle.read_bytes(), PATCHED, "第二次没还原")
+        self.assertEqual(len(self.stopped.read_text("utf-8").strip().splitlines()), 1)
+
+
+class RunningWorkerTests(PatchGuardTests):
+    """文件对不代表在跑的那个对 —— 它可能压根不在这些目标里。
+
+    2026-09-19 实测 hook 从一个未打补丁的旧版本目录拉起过 worker。这种情况
+    只出声不自动重启：正解通常是「版本变了，补丁要重做」，而不是打断在跑的那个。
+    """
+
+    def serve(self, bundle_path: str):
+        """起一个假 /health，返回一个 pid，并让 ps 能查到它的命令行。"""
+        import http.server, threading, os, subprocess, sys
+        # 用一个真实存在的子进程当"在位 worker"，命令行里带上 bundle 路径
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 f"import time,sys;sys.argv.append({bundle_path!r});time.sleep(30)",
+                                 bundle_path])
+        self.addCleanup(proc.kill)
+        pid = proc.pid
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = f'{{"status":"ok","pid":{pid}}}'.encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            def log_message(self, *a): pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.worker_health = f"http://127.0.0.1:{server.server_address[1]}/health"
+
+    def test_an_unpatched_running_worker_is_reported(self):
+        stray = Path(self.tmp.name) / "stray"
+        stray.mkdir()
+        (stray / "worker-service.cjs").write_bytes(STOCK)
+        self.serve(str(stray / "worker-service.cjs"))
+        self.write_target(PATCHED, VERSION)        # 文件都对，只有在跑的那个不对
+        log = self.run_guard()
+        self.assertIn("在位 worker 跑的不是打过补丁的那份", log)
+
+    def test_a_patched_running_worker_stays_silent(self):
+        self.write_target(PATCHED, VERSION)
+        self.serve(str(self.bundle))
+        self.assertEqual(self.run_guard(), "")
 
 
 class WiringTests(unittest.TestCase):
