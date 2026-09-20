@@ -175,30 +175,43 @@ def live_commit(ssh_target: str, src: str) -> str:
 
 
 def fetch_origin() -> bool:
-    """把 origin 拉新。失败返回 False。
-
-    判「在不在主干上」之前必须拉一次：本地 origin/main 陈旧的话，一个已经合进
-    主干的 commit 会被判成「不在主干上」—— 那是这条检测里最响的一档警报，
-    拿它去报一件不存在的事，等于把警报变成噪音（准则 28）。
-    """
+    """把 origin 拉新。失败返回 False。"""
     proc = subprocess.run(["git", "-C", str(REPO), "fetch", "origin", "--quiet"],
                           capture_output=True, text=True)
     return proc.returncode == 0
 
 
-def on_trunk(ref: str, trunk: str = "origin/main") -> bool | None:
-    """ref 在不在主干这条线上。本地没有这个 commit 时返回 None。
+def trunk_verdict(ref: str, trunk: str = "origin/main") -> tuple[str, str]:
+    """ref 在不在主干这条线上。返回 (判决, 一句人话)，判决三选一：on / off / unknown。
 
-    用 `merge-base --is-ancestor` 而不是「等于 trunk」：**回滚到一个更早的
-    commit 是正当操作**，只要它确实在主干这条线上（准则 18 原话）。
-    写成相等的话，每一次正当回滚都会被报成漂移。
+    **用 `merge-base --is-ancestor` 而不是「等于 trunk」。** 准则 18 原话：回滚到
+    一个更早的 commit 是正当操作，只要它确实在主干这条线上。写成相等的话，
+    每一次正当回滚都会被报成漂移 —— 而回滚恰恰是最不需要一条看不懂的红灯的时刻。
+
+    **为什么拉不到 origin 不是直接判 unknown。** 陈旧的 origin/main 只会造成
+    **单向**的错：一个 commit 若是旧主干的祖先，它必然也是新主干的祖先，所以
+    `True` 在陈旧基线下依然可信；只有 `False` 可能是「其实已经合进去了，只是
+    这次没拉到」。于是拉不到时 True 照常放行，False 降级成 unknown。
+    不这么分的话，一次网络抖动就会把一条正常的绿变成 rc=2 的橙 —— 而这条链路
+    有据可查地会抖（Mac 侧实测多次），天天亮的橙灯等于没有灯（准则 28）。
     """
-    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
-                      capture_output=True).returncode != 0:
-        return None
-    return subprocess.run(
-        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", ref, trunk],
+    fetched = fetch_origin()
+    short = ref[:12]
+    exists = subprocess.run(
+        ["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
         capture_output=True).returncode == 0
+    if not exists:
+        if not fetched:
+            return "unknown", f"{short} 本地没有，且这次没拉到 origin —— 判不了"
+        return "off", f"{short} 在 origin 上根本不存在（线上跑着一个没推上来的版本）"
+    if subprocess.run(
+            ["git", "-C", str(REPO), "merge-base", "--is-ancestor", ref, trunk],
+            capture_output=True).returncode == 0:
+        return "on", f"{short} 在 {trunk} 这条线上"
+    if not fetched:
+        return "unknown", (f"{short} 看着不在主干上，但这次没拉到 origin，"
+                           "本地主干可能是陈旧的 —— 不作判决")
+    return "off", f"{short} 不在 {trunk} 这条线上"
 
 
 def tracked_at(ref: str) -> list[str]:
@@ -346,25 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     # （既有用例钉着「--list-extra 永远不写 verdict」）。主干这一判属于判决，
     # 不该挡住一个只读清单的调用。
     trunk_checked = not args.skip_trunk and not args.list_extra
-    on_main = None
-    if trunk_checked:
-        if not fetch_origin():
-            # 拉不到 origin 就判不了「在不在主干上」。此时**不许出 ok**：
-            # 拿陈旧的主干去判，一个已经合进主干的 commit 会被报成不在主干上。
-            detail = f"{short} 拉不到 origin，判不了在不在主干上，本次不作判决"
-            print(f"🟠 {detail}")
-            write_status(args.status_file, "error", detail)
-            return 2
-        on_main = on_trunk(ref)
-        if on_main is None:
-            # 拉过 origin 之后本地仍然没有这个 commit —— 线上跑的东西在远端**根本
-            # 不存在**。这是最严重的一档：连"它漂没漂"都无从谈起，因为没有对照物。
-            detail = f"{short} 在 origin 上根本不存在（线上跑着一个没推上来的版本）"
-            print(f"❌ {detail}")
-            print("   先把线上那份取回来建快照分支，再决定怎么合 —— "
-                  "在那之前任何比对都是对着空气比。")
-            write_status(args.status_file, "drift", detail)
-            return 1
+    trunk, trunk_why = trunk_verdict(ref) if trunk_checked else ("on", "")
+    if trunk == "unknown":
+        print(f"🟠 {trunk_why}")
+        write_status(args.status_file, "error", trunk_why)
+        return 2
 
     try:
         subject = subprocess.run(
@@ -376,11 +375,11 @@ def main(argv: list[str] | None = None) -> int:
 
     bad = compare(ssh_target, src, ref)
 
-    if trunk_checked and on_main is False and not args.list_extra:
+    if trunk == "off":
         # 文件对不对得上它，在这里是次要的。主干上没有这个版本，意味着下一个人
         # 从 main 出发做的任何事（发布、回滚、比对漂移）都会把它悄悄抹掉，
         # **而且不会有冲突提示，因为 main 从来就不知道它存在**（准则 18 原话）。
-        detail = (f"{short} 不在 origin/main 这条线上"
+        detail = (trunk_why
                   + (f"；另有 {len(bad)} 处文件差异" if bad else "，文件本身与它一致"))
         print(f"❌ 线上跑的 commit 不在主干上：{short} {subject}")
         print(f"   {detail}")
