@@ -124,10 +124,13 @@ services:
       - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
       # LLM 并发/限速。默认全串行(对 NAS 温柔);经 .env 可调——2026-08-14 实测
       # 单条入图 80s 全卡在这里(温度只占 20% 暂停),提产能的唯一开关就是这两个。
-      - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-1}
-      - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-4.0}
+      # 2 是线上实际在跑的值（此前只存在于 NAS 的 .env 里，git 说 1）。
+      - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
+      # 2.0 是线上实际在跑的值 —— 把模型调用速率相对 git 里的 4.0 翻了一倍。
+      - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-2.0}
       # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
-      - KG_HUB_PREDIGEST=${KG_HUB_PREDIGEST:-0}
+      # 1 是线上实际在跑的值（git 说 0）。
+      - KG_HUB_PREDIGEST=${KG_HUB_PREDIGEST:-1}
       # 门户「精炼层」卡读 refinery 的 status.json(ro 共享卷)
       - KG_HUB_REFINERY_STATUS=/refinery-state/status.json
       # device_liveness 容器每分钟写入真实 `tailscale status --json`；server
@@ -300,14 +303,18 @@ services:
       - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-22}
       - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
-      - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-52}
+      # 59 是用户 2026-09-17 明确拍板上调的温控阈值（DSM 约 61°C 强制关机）。
+      # 此前它只存在于 NAS 的 .env 里，git 一直说 52 —— 2026-09-20 排查
+      # 「积压为什么不动」时因此绕了好几轮才发现真值。
+      - KG_HUB_REFINERY_MAX_DISK_TEMP=${KG_HUB_REFINERY_MAX_DISK_TEMP:-59}
       # 承载 KG_HUB_DATA_ROOT 的那块盘(如 sata3)。**只用于记录,不参与判定** ——
       # 闸门仍取 max(全部盘)。填了它,status.json 才会单列"本来只看自己那块
       # 会是多少",否则"闸门是不是拦错盘"只能靠人 ssh 上去翻。
       # 怎么查:`df -P $KG_HUB_DATA_ROOT` 拿到 cachedev_N,
       #        再 `ls -l /sys/block/dm-*/slaves/` 找到对应 mdN,
       #        最后 `cat /proc/mdstat` 看 mdN 由哪块 sata 组成。
-      - KG_HUB_REFINERY_DATA_DISK=${KG_HUB_REFINERY_DATA_DISK:-}
+      # sata3 是承载数据卷的那块盘（遥测单列一栏用，判定仍取 max(全部盘)）。
+      - KG_HUB_REFINERY_DATA_DISK=${KG_HUB_REFINERY_DATA_DISK:-sata3}
     volumes:
       # 群晖盘温直读(免sudo),温度门控数据源
       - /run/synostorage/disks:/disktemp:ro
