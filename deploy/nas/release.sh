@@ -569,6 +569,7 @@ fi
 producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
 discard_refinery_window_backup
 refresh_drift_verdict
+report_prunable
 say "✅ 发布完成：kg-hub-server:${SHA}（上一个 $PREV 仍在盘上，可 --rollback）"
 }
 
@@ -594,6 +595,31 @@ refresh_drift_verdict() {
     # 非零也可能只是「确实有漂移」——那是真话，照样算刷新成功。
     say "  巡检判决已刷新（有待处理项，见 $HOME/.cache/kg-hub/source-drift.status）"
   fi
+}
+
+# 发完列一遍「NAS 上有、git 里没有」的文件 —— **只打印，绝不删**（T-0084 观察期）。
+#
+# 本脚本是逐文件 mv -f 覆盖，从不删除，所以从 git 删掉的文件会一直留在 NAS 上被
+# 执行。2026-09-20 抓到的 ingesters/claude_mem_obs.py 就是这么来的：git 早已
+# 删除（972cfae「退役：没人 import、没有作业跑它」），NAS 上却活着，靠漂移检测
+# 报红六小时后人工清掉。
+#
+# 为什么先只打印：自动删的风险是**误删生产独有的必需文件**（准则 5「备份范围 ⊇
+# 覆盖范围」踩过的坑）。观察期的目的就是攒够证据——确认这份清单里从不出现真正
+# 需要的文件，再谈开删。在那之前，这里一个字节都不动 NAS。
+#
+# 清单取自 check_source_drift.py --list-extra，与漂移报告同一处定义
+# （EXTRA_REASONS），所以「该删什么」与「报什么漂移」不可能各自演化。
+report_prunable() {
+  [ "${DRY_RUN:-0}" != 1 ] || return 0
+  checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
+  [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
+  extra=$(python3 "$checker" --list-extra --ref "$SHA" 2>/dev/null) || return 0
+  [ -n "$extra" ] || { say "  NAS 无多余文件（git 已删但仍在线上的：0 个）"; return 0; }
+  n=$(printf '%s\n' "$extra" | wc -l | tr -d ' ')
+  say "  ⚠ NAS 上有 $n 个文件 git 里已经没有了（观察期：本次未删除任何文件）"
+  printf '%s\n' "$extra" | sed 's/^/        /'
+  say "        处置见 T-0084；确认无误可手工删，自动 prune 尚未启用"
 }
 
 # 允许 shell 测试 source 本文件、替换 on_nas 后直接覆盖 .env 事务的失败分支；正常
