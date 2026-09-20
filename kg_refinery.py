@@ -227,7 +227,21 @@ def bounded_heartbeat_interval(raw: str | None) -> int:
 # 这是存活信号，不是批次进度：长批次逐条 poll 时也必须持续刷新。
 HEARTBEAT_INTERVAL = bounded_heartbeat_interval(
     os.environ.get("KG_HUB_REFINERY_HEARTBEAT_SEC"))
-BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "15"))
+# backlog 与 live 的默认值必须一致：两条线平分每轮名额。默认值写歪了，没设环境变量的
+# 部署就会悄悄回到失衡状态，而那正是 09-19 那晚的病因。
+BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "50"))
+# live 每轮取多少条。2026-09-20 之前这是源码里写死的 200，而 backlog 可配且线上是 8
+# —— 25:1。实测后果（09-19 夜窗口）：
+#
+#   日配额 5000 次模型调用 ÷ 每条观测约 20 次 ≈ 250 条观测/天
+#   每轮名额 8 + 200 = 208 条 ≈ 4160 次调用  →  配额只够 1.2 轮
+#
+# 于是 10 小时窗口里真正干活的只有**头 3 分钟**，其余时间全在暂停循环里空转；
+# 积压整夜只分到 15 条（7452→7437），而 live 拿走 94%。按这个速度 7437 条要 496 晚
+# —— 不是慢，是结构上到不了。
+#
+# 两条都可配之后，比例就是一个能被审阅、被测试钉住的决策，而不是藏在切片里的常数。
+LIVE_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_LIVE_PER_CYCLE", "50"))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
 # 夜间回填窗口(北京时间 / Asia/Shanghai, UTC+8;含头不含尾;跨午夜写成 start>end)。
 # 默认 22:00-08:00，由环境变量显式覆盖时以覆盖值为准。
@@ -941,11 +955,11 @@ async def main() -> int:
                      live_processed={"ingested": 0, "rejected": 0, "deferred": 0,
                                      "pending_this_cycle": True})
 
-            # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累>200条后永久卡死)
+            # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累超过一批后永久卡死)
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
             cursor = wm.get("live_cursor") or boundary
             live_ids = [i for i in fetch_ids(min_id_exclusive=cursor)
-                        if i not in terminal][:200]
+                        if i not in terminal][:LIVE_PER_CYCLE]
             s_live = await process_batch(
                 fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live",
                 quota_pause=quota_pause,
