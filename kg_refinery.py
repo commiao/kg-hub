@@ -7,7 +7,11 @@ NAS(sync_claude_mem_to_nas.sh),此前无消费者(4555 条积压)。本进程:
         ──▶ POST /api/ingest(唯一治理写入通道:幂等键/备份/kind链/预拆分流)
              逐条 poll-drain 串行(尊重单写者,模式同 vps_push_capsules)
 
-与退役的 ingesters/claude_mem_obs.py 的关系:查询/正文拼装/过滤调用逐字段镜像
+与退役的 claude_mem_obs 的关系:查询/正文拼装/过滤调用逐字段镜像。
+该文件已于 2026-09-20 删除(它不被任何代码 import、也没有任何容器或作业执行,
+16 处引用全是本文件里的血缘注释)。下面那些「镜像 claude_mem_obs.xxx」按函数名
+去 git 历史找:`git log --all -- ingesters/claude_mem_obs.py`,最后一版在 d54cfde。
+留着一份没人执行的副本,下一个人会以为它还在跑 —— 今天已经被这个形态骗过好几次。
 (语义等价),唯一区别是写入从「直连 FalkorDB add_episode(无治理)」改为
 「HTTP /api/ingest(全治理)」。旧水印(526 ingested + 2471 rejected)首轮自动迁移。
 

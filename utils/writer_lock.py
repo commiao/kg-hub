@@ -10,8 +10,10 @@ read-then-write is logically atomic w.r.t. FalkorDB state.
 
 Scope:
   * In-scope: any process on this Mac that calls graphiti.add_episode()
-    (ingesters/openclaw_capsule.py, ingesters/claude_mem_obs.py, future
-    manual or MCP-triggered writers).
+    (ingesters/openclaw_capsule.py, kg_refinery.py, future manual or
+    MCP-triggered writers).
+    claude_mem_obs 已于 2026-09-20 删除，职责由 kg_refinery 承接 —— 把一个
+    不存在的写入方列在这里，会让人以为锁的覆盖面比实际更宽。
   * Out-of-scope: MCP READ tools (kg_search etc.) — they don't write.
   * Out-of-scope: cross-machine writers (Phase 3 OpenClaw push) — those
     will need server-side idempotency keys, which file locks can't provide.
