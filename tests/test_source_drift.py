@@ -163,6 +163,86 @@ class UnionTests(unittest.TestCase):
         self.assertEqual(self.compare_with(["a.py"], ["a.py"], {"a.py": "1" * 64}), {})
 
 
+class ListExtraTests(unittest.TestCase):
+    """--list-extra：观察期的唯一产物，将来 release.sh 要照它 prune。
+
+    这份清单有两条性质必须钉死，丢了任何一条都会变成「删错东西」：
+      1. 它和漂移报告取自**同一处**定义（EXTRA_REASONS），不能各自演化
+      2. 豁免文件（.env 等）绝不能出现在里面 —— 那是生产凭据
+    """
+
+    def run_list_extra(self, bad):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with mock.patch.object(D, "compare", return_value=bad), \
+             mock.patch.object(D, "release_config",
+                               return_value={"ssh": "x@y", "src": "/src"}), \
+             mock.patch.object(D, "live_commit", return_value="d" * 40), \
+             mock.patch.object(D, "write_status") as ws, \
+             redirect_stdout(buf):
+            rc = D.main(["--list-extra"])
+        return rc, [l for l in buf.getvalue().splitlines() if l], ws
+
+    def test_lists_only_the_nas_side_extras(self):
+        rc, out, _ = self.run_list_extra([
+            ("a.py", "内容不一致"),          # 不是多出来的，是改过的 —— 不能删
+            ("b.py", "NAS 上没有"),          # 根本不在 NAS 上 —— 更不能"删"
+            ("ghost.py", D.EXTRA_REASONS[0]),
+            ("x.py.bak", D.EXTRA_REASONS[1]),
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, ["ghost.py", "x.py.bak"])
+
+    def test_content_mismatch_never_enters_the_prune_list(self):
+        # 最要命的误删形态：文件两边都有、只是内容不同。它属于"该重新发布"，
+        # 不属于"该删除"。把它混进清单，一次 prune 就把生产文件删了。
+        _, out, _ = self.run_list_extra([("kg_hub_server.py", "内容不一致")])
+        self.assertEqual(out, [])
+
+    def test_labels_come_from_one_definition(self):
+        # compare() 打的标签必须就是 EXTRA_REASONS 里的那两个字符串。
+        # 任一处被改成字面量而另一处没跟着改，这条立刻转红。
+        with mock.patch.object(D, "tracked_at", return_value=[]), \
+             mock.patch.object(D, "remote_listing",
+                               return_value=["ghost.py", "x.py.bak"]), \
+             mock.patch.object(D, "remote_hashes", return_value={}), \
+             mock.patch.object(D, "git_hash", return_value=None):
+            reasons = set(dict(D.compare("x@y", "/src", "ref")).values())
+        self.assertTrue(reasons <= set(D.EXTRA_REASONS), reasons)
+
+    def test_exempt_files_can_never_reach_the_list(self):
+        """.env 是生产凭据，进了这份清单将来就会被 prune 删掉。
+
+        它在 remote_listing 源头就被滤掉，所以进不了 compare 的结果、
+        也就进不了清单。这里端到端锁一遍：给 remote_listing 喂进 .env，
+        清单里必须没有它、而真正多余的那个必须在。
+        """
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        raw = [".env", ".DS_Store", "a/__pycache__/x.pyc", "._foo", "ghost.py"]
+        with mock.patch.object(D, "tracked_at", return_value=[]), \
+             mock.patch.object(D, "remote_listing",
+                               side_effect=lambda *a: [n for n in raw
+                                                       if not D.is_allowed_untracked(n)]), \
+             mock.patch.object(D, "remote_hashes", return_value={}), \
+             mock.patch.object(D, "git_hash", return_value=None), \
+             mock.patch.object(D, "release_config",
+                               return_value={"ssh": "x@y", "src": "/src"}), \
+             mock.patch.object(D, "live_commit", return_value="d" * 40), \
+             mock.patch.object(D, "write_status"), \
+             redirect_stdout(buf):
+            D.main(["--list-extra"])
+        listed = [l for l in buf.getvalue().splitlines() if l]
+        self.assertEqual(listed, ["ghost.py"], listed)
+
+    def test_list_extra_never_writes_a_verdict(self):
+        # 观察期只读：不许写状态文件，否则会把巡检面板的判决覆盖掉。
+        _, _, ws = self.run_list_extra([("ghost.py", D.EXTRA_REASONS[0])])
+        ws.assert_not_called()
+
+
 class StatusFileTests(unittest.TestCase):
     """判决必须带写入时刻，且只剩杂物时不许报成实质漂移。"""
 

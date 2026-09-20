@@ -201,6 +201,11 @@ def git_hash(ref: str, name: str) -> str | None:
     return hashlib.sha256(proc.stdout).hexdigest() if proc.returncode == 0 else None
 
 
+# compare() 里代表「NAS 上多出来、git 里没有」的两个标签。--list-extra 按它取，
+# 报告也按它分堆 —— 「该删什么」与「报什么漂移」由此出自同一处定义，不会各自演化。
+EXTRA_REASONS = ("只在 NAS 上，git 未跟踪", "备份杂物")
+
+
 def compare(ssh_target: str, src: str, ref: str) -> list[tuple[str, str]]:
     """返回 [(文件, 问题)]。只报「不一致」，不猜方向。
 
@@ -228,8 +233,8 @@ def compare(ssh_target: str, src: str, ref: str) -> list[tuple[str, str]]:
     for name in sorted(set(on_nas) - set(names)):
         # 最危险的一种：生产在跑，git 里连文件都没有。对 kg-hub 还有第二种来源 ——
         # release.sh 从不删除，所以 git 里删掉的文件会一直留在 NAS 上被执行。
-        bad.append((name, "备份杂物" if looks_like_backup(name)
-                    else "只在 NAS 上，git 未跟踪"))
+        bad.append((name, EXTRA_REASONS[1] if looks_like_backup(name)
+                    else EXTRA_REASONS[0]))
     return bad
 
 
@@ -259,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
                          "作业跑发布产物时必须显式给出——产物里没有 .git。")
     ap.add_argument("--status-file", help="把一行判决写到这里，供 SessionStart hook 读")
     ap.add_argument("--ref", help="指定要比对的 commit（默认取线上 .env 的镜像标签）")
+    ap.add_argument("--list-extra", action="store_true",
+                    help="只列「NAS 上有、git 里没有」的文件，每行一个，供 release.sh "
+                         "在发布时打印（观察期只打印不删）。清单与漂移报告取自同一处"
+                         "定义（EXTRA_REASONS），所以「该删什么」与「报什么漂移」"
+                         "不可能各自演化")
     args = ap.parse_args(argv)
     if args.repo is not None:
         set_repo(args.repo)
@@ -277,6 +287,14 @@ def main(argv: list[str] | None = None) -> int:
         subject = "(本地仓库里没有这个 commit)"
 
     bad = compare(ssh_target, src, ref)
+
+    if args.list_extra:
+        # 机器可读、只此一样东西：不写状态文件、不打判决。观察期的唯一产物就是这份
+        # 清单，谁要删由调用方决定——本脚本永远只读不写 NAS。
+        for name, _ in [x for x in bad if x[1] in EXTRA_REASONS]:
+            print(name)
+        return 0
+
     if not bad:
         detail = f"{short} {subject}"
         print(f"✅ NAS 源码等于 {detail}")
@@ -285,8 +303,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # 危险的排前面：内容对不上、该有却没有、git 里删掉却还在生产上跑。
     # 备份杂物单独归堆 —— 混在一起看，真信号会被 15 行噪音淹掉。
-    junk = [x for x in bad if x[1] == "备份杂物"]
-    real = [x for x in bad if x[1] != "备份杂物"]
+    junk = [x for x in bad if x[1] == EXTRA_REASONS[1]]
+    real = [x for x in bad if x[1] != EXTRA_REASONS[1]]
     if not real:
         # 只剩杂物：如实说，但别报成实质漂移 —— 否则这条检查永远红，而永远红的
         # 检查等于没有，没人会再看它。
