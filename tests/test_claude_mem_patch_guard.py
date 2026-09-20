@@ -176,7 +176,7 @@ class RestartAfterRestoreTests(PatchGuardTests):
         self.assertEqual(self.bundle.read_bytes(), PATCHED)
         self.assertTrue(self.stopped.exists(), "还原了文件却没重启 worker")
         self.assertIn("stop", self.stopped.read_text("utf-8"))
-        self.assertIn("已重启 worker", log)
+        self.assertIn("已排空并重启 worker", log)
 
     def test_an_intact_patch_does_not_restart_anything(self):
         """没还原就别动在跑的进程。"""
@@ -220,6 +220,78 @@ class RestartAfterRestoreTests(PatchGuardTests):
         self.run_guard()
         self.assertEqual(self.bundle.read_bytes(), PATCHED, "第二次没还原")
         self.assertEqual(len(self.stopped.read_text("utf-8").strip().splitlines()), 1)
+
+
+class DrainBeforeRestartTests(RestartAfterRestoreTests):
+    """重启之前必须排空 —— 准则 29。
+
+    2026-09-20 在网关那边查实：没排空就重启，在飞的付费请求会变成永不过期的孤儿
+    （钱付了、答案没拿到、只能人工核实）。那 18 条未决只来自三次事件，每次都是
+    一整批在几十秒内同时死，其中一次对得上 02:05 的裸 `docker restart`。
+
+    worker 这一侧同理：它正在等的那次模型调用是花了钱的。
+    """
+
+    def serve_sessions(self, active: int):
+        """假一个 /health，报指定数量的在飞会话。"""
+        import http.server, threading
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = f'{{"status":"ok","activeSessions":{active},"pid":1}}'.encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            def log_message(self, *a): pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.worker_health = f"http://127.0.0.1:{server.server_address[1]}/health"
+
+    def run_guard(self, drain_timeout="5") -> str:
+        import subprocess
+        done = subprocess.run(
+            ["/bin/sh", str(self.repo / "tools" / "claude_mem_patch_guard.sh")],
+            capture_output=True, text=True,
+            env={"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
+                 "CLAUDE_MEM_PATCH_LOG": str(self.log),
+                 "CLAUDE_MEM_PATCH_STATE": str(Path(self.tmp.name) / "state"),
+                 "CLAUDE_MEM_WORKER_HEALTH": self.worker_health,
+                 "CLAUDE_MEM_DRAIN_TIMEOUT": drain_timeout},
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return self.log.read_text("utf-8") if self.log.exists() else ""
+
+    def test_a_busy_worker_is_not_restarted(self):
+        """**本文件最承重的一条。** 有在飞请求就不停 —— 停了就是制造孤儿付费记录。"""
+        self.serve_sessions(3)
+        log = self.run_guard()
+        self.assertEqual(self.bundle.read_bytes(), PATCHED, "文件还是要还原的")
+        self.assertFalse(self.stopped.exists(), "有在飞请求却把 worker 停了")
+        self.assertIn("仍有在飞请求", log)
+
+    def test_an_idle_worker_is_restarted(self):
+        self.serve_sessions(0)
+        log = self.run_guard()
+        self.assertTrue(self.stopped.exists(), "空闲却没重启")
+        self.assertIn("已排空并重启", log)
+
+    def test_a_skipped_restart_is_retried_next_round(self):
+        """排不空就**不写标记** —— 否则这一版永远等不到重启。
+
+        守护每 300 秒一轮，下一轮 worker 空了就该补上。
+        """
+        self.serve_sessions(3)
+        self.run_guard()
+        self.assertFalse(self.stopped.exists())
+        self.serve_sessions(0)                      # 下一轮：空了
+        self.write_target(STOCK, VERSION)           # 再次被覆盖
+        self.run_guard()
+        self.assertTrue(self.stopped.exists(), "下一轮空闲了仍然没补上重启")
+
+    def test_an_unreachable_health_endpoint_does_not_block_forever(self):
+        """读不出在飞数就放行 —— 卡死在这一步会让补丁永远装不上，那是确定的损失。"""
+        self.worker_health = "http://127.0.0.1:1/health"
+        self.run_guard()
+        self.assertTrue(self.stopped.exists())
 
 
 class RunningWorkerTests(PatchGuardTests):

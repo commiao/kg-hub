@@ -82,15 +82,53 @@ fi
 # 重启走 worker 自己的 stop（优雅），之后 launchd 待命那份或下一个 hook 接管。
 # 不怕丢数据：队列只有 pending/processing 两态、成功消费才删行，
 # 下一轮 resetProcessingToPending 会把没确认的重新发出来。
+# 重启之前先排空 —— 准则 29。
+#
+# 2026-09-20 在网关那边查实：没排空就重启，**在飞的付费请求会变成永不过期的孤儿**
+# （钱付了、答案没拿到、不能自动重试、只能人工核实）。`kg_hub.entity_extract` 那
+# 18 条未决只来自三次事件，每次都是一整批在几十秒内同时死，其中一次对得上 02:05
+# 的裸 `docker restart`。
+#
+# worker 这一侧同理：它正在等的那次模型调用是花了钱的。
+# `/health` 的 `activeSessions` 就是在飞标志。
+#
+# **等不到空就不重启**，而不是等够时间硬停：补丁再晚生效五分钟的代价，远小于
+# 弄出一条只能人工核实的付费记录。守护每 300 秒还会再来一次。
+DRAIN_TIMEOUT=${CLAUDE_MEM_DRAIN_TIMEOUT:-180}
+WORKER_HEALTH=${CLAUDE_MEM_WORKER_HEALTH:-http://127.0.0.1:37701/health}
+
+worker_active_sessions() {
+  curl -s -m 3 "$WORKER_HEALTH" 2>/dev/null \
+    | sed -n 's/.*"activeSessions":\([0-9]*\).*/\1/p'
+}
+
+wait_until_drained() {
+  deadline=$(( $(date +%s) + DRAIN_TIMEOUT ))
+  while :; do
+    n=$(worker_active_sessions)
+    # 读不出来（worker 没在跑 / 端点变了）：没有在飞的证据，按可以停处理。
+    # 这里宁可放行 —— 卡死在这一步会让补丁永远装不上，而那是确定的损失。
+    [ -z "$n" ] && return 0
+    [ "$n" -eq 0 ] 2>/dev/null && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 5
+  done
+}
+
 restart_worker_once() {
   sha=$1
   mark="$STATE_DIR/patch-worker-restarted-$sha"
   [ -f "$mark" ] && return 0
+  if ! wait_until_drained; then
+    # 不写标记：这一版还没重启过，下一轮（300 秒后）再试。
+    note "worker 仍有在飞请求（${DRAIN_TIMEOUT}s 未排空），本轮不重启 —— 重启会把在飞的付费调用变成孤儿"
+    return 0
+  fi
   mkdir -p "$STATE_DIR" 2>/dev/null
   : > "$mark" 2>/dev/null
   runner=$(command -v bun || echo "$HOME/.bun/bin/bun")
   if [ -x "$runner" ] && "$runner" "$SOURCE" stop >/dev/null 2>&1; then
-    note "已重启 worker，让它加载新补丁"
+    note "已排空并重启 worker，让它加载新补丁"
   else
     note "重启 worker 失败 —— 补丁在盘上但进程可能仍是旧的"
     alert_once restart-failed "🔴 kg-hub：claude-mem 补丁已还原但 worker 重启失败。进程仍可能跑着未打补丁的代码（盘上对、跑的错），需手动重启 worker。"
