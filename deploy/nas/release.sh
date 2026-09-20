@@ -568,8 +568,10 @@ fi
 
 producers_stopped=0   # 上一步的 up -d 已经把它们带起来了
 discard_refinery_window_backup
+# 顺序要紧：prune 会改变「NAS 上有什么」，而漂移判决正是对这件事的结论。
+# 刷在前面的话，刚刷的那条判决在几秒后就被自己这一步弄过期了（准则 10）。
+prune_orphans
 refresh_drift_verdict
-report_prunable
 say "✅ 发布完成：kg-hub-server:${SHA}（上一个 $PREV 仍在盘上，可 --rollback）"
 }
 
@@ -588,38 +590,87 @@ refresh_drift_verdict() {
   [ "${DRY_RUN:-0}" != 1 ] || return 0
   checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
   [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
-  if python3 "$checker" --status-file "$HOME/.cache/kg-hub/source-drift.status" \
-       >/dev/null 2>&1; then
-    say "  巡检判决已刷新"
-  else
-    # 非零也可能只是「确实有漂移」——那是真话，照样算刷新成功。
-    say "  巡检判决已刷新（有待处理项，见 $HOME/.cache/kg-hub/source-drift.status）"
-  fi
+  set +e
+  python3 "$checker" --status-file "$HOME/.cache/kg-hub/source-drift.status" \
+    >/dev/null 2>&1
+  local rc=$?
+  set -e
+  # 三档，不能并成两档。原来写的是「非零一律算刷新成功，因为非零也可能只是确实
+  # 有漂移」—— 那句把「有漂移」和「检测压根没跑成」混成了一句，而后者状态文件
+  # **根本没写**，此时说「已刷新」是假话。准则 10 的要害正是「能改变判决的动作
+  # 要对判决负责」。
+  case "$rc" in
+    0) say "  巡检判决已刷新：一致" ;;
+    1) say "  巡检判决已刷新：有待处理项，见 $HOME/.cache/kg-hub/source-drift.status" ;;
+    *) say "  ⚠ 巡检判决**没有**刷新（检测退出 ${rc}）；状态文件可能还是发布前那条"
+       say "    以 $HOME/.cache/kg-hub/source-drift.status 里的时间戳为准" ;;
+  esac
 }
 
-# 发完列一遍「NAS 上有、git 里没有」的文件 —— **只打印，绝不删**（T-0084 观察期）。
+# 发完清掉「git 已经没有、而 NAS 上还在」的文件。
 #
-# 本脚本是逐文件 mv -f 覆盖，从不删除，所以从 git 删掉的文件会一直留在 NAS 上被
-# 执行。2026-09-20 抓到的 ingesters/claude_mem_obs.py 就是这么来的：git 早已
-# 删除（972cfae「退役：没人 import、没有作业跑它」），NAS 上却活着，靠漂移检测
-# 报红六小时后人工清掉。
+# 本脚本是逐文件 mv -f 覆盖、**从不删除**，所以从 git 删掉的文件会一直留在 NAS 上
+# 被执行 —— 于是「线上等于某个 commit」只在「有什么」这一半成立。
+# 2026-09-20 抓到的 ingesters/claude_mem_obs.py 就是这么来的：git 早已删除
+# （972cfae「退役：没人 import、没有作业跑它」），NAS 上却活着，靠漂移检测报红
+# 六小时后人工清掉。
 #
-# 为什么先只打印：自动删的风险是**误删生产独有的必需文件**（准则 5「备份范围 ⊇
-# 覆盖范围」踩过的坑）。观察期的目的就是攒够证据——确认这份清单里从不出现真正
-# 需要的文件，再谈开删。在那之前，这里一个字节都不动 NAS。
+# 判据是 `--list-prunable`：**NAS 上那份内容在 git 历史里找得到一模一样的**。
+# 不是 `--list-extra`（「git 里现在没有」的补集）—— 那里面装着生产独有却正在跑的
+# 文件，实测过的例子是 credvault 的 deploy/hot_config_reconciliation.py：360 行、
+# NAS 上在跑、git 里连文件名都没有。删它就是把生产打掉（T-0084 立的约束）。
 #
-# 清单取自 check_source_drift.py --list-extra，与漂移报告同一处定义
-# （EXTRA_REASONS），所以「该删什么」与「报什么漂移」不可能各自演化。
-report_prunable() {
+# 准则 5「备份范围 ⊇ 覆盖范围」在这里是**靠判据本身**满足的：kg-hub 的发布没有
+# 整树备份（只有 .env 的事务备份），而被删的每一个字节都能用
+# `git show <commit>:<path>` 原样取回，且这件事在删之前被机器验证过，不靠人核对。
+#
+# 曾被 git 跟踪、但 NAS 上内容与历史里任何一版都不同的（多半有人直接改过生产），
+# 检测走 stderr 单独报出来，**不删**。
+prune_orphans() {
   [ "${DRY_RUN:-0}" != 1 ] || return 0
+  [ "${NO_PRUNE:-0}" != 1 ] || { say "  跳过清理（NO_PRUNE=1）"; return 0; }
   checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
-  [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
-  extra=$(python3 "$checker" --list-extra --ref "$SHA" 2>/dev/null) || return 0
-  [ -n "$extra" ] || { say "  NAS 无多余文件（git 已删但仍在线上的：0 个）"; return 0; }
-  n=$(printf '%s\n' "$extra" | wc -l | tr -d ' ')
-  say "  ⚠ NAS 上有 $n 个文件 git 里已经没有了（观察期：本次未删除任何文件）"
-  printf '%s\n' "$extra" | sed 's/^/        /'
-  say "        处置见 T-0084；确认无误可手工删，自动 prune 尚未启用"
+  [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || {
+    say "  ⚠ 找不到检测脚本或 python3，本次不清理任何文件"; return 0; }
+
+  set +e
+  extra=$(python3 "$checker" --list-prunable --ref "$SHA" 2>/tmp/kg-prune-skipped.$$)
+  local rc=$?
+  set -e
+  skipped=$(cat /tmp/kg-prune-skipped.$$ 2>/dev/null || true); rm -f /tmp/kg-prune-skipped.$$
+
+  # 「没有多余文件」和「这次没查成」必须分开报。判据写成「等于某个我预料到的
+  # 失败码」会漏掉预料之外的那些 —— 未捕获异常给的是 rc=1，正好顺着 happy path
+  # 走成「清理干净」。所以这里写「不是明确的成功就按失败处理」。
+  if [ "$rc" != "0" ]; then
+    say "  ⚠ 拿不到可删清单（检测退出 ${rc}），本次不删任何文件"
+    say "    宁可留着让漂移检测继续报，也不在没查清时删生产上的文件"
+    return 0
+  fi
+
+  [ -z "$skipped" ] || printf '%s\n' "$skipped" | sed 's/^/        /'
+
+  if [ -z "$extra" ]; then
+    say "  NAS 无可清理的残留（git 已删但仍在线上的：0 个）"
+    return 0
+  fi
+
+  pruned=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    # 清单是外部命令的输出：绝对路径和 .. 一律拒绝，只在 $SRC 里删。
+    case "$path" in
+      /*|*..*) say "        拒绝删除可疑路径：$path"; continue ;;
+    esac
+    say "        删除：$path"
+    on_nas "rm -f -- '$SRC/$path'" >/dev/null
+    pruned=$((pruned + 1))
+  done <<EOF
+$extra
+EOF
+  # 删空的目录顺手清掉，但绝不碰 $SRC 本身。
+  on_nas "find '$SRC' -mindepth 1 -type d -empty -delete 2>/dev/null || true" >/dev/null
+  say "  已清理 $pruned 个 git 已删除的残留文件（内容均可由 git 历史原样取回）"
 }
 
 # 允许 shell 测试 source 本文件、替换 on_nas 后直接覆盖 .env 事务的失败分支；正常

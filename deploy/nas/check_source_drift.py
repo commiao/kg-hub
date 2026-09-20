@@ -267,9 +267,66 @@ def git_hash(ref: str, name: str) -> str | None:
     return hashlib.sha256(proc.stdout).hexdigest() if proc.returncode == 0 else None
 
 
-# compare() 里代表「NAS 上多出来、git 里没有」的两个标签。--list-extra 按它取，
-# 报告也按它分堆 —— 「该删什么」与「报什么漂移」由此出自同一处定义，不会各自演化。
+# compare() 里代表「NAS 上多出来、git 里没有」的两个标签。
+#
+# ⚠️ 这里原先写着「--list-extra 按它取，报告也按它分堆 —— 『该删什么』与『报什么
+# 漂移』由此出自同一处定义，不会各自演化」。**那条理由已被推翻**（T-0084）。
+#
+# 「该报什么」和「该删什么」**必须是两个不同的集合，这是安全边界不是冗余**：
+# 报告要看见全部生产独有文件（准则 4：只按 git 清单查，永远看不见「只在生产上
+# 存在」的那些）；而自动删的范围必须窄得多。让两者同源，等于把删除的判据写成
+# 「git 里没有的都删」—— 那个补集里装着生产独有却正在跑的文件。实测过的例子是
+# credvault 的 deploy/hot_config_reconciliation.py：360 行、NAS 上在跑、git 里连
+# 文件名都没有。误删它就是把生产打掉。
+#
+# 所以 --list-extra 仍给全集（报告用），--list-prunable 给可删子集，见下。
 EXTRA_REASONS = ("只在 NAS 上，git 未跟踪", "备份杂物")
+
+
+def was_ever_tracked(path: str) -> bool:
+    """这条路径在 git 历史里出现过吗？只用来措辞，不作删除判据。"""
+    out = subprocess.run(["git", "-C", str(REPO), "log", "--all", "--oneline",
+                          "-1", "--", path], capture_output=True, text=True)
+    return out.returncode == 0 and bool(out.stdout.strip())
+
+
+def historical_hashes(path: str, ref: str) -> set[str]:
+    """这条路径在 **ref 的祖先链上**出现过的全部内容指纹（sha256）。
+
+    ⚠️ 范围必须是 `ref` 的祖先，不能是 `--all`。2026-09-21 在真机上撞到：
+    NAS 跑着 49bc2d87，而目录里有一个 `tests/test_upstream_error_classification.py`
+    —— 它来自 **比线上更新的** commit（9ef37b5，已在主干）。用 `--all` 查，它
+    「在 git 历史里找得到」，于是被判成可删。
+
+    但它根本不是孤儿：它是**部署不完整的信号**。删掉它等于把信号抹了，下次
+    还会以同样的方式出现，而没人知道为什么。`--all` 还会把任何分支上的文件
+    都算进来 —— 别人从分支拷一份到生产，发布就会替他删掉。
+
+    按祖先链查，这两类都自动落在删除范围外，并继续被漂移报告说出来。
+
+    删除的判据是「NAS 上这一份，能在 git 历史里找到一模一样的内容」，而不是
+    「这条路径曾被跟踪」。紧的那一档正是要害：**被跟踪过 ≠ NAS 上那份还等于
+    历史里某一版**。生产上被手改过、git 后来又删掉的文件只满足前者，删了它那些
+    改动就真没了。
+
+    这对 kg-hub 尤其要紧：release.sh **没有整树备份**（只有 .env 的事务备份），
+    所以准则 5「备份范围 ⊇ 覆盖范围」在这里唯一的依靠就是「git 历史里找得到」
+    —— 而那必须被机器验证，不能靠人每次删之前自己核对一遍。
+
+    顺带把「从没被跟踪过」也覆盖了：没有历史版本 → 集合为空 → 永远不匹配。
+    所以这是一条规则，不是两条。失败方向也对：git 查不动就返回空集合，即不删。
+    """
+    out = subprocess.run(["git", "-C", str(REPO), "log", ref, "--format=%H",
+                          "--", path], capture_output=True, text=True)
+    if out.returncode != 0:
+        return set()
+    shas: set[str] = set()
+    for commit in out.stdout.split():
+        blob = subprocess.run(["git", "-C", str(REPO), "show", f"{commit}:{path}"],
+                              capture_output=True)
+        if blob.returncode == 0:
+            shas.add(hashlib.sha256(blob.stdout).hexdigest())
+    return shas
 
 
 def compare(ssh_target: str, src: str, ref: str) -> list[tuple[str, str]]:
@@ -334,10 +391,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="跳过「线上 commit 在不在主干上」这一判。只给离线/测试用——"
                          "常规巡检不要带，带上就退回补这段之前的语义")
     ap.add_argument("--list-extra", action="store_true",
-                    help="只列「NAS 上有、git 里没有」的文件，每行一个，供 release.sh "
-                         "在发布时打印（观察期只打印不删）。清单与漂移报告取自同一处"
-                         "定义（EXTRA_REASONS），所以「该删什么」与「报什么漂移」"
-                         "不可能各自演化")
+                    help="列「NAS 上有、git 里没有」的**全集**，每行一个。报告用。"
+                         "绝不可拿它当删除清单——那个补集里装着生产独有却在跑的文件")
+    ap.add_argument("--list-prunable", action="store_true",
+                    help="列可安全删除的子集：NAS 上那份内容在 git 历史里找得到"
+                         "一模一样的。曾被跟踪但内容对不上的另走 stderr 报出来，不删")
     args = ap.parse_args(argv)
     if args.repo is not None:
         set_repo(args.repo)
@@ -356,9 +414,11 @@ def main(argv: list[str] | None = None) -> int:
     #
     # 2026-09-21 实测四个服务的 ok 有三种含义，而巡检把它们渲染成同一条绿（T-0099）。
     # --list-extra 是纯列举模式：它给 release.sh 提供机器可读的清单，不出判决
-    # （既有用例钉着「--list-extra 永远不写 verdict」）。主干这一判属于判决，
+    # （既有用例钉着「--list-extra 永远不写 verdict」）。--list-prunable 同理。
+    # 主干这一判属于判决，
     # 不该挡住一个只读清单的调用。
-    trunk_checked = not args.skip_trunk and not args.list_extra
+    trunk_checked = (not args.skip_trunk and not args.list_extra
+                     and not args.list_prunable)
     trunk, trunk_why = trunk_verdict(ref) if trunk_checked else ("on", "")
     if trunk == "unknown":
         print(f"🟠 {trunk_why}")
@@ -375,6 +435,40 @@ def main(argv: list[str] | None = None) -> int:
 
     bad = compare(ssh_target, src, ref)
 
+    extras = [name for name, why in bad if why in EXTRA_REASONS]
+
+    if args.list_extra:
+        # 机器可读、只此一样东西：不写状态文件、不打判决。这是**报告用的全集**，
+        # 谁要删由调用方决定——本脚本永远只读不写 NAS。
+        for name in extras:
+            print(name)
+        return 0
+
+    if args.list_prunable:
+        # 判据：NAS 上这份内容的 sha256，能在该路径的 git 历史里找到一模一样的。
+        # 不是「这条路径曾被跟踪」，更不是「git 里现在没有」。
+        #
+        # 三档，缺一不可：
+        #   内容 = 历史某一版        → 输出，可删（git 历史即可验证的备份）
+        #   曾被跟踪但哪版都对不上    → 不删，走 stderr 单独报（多半有人改过生产）
+        #   从没进过 git            → 不删，继续由漂移报告去说（准则 4）
+        #
+        # 取不到 NAS 侧哈希时同样不输出：失败方向必须是「不删」。
+        got = remote_hashes(ssh_target, src, sorted(extras))
+        for name in sorted(extras):
+            digest = got.get(name)
+            if digest is not None and digest in historical_hashes(name, ref):
+                print(name)
+            elif was_ever_tracked(name):
+                # 两种来源，都不该删，但要说得准 —— 这行字是人据以行动的东西：
+                #   有人直接改了生产       → 删掉就是把那些改动弄丢
+                #   来自别的分支/更新的提交 → 它是**部署不完整**的信号，删掉等于抹了信号
+                print(f"跳过 {name}：git 认识这条路径，但 NAS 上这份内容在 {short} "
+                      "这条线的历史里找不到 —— 要么有人直接改了生产，要么它来自别的"
+                      "分支或更新的提交（部署不完整）。两种都不该由发布来删",
+                      file=sys.stderr)
+        return 0
+
     if trunk == "off":
         # 文件对不对得上它，在这里是次要的。主干上没有这个版本，意味着下一个人
         # 从 main 出发做的任何事（发布、回滚、比对漂移）都会把它悄悄抹掉，
@@ -386,13 +480,6 @@ def main(argv: list[str] | None = None) -> int:
         print("   处置：把它合回主干，或从主干重新发一次。")
         write_status(args.status_file, "drift", detail)
         return 1
-
-    if args.list_extra:
-        # 机器可读、只此一样东西：不写状态文件、不打判决。观察期的唯一产物就是这份
-        # 清单，谁要删由调用方决定——本脚本永远只读不写 NAS。
-        for name, _ in [x for x in bad if x[1] in EXTRA_REASONS]:
-            print(name)
-        return 0
 
     if not bad:
         detail = f"{short} {subject}"
