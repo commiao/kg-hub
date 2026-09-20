@@ -184,6 +184,35 @@ class RestartAfterRestoreTests(PatchGuardTests):
         self.run_guard()
         self.assertFalse(self.stopped.exists(), "什么都没改却重启了 worker")
 
+    def test_the_restart_happens_only_after_every_target_is_restored(self):
+        """重启必须排在**所有**目标都还原之后。
+
+        2026-09-20 第一版把重启写在循环里，还原完第一个目标就重启 —— worker 起来
+        时恰好可能加载到那些还没轮到的目标，于是「重启让它加载新补丁」反而把未打
+        补丁的那份装进了内存。**和它要治的那个病一模一样，只是快了几百毫秒。**
+
+        这里让假 bun 在被调用的那一刻记下每个目标的内容，事后检查。
+        """
+        second = self.home / ".claude/plugins/cache/thedotmack/claude-mem/13.25.1"
+        (second / "scripts").mkdir(parents=True)
+        (second / "scripts" / "worker-service.cjs").write_bytes(STOCK)
+        (second / "package.json").write_text(json.dumps({"version": VERSION}), "utf-8")
+        manifest = self.repo / "tools" / "claude_mem_patch.manifest"
+        manifest.write_text(manifest.read_text("utf-8")
+                            + ".claude/plugins/cache/thedotmack/claude-mem/13.25.1\n"
+                            .join(["target=", ""]), "utf-8")
+        snapshot = Path(self.tmp.name) / "snapshot"
+        (self.bin / "bun").write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "$*" >> {self.stopped}\n'
+            f'cat "{self.bundle}" "{second}/scripts/worker-service.cjs" > {snapshot}\nexit 0\n',
+            "utf-8")
+        (self.bin / "bun").chmod(0o755)
+
+        self.run_guard()
+        self.assertTrue(snapshot.exists(), "没重启")
+        self.assertEqual(snapshot.read_bytes(), PATCHED + PATCHED,
+                         "重启时还有目标没还原 —— worker 可能加载到旧的那份")
+
     def test_one_restart_per_patch_version_not_every_five_minutes(self):
         """一个 sha 只重启一次。判据万一算错，不能变成每 5 分钟打断一次采集。"""
         self.run_guard()

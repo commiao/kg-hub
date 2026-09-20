@@ -149,12 +149,22 @@ except Exception:
   if cp "$SOURCE" "$bundle" 2>/dev/null; then
     note "补丁被覆盖，已还原：$bundle（原 ${now_sha:-空}）"
     alert_once restored "🔧 kg-hub：claude-mem worker 补丁曾被覆盖（多半是插件升级），已自动还原并重启 worker。"
-    restart_worker_once "$want_sha"
+    # 只记一笔，**不在这里重启** —— 循环还没走完，后面的目标还是旧的。
+    # 2026-09-20 第一版就在这里直接重启了：worker 起来时恰好可能加载到那些
+    # 还没轮到的目标，于是「重启让它加载新补丁」反而把未打补丁的那份装进了内存。
+    # 和它要治的那个病一模一样，只是快了几百毫秒。
+    : > "$STATE_DIR/patch-restore-happened.$$" 2>/dev/null
   else
     note "还原失败（写不进去）：$bundle"
     alert_once restore-failed "🔴 kg-hub：claude-mem worker 补丁被覆盖且还原失败（$bundle 写不进去）。"
   fi
 done
+
+# 循环跑在子 shell 里（`sed | while`），变量出不来，所以用文件传信号。
+if [ -f "$STATE_DIR/patch-restore-happened.$$" ]; then
+  rm -f "$STATE_DIR/patch-restore-happened.$$"
+  restart_worker_once "$want_sha"
+fi
 
 check_running_worker
 exit 0
