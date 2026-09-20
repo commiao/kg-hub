@@ -63,17 +63,40 @@ deploy/mac/install.sh --check  # 只比对不改动 —— 发现有人手改了
 deploy/mac/install.sh com.kg-hub.weekly-report   # 只装指定的
 ```
 
-**改调度的正确姿势**：改 `agents/` 里的模板 → 提交 → 跑 `install.sh`。
+**改调度的正确姿势**：改 `agents/` 里的模板 → 走分支 → 合主干 → 跑 `install.sh`。
 不要直接改 `~/Library/LaunchAgents/`——那样 `--check` 会报不一致，而且改动会在
 下次安装时被覆盖掉。
+
+**改脚本（`tools/*.py`、`tools/*.sh`）则要先发布**，否则改了不生效：
+
+```
+# fleet-ops/bin/mac-release.py —— 从主干 commit 落一份不可变产物，原子切 current
+python3 ~/workspace_claudeCode/fleet-ops/bin/mac-release.py kg-hub \
+    --repo ~/workspace_claudeCode/kg-hub
+python3 ~/workspace_claudeCode/fleet-ops/bin/mac-release.py kg-hub \
+    --repo ~/workspace_claudeCode/kg-hub --check    # current 对应哪个 commit
+```
+
+2026-09-20 之前，这 8 个作业的 plist 直接指向开发工作树 —— 于是"改完即生效"，
+而那不是优点，是**没有发布这一步**的另一种说法：在分支里改不生效、所有会话被迫
+在同一棵树上直接改生产、脚本还可能正被执行时被原地改写（sh 边读边执行、字节偏移
+错位崩溃，见本仓库 `a5325e0`）。
 
 ## 占位符
 
 模板里不存绝对路径也不存机密：
 
-- `__REPO__` → 仓库路径，安装时按脚本位置推出来
+- `__CODE__` → 发布产物目录 `~/.local/share/kg-hub/current`，**生产的代码来源**
+- `__VENV__` → 解释器环境 `~/.local/share/kg-hub/venv`。它是**环境**不是代码，
+  不进 git archive，所以住在产物之外（内容由 `deploy/nas/requirements.txt` 决定）
+- `__GITREPO__` → 开发工作树。**只有 `source-drift` 用得上**，而且是作为输入数据：
+  它的职责就是比对 git 仓库，而发布产物里没有 `.git`
 - `__HOME__` → `$HOME`
 - `@KG_HUB_FEISHU_WEBHOOK@` → 从 `<repo>/.env`（0600、已 gitignore）或同名环境变量取
+
+机密同样不进产物：`claude_mem_guard.sh` 默认读 `$SCRIPT_DIR/../.env`，那是工作树
+布局的假设，在产物里不存在，会**静默**拿不到 webhook。所以它的 plist 显式给
+`KG_HUB_ENV_FILE` 指到 `~/.config/kg-hub/.env`。
 
 取不到机密就**拒绝安装那一个**，不会装一个带着 `@VAR@` 字面量的坏 plist 上去。
 
