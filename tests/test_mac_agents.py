@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import plistlib
 import re
+import os
 import shutil
 import subprocess
 import sys
@@ -290,6 +291,55 @@ class InstallScriptTests(unittest.TestCase):
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", str(checkout)],
                            cwd=str(ROOT), capture_output=True, timeout=60)
+
+
+class NonGitCheckoutTests(unittest.TestCase):
+    """不是 git 检出时（最典型：从发布产物里跑）必须**出声退出**，不许猜。
+
+    2026-09-20 实测，此前它悄悄回落到「install.sh 自己所在的目录」，于是：
+
+        ✗ capsule-watch：缺机密（去产物目录找 .env，那儿没有）
+        ✗ source-drift：机器上的与仓库里的不一致（--repo 指向了产物）
+
+    而机器上其实什么都没错。**用一个错的值静静跑下去，比停下来糟**：
+    这两条假红会长期挂着，然后淹掉它本该抓的真漂移。
+
+    这里也没有正确的默认值可猜 —— 产物里没有任何线索指向那棵工作树。
+    """
+
+    def _artifact_copy(self) -> Path:
+        """把 deploy/ 复制到一个**没有 .git** 的目录，模拟发布产物。"""
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="kg-nogit-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copytree(ROOT / "deploy", root / "deploy")
+        return root / "deploy/mac/install.sh"
+
+    def test_it_refuses_instead_of_guessing(self):
+        done = subprocess.run(["bash", str(self._artifact_copy()), "--check"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(done.returncode, 0, "不是 git 检出却照样跑了下去")
+        self.assertIn("不是 git 检出", done.stderr)
+        self.assertIn("KG_HUB_GIT_REPO", done.stderr, "没告诉人怎么办")
+
+    def test_an_explicit_repo_makes_it_work(self):
+        """给了约定的工作树就该正常工作 —— 拒绝不能变成「从产物里根本用不了」。"""
+        target = Path.home() / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
+        if not target.exists():
+            self.skipTest("这台机器上没装 kg-hub 的 launchd 服务")
+        # **必须传约定的那棵主工作树，不是 ROOT。** ROOT 是「测试碰巧在哪个检出里」，
+        # 而机器上装的 plist 指向主工作树 —— 拿 ROOT 去比，比的是两个不同的东西。
+        # 同一个毛病在这个文件里今天已经是第三次（准则 28）。
+        canonical = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+        self.assertEqual(canonical.returncode, 0, canonical.stderr)
+        env = {**os.environ,
+               "KG_HUB_GIT_REPO": str(Path(canonical.stdout.strip()).parent)}
+        done = subprocess.run(["bash", str(self._artifact_copy()), "--check"],
+                              capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(done.returncode, 0, done.stdout[-700:] + done.stderr[-300:])
+        self.assertNotIn("✗", done.stdout)
 
 
 class ManifestTests(unittest.TestCase):

@@ -57,7 +57,23 @@ VENV="${KG_HUB_VENV:-$HOME/.local/share/kg-hub/venv}"
 GITREPO="${KG_HUB_GIT_REPO:-}"
 if [ -z "$GITREPO" ]; then
   common=$(cd "$REPO" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  if [ -n "$common" ]; then GITREPO=$(dirname "$common"); else GITREPO="$REPO"; fi
+  if [ -n "$common" ]; then
+    GITREPO=$(dirname "$common")
+  else
+    # 不是 git 检出 —— 最典型的就是**从发布产物里跑**（`git archive` 不带 .git）。
+    #
+    # 此前这里悄悄回落到 ${REPO} （= 产物目录），后果是两条假红：
+    #     ✗ capsule-watch：缺机密（去产物目录找 .env，那儿没有）
+    #     ✗ source-drift：机器上的与仓库里的不一致（--repo 指向了产物）
+    # 而机器上其实什么都没错。**用一个错的值静静地跑下去，比停下来糟。**
+    #
+    # 这里没有正确的默认值可猜：产物里没有任何线索指向那棵工作树。
+    # 所以要么调用方给 KG_HUB_GIT_REPO，要么停。
+    echo "错误：$REPO 不是 git 检出（多半是从发布产物里跑的），" >&2
+    echo "      而漂移巡检需要知道这台机器约定的那棵 git 工作树。" >&2
+    echo "      请从 git 检出里跑，或显式指定：KG_HUB_GIT_REPO=/path/to/kg-hub $0 $*" >&2
+    exit 2
+  fi
 fi
 TARGET="$HOME/Library/LaunchAgents"
 # 同上：`.env` 是**这台机器的配置数据**，住在约定的那棵工作树里。
