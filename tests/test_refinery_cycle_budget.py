@@ -123,5 +123,26 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertNotIn("note_budget", SOURCE.split("on_progress=lambda st: snapshot(", 1)[1][:200])
 
 
+class PerCycleFreshnessTests(unittest.TestCase):
+    """状态里的每轮名额不许比进程里的旧。"""
+
+    def test_fields_report_the_live_constants(self):
+        f = refinery.cycle_budget_fields()
+        self.assertEqual(f["per_cycle"], refinery.BACKLOG_PER_CYCLE)
+        self.assertEqual(f["live_per_cycle"], refinery.LIVE_PER_CYCLE)
+
+    def test_every_status_writing_path_reports_them(self):
+        """原先只有窗口内那条写 per_cycle。
+
+        2026-09-20 实测:把 8 改成 50 发布后,窗口关着 → 状态文件里 per_cycle 停在
+        重启前的 8,而 heartbeat_at 是新鲜的。新鲜时间戳盖着陈旧数字,看的人会
+        判定"配置没生效"。所以三条路径必须都带上。
+        """
+        self.assertEqual(SOURCE.count("**cycle_budget_fields()"), 3,
+                         "窗口内/窗口外/温度歇工,三条写状态的路径都要带")
+        self.assertNotIn("per_cycle=BACKLOG_PER_CYCLE", SOURCE,
+                         "不许再有分支自己拼这个字段——那正是漏写的来源")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -346,6 +346,17 @@ _budget_today: dict[str, object] = {"day": "", "lines": {}}
 _BUDGET_TALLIES = ("ingested", "rejected", "deferred", "backoff_skipped")
 
 
+def cycle_budget_fields() -> dict[str, int]:
+    """每轮名额,三条写状态的路径共用同一份。
+
+    2026-09-20 实测的坑:`per_cycle` 原先只在**窗口内**那条分支写。发布把 8 改成
+    50 之后,窗口是关着的,于是状态文件里 `per_cycle` 一直停在重启前的 8 —— 而
+    旁边 `heartbeat_at` 是新鲜的。**新鲜时间戳盖着陈旧数字**,看的人会以为配置没生效。
+    写成一处共用就不会再有"某条分支忘了写"这种事。
+    """
+    return {"per_cycle": BACKLOG_PER_CYCLE, "live_per_cycle": LIVE_PER_CYCLE}
+
+
 def note_budget(kind: str, stats: dict) -> dict[str, object]:
     """把一轮某条线的 stats 累进当日账(UTC 日切清零),返回可写进 status 的一段。
 
@@ -917,7 +928,8 @@ async def main() -> int:
                             dtemp, MAX_DISK_TEMP, thermal["holds"],
                             thermal["minutes"], temps)
                 write_status(disk_temp=dtemp, thermal_hold=True, thermal=thermal,
-                             backlog_window_open=in_backlog_window(), last_error=None)
+                             backlog_window_open=in_backlog_window(), last_error=None,
+                             **cycle_budget_fields())
                 await asyncio.sleep(INTERVAL)
                 continue
             # —— 工作窗口门控(默认北京时间 22:00-08:00):窗口外新 obs 与
@@ -925,7 +937,8 @@ async def main() -> int:
             if not in_backlog_window():
                 write_status(disk_temp=dtemp, thermal_hold=False, thermal=thermal,
                              backlog_window_open=False, idle_outside_window=True,
-                             last_error=None)
+                             last_error=None,
+                             **cycle_budget_fields())
                 await asyncio.sleep(INTERVAL)
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
@@ -955,7 +968,7 @@ async def main() -> int:
                     idle_outside_window=False,
                     boundary_id=boundary, live_cursor=wm.get("live_cursor"),
                     backlog_window_open=in_backlog_window(),
-                    per_cycle=BACKLOG_PER_CYCLE,
+                    **cycle_budget_fields(),
                     backoff_pending=len(backoff),
                     quota_paused=False,
                     rate_limited=False,
