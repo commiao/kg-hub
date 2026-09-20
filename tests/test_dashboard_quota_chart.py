@@ -72,6 +72,25 @@ class ChartTemplateTests(unittest.TestCase):
         legend = TEMPLATE.split("lg.append(sp)", 1)[0]
         self.assertIn("if(MODE==='key'){const cap=", legend)
 
+    def test_quota_share_numerator_is_same_day_only(self):
+        """占比的分子分母必须落在同一个 UTC 配额日。
+
+        2026-09-20 第一版就栽在这里:柱子画近 24 小时、会跨两个配额日,分子拿
+        跨日合计、分母拿日上限,页面上显示成「10000 / 5000（200%）」。
+        额度按 UTC 日重置,跨日合计除以日上限没有任何意义。
+        """
+        legend = TEMPLATE.split("S.keys.forEach((k,ki)=>", 1)[1].split("lg.append(sp)", 1)[0]
+        self.assertIn("dayOf(h)===today", legend,
+                      "分子必须先按当日过滤,不能直接用 24h 合计")
+        share = legend.split("cap?", 1)[1][:120]
+        self.assertIn("dayTot", share, "百分比要用当日合计算,不是 tot")
+        self.assertNotIn("tot*100/cap", legend, "不许再用跨日合计算占比")
+
+    def test_the_bold_number_says_what_period_it_covers(self):
+        """粗体那个数字是 24h 合计,不是当日 —— 页面上要说清楚,否则又是一个混淆源。"""
+        self.assertIn("近 24h 合计", TEMPLATE)
+        self.assertIn("近 24 小时", TEMPLATE)
+
     def test_missing_data_says_why_instead_of_drawing_an_empty_chart(self):
         self.assertIn("暂无去向账", TEMPLATE)
         self.assertIn("暂无用量快照", TEMPLATE)

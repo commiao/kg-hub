@@ -4292,7 +4292,7 @@ function seriesByKey(n){
  const keys=[...new Set((D.hourly||[]).map(r=>String(r.business_key)))].sort();
  const at=new Map();(D.hourly||[]).forEach(r=>at.set(r.hour+'|'+r.business_key,Number(r.count)||0));
  return {hours:hours,keys:keys,get:(h,k)=>at.get(h+'|'+k)||0,
-   unit:'调用次数（网关放行的外呼）',title:'逐小时调用量 · 按业务 key'}}
+   unit:'调用次数（网关放行的外呼）',title:'逐小时调用量 · 按业务 key（近 24 小时，跨 UTC 日）'}}
 function seriesByLine(n){
  const bh=D.budget_hourly||{},hours=Object.keys(bh).sort().slice(-n);
  const keys=[...new Set(hours.flatMap(h=>Object.keys(bh[h]||{})))].sort();
@@ -4332,16 +4332,23 @@ function draw(){
    const t=el('text',{x:PL+hi*bw,y:H-6,'font-size':11,fill:'currentColor','fill-opacity':.5});
    t.textContent=h.slice(-2)+':00';svg.append(t)}});
  box.append(svg);
+ // 占比的分子**只能取当日**那些小时。柱子画的是近 24 小时,会跨两个 UTC 配额日,
+ // 拿跨日合计去除以日上限必然超 100%——实测第一版就显示成了「10000 / 5000 (200%)」。
+ // 额度是按 UTC 日重置的,所以分子分母必须落在同一天。
+ const dayOf=h=>String(h).slice(0,10);
+ const today=S.hours.length?dayOf(S.hours[S.hours.length-1]):null;
  S.keys.forEach((k,ki)=>{const tot=S.hours.reduce((a,h)=>a+S.get(h,k),0);
   const sp=document.createElement('span');sp.className='i';
   const sw=document.createElement('i');sw.style.background=colorOf(ki);
   const nm=document.createElement('span');nm.textContent=(S.label?S.label(k):k)+' ';
   const b=document.createElement('b');b.textContent=tot;
   sp.append(sw,nm,b);
-  if(MODE==='key'){const cap=(D.limits||{})[k];const u=document.createElement('u');
-   u.textContent=cap?(' / '+cap+'（'+Math.round(tot*100/cap)+'%）'):' / 上限未知';
-   sp.append(u)}
-  lg.append(sp)})}
+  const u=document.createElement('u');
+  if(MODE==='key'){const cap=(D.limits||{})[k];
+   const dayTot=S.hours.filter(h=>dayOf(h)===today).reduce((a,h)=>a+S.get(h,k),0);
+   u.textContent=' ｜今日 '+dayTot+(cap?(' / '+cap+'（'+Math.round(dayTot*100/cap)+'%）'):' ／上限未知');
+  }else{u.textContent=' （近 24h 合计）'}
+  sp.append(u);lg.append(sp)})}
 const seg=document.getElementById('seg');
 [['key','业务 key'],['line','下钻：backlog / live']].forEach(function(pair){
  const b=document.createElement('button');b.textContent=pair[1];
