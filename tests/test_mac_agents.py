@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -226,6 +227,69 @@ class InstallScriptTests(unittest.TestCase):
         done = subprocess.run(["bash", str(INSTALL), "--check"],
                               capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_the_git_repo_placeholder_does_not_follow_whichever_checkout_ran_it(self):
+        """`__GITREPO__` 必须解析成**这台机器约定的那棵工作树**，
+        而不是「谁碰巧执行了安装」。
+
+        2026-09-20 实测的坑：默认值曾是 `$REPO`（install.sh 自己在哪个检出里）。
+        在主工作树里它恰好等于机器上装的那个值，所以一直没人发现。两层后果：
+
+        1. `--check` 在任何非主工作树里必红 —— 而现在的纪律恰恰是「在独立 worktree
+           上检出 origin/main、在那里跑全量再发布」。那个红与机器状态无关，
+           正好淹掉它本该抓的真漂移。
+        2. **更要紧**：谁要是从一个临时发布 worktree 跑过一次 install.sh，
+           漂移巡检就被永久指向那个临时目录 —— 而它随后会被删掉。
+           失效方式是安静的：巡检照跑、照报绿。
+
+        这条按 linked worktree 里跑一遍来验 —— 那正是它当初漏掉的场景。
+        （deploy-standard 准则 28：判断的两端要取自同一来源。）
+        """
+        import tempfile
+        probe = Path(tempfile.mkdtemp(prefix="kg-gitrepo-probe-"))
+        checkout = probe / "checkout"
+        add = subprocess.run(["git", "worktree", "add", "-q", "--detach",
+                              str(checkout), "HEAD"],
+                             cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+        if add.returncode != 0:
+            self.skipTest(f"建不了 worktree：{add.stderr[:120]}")
+        try:
+            # 要钉的属性是**不变性**，不是「等于某个具体路径」：
+            # 从两个不同的检出解析，必须得到同一个答案。
+            # 第一版我拿 ROOT（测试当前所在的检出）当期望值 —— 而这条测试本身就
+            # 可能在 worktree 里跑，于是期望值跟着执行位置变，又犯了它要防的那个病。
+            def resolve_from(path: Path) -> Path:
+                done = subprocess.run(
+                    ["bash", "-c",
+                     'cd "$1"; git rev-parse --path-format=absolute --git-common-dir',
+                     "_", str(path)],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                return Path(done.stdout.strip()).parent.resolve()
+
+            from_here = resolve_from(ROOT)
+            from_worktree = resolve_from(checkout)
+            self.assertEqual(from_worktree, from_here,
+                             "解析结果跟着执行位置跑了 —— 正是这条要防的")
+            self.assertNotEqual(from_worktree, checkout.resolve(),
+                                "解析成了临时检出本身；它随后会被删掉")
+            # 真跑一遍 --check，而且跑的必须是**当前工作树里这一版**。
+            #
+            # `git worktree add HEAD` 取的是已提交内容，直接跑它等于测上一个版本 ——
+            # 本地改了还没提交时会红，而红的原因跟被测属性无关。所以把当前的
+            # deploy/ 覆盖进去再跑：这样验的是手上这份代码在 worktree 里的行为。
+            shutil.rmtree(checkout / "deploy", ignore_errors=True)
+            shutil.copytree(ROOT / "deploy", checkout / "deploy")
+            target = Path.home() / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
+            if not target.exists():
+                self.skipTest("这台机器上没装 kg-hub 的 launchd 服务")
+            done = subprocess.run(["bash", str(checkout / "deploy/mac/install.sh"),
+                                   "--check"], capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 0,
+                             f"--check 从 worktree 跑红了：{done.stdout[-700:]}")
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", str(checkout)],
+                           cwd=str(ROOT), capture_output=True, timeout=60)
 
 
 class ManifestTests(unittest.TestCase):

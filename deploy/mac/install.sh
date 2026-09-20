@@ -43,9 +43,27 @@ AGENTS="$REPO/deploy/mac/agents"
 # 而产物里没有 .git），不是任何人的代码来源。
 CODE="${KG_HUB_CODE_ROOT:-$HOME/.local/share/kg-hub/current}"
 VENV="${KG_HUB_VENV:-$HOME/.local/share/kg-hub/venv}"
-GITREPO="${KG_HUB_GIT_REPO:-$REPO}"
+# **不能用 `$REPO`（install.sh 自己在哪个检出里）当默认值。**
+# 2026-09-20：`$REPO` 在主工作树里恰好等于机器上该装的那个值，所以一直没人发现。
+# 换个 worktree 就不等了 —— 而现在的纪律恰恰是「在独立 worktree 上检出 origin/main、
+# 在那里跑全量再发布」。后果有两层：
+#   1. `--check` 在任何非主工作树里必红，而那个红与机器状态无关，正好淹掉它本该抓的真漂移
+#   2. **更要紧**：谁要是从一个临时发布 worktree 跑了一次 install.sh，漂移巡检就被
+#      永久指向那个临时目录 —— 而它随后会被删掉。失效方式是安静的：巡检照跑、照报绿。
+#
+# 漂移巡检要比对的是**这台机器约定的那棵 git 工作树**，不是「谁碰巧执行了安装」。
+# `--git-common-dir` 在 linked worktree 里返回的是主工作树的 .git，正好是这个语义。
+# 不是 git 检出时（比如从 tar 解出来跑）回落到 ${REPO} ，保持原行为。
+GITREPO="${KG_HUB_GIT_REPO:-}"
+if [ -z "$GITREPO" ]; then
+  common=$(cd "$REPO" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  if [ -n "$common" ]; then GITREPO=$(dirname "$common"); else GITREPO="$REPO"; fi
+fi
 TARGET="$HOME/Library/LaunchAgents"
-ENV_FILE="${KG_HUB_ENV_FILE:-$REPO/.env}"
+# 同上：`.env` 是**这台机器的配置数据**，住在约定的那棵工作树里。
+# 用 $REPO 的话，从任何 worktree 跑 --check 都会报「缺机密」—— 而机器上其实配好了。
+# 2026-09-20 实测：那正是 capsule-watch 那一格红的原因。
+ENV_FILE="${KG_HUB_ENV_FILE:-$GITREPO/.env}"
 DOMAIN="gui/$(id -u)"
 
 mode=install
