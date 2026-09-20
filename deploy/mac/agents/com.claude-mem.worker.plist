@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
-        <string>__REPO__/tools/claude_mem_worker_launchd.sh</string>
+        <string>__CODE__/tools/claude_mem_worker_launchd.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>

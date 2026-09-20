@@ -67,8 +67,10 @@ class TemplateTests(unittest.TestCase):
     def test_templates_are_valid_plists_once_rendered(self):
         for path in self.templates():
             with self.subTest(agent=path.stem):
-                text = (path.read_text("utf-8")
-                        .replace("__REPO__", "/repo").replace("__HOME__", "/home"))
+                text = path.read_text("utf-8")
+                for name, value in (("__CODE__", "/code"), ("__VENV__", "/venv"),
+                                    ("__GITREPO__", "/repo"), ("__HOME__", "/home")):
+                    text = text.replace(name, value)
                 text = re.sub(r"@[A-Z_]+@", "x", text)
                 document = plistlib.loads(text.encode("utf-8"))
                 self.assertEqual(document["Label"], path.stem,
@@ -76,9 +78,99 @@ class TemplateTests(unittest.TestCase):
                 self.assertTrue(document.get("ProgramArguments"))
 
 
+    def test_code_comes_from_the_release_not_the_worktree(self):
+        """准则 20 的机器检查：脚本和解释器都不许来自开发工作树。
+
+        2026-09-19 盘点时 Mac 侧 14 个作业**全部**指向工作树，而准则当时已经写好
+        了 —— 不参与判断的准则会被绕过。后果是三类实测事故：分支上改了不生效
+        （所有会话被迫在同一棵树上直接改生产）、脚本正被执行时被原地改写
+        （sh 边读边执行、字节偏移错位崩溃，本仓库 a5325e0）、说不清线上是哪一版。
+        """
+        for path in self.templates():
+            with self.subTest(agent=path.stem):
+                text = path.read_text("utf-8")
+                self.assertNotIn(
+                    "__CODE__/spike-graphiti/.venv", text,
+                    "解释器要用 __VENV__（产物之外的环境），不能从产物里取")
+                argv = plistlib.loads(
+                    _render_for_test(text).encode("utf-8"))["ProgramArguments"]
+                for item in argv:
+                    if item.endswith((".py", ".sh")) or item.endswith("/bin/python"):
+                        self.assertFalse(
+                            item.startswith("/repo"),
+                            f"{path.stem} 的代码或解释器来自工作树：{item}")
+
+    def test_the_worktree_path_only_appears_as_the_drift_checker_input(self):
+        """工作树路径可以作为**数据**出现，但必须是报备过的那个开关的值。
+
+        没有这一条，上面那条检查就能靠「把路径挪到下一个参数里」绕过去。
+        目前只有一个正当用法：漂移巡检要比对 git 仓库，而发布产物里没有 .git ——
+        仓库是它的输入，不是它的代码来源。
+        """
+        for path in self.templates():
+            with self.subTest(agent=path.stem):
+                argv = plistlib.loads(
+                    _render_for_test(path.read_text("utf-8")).encode("utf-8")
+                )["ProgramArguments"]
+                for index, item in enumerate(argv):
+                    if not str(item).startswith("/repo"):
+                        continue
+                    previous = argv[index - 1] if index else None
+                    self.assertEqual(
+                        previous, "--repo",
+                        f"{path.stem} 第 {index} 个参数带工作树路径，前面却是 {previous!r}")
+
+    def test_secrets_are_read_from_outside_the_release(self):
+        """机密既不在 git 里也不在发布产物里，运行时必须显式指到产物外。
+
+        guard 脚本默认读 `$SCRIPT_DIR/../.env` —— 那是工作树布局的假设，
+        在发布产物里根本不存在，于是它会静默地拿不到 webhook。
+        """
+        guard = AGENTS / "com.kg-hub.claude-mem-guard.plist"
+        document = plistlib.loads(
+            _render_for_test(guard.read_text("utf-8")).encode("utf-8"))
+        env = document.get("EnvironmentVariables") or {}
+        self.assertIn("KG_HUB_ENV_FILE", env)
+        self.assertFalse(str(env["KG_HUB_ENV_FILE"]).startswith(("/code", "/repo")),
+                         "机密不该从发布产物或工作树里取")
+
+
+def _render_for_test(text: str) -> str:
+    for name, value in (("__CODE__", "/code"), ("__VENV__", "/venv"),
+                        ("__GITREPO__", "/repo"), ("__HOME__", "/home")):
+        text = text.replace(name, value)
+    return re.sub(r"@[A-Z_]+@", "x", text)
+
+
 class InstallScriptTests(unittest.TestCase):
     def setUp(self):
         self.source = INSTALL.read_text("utf-8")
+
+    def test_install_renders_code_paths_to_the_release(self):
+        """渲染目标必须是发布产物，不是 install.sh 自己所在的那棵树。
+
+        原来 `__REPO__` 直接渲染成工作树路径 —— 于是「装好了」等于「把生产指回了
+        开发目录」，而这正是准则 20 要消掉的东西。
+        """
+        render = [line for line in self.source.splitlines()
+                  if "sed -e" in line or (line.strip().startswith("-e")
+                                          and "__" in line)]
+        self.assertTrue(render, "找不到渲染那几行")
+        joined = "\n".join(render)
+        self.assertIn("__CODE__", joined)
+        self.assertIn("__VENV__", joined)
+        # 只看渲染逻辑，不看注释：注释里提到旧占位符是讲历史，不是行为。
+        self.assertNotIn("__REPO__", joined,
+                         "还在把代码路径渲染成开发工作树")
+        # 钉赋值那一行，不是"文件里出现过这个字符串"。
+        # 第一版就写成了后者，而我自己刚在文件头的注释里写了同一串路径 ——
+        # 于是把 CODE 改回 $REPO 的变异照样绿。**注释会替代码背书。**
+        assignment = [line.strip() for line in self.source.splitlines()
+                      if line.startswith("CODE=")]
+        self.assertEqual(len(assignment), 1, f"CODE 赋值不止一处：{assignment}")
+        self.assertIn(".local/share/kg-hub/current", assignment[0])
+        self.assertNotIn("$REPO", assignment[0],
+                         "CODE 指回了开发工作树")
 
     def test_has_a_drift_check_that_changes_nothing(self):
         # 「避免各种版本互相冲突」靠的就是这个：能发现有人手改了 plist 却没回写仓库。
@@ -95,6 +187,35 @@ class InstallScriptTests(unittest.TestCase):
         boot_out = self.source.index("launchctl bootout")
         boot_strap = self.source.index("launchctl bootstrap")
         self.assertLess(boot_out, boot_strap)
+
+    def test_no_variable_is_glued_to_a_cjk_character(self):
+        """`$label：` 在非 UTF-8 locale 下会被读成变量名 `label\xef`。
+
+        2026-09-20 实测：`--check` 的失败分支因此直接崩在
+        `line 116: label\xef: unbound variable`。**这个 bug 在失败路径上藏了很久** ——
+        只要机器和仓库一直一致，那几行就从没被执行过；这次把代码路径改成发布产物、
+        第一次真出现不一致，它才冒出来。
+
+        launchd 跑作业时的 locale 与人在终端里的不同，所以"我本地跑没事"说明不了
+        任何事。CJK 相邻的展开一律写 `${var}`。
+        """
+        source = INSTALL.read_text("utf-8")
+        glued = [line.strip() for line in source.splitlines()
+                 if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]", line)]
+        self.assertEqual(glued, [], f"变量紧贴非 ASCII 字符：{glued}")
+
+    def test_the_failure_branch_survives_a_stripped_locale(self):
+        """失败分支必须能在被剥干净的环境里跑完，而不是自己崩掉。
+
+        上一条钉的是写法，这一条钉的是**行为** —— 光看源码看不出 bash 会怎么解析。
+        """
+        done = subprocess.run(
+            ["bash", str(INSTALL), "--check", "com.kg-hub.does-not-exist"],
+            capture_output=True, timeout=60,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LANG": "C"})
+        stderr = done.stderr.decode("utf-8", "replace")
+        self.assertNotIn("unbound variable", stderr)
+        self.assertNotIn("\ufffd", stderr, "输出里有解不出来的字节")
 
     def test_check_mode_runs_clean_against_this_machine(self):
         # 模板必须能逐字节还原出机器上正在跑的那份，否则「进仓库」这件事本身就

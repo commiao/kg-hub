@@ -7,13 +7,13 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__REPO__/spike-graphiti/.venv/bin/python</string>
+        <string>__VENV__/bin/python</string>
         <string>-m</string>
         <string>tools.weekly_report</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>__REPO__</string>
+    <string>__CODE__</string>
 
     <key>EnvironmentVariables</key>
     <dict>

@@ -12,7 +12,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>__REPO__/deploy/nas/check_source_drift.py</string>
+        <string>__CODE__/deploy/nas/check_source_drift.py</string>
+        <!-- 代码来自发布产物。下面那个仓库路径是**数据**不是代码来源：这个工具
+             的职责就是比对 git 仓库，而发布产物里没有 .git。 -->
+        <string>--repo</string>
+        <string>__GITREPO__</string>
         <string>--status-file</string>
         <string>__HOME__/.cache/kg-hub/source-drift.status</string>
     </array>
@@ -26,7 +30,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>__REPO__</string>
+    <string>__CODE__</string>
 
     <key>StartCalendarInterval</key>
     <dict>

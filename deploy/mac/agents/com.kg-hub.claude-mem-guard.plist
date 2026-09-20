@@ -8,11 +8,14 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
-        <string>__REPO__/tools/claude_mem_guard.sh</string>
+        <string>__CODE__/tools/claude_mem_guard.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- 机密不进发布产物也不进 git。脚本默认读 $SCRIPT_DIR/../.env，
+             那在产物里不存在，所以显式指到产物外的稳定位置。 -->
+        <key>KG_HUB_ENV_FILE</key><string>__HOME__/.config/kg-hub/.env</string>
         <key>HOME</key>
         <string>__HOME__</string>
         <key>PATH</key>

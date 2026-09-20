@@ -19,8 +19,8 @@
 	<string>Background</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>__REPO__/spike-graphiti/.venv/bin/python</string>
-		<string>__REPO__/tools/capture_probe.py</string>
+		<string>__VENV__/bin/python</string>
+		<string>__CODE__/tools/capture_probe.py</string>
 		<string>--report</string>
 		<string>--out</string>
 		<string>__HOME__/.kg-hub/state/topology-latest.json</string>
@@ -37,6 +37,6 @@
 	<key>StartInterval</key>
 	<integer>600</integer>
 	<key>WorkingDirectory</key>
-	<string>__REPO__</string>
+	<string>__CODE__</string>
 </dict>
 </plist>

@@ -49,8 +49,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# 这个工具的**输入**是 git 仓库本身（它要回答「线上跑的对应哪个 commit」），
+# 所以仓库路径是数据，不是代码来源。二者必须能分开：Mac 侧作业改成跑发布产物之后，
+# 产物里没有 .git —— 不分开的话，这个工具就只能继续跑工作树。
 REPO = Path(__file__).resolve().parent.parent.parent
 RELEASE = REPO / "deploy" / "nas" / "release.sh"
+
+
+def set_repo(path) -> None:
+    """覆盖被检查的仓库。默认是脚本自己所在的那棵树。"""
+    global REPO, RELEASE
+    REPO = Path(path).resolve()
+    RELEASE = REPO / "deploy" / "nas" / "release.sh"
 
 # NAS 上允许存在、但 git 里本来就不该有的东西。每一条都要能说出为什么，
 # 否则就是在给真正的漂移留藏身处。
@@ -244,9 +254,14 @@ def write_status(path: str | None, verdict: str, detail: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="kg-hub NAS 源码漂移检测")
+    ap.add_argument("--repo", default=None,
+                    help="被检查的 git 仓库；默认取脚本自身所在的那棵树。"
+                         "作业跑发布产物时必须显式给出——产物里没有 .git。")
     ap.add_argument("--status-file", help="把一行判决写到这里，供 SessionStart hook 读")
     ap.add_argument("--ref", help="指定要比对的 commit（默认取线上 .env 的镜像标签）")
     args = ap.parse_args(argv)
+    if args.repo is not None:
+        set_repo(args.repo)
 
     config = release_config()
     ssh_target, src = config["ssh"], config["src"]

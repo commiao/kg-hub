@@ -8,11 +8,11 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
-        <string>__REPO__/tools/sync_claude_mem_to_nas.sh</string>
+        <string>__CODE__/tools/sync_claude_mem_to_nas.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>__REPO__</string>
+    <string>__CODE__</string>
 
     <key>EnvironmentVariables</key>
     <dict>

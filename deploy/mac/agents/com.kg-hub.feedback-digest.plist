@@ -15,7 +15,7 @@
 	<string>Background</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>__REPO__/spike-graphiti/.venv/bin/python</string>
+		<string>__VENV__/bin/python</string>
 		<string>-m</string>
 		<string>tools.feedback_digest</string>
 	</array>
@@ -33,6 +33,6 @@
 		<integer>35</integer>
 	</dict>
 	<key>WorkingDirectory</key>
-	<string>__REPO__</string>
+	<string>__CODE__</string>
 </dict>
 </plist>

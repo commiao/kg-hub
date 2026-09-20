@@ -13,8 +13,17 @@
 # ## 为什么是模板而不是直接放 plist
 #
 # 装好的 plist 里写死了 `/Users/mac/...`，而且 `capsule-watch` 那份里**明文存着飞书
-# webhook**。直接提交等于把机密写进仓库。所以路径用 `__HOME__` / `__REPO__` 占位，
-# 机密用 `@VAR@` 占位，安装时才渲染。
+# webhook**。直接提交等于把机密写进仓库。所以路径用占位符、机密用 `@VAR@` 占位，
+# 安装时才渲染：
+#
+#   __CODE__     发布产物目录（`~/.local/share/kg-hub/current`）—— 生产的代码来源
+#   __VENV__     解释器环境，在产物之外（它是环境不是代码，不进 git archive）
+#   __GITREPO__  开发工作树。**只有漂移巡检用得上**，而且是作为输入数据：
+#                它的职责就是比对 git 仓库，而发布产物里没有 .git
+#   __HOME__     $HOME
+#
+# 2026-09-20 之前这里是 `__REPO__` 一路渲染成开发工作树 —— 那等于「装好了」就是
+# 「把生产指回开发目录」，分支因此不可用（准则 20）。
 #
 # ## 用法
 #
@@ -28,6 +37,13 @@ set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 AGENTS="$REPO/deploy/mac/agents"
+# 生产跑的是**发布产物**，不是这棵开发工作树（准则 20）。
+# 模板里 __CODE__ 渲染成产物目录、__VENV__ 渲染成产物外的解释器环境；
+# 只有 __GITREPO__ 仍指工作树 —— 那是漂移巡检的**输入数据**（它要比对 git，
+# 而产物里没有 .git），不是任何人的代码来源。
+CODE="${KG_HUB_CODE_ROOT:-$HOME/.local/share/kg-hub/current}"
+VENV="${KG_HUB_VENV:-$HOME/.local/share/kg-hub/venv}"
+GITREPO="${KG_HUB_GIT_REPO:-$REPO}"
 TARGET="$HOME/Library/LaunchAgents"
 ENV_FILE="${KG_HUB_ENV_FILE:-$REPO/.env}"
 DOMAIN="gui/$(id -u)"
@@ -55,10 +71,12 @@ secret() {
 }
 
 render() {
-  # 占位替换顺序要紧：__REPO__ 是 __HOME__ 的子路径，先 REPO 再 HOME 会把
-  # 已经替换出来的路径再替一次。这里两个都是整串占位符，互不包含，安全。
+  # 占位替换顺序要紧：替换出来的路径本身含有 ${HOME}，先替 __HOME__ 会把
+  # 后续替换出来的路径再替一次。这几个都是整串占位符、互不包含，所以安全；
+  # __HOME__ 放最后只是为了万一。
   local file=$1 text
-  text=$(sed -e "s|__REPO__|$REPO|g" -e "s|__HOME__|$HOME|g" "$file")
+  text=$(sed -e "s|__CODE__|$CODE|g" -e "s|__VENV__|$VENV|g" \
+             -e "s|__GITREPO__|$GITREPO|g" -e "s|__HOME__|$HOME|g" "$file")
   # 机密占位
   local missing=()
   while IFS= read -r name; do
@@ -90,12 +108,12 @@ for template in "$AGENTS"/com.*.plist; do
 
   if [ "$mode" = check ]; then
     if [ ! -f "$installed" ]; then
-      say "  ✗ $label：仓库里有，机器上没装"; rc=1
+      say "  ✗ ${label}：仓库里有，机器上没装"; rc=1
     elif printf '%s\n' "$rendered" | diff -q - "$installed" >/dev/null 2>&1; then
       say "  ✓ $label"
     else
       # 手改过 plist 而没回写仓库 —— 这正是「各种版本互相冲突」的起点。
-      say "  ✗ $label：机器上的与仓库里的不一致"
+      say "  ✗ ${label}：机器上的与仓库里的不一致"
       printf '%s\n' "$rendered" | diff -u "$installed" - | sed -n '3,12p' >&2
       rc=1
     fi
@@ -106,12 +124,12 @@ for template in "$AGENTS"/com.*.plist; do
   tmp=$(mktemp "$TARGET/.$label.XXXXXX")
   printf '%s\n' "$rendered" > "$tmp"
   chmod 600 "$tmp"
-  plutil -lint "$tmp" >/dev/null || { say "  ✗ $label：渲染出的 plist 不合法"; rm -f "$tmp"; rc=1; continue; }
+  plutil -lint "$tmp" >/dev/null || { say "  ✗ ${label}：渲染出的 plist 不合法"; rm -f "$tmp"; rc=1; continue; }
   mv -f "$tmp" "$installed"
   # bootout 再 bootstrap 才会重读文件；单纯 kickstart 用的还是旧定义。
   launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
   launchctl bootstrap "$DOMAIN" "$installed" 2>/dev/null \
-    || { say "  ✗ $label：bootstrap 失败"; rc=1; continue; }
+    || { say "  ✗ ${label}：bootstrap 失败"; rc=1; continue; }
   say "  ✓ $label 已安装并重载"
 done
 
