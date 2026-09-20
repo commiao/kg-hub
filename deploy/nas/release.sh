@@ -668,8 +668,21 @@ prune_orphans() {
   done <<EOF
 $extra
 EOF
-  # 删空的目录顺手清掉，但绝不碰 $SRC 本身。
-  on_nas "find '$SRC' -mindepth 1 -type d -empty -delete 2>/dev/null || true" >/dev/null
+  # 删空的目录顺手清掉，但绝不碰 $SRC 本身，**也绝不碰任何点目录**。
+  #
+  # 点目录必须排除，有两个独立理由：
+  #
+  # 一、`$SRC/.release.lock` 就是一个点目录，而这一步跑的时候**我们正握着它**。
+  #    正常情况它含 owner 文件、非空、删不到；但 `mkdir $LOCK` 与写 owner 之间
+  #    有一个窗口（取锁和抢占陈旧锁两条路径都有），写失败就留下一个空锁目录 ——
+  #    然后这行把自己正握着的锁悄悄删掉，没有任何报错，并发闸当场失效。
+  #    概率低，可后果正是这套东西要防的那一类，而排除它的成本是一个 `-name`。
+  #
+  # 二、漂移检测对根下点目录是**整体豁免**的（is_allowed_untracked：那里全是历次
+  #    部署留下的备份与暂存）。既然它们从来不被报，就不该被这一步删 ——
+  #    「删什么」不能超出「报什么」，超出的那部分没有任何东西看着。
+  on_nas "find '$SRC' -mindepth 1 -name '.*' -prune -o \
+          -type d -empty -exec rmdir {} + 2>/dev/null || true" >/dev/null
   say "  已清理 $pruned 个 git 已删除的残留文件（内容均可由 git 历史原样取回）"
 }
 

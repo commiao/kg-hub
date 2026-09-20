@@ -192,6 +192,55 @@ class TheDecidingLineActuallyUsesTheGateTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+
+class EmptyDirCleanupNeverTouchesDotDirsTests(unittest.TestCase):
+    """清空目录那一步绝不能碰点目录 —— `$SRC/.release.lock` 就是其中之一。
+
+    正常情况锁目录含 owner 文件、非空、删不到。但 `mkdir $LOCK` 与写 owner 之间
+    有窗口（取锁和抢占陈旧锁两条路径都有），写失败就留下一个**空的锁目录**，
+    然后这一步把自己正握着的锁悄悄删掉 —— 没有任何报错，并发闸当场失效。
+
+    第二个独立理由：漂移检测对根下点目录整体豁免，从来不报它们。
+    **「删什么」不能超出「报什么」**，超出的那部分没有任何东西看着。
+    """
+
+    def test_the_find_prunes_dot_entries_before_deleting(self):
+        # 续行要先拼成逻辑行：那条命令跨两行，按物理行取会把 -prune 落在另一行上，
+        # 断言于是钉了半句话。（第一版就是这么写的，当场假红。）
+        logical, buf = [], ""
+        for raw in RELEASE.read_text("utf-8").splitlines():
+            if raw.lstrip().startswith("#"):
+                continue
+            buf += raw.rstrip()
+            if buf.endswith("\\"):
+                buf = buf[:-1] + " "
+                continue
+            logical.append(buf.strip()); buf = ""
+        hits = [x for x in logical if "-type d -empty" in x]
+        self.assertTrue(hits, "找不到清空目录那条命令")
+        for cmd in hits:
+            self.assertIn("-name '.*' -prune", cmd,
+                          "空目录清理没有排除点目录，会删掉正握着的 .release.lock")
+
+    def test_it_really_spares_an_empty_lock_dir(self):
+        """光看命令看不出 find 会怎么解析，所以真跑一次。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".release.lock").mkdir()      # 空锁：正是危险的那一刻
+            (root / "normal_empty").mkdir()
+            (root / "keep").mkdir()
+            (root / "keep/f").write_text("x", encoding="utf-8")
+            subprocess.run(
+                ["find", str(root), "-mindepth", "1", "-name", ".*", "-prune",
+                 "-o", "-type", "d", "-empty", "-exec", "rmdir", "{}", "+"],
+                capture_output=True)
+            self.assertTrue((root / ".release.lock").is_dir(),
+                            "把正握着的锁删掉了")
+            self.assertFalse((root / "normal_empty").exists(),
+                             "对照组：普通空目录该被清掉，否则这条用例没在验东西")
+            self.assertTrue((root / "keep/f").exists())
+
+
 class ReleaseScriptWiringTests(unittest.TestCase):
     """接线：发布脚本真的用了收窄后的那个出口，而不是全集。
 
