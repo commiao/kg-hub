@@ -291,9 +291,13 @@ services:
       - KG_HUB_REFINERY_STATE=/state
       - KG_HUB_REFINERY_INTERVAL_SEC=90
       # live 与 backlog 的每轮名额。2026-09-20 之前是 200:8（live 那个还写死在源码里），
-      # 配额只够 1.2 轮，积压整夜只分到 15 条。改成 50:50 让两条线平分。
-      - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=${KG_HUB_REFINERY_PER_CYCLE:-50}
-      - KG_HUB_REFINERY_LIVE_PER_CYCLE=${KG_HUB_REFINERY_LIVE_PER_CYCLE:-50}
+      # 配额只够 1.2 轮，积压整夜只分到 15 条；先改成 50:50 让两条线平分。
+      # 2026-09-20 夜用户拍板「维持网关日额度不提，窗口内积压优先于 live」，
+      # 于是同一个旋钮再调成 70:30 —— 两条线的名额仍是同一种东西（都走环境变量），
+      # 比例写在这里，任何人都能审。不取 75:25 是因为 75% 正好压在
+      # tests/test_refinery_cycle_budget.py 的饿死线上，不留余量的默认值不算定案。
+      - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=${KG_HUB_REFINERY_PER_CYCLE:-70}
+      - KG_HUB_REFINERY_LIVE_PER_CYCLE=${KG_HUB_REFINERY_LIVE_PER_CYCLE:-30}
       # 批内并发抽取上限。服务端写锁串行化 add_episode,所以这不提高抽取吞吐,
       # 只消除批内队头阻塞(一条 p90 180s 的慢抽取此前会堵住身后的快速失败条目)。
       - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-2}

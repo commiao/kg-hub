@@ -56,6 +56,41 @@ class CycleBudgetTests(unittest.TestCase):
                 share, 0.75,
                 f"{name} 独占 {share:.0%} 的每轮名额——另一条线会饿死（09-19 实测 live 占 94%）")
 
+    def test_backlog_is_dispatched_before_live(self):
+        """积压必须排在 live 前面 —— 这是 2026-09-07 夜实测换来的顺序。
+
+        当时 live 一轮吃掉整个 12 小时窗口，排在它后面的积压名额整夜拿不到，
+        backlog_remaining 连续 4 天恒为 7786。顺序是承载性的，却一直没人钉住：
+        谁把这两段调个个儿，测试都不会响。
+        """
+        back = SOURCE.index("s_back = await process_batch(")
+        live = SOURCE.index("s_live = await process_batch(")
+        self.assertLess(back, live,
+                        "backlog 批必须先于 live 批派发——顺序反了积压整夜拿不到名额")
+
+    def test_backlog_is_never_given_less_than_live(self):
+        """2026-09-20 用户拍板：维持网关日额度不提，窗口内积压优先于 live。
+
+        「优先」在这套代码里只有两个可审的落点：派发顺序（上一条钉住）和每轮
+        名额。名额上 backlog 低于 live 就等于没优先，所以这里只钉方向，不钉数值——
+        具体比例留给 compose，饿死线仍由 test_neither_line_can_starve_the_other 管。
+        """
+        self.assertGreaterEqual(
+            refinery.BACKLOG_PER_CYCLE, refinery.LIVE_PER_CYCLE,
+            "积压优先意味着它的每轮名额不得低于 live")
+
+    def test_compose_defaults_keep_backlog_ahead(self):
+        """线上取值来自 compose 默认值，源码默认值拦不住它。"""
+        found = dict(re.findall(
+            r"KG_HUB_REFINERY_(BACKLOG|LIVE)_PER_CYCLE=\$\{[A-Z_]+:-(\d+)\}", COMPOSE))
+        self.assertEqual(set(found), {"BACKLOG", "LIVE"}, f"compose 默认值没解析出来: {found}")
+        back, live = int(found["BACKLOG"]), int(found["LIVE"])
+        self.assertGreaterEqual(back, live, f"compose 默认比例没让积压优先: {found}")
+        # 饿死线原先只管源码默认值,而线上跑的是 compose 这一份 —— 同一条线必须
+        # 两边都拦,否则「优先」可以在 compose 里一路滑到 live 永远轮不到。
+        self.assertLessEqual(back / (back + live), 0.75,
+                             f"compose 默认值把 live 饿死了: {found}")
+
     def test_compose_passes_both_knobs(self):
         """线上取值经 compose 注入；漏掉一个就会悄悄回落到默认值。"""
         for var in ("KG_HUB_REFINERY_BACKLOG_PER_CYCLE",
