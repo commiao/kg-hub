@@ -205,6 +205,31 @@ ensure_compose_gateway_route() {
   " || die "模型网关路由缺失、重复或不是受控的本地业务路由"
 }
 
+# 上面那几条各自校验一个具体条件（数据目录、令牌、路由、私有网络）。它们合起来
+# 仍然回答不了最朴素的那一问：**这套 compose 现在整体解析得通吗？**
+#
+# 为什么必须在停生产者之前问：一旦 refinery/ingester 停了，后面每一步 —— 起候选
+# 容器、回滚 —— 都要 compose 能解析。解析不通的话，生产者已经停了，而任何一条
+# 恢复路径都走不了。那正是「切了之后回不来」的形态。
+#
+# 不是假设：`docker-compose.yml` 里用的是 `${KG_HUB_IMAGE_TAG:?...}` 这类硬引用
+# （铁律三：少了变量就当场失败，不许隐式默认）。**这个设计本身就意味着「.env 少
+# 一行 = compose 整体不可用」**，而 .env 在发布过程中会被改写。上面那几条检查只覆盖
+# 它们各自关心的那一个变量；新加一个变量、或者别的 actor 改了 override，它们一个
+# 都不会响。
+#
+# `config -q` 只解析不执行、不碰任何容器，代价是一次远端调用。
+ensure_compose_parses() {
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    say "  [dry-run] 会跑 compose config -q，确认整套文件在停生产者前解析得通"
+    return 0
+  fi
+  # 同时传两个文件和同一个项目名 —— 必须和真正执行时的参数完全一致，
+  # 否则校验的是另一套东西（准则 28：比较的两端要取自同一来源）。
+  on_nas "cd '$SRC' && $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT config -q" \
+    || die "compose 解析失败（少变量或文件有误）；已在停生产者前中止，线上未受影响"
+}
+
 # server/ingester/watchdog 和 model-gateway 属于两个 Compose 项目。默认网络隔离
 # 是正确的；只有这三个调用者通过已存在的 private network 相连，refinery 不接入。
 # 漏掉 override 会在容器重建时静默断开 DNS，所有抽取都变成 deferred。必须在
@@ -379,6 +404,7 @@ ensure_compose_data_root
 ensure_compose_model_gateway_token
 ensure_compose_gateway_route
 ensure_model_gateway_private_network
+ensure_compose_parses
 
 # 锁必须已经取得，才允许读、备份、替换 NAS 的 .env。之后的任何失败都会由
 # release_exit 复原这份完整旧配置。

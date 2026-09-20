@@ -82,6 +82,42 @@ class ReleaseScriptTests(unittest.TestCase):
         build = self.code.index("build -t kg-hub-server:")
         self.assertLess(seed, build)
 
+    def test_compose_is_proven_to_parse_before_producers_stop(self):
+        """停生产者之前，整套 compose 必须先证明解析得通。
+
+        一旦 refinery/ingester 停了，后面每一步 —— 起候选容器、回滚 —— 都要 compose
+        能解析。解析不通的话，生产者已经停了，而**任何一条恢复路径都走不了**。
+        那正是「切了之后回不来」的形态（准则 6）。
+
+        不是假设：compose 里用的是 `${...:?}` 硬引用（铁律三），这意味着
+        **.env 少一行 = compose 整体不可用**，而 .env 在发布过程中会被改写。
+        上面那几条 ensure_* 各自只覆盖它们关心的那一个变量。
+
+        这一条 2026-09-18 就该做，挂了两天没人接 —— 所以它现在有测试。
+        """
+        self.assertIn("config -q", self.code, "没有 compose 解析预检")
+        # 量的必须是**调用**的位置，不是函数定义的位置 —— 定义总在文件前面，
+        # 拿它比较的话，把调用挪到停机之后也测不出来（第一版就是这么漏的）。
+        lines = self.code.splitlines()
+        calls = [i for i, l in enumerate(lines) if l.strip() == "ensure_compose_parses"]
+        self.assertEqual(len(calls), 1, "预检没有被调用，或被调用了多次")
+        stops = [i for i, l in enumerate(lines) if "stop -t 30 refinery ingester" in l]
+        self.assertTrue(stops, "找不到停生产者那一步，锚点失效了")
+        self.assertLess(calls[0], stops[0], "预检排在停生产者之后，等于没检")
+
+    def test_the_preflight_uses_the_same_files_and_project_as_the_real_run(self):
+        """校验的必须是**将要执行的那一套**，不是另一套。
+
+        文件少传一个、项目名写错，解析的就是别的东西 —— 准则 28：
+        比较的两端要取自同一来源。
+        """
+        # 挑**真正执行**的那一行，不是 dry-run 的提示行 —— 后者里没有参数，
+        # 拿它来断言等于什么都没验。
+        line = next(l for l in self.code.splitlines()
+                    if "config -q" in l and "compose" in l and "dry-run" not in l)
+        for token in ("$COMPOSE_BASE", "$COMPOSE_GATEWAY_OVERRIDE", "$PROJECT"):
+            self.assertIn(token, line, f"预检没带上 {token}")
+
     def test_rollback_reuses_the_old_image_and_verifies_it_exists(self):
         self.assertIn("--rollback", self.source)  # 用法说明里也要有
         self.assertIn("image inspect kg-hub-server:", self.code)
