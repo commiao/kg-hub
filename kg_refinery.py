@@ -344,6 +344,10 @@ _thermal_today: dict[str, object] = {"day": "", "holds": 0, "seconds": 0}
 _budget_today: dict[str, object] = {"day": "", "lines": {}}
 
 _BUDGET_TALLIES = ("ingested", "rejected", "deferred", "backoff_skipped")
+# 小时桶保留多久。窗口是 10 小时,留 48 小时能把"昨晚 vs 前晚"并排看,
+# 又不会让每轮都整体重写的 status.json 无限长大。
+BUDGET_HOURS = int(os.environ.get("KG_HUB_REFINERY_BUDGET_HOURS", "48"))
+_budget_hourly: dict[str, dict] = {}
 
 
 def cycle_budget_fields() -> dict[str, int]:
@@ -375,6 +379,17 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
     for bucket in ("result_counts", "filter_counts"):
         for name, n in (stats.get(bucket) or {}).items():
             line[bucket][name] = int(line[bucket].get(name, 0)) + int(n)
+    # 小时桶:看板要画的是逐小时柱状图,只有当日合计画不出"什么时候烧的"。
+    # 保留 BUDGET_HOURS 小时就够覆盖一个窗口加上前后各半天;无上限会让 status.json
+    # 越长越大,而它每轮都要整体重写。
+    hour = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H")
+    bucket = _budget_hourly.setdefault(hour, {})
+    hline = bucket.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
+    for t in _BUDGET_TALLIES:
+        hline[t] = int(hline.get(t, 0)) + int(stats.get(t, 0) or 0)
+    for name in sorted(_budget_hourly)[:-BUDGET_HOURS]:
+        _budget_hourly.pop(name, None)
+
     total = sum(int(v.get("ingested", 0)) + int(v.get("rejected", 0))
                 for v in lines.values())
     return {
@@ -382,6 +397,8 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
         "unit": "observations",     # 不是模型调用次数,别和网关日计数混算
         "terminal_total": total,
         "lines": {k: dict(v) for k, v in lines.items()},
+        "hourly": {h: {k: dict(v) for k, v in b.items()}
+                   for h, b in sorted(_budget_hourly.items())},
     }
 
 

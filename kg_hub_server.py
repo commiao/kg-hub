@@ -4219,11 +4219,24 @@ a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font
 .ct{font-size:12px;width:56px;text-align:right;flex:none;font-family:ui-monospace,monospace}
 .ts{color:GrayText;font-size:12px}
 .warn{background:#FDEDED;color:#8A1C1C;border-radius:8px;padding:.5rem .8rem;font-size:13px;margin:.6rem 0}
-.note{font-size:12px;color:GrayText;margin:.4rem 0 0}</style></head><body>
+.note{font-size:12px;color:GrayText;margin:.4rem 0 0}
+.chead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:1.3rem 0 .2rem}
+.chead .t{font-size:13px;color:GrayText}.chead .u{font-size:12px;color:GrayText}
+.seg{margin-left:auto;display:flex;gap:2px;background:color-mix(in srgb,CanvasText 10%,transparent);border-radius:999px;padding:2px}
+.seg button{border:0;background:transparent;color:GrayText;font:inherit;font-size:12px;padding:3px 12px;border-radius:999px;cursor:pointer}
+.seg button[aria-pressed=true]{background:color-mix(in srgb,CanvasText 22%,transparent);color:CanvasText}
+.lg{display:flex;flex-wrap:wrap;gap:10px 18px;margin:.5rem 0 0;font-size:12px}
+.lg span.i{display:inline-flex;align-items:center;gap:5px}
+.lg i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.lg b{font-weight:500;font-family:ui-monospace,monospace}
+.lg u{text-decoration:none;color:GrayText}</style></head><body>
 <a class=back href="/portal">← 报表门户</a><h1>模型用量与成本</h1>
 <div id=warn></div>
 <div class=note id=note></div>
 <div class=cards id=cards></div>
+<div class=chead><span class=t id=chartTitle></span><span class=u id=chartUnit></span>
+<span class=seg id=seg></span></div>
+<div id=chart></div><div class=lg id=legend></div>
 <div class=lbl>按月</div><div id=monthly></div>
 <div class=lbl>按日（最近 14 天）</div><div id=daily></div>
 <div class=lbl>按小时（最近 48 小时）</div><div id=hourly></div>
@@ -4268,6 +4281,75 @@ function bars(rows,labelKey,target,keep){
   const dt=document.createElement('span');dt.className='ts';dt.style.flex='1';
   dt.textContent=[...per.entries()].sort().map(([k,v])=>k.split('.')[0]+' '+v).join(' · ');
   row.append(nm,bar,ct,dt);box.append(row)})}
+// ---- 逐小时堆叠柱 ----
+// 两个口径**绝不混算**:网关记的是模型调用次数,refinery 记的是观测条数,实测差约
+// 20 倍(一条观测要抽实体/关系/去重/摘要)。所以下钻换的不只是分组,连单位一起换,
+// 标题上如实写明。宁可让人多看一眼,也不要给一个看起来精确的假比例。
+const PALETTE=['#5B8FF9','#7B61FF','#5AD8A6','#F6BD16','#E8684A','#6DC8EC'];
+function colorOf(i){return PALETTE[i%PALETTE.length]}
+function seriesByKey(n){
+ const hours=[...new Set((D.hourly||[]).map(r=>String(r.hour)))].sort().slice(-n);
+ const keys=[...new Set((D.hourly||[]).map(r=>String(r.business_key)))].sort();
+ const at=new Map();(D.hourly||[]).forEach(r=>at.set(r.hour+'|'+r.business_key,Number(r.count)||0));
+ return {hours:hours,keys:keys,get:(h,k)=>at.get(h+'|'+k)||0,
+   unit:'调用次数（网关放行的外呼）',title:'逐小时调用量 · 按业务 key'}}
+function seriesByLine(n){
+ const bh=D.budget_hourly||{},hours=Object.keys(bh).sort().slice(-n);
+ const keys=[...new Set(hours.flatMap(h=>Object.keys(bh[h]||{})))].sort();
+ const LB={backlog:'积压处理 backlog',live:'实时数据 live'};
+ return {hours:hours,keys:keys,label:k=>LB[k]||k,
+   get:(h,k)=>{const v=(bh[h]||{})[k]||{};return (Number(v.ingested)||0)+(Number(v.rejected)||0)},
+   unit:'观测条数（终态：入图＋拒绝）—— 不是调用次数，两者实测差约 20 倍',
+   title:'逐小时处理量 · kg_hub.entity_extract 下钻到两条线'}}
+let MODE='key';
+function draw(){
+ const n=24,S=MODE==='key'?seriesByKey(n):seriesByLine(n);
+ document.getElementById('chartTitle').textContent=S.title;
+ document.getElementById('chartUnit').textContent='单位：'+S.unit;
+ const box=document.getElementById('chart'),lg=document.getElementById('legend');
+ box.textContent='';lg.textContent='';
+ if(!S.hours.length||!S.keys.length){const e=document.createElement('div');e.className='ts';
+  e.textContent=MODE==='key'?'暂无用量快照':'暂无去向账 —— refinery 需跑过一轮窗口才会产生';
+  box.append(e);return}
+ const W=880,H=210,PL=44,PB=22;
+ const peak=Math.max(1,...S.hours.map(h=>S.keys.reduce((a,k)=>a+S.get(h,k),0)));
+ const NS='http://www.w3.org/2000/svg';
+ function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e}
+ const svg=el('svg',{viewBox:'0 0 '+W+' '+H,width:'100%'});
+ [0,.5,1].forEach(f=>{const y=(H-PB)-(H-PB-10)*f;
+  svg.append(el('line',{x1:PL,x2:W,y1:y,y2:y,stroke:'currentColor','stroke-opacity':.15}));
+  const t=el('text',{x:0,y:y+4,'font-size':11,fill:'currentColor','fill-opacity':.5});
+  t.textContent=Math.round(peak*f);svg.append(t)});
+ const bw=(W-PL)/S.hours.length;
+ S.hours.forEach((h,hi)=>{let acc=0;
+  S.keys.forEach((k,ki)=>{const v=S.get(h,k);if(!v)return;
+   const hh=(H-PB-10)*v/peak,y=(H-PB)-hh-acc;acc+=hh;
+   const r=el('rect',{x:PL+hi*bw+bw*0.15,y:y,width:Math.max(1,bw*0.7),
+                      height:Math.max(1,hh),fill:colorOf(ki),rx:1});
+   const ti=document.createElementNS(NS,'title');
+   ti.textContent=h+'  '+(S.label?S.label(k):k)+'  '+v;r.append(ti);svg.append(r)});
+  if(hi%6===0||hi===S.hours.length-1){
+   const t=el('text',{x:PL+hi*bw,y:H-6,'font-size':11,fill:'currentColor','fill-opacity':.5});
+   t.textContent=h.slice(-2)+':00';svg.append(t)}});
+ box.append(svg);
+ S.keys.forEach((k,ki)=>{const tot=S.hours.reduce((a,h)=>a+S.get(h,k),0);
+  const sp=document.createElement('span');sp.className='i';
+  const sw=document.createElement('i');sw.style.background=colorOf(ki);
+  const nm=document.createElement('span');nm.textContent=(S.label?S.label(k):k)+' ';
+  const b=document.createElement('b');b.textContent=tot;
+  sp.append(sw,nm,b);
+  if(MODE==='key'){const cap=(D.limits||{})[k];const u=document.createElement('u');
+   u.textContent=cap?(' / '+cap+'（'+Math.round(tot*100/cap)+'%）'):' / 上限未知';
+   sp.append(u)}
+  lg.append(sp)})}
+const seg=document.getElementById('seg');
+[['key','业务 key'],['line','下钻：backlog / live']].forEach(function(pair){
+ const b=document.createElement('button');b.textContent=pair[1];
+ b.setAttribute('aria-pressed',String(pair[0]===MODE));
+ b.onclick=function(){MODE=pair[0];
+  [].forEach.call(seg.children,c=>c.setAttribute('aria-pressed',String(c===b)));draw()};
+ seg.append(b)});
+draw();
 bars(D.monthly,'month','monthly',0);
 bars(D.daily,'day','daily',14);
 bars(D.hourly,'hour','hourly',48);
@@ -4287,7 +4369,11 @@ async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
     """
     data: dict = {"totals": {}, "monthly": [], "daily": [], "hourly": [],
                   "window": {}, "generated_at": None, "backlog": None,
-                  "backlog_at": None, "error": None}
+                  "backlog_at": None, "error": None,
+                  # 每个 business_key 的当前日上限 —— "5000 额度被谁占了多少"要有分母
+                  "limits": {},
+                  # refinery 的小时级去向账(单位:观测条数,与调用次数差约 20 倍)
+                  "budget_hourly": {}, "budget_day": None}
     path = Path(os.environ.get("KG_HUB_GATEWAY_USAGE", "/gateway-usage/usage.json"))
     try:
         if path.exists():
@@ -4296,6 +4382,12 @@ async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
                         "generated_at"):
                 if key in snapshot:
                     data[key] = snapshot[key]
+            # 分母取"当前有效额度"而非审批上限:后者不是正在执行的那一个。
+            limits = snapshot.get("effective_limits")
+            if isinstance(limits, dict):
+                data["limits"] = {
+                    k: v.get("daily_requests") for k, v in limits.items()
+                    if isinstance(v, dict) and isinstance(v.get("daily_requests"), int)}
         else:
             data["error"] = f"用量快照不存在({path})—— 导出器未运行或共享卷未挂"
     except Exception as exc:  # noqa: BLE001
@@ -4310,6 +4402,14 @@ async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
             if isinstance(rstatus.get("backlog_remaining"), int):
                 data["backlog"] = rstatus["backlog_remaining"]
             data["backlog_at"] = (rstatus.get("ts") or "")[:19] or None
+            # 下钻用:kg_hub.entity_extract 这一条线内部,积压 vs 实时各占多少。
+            # 只有 refinery 知道这件事,网关那边只看得到一个 business_key。
+            budget = rstatus.get("budget_today")
+            if isinstance(budget, dict):
+                hourly = budget.get("hourly")
+                if isinstance(hourly, dict):
+                    data["budget_hourly"] = hourly
+                data["budget_day"] = budget.get("day")
     except Exception:  # noqa: BLE001
         pass
 
