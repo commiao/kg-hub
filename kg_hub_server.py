@@ -238,7 +238,10 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         # breaker_open 同属"没到供应商、与观测内容无关"这一类:人工断开期间万一
         # 有键漏下来,不该让观测为一次运维动作白锁 24h。
         "  AND (k.error_kind IN ['quota_exhausted', 'rate_limited', "
-        "                        'gateway_unavailable', 'breaker_open'] "
+        "                        'gateway_unavailable', 'breaker_open', "
+        # upstream_error:网关/供应商回的 5xx。同属"与观测内容无关",没有理由比
+        # 连不上网关多锁 23 小时。
+        "                        'upstream_error'] "
         "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
         "       OR k.error_message CONTAINS '网关本地配置不可用' "
         "       OR k.error_message STARTS WITH 'RateLimitError' "
@@ -326,6 +329,23 @@ def classify_extract_error(exc: BaseException) -> str | None:
     if type(exc).__name__ in {"APIConnectionError", "ConnectError", "ConnectTimeout",
                               "RemoteProtocolError"} or "Connection error" in text:
         return "gateway_unavailable"
+    # 兜底:任何 5xx 都是调用链上游的失败,与这条观测的内容无关。
+    #
+    # 2026-09-20 夜实测,这是**同一个病的第三次发作**。前两次的修法都是往上面那些
+    # 字符串匹配里再加一条(「网关本地配置不可用」、几个连接异常类名),于是网关换一句
+    # 新文案就又漏下来:这次是 503「幂等终态写入尚未恢复,已拒绝付费请求」。漏下来的
+    # 后果不是少一个标签——error_kind 为空就不满足上面那条「网关侧错误 1h 即清」,
+    # 于是落进 24h 通用清理,被当成「这条观测本身有毛病」,重推一律 409 + 指数退避。
+    # 一次网关抖动因此停用了 74 条观测整整一天(图里 82 条 error 键有 74 条是它)。
+    #
+    # 所以这里改判据:不再问「它说了什么」,而是问「它回了几」。状态码是协议里定死的,
+    # 不跟着文案漂(准则 22)。5xx 一律归上游,重试节奏由 1h 清理接管。
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and 500 <= status <= 599:
+        # 与 gateway_unavailable 分开:那个是「够不着网关」,这个是「网关活着并回了
+        # 一个 5xx」。两者的运维动作不同——把后者报成前者,值班的第一反应会是去重启
+        # 网关,而那恰恰是准则 29 说的、会制造孤儿付费记录的那个动作。
+        return "upstream_error"
     return None
 
 

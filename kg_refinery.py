@@ -648,6 +648,11 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
                 return "quota"  # 网关配额拒绝:暂停后再探
             if st == "error" and d.get("error_kind") == "rate_limited":
                 return "rate_limited"  # 上游限流:等服务端释放错误键后再探
+            if st == "error" and d.get("error_kind") == "upstream_error":
+                # 网关/供应商回 5xx。和上面两条同类:失败不属于这条观测,
+                # 继续逐条撞只会把整批的模型调用白烧掉(实测 503 打在
+                # resolve_extracted_edges,那时约 20 次调用已经花出去了)。
+                return "upstream_error"
             if st in ("ok", "skipped", "error"):
                 return st
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
@@ -850,6 +855,20 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             log.warning("[%s] obs-%d → 上游限流,停发 %d 轮(≈%dmin)后再探",
                         kind, oid, RATE_LIMIT_PAUSE_CYCLES,
                         RATE_LIMIT_PAUSE_CYCLES * INTERVAL // 60)
+        elif st == "upstream_error":
+            # 网关活着但回 5xx。服务端对这类键同样按 1 小时清理,所以暂停节奏跟
+            # rate_limited 走同一个常数——它就是按「盖住那 1 小时」算出来的。
+            if quota_pause is not None:
+                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
+                candidate_until = cycle + RATE_LIMIT_PAUSE_CYCLES
+                if candidate_until >= quota_pause.get("until_cycle", 0):
+                    quota_pause["until_cycle"] = candidate_until
+                    quota_pause["reason"] = "upstream_error"
+            stats["upstream_error"] = 1
+            stats["deferred"] += 1
+            log.warning("[%s] obs-%d → 上游 5xx,停发 %d 轮(≈%dmin)后再探",
+                        kind, oid, RATE_LIMIT_PAUSE_CYCLES,
+                        RATE_LIMIT_PAUSE_CYCLES * INTERVAL // 60)
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
@@ -874,7 +893,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs)
-            if (st in ("quota", "rate_limited", "net")
+            if (st in ("quota", "rate_limited", "net", "upstream_error")
                     or st.startswith("graphiti_unavailable_")):
                 halt["stop"] = True         # 尚未拿到令牌的条目不再发
             settle(obs, st)
@@ -986,6 +1005,7 @@ async def main() -> int:
                 pause_reason = quota_pause.get("reason", "quota_exhausted")
                 write_status(quota_paused=pause_reason == "quota_exhausted",
                              rate_limited=pause_reason == "rate_limited",
+                             upstream_error_paused=pause_reason == "upstream_error",
                              rate_limit_paused_until_cycle=quota_pause["until_cycle"],
                              rate_limit_hits=quota_pause.get("hits", 0),
                              quota_paused_until_cycle=quota_pause["until_cycle"],
@@ -1012,6 +1032,7 @@ async def main() -> int:
                     backoff_pending=len(backoff),
                     quota_paused=False,
                     rate_limited=False,
+                    upstream_error_paused=False,
                     rate_limit_paused_until_cycle=quota_pause.get("until_cycle"),
                     rate_limit_hits=quota_pause.get("hits", 0),
                     quota_paused_until_cycle=quota_pause.get("until_cycle"),
