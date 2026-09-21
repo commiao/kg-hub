@@ -53,6 +53,17 @@ from mcp.server.fastmcp import FastMCP
 KG_HUB_URL = os.environ.get("KG_HUB_URL", "http://127.0.0.1:8080")
 KG_HUB_API_TOKEN = os.environ.get("KG_HUB_API_TOKEN")
 
+# 只读设备(T-0052)。服务端的 scoped token 本来就会把写请求挡成 403 —— 这里不注册
+# 写工具是为了**别让对面先看见再被拒**:一个列在工具表里、点下去必失败的工具，
+# 比没有这个工具更糟(它看起来像在处理一种情况)。
+# 安全边界在服务端，不在这里：这个开关只影响"露不露出来"。
+READONLY = os.environ.get("KG_HUB_MCP_READONLY", "0").strip().lower() in ("1", "true", "yes")
+
+
+def write_tool(fn):
+    """只读模式下不注册；否则与 @mcp.tool() 等价。"""
+    return fn if READONLY else mcp.tool()(fn)
+
 # ---------- Client-side unreachable alert (L3 monitoring) ----------
 # If kg-hub is unreachable/timing out from where the MCP runs, proactively push a
 # Feishu alert. This is the client-vantage watcher (lives off the NAS), complementary
@@ -205,7 +216,7 @@ async def kg_episode_search(query: str, num_results: int = 5) -> list[dict[str, 
     return data.get("results", [])
 
 
-@mcp.tool()
+@write_tool
 async def kg_add_episode(
     content: str,
     source_description: str,

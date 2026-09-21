@@ -26,6 +26,7 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import math
@@ -79,6 +80,7 @@ from utils.predigest import (  # noqa: E402
 )
 from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
+from utils import token_auth  # noqa: E402
 from model_gateway_client import (  # noqa: E402
     envelope_repairs_total, model_operation, offscript_total, stable_operation_id)
 
@@ -168,10 +170,30 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
             )
         token = header[len("Bearer "):].strip()
-        if token != API_TOKEN:
+        # 管理员 token:全权。用 compare_digest 而不是 `!=` —— 两把都不对的 token
+        # 不该因为"前几个字符碰巧对"而花掉不同的时间。
+        if hmac.compare_digest(token.encode("utf-8"), (API_TOKEN or "").encode("utf-8")):
+            return await call_next(request)
+        # 可撤销的 scoped token(T-0052)。**边界说准**:它管的是 /api/* 这一面;
+        # 上面那条豁免让 / /portal /dashboard 整体免鉴权(含 12 条 POST),
+        # 2026-09-21 用户明确决定维持现状(单人内网)。所以这把 token 的保证是
+        # "经 /api/* 写不进去",不是"这个端口上写不进去"。mcp_server.py 只调
+        # /api/* 的六个读端点,所以一台只跑 MCP 的设备确实写不了。
+        principal = token_auth.principal_for(token)
+        if principal is None:
             return JSONResponse(
                 {"status": "error", "code": "unauthorized", "message": "invalid token"},
                 status_code=401,
+            )
+        if not token_auth.allows(principal, request.method, path):
+            # 401 是"你是谁我不认",403 是"认得你,但这件事不归你"——对面要据此
+            # 决定是换 token 还是别再试了,混成一个码它就只能猜(准则 23)。
+            logger.warning("[auth:denied] principal=%s method=%s path=%s",
+                           principal.get("name"), request.method, path)
+            return JSONResponse(
+                {"status": "error", "code": "forbidden_scope",
+                 "message": "this token is not allowed on this endpoint"},
+                status_code=403,
             )
         return await call_next(request)
 

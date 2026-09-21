@@ -142,6 +142,10 @@ services:
       # 刻意不让 server 直连回滚见证库:网关把见证不可用当致命(对外 503),
       # 请求路径上的读者一旦持锁就可能打挂整条链路(T-0046)。
       - KG_HUB_GATEWAY_USAGE=/gateway-usage/usage.json
+      # 可撤销的 scoped Token 注册表(T-0052)。**只读挂载**:服务端只查摘要,
+      # 发放与撤销都在宿主机上改这个文件 —— 服务端按 mtime 重载,撤销即时生效,
+      # 不用重启。文件里没有明文 token,只有 SHA-256 摘要。
+      - KG_HUB_ACCESS_CONTROL=/access-control/read-tokens.json
     volumes:
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/models:/models
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/ingest-backup:/backup
@@ -150,6 +154,8 @@ services:
       # 其余容器只读挂载——能扳开关的只有那一个页面。
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/breakers:/breakers
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/gateway-usage:/gateway-usage:ro
+      # ro:服务端无权改它 —— 能发/能撤的只有宿主机上的人。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/access-control:/access-control:ro
       # 动态快照目录与可信配置分别只读挂载；producer 无法改告警策略。
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/runtime:/device-liveness:ro
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/device-liveness/device-liveness.json:/device-liveness-config/device-liveness.json:ro
