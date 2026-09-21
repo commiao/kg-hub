@@ -337,6 +337,32 @@ rollback_to_previous_image() {
     || die "回滚也失败了；线上需要人工介入（旧镜像 kg-hub-server:$PREV 仍在盘上）"
 }
 
+# 让 kg-hub 在排空期间拒收**新的**写入，使「排空不掉就别发」这条闸的终点可达。
+#
+# 停生产者只停得住自己的 refinery / ingester。`/api/ingest` 还有别的写入方：
+# NAS 上的 task-hub 容器会把 done 任务结晶入图，任何用 kg_hub MCP 的会话也能直写。
+# 2026-09-21 实测：12:16 那次发布等了约 1260s 才归零，期间一直有新条目进来。
+# 预算再大也没用 —— 只要到达率不为零，计数就可能一直不为零（T-0117）。
+#
+# 拒收是安全的，这一点是读了调用方的重试路径才敢做的，不是假设：task-hub 的
+# reconciler 只在 POST 返回 2xx 之后才落 reconciler_marks，失败就不落、下一轮
+# （300s）重来、按任务 id 幂等。所以 503 不丢数据，只是晚几分钟入图。
+#
+# 令牌只在 NAS 上取用：不回传到本机 stdout、日志或命令插值（与本脚本处理
+# KG_HUB_MODEL_GATEWAY_TOKEN 的做法一致）。
+set_drain() {
+  local seconds="$1"
+  [ "${DRY_RUN:-0}" = 1 ] && { say "  [dry-run] 会把 kg-hub 排空态设为 ${seconds}s"; return 0; }
+  on_nas "set -eu
+    cd '$SRC'
+    tok=\$(sed -n 's/^KG_HUB_API_TOKEN=//p' .env | head -1)
+    test -n \"\$tok\"
+    curl -fsS -m 10 -X POST \
+      -H \"Authorization: Bearer \$tok\" -H 'Content-Type: application/json' \
+      -d '{\"seconds\": ${seconds}}' http://127.0.0.1:17171/api/drain >/dev/null
+  "
+}
+
 release_exit() {
   local rc=$?
   # 清理途中再次收到中断时不能跳过恢复步骤。先忽略这三种信号，再撤销 EXIT
@@ -347,6 +373,9 @@ release_exit() {
     restore_refinery_window_env || say "  ⚠ 未能自动恢复 .env 备份"
   fi
   restore_producers 2>/dev/null || true
+  # 解除排空态。它本身带截止时间兜底，但那是**兜底**不是正常路径：
+  # 中止之后让写入方白等几分钟没有任何好处。
+  set_drain 0 >/dev/null 2>&1 || true
   if [ "$lock_acquired" = 1 ]; then
     ssh "${SSH_OPTS[@]}" "$NAS" "rm -rf '$LOCK'" >/dev/null 2>&1 || true
   fi
@@ -545,6 +574,13 @@ case "$DRAIN_BUDGET_S" in
   ''|*[!0-9]*) die "排空预算算不出来（utils/ingest_budget.py）——不猜一个数就发" ;;
 esac
 say "  排空预算 ${DRAIN_BUDGET_S}s（服务端一次 ingest 的最坏用时；归零即继续）"
+# 先让服务端拒收新写入，再开始等 —— 顺序反了的话，等的过程中还会有新条目进来，
+# 终点就可能永远到不了（T-0117）。
+if set_drain "$DRAIN_BUDGET_S"; then
+  say "  已让 kg-hub 拒收新写入（外部写入方会在各自的下一轮重试，不丢）"
+else
+  say "  ⚠ 没能让 kg-hub 进入排空态；继续等，但外部写入方仍在推，可能等不到归零"
+fi
 drained=0
 waited=0
 while [ "$waited" -lt "$DRAIN_BUDGET_S" ]; do

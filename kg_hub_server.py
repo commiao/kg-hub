@@ -447,6 +447,51 @@ _active_extractions = 0
 _active_extractions_lock = threading.Lock()
 
 
+# 排空态：发布期间拒收**新的**写入，让 _active_extractions 有机会真的归零。
+#
+# 为什么需要它（2026-09-21 实测，T-0117）：release.sh 停的是 refinery 和 ingester，
+# 也就是「自己的生产者」。但 `/api/ingest` 还有别的写入方 —— NAS 上的 task-hub 容器
+# 会把 done 任务结晶入图（`KGHUB_INGEST=http://kg-hub-server:8080/api/ingest`），
+# 任何用 kg_hub MCP 的会话也能直写。于是排空的终点**可能永远到不了**：
+# 12:16 那次发布等了约 1260s 才归零，期间一直有新条目进来。
+#
+# 预算再大也解决不了 —— 只要到达率不为零，计数就可能一直不为零，最后一律落到
+# 「排空不掉就别发」的中止上。也就是说：**有人在干活的时候就发不了版**，
+# 而那恰恰是最想发版的时候。
+#
+# 为什么拒收是安全的（读了调用方的重试路径才敢这么做，不是假设）：
+# task-hub 的 reconciler 只在 POST 返回 2xx 之后才落 `reconciler_marks`，
+# 失败就不落、下一轮（`TASKHUB_RECONCILE_SECONDS=300`）重来，且按任务 id 幂等。
+# 所以 503 不会丢数据，只会晚 5 分钟入图。
+#
+# **必须带截止时间。** 发布中途崩掉、ssh 断掉、人按了 Ctrl-C —— 任何一种都会留下
+# 一个再也没人来清的排空态，那就成了永久拒写。到期自动解除，代价上限是可算的。
+_drain_until = 0.0
+_drain_lock = threading.Lock()
+
+
+def set_drain(seconds: float) -> float:
+    """进入/延长排空态，返回剩余秒数。`seconds <= 0` 立即解除。
+
+    上限取自 `utils.ingest_budget` —— 和排空预算同源。不另写一个数：
+    2026-09-20 同一件事上有三个互不相同的常数，谁也不知道另外两个存在。
+    """
+    global _drain_until
+    try:
+        from utils.ingest_budget import ingest_ceiling_sec
+        cap = float(ingest_ceiling_sec())
+    except Exception:            # noqa: BLE001 —— 算不出上限时给一个保守的小值，
+        cap = 600.0              # 宁可提前解除也不要无界拒写
+    with _drain_lock:
+        _drain_until = 0.0 if seconds <= 0 else time.time() + min(float(seconds), cap)
+        return max(0.0, _drain_until - time.time())
+
+
+def drain_seconds_left() -> float:
+    with _drain_lock:
+        return max(0.0, _drain_until - time.time())
+
+
 def _extraction_started() -> None:
     global _active_extractions
     with _active_extractions_lock:
@@ -465,8 +510,33 @@ def active_extractions() -> int:
 
 
 async def health(request: Request) -> JSONResponse:
+    left = drain_seconds_left()
     return JSONResponse({"status": "ok", "service": "kg_hub_server",
-                         "active_extractions": active_extractions()})
+                         "active_extractions": active_extractions(),
+                         # 发布方要能看出「计数不降是因为还有人在写」还是「真的在排空」。
+                         "draining": left > 0,
+                         "drain_seconds_left": int(left)})
+
+
+async def drain(request: Request) -> JSONResponse:
+    """POST /api/drain {"seconds": N} —— 进入排空态，拒收新的写入。
+
+    走 Bearer 中间件鉴权（除 /health 外全局生效），所以不用再自己判一遍。
+    `seconds<=0` 立即解除；上限由 utils.ingest_budget 兜住，到期自动解除。
+    """
+    try:
+        body = await request.json()
+    except Exception:            # noqa: BLE001 —— 空 body 视为按上限排空
+        body = {}
+    try:
+        seconds = float(body.get("seconds", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"status": "error", "code": "bad_seconds"},
+                            status_code=400)
+    left = set_drain(seconds)
+    logger.info("[drain] %s，剩余 %.0fs", "进入排空态" if left > 0 else "解除排空态", left)
+    return JSONResponse({"status": "ok", "draining": left > 0,
+                         "drain_seconds_left": int(left)})
 
 
 def bounded_search_episode_uuids(candidate: dict, limit: int = 8) -> list[str]:
@@ -946,6 +1016,18 @@ async def ingest(request: Request) -> JSONResponse:
 
     See DESIGN decision 14 (schema) + decision 16 (write-path policy).
     """
+    # 排空态只拦**新的写入**，而且只拦在这里：`/api/ingest/status` 必须照常可查，
+    # 否则已经在飞的那些反倒问不到终态，调用方会以为自己超时了而重推 ——
+    # 那正是 utils/ingest_budget 那份文档里记的「假 timeout 造出真 409」。
+    left = drain_seconds_left()
+    if left > 0:
+        return JSONResponse(
+            {"status": "error", "code": "draining",
+             "message": f"kg-hub 正在为发布排空，{int(left)}s 后恢复；请稍后重试",
+             "retry_after_seconds": int(left) + 1},
+            status_code=503,
+            headers={"Retry-After": str(int(left) + 1)},
+        )
     try:
         raw = await request.json()
     except Exception as exc:
@@ -4578,6 +4660,7 @@ app = Starlette(
         Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
+        Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
