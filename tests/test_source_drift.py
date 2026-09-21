@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -342,84 +343,98 @@ def _git(*args, cwd):
                           check=True, capture_output=True, text=True).stdout.strip()
 
 
-class TrunkVerdictTests(unittest.TestCase):
-    """「ok」只有一个含义：等于**主干这条线上**的某个 commit。
+class SharedTrunkVerdictWiringTests(unittest.TestCase):
+    """主干判据已搬到 fleet-ops（T-0099 A 项），这里只钉**接线**。
 
-    补这段之前，kg-hub 的 ok 只说明「NAS 上的文件等于它自称的那个 commit」——
-    那个 commit 可以在任何分支上、甚至从没推上来过。于是准则 18（只发主干）在
-    这条检测里查不出来，只活在 release.sh 的闸上。而绕过发布脚本改生产正是这套
-    检测存在的理由（credvault 实测被绕过两次，准则 21）。闸和检测同时只剩一个时，
-    剩下的那个是检测。
+    原先这里有 7 条属性用例（is-ancestor 不是相等、拉不到 origin 时单向降级…），
+    它们的前提随判据一起搬走了 —— fleet-ops `tests/test_fleetops_drift.py` 11 例
+    真建 git 仓库跑、5 变异全红。**在这边再留一份属性用例，就是再造一个会各自漂
+    的副本**，正是本任务要消灭的东西。
 
-    用真 git 仓库而不是 mock：要钉的是 git 的行为，mock 掉就什么也没钉。
+    留下的是「函数对了不等于有人用对了」那一类：
     """
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.repo = Path(self._tmp.name) / "r"
-        self.repo.mkdir()
-        _git("init", "-q", "-b", "main", ".", cwd=self.repo)
-        for k, v in (("user.email", "t@e.com"), ("user.name", "t"),
-                     ("commit.gpgsign", "false")):
-            _git("config", k, v, cwd=self.repo)
-        self.shas = []
-        for i in range(3):
-            (self.repo / "f.txt").write_text(str(i))
-            _git("add", "f.txt", cwd=self.repo)
-            _git("commit", "-q", "-m", f"c{i}", cwd=self.repo)
-            self.shas.append(_git("rev-parse", "HEAD", cwd=self.repo))
-        _git("checkout", "-q", "-b", "side", self.shas[1], cwd=self.repo)
-        (self.repo / "g.txt").write_text("x")
-        _git("add", "g.txt", cwd=self.repo)
-        _git("commit", "-q", "-m", "side", cwd=self.repo)
-        self.side = _git("rev-parse", "HEAD", cwd=self.repo)
-        _git("checkout", "-q", "main", cwd=self.repo)
-        self._old = D.REPO
-        D.set_repo(self.repo)
-        self.addCleanup(D.set_repo, self._old)
+    def test_源码里不再有本地副本(self) -> None:
+        """回退到本地副本是 T-0107 否掉的形态：兜底只在产物缺失时发作。"""
+        src = (ROOT / "deploy/nas/check_source_drift.py").read_text("utf-8")
+        self.assertNotIn("def trunk_verdict", src)
+        self.assertNotIn("def fetch_origin", src)
+        self.assertIn("from fleetops_drift import trunk_verdict", src)
 
-    def verdict(self, ref, *, fetched=True):
-        with mock.patch.object(D, "fetch_origin", return_value=fetched):
-            return D.trunk_verdict(ref, "main")[0]
-
-    def test_主干_tip_在主干上(self):
-        self.assertEqual(self.verdict(self.shas[2]), "on")
-
-    def test_更早的主干_commit_也算在主干上_回滚是正当操作(self):
-        """is-ancestor 与「等于 tip」的分界就在这一条。写成相等，它当场转红。
-
-        实况佐证：2026-09-21 NAS 跑着 49bc2d87，而主干 tip 已经是 c6b5f75 ——
-        两者都正常，因为发布之后主干又前进了。写成相等的话，每次发布之后到
-        下次发布之前，这条检查会一直红。
+    def test_调用点把_REPO_传进去(self) -> None:
+        """生产 plist 带 --repo 指向工作树，set_repo 会重绑 REPO。
+        漏传的话判的是脚本自己那棵树，而不是被检查的那棵（准则 32）。
         """
-        self.assertEqual(self.verdict(self.shas[0]), "on")
+        seen = {}
 
-    def test_旁支上的_commit_不在主干上(self):
-        self.assertEqual(self.verdict(self.side), "off")
+        def fake(repo, ref, trunk="origin/main"):
+            seen["repo"] = repo
+            return ("on", "")
 
-    def test_仓库里根本没有的_commit_是最严重的一档(self):
-        self.assertEqual(self.verdict("0" * 40), "off")
+        with mock.patch.object(D, "trunk_verdict", fake), \
+             mock.patch.object(D, "compare", return_value=[]), \
+             mock.patch.object(D, "release_config",
+                               return_value={"ssh": "x@y", "src": "/src"}), \
+             mock.patch.object(D, "live_commit", return_value="d" * 40), \
+             mock.patch.object(D, "write_status"):
+            D.main([])
+        self.assertEqual(seen.get("repo"), D.REPO)
 
-    def test_拉不到_origin_时_在主干上依然可信(self):
-        """陈旧的 origin/main 只会造成单向的错。
+    def test_取不到共享判据时落第三态_不静默继续(self) -> None:
+        with mock.patch.object(D, "trunk_verdict", None), \
+             mock.patch.object(D, "TRUNK_UNAVAILABLE", "主干判据取不到：装了个假的"), \
+             mock.patch.object(D, "compare", return_value=[]), \
+             mock.patch.object(D, "release_config",
+                               return_value={"ssh": "x@y", "src": "/src"}), \
+             mock.patch.object(D, "live_commit", return_value="d" * 40), \
+             mock.patch.object(D, "write_status") as ws:
+            rc = D.main([])
+        self.assertEqual(rc, 2)
+        self.assertEqual(ws.call_args[0][1], "error")
 
-        一个 commit 若是旧主干的祖先，它必然也是新主干的祖先 —— 所以 True 在
-        陈旧基线下依然成立。不这么分的话，一次网络抖动就把一条正常的绿变成橙。
-        **实测就是这么发现的**：第一版写成「fetch 失败一律不作判决」，
-        credvault 那边的既有用例当场随机转红。
+    def test_不往_fleet_ops_的不可变产物里写_pycache(self) -> None:
+        """那个目录的契约是内容不可变，原子切换靠它成立。
+        接入这条线的前两个服务都踩过（report-portal 6a0022f、credvault 4764929）。
         """
-        self.assertEqual(self.verdict(self.shas[0], fetched=False), "on")
+        src = (ROOT / "deploy/nas/check_source_drift.py").read_text("utf-8")
+        self.assertIn("sys.dont_write_bytecode = True", src)
+        # 钉行为不只钉写法：真造一个假 lib 目录指过去，跑完断言没多出东西
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "lib"
+            lib.mkdir()
+            (lib / "fleetops_drift.py").write_text(
+                "def fetch_origin(repo):\n    return True\n"
+                "def trunk_verdict(repo, ref, trunk='origin/main'):\n"
+                "    return ('on', '')\n")
+            subprocess.run(
+                [sys.executable, "-c",
+                 f"import sys; sys.path.insert(0, {str(ROOT / 'deploy/nas')!r}); "
+                 "import check_source_drift"],
+                env={**os.environ, "FLEET_OPS_LIB": str(lib)},
+                capture_output=True, check=True)
+            self.assertEqual(sorted(x.name for x in lib.iterdir()),
+                             ["fleetops_drift.py"])
 
-    def test_拉不到_origin_时_看着不在主干上要降级成判不了(self):
-        """False 这一侧不可信：可能是它其实已经合进去了，只是这次没拉到。
+    def test_作业用的解释器能导入它(self) -> None:
+        """launchd 写死 /usr/bin/python3（系统 3.9），不是跑测试的这个。
 
-        把它报成 drift，就是拿这条检测里最响的警报去报一件不存在的事（准则 28）。
+        2026-09-21 task-hub 那边就是这么崩的：`-> str | None` 在 3.13 全绿、
+        在 3.9 的 import 阶段 TypeError，而包装层把崩溃和「查出漂移」映射成同一个
+        退出码，于是状态文件停在前一天那条 ok（准则 33）。
         """
-        self.assertEqual(self.verdict(self.side, fetched=False), "unknown")
-
-    def test_拉不到_origin_且本地没有这个_commit_也判不了(self):
-        self.assertEqual(self.verdict("0" * 40, fetched=False), "unknown")
+        job_python = "/usr/bin/python3"
+        if not Path(job_python).exists():
+            self.skipTest(f"{job_python} 不存在")
+        plist = Path.home() / "Library/LaunchAgents/com.kg-hub.source-drift.plist"
+        if plist.exists():
+            # 两端同源：断言的解释器必须就是作业里写死的那个（准则 28）
+            self.assertIn(job_python, plist.read_text("utf-8"))
+        done = subprocess.run(
+            [job_python, "-c",
+             f"import sys; sys.path.insert(0, {str(ROOT / 'deploy/nas')!r}); "
+             "import check_source_drift"],
+            capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
 
 
 class TrunkVerdictReachesTheStatusFileTests(unittest.TestCase):

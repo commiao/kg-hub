@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -79,6 +80,33 @@ from pathlib import Path
 # 所以仓库路径是数据，不是代码来源。二者必须能分开：Mac 侧作业改成跑发布产物之后，
 # 产物里没有 .git —— 不分开的话，这个工具就只能继续跑工作树。
 REPO = Path(__file__).resolve().parent.parent.parent
+
+# 主干判据不在这里存第四份副本：fleet-ops 收了一份共用的（T-0099 A 项）。
+# 判据散成多份时，改漏的那份不会报错，只会在下次事故里给出一个看着很正常的绿。
+#
+# 路径取环境变量或生产契约，**不从 `__file__` 推** —— 这个脚本有两个跑法
+# （人从工作树跑、launchd 从发布产物跑），从 `__file__` 推两边会指到不同的东西。
+#
+# **拿不到不回退到本地副本。** T-0107 否掉了这个形态：兜底等于把 bug 以兜底之名
+# 留下，且只在产物缺失时发作。拿不到就报「查不了」——判空放在真正用到它的那一处，
+# 不在 import 处抛：`--list-extra` 根本不需要主干判决，在这里抛会让 fleet-ops
+# 一缺席就连 release.sh 的 prune 一起瘫。
+FLEET_LIB = Path(os.environ.get(
+    "FLEET_OPS_LIB", Path.home() / ".local/share/fleet-ops/current/lib"))
+# 别把 __pycache__ 写进人家的发布产物目录：fleet-ops 的 releases/<sha>/ 契约是
+# **内容不可变**，原子切换就是靠这一点成立的。report-portal 接入时第一次跑就踩过
+# （6a0022f），credvault 同样（4764929）—— 这是这条接入线上的第三脚。
+sys.dont_write_bytecode = True
+if str(FLEET_LIB) not in sys.path:
+    sys.path.insert(0, str(FLEET_LIB))
+try:
+    from fleetops_drift import trunk_verdict
+    TRUNK_UNAVAILABLE = ""
+except ImportError as exc:                       # noqa: BLE001 —— 要的就是兜住并说话
+    trunk_verdict = None
+    TRUNK_UNAVAILABLE = (
+        f"主干判据取不到：{FLEET_LIB}/fleetops_drift.py 导入失败（{exc}）——"
+        "fleet-ops 产物缺失或 current 软链断了。这不等于没漂，只是这次判不了。")
 RELEASE = REPO / "deploy" / "nas" / "release.sh"
 
 
@@ -172,46 +200,6 @@ def live_commit(ssh_target: str, src: str) -> str:
         raise SystemExit(
             f"读不到线上镜像标签（拿到 {value!r}）：{proc.stderr.strip() or '无输出'}")
     return value
-
-
-def fetch_origin() -> bool:
-    """把 origin 拉新。失败返回 False。"""
-    proc = subprocess.run(["git", "-C", str(REPO), "fetch", "origin", "--quiet"],
-                          capture_output=True, text=True)
-    return proc.returncode == 0
-
-
-def trunk_verdict(ref: str, trunk: str = "origin/main") -> tuple[str, str]:
-    """ref 在不在主干这条线上。返回 (判决, 一句人话)，判决三选一：on / off / unknown。
-
-    **用 `merge-base --is-ancestor` 而不是「等于 trunk」。** 准则 18 原话：回滚到
-    一个更早的 commit 是正当操作，只要它确实在主干这条线上。写成相等的话，
-    每一次正当回滚都会被报成漂移 —— 而回滚恰恰是最不需要一条看不懂的红灯的时刻。
-
-    **为什么拉不到 origin 不是直接判 unknown。** 陈旧的 origin/main 只会造成
-    **单向**的错：一个 commit 若是旧主干的祖先，它必然也是新主干的祖先，所以
-    `True` 在陈旧基线下依然可信；只有 `False` 可能是「其实已经合进去了，只是
-    这次没拉到」。于是拉不到时 True 照常放行，False 降级成 unknown。
-    不这么分的话，一次网络抖动就会把一条正常的绿变成 rc=2 的橙 —— 而这条链路
-    有据可查地会抖（Mac 侧实测多次），天天亮的橙灯等于没有灯（准则 28）。
-    """
-    fetched = fetch_origin()
-    short = ref[:12]
-    exists = subprocess.run(
-        ["git", "-C", str(REPO), "cat-file", "-e", f"{ref}^{{commit}}"],
-        capture_output=True).returncode == 0
-    if not exists:
-        if not fetched:
-            return "unknown", f"{short} 本地没有，且这次没拉到 origin —— 判不了"
-        return "off", f"{short} 在 origin 上根本不存在（线上跑着一个没推上来的版本）"
-    if subprocess.run(
-            ["git", "-C", str(REPO), "merge-base", "--is-ancestor", ref, trunk],
-            capture_output=True).returncode == 0:
-        return "on", f"{short} 在 {trunk} 这条线上"
-    if not fetched:
-        return "unknown", (f"{short} 看着不在主干上，但这次没拉到 origin，"
-                           "本地主干可能是陈旧的 —— 不作判决")
-    return "off", f"{short} 不在 {trunk} 这条线上"
 
 
 def tracked_at(ref: str) -> list[str]:
@@ -419,7 +407,13 @@ def main(argv: list[str] | None = None) -> int:
     # 不该挡住一个只读清单的调用。
     trunk_checked = (not args.skip_trunk and not args.list_extra
                      and not args.list_prunable)
-    trunk, trunk_why = trunk_verdict(ref) if trunk_checked else ("on", "")
+    if trunk_checked and trunk_verdict is None:
+        print(f"🟠 {TRUNK_UNAVAILABLE}")
+        write_status(args.status_file, "error", TRUNK_UNAVAILABLE)
+        return 2
+    # 传 REPO 是必须的：生产 plist 带 --repo 指向工作树，set_repo 会重绑它，
+    # 而这里在**调用时**取当前值，语义与原副本一致。
+    trunk, trunk_why = trunk_verdict(REPO, ref) if trunk_checked else ("on", "")
     if trunk == "unknown":
         print(f"🟠 {trunk_why}")
         write_status(args.status_file, "error", trunk_why)
