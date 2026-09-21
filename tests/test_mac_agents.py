@@ -148,6 +148,24 @@ def _render_for_test(text: str) -> str:
 class InstallScriptTests(unittest.TestCase):
     def setUp(self):
         self.source = INSTALL.read_text("utf-8")
+        # install.sh 现在 source fleet-ops 的 launchd 库（重载的等待逻辑一处实现，
+        # 见 fleet-ops T-0142）。这里给一个桩，理由有两条：
+        #   一、不给的话脚本在临时 HOME 下会因「库不在」提前退出，
+        #      下面那些用例一个失败分支都走不到 —— 看着通过，其实什么都没验；
+        #   二、不给桩而让它读本机真实安装的那份，等于把判据接到机器状态上，
+        #      别的机器（或 fleet-ops 没装时）结果就不一样。
+        # 真正的重载行为由 fleet-ops 自己的 9 条用例钉，不在这里重复。
+        self._libdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._libdir.cleanup)
+        stub = Path(self._libdir.name) / "launchd.sh"
+        stub.write_text("launchd_label() { echo com.stub.label; }\n"
+                        "launchd_reload() { return 0; }\n", encoding="utf-8")
+        self.stub_lib = str(stub)
+        prev = os.environ.get("FLEET_OPS_LAUNCHD_LIB")
+        os.environ["FLEET_OPS_LAUNCHD_LIB"] = self.stub_lib
+        self.addCleanup(lambda: (os.environ.__setitem__("FLEET_OPS_LAUNCHD_LIB", prev)
+                                 if prev is not None
+                                 else os.environ.pop("FLEET_OPS_LAUNCHD_LIB", None)))
 
     def test_install_renders_code_paths_to_the_release(self):
         """渲染目标必须是发布产物，不是 install.sh 自己所在的那棵树。
@@ -183,13 +201,44 @@ class InstallScriptTests(unittest.TestCase):
     def test_refuses_to_install_with_an_unresolved_secret(self):
         # 装一个带着 @VAR@ 字面量的 plist 上去，服务会以一种很难查的方式坏掉。
         self.assertIn("缺机密", self.source)
-        self.assertIn("plutil -lint", self.source)
 
-    def test_reloads_by_bootout_then_bootstrap(self):
-        # 只 kickstart 的话 launchd 用的还是旧定义，改了等于没改。
-        boot_out = self.source.index("launchctl bootout")
-        boot_strap = self.source.index("launchctl bootstrap")
-        self.assertLess(boot_out, boot_strap)
+    def test_plist_用真解析器校验_且在就位之前(self):
+        """保证有两半：**用会真正解析它的那个解析器**，且**先验再就位**。
+
+        原来这条钉的是 `assertIn("plutil -lint")` —— 钉在实现字面量上。
+        准则 27 记着 `plutil -lint` 对一份非法 plist 报过「合法」（XML 注释里
+        出现 `--`），而 python 的 plistlib 当场拒绝。换成 plistlib 之后，
+        **那条断言照样绿** —— 它被新写的那句「不用 plutil -lint，因为它报过
+        假合法」的注释满足了。一条被意思相反的注释喂饱的断言，比没有更坏。
+
+        所以这里钉两件可验证的事，都不看具体用了哪个命令名：
+        校验必须由真解析器做（launchd_label 内部是 plistlib），
+        且必须排在 `mv` 之前 —— 否则非法的那份已经躺在 $installed 里了。
+        """
+        self.assertNotRegex(self.source, r"^\s*plutil\s+-lint",
+                            "plutil -lint 对非法 plist 报过「合法」（准则 27）")
+        validate = self.source.index('launchd_label "$tmp"')
+        move = self.source.index('mv -f "$tmp" "$installed"')
+        self.assertLess(validate, move, "先 mv 再验 —— 非法的那份已经就位了")
+
+    def test_重载走_fleet_ops_的公共实现(self):
+        """原来这条钉的是 `bootout` 出现在 `bootstrap` 之前。
+
+        那个顺序是对的但不够：**`bootout` 返回不等于作业已退干净**。
+        2026-09-22 实测（fleet-ops T-0142）批量切 4 个作业，四个全部
+        `Bootstrap failed`，旧的已卸、新的没装，停了约两分钟。前一天切单个
+        没事 —— 人读输出的那点时间盖住了竞态。**一次只做一个时藏着的竞态，
+        批量做就现形。**
+
+        正确的等待逻辑只该有一处实现（这次的根因就是一行复制多份），
+        所以这里钉「不自己发装载命令」而不是钉命令顺序。
+        """
+        hits = re.findall(r"launchctl\s+(bootstrap|load)\b", self.source)
+        self.assertFalse(hits, (
+            f"install.sh 自己发了 {sorted(set(hits))} —— 手写的那两行少了"
+            f"「等旧作业退干净」。改用 fleet-ops 的 launchd_reload。"))
+        self.assertIn("launchd_reload", self.source)
+        self.assertIn("platform/darwin/launchd.sh", self.source)
 
     def test_no_variable_is_glued_to_a_cjk_character(self):
         """`$label：` 在非 UTF-8 locale 下会被读成变量名 `label\xef`。
@@ -238,6 +287,7 @@ class InstallScriptTests(unittest.TestCase):
                 ["bash", str(INSTALL), "--check"],
                 capture_output=True, timeout=60,
                 env={"PATH": "/usr/bin:/bin", "HOME": home,
+                     "FLEET_OPS_LAUNCHD_LIB": self.stub_lib,
                      **self.TRIGGERING_LOCALE})
         stderr = done.stderr.decode("utf-8", "replace")
         # 先确认真的**走到了**失败分支，再谈它有没有崩。

@@ -84,10 +84,19 @@ class CJKAdjacentExpansionTests(unittest.TestCase):
             LC_ALL=UTF-8       line 145: label\xef: unbound variable
         """
         with tempfile.TemporaryDirectory() as home:
+            # install.sh 现在 source fleet-ops 的 launchd 库（重载的等待逻辑
+            # 一处实现，fleet-ops T-0142）。这里给个桩，否则脚本会因「库不在」
+            # 提前退出，**一条失败路径都走不到** —— 而这条用例的全部要害就是
+            # 「它只在失败路径上炸」。不给桩而读本机真实安装的那份也不行：
+            # 那等于把判据接到机器状态上。
+            lib = Path(home) / "launchd.sh"
+            lib.write_text("launchd_label() { echo com.stub.label; }\n"
+                           "launchd_reload() { return 0; }\n", encoding="utf-8")
             done = subprocess.run(
                 ["bash", str(ROOT / "deploy/mac/install.sh"), "--check"],
                 capture_output=True, timeout=120,
                 env={"PATH": "/usr/bin:/bin", "HOME": home,
+                     "FLEET_OPS_LAUNCHD_LIB": str(lib),
                      "LC_ALL": "en_US.UTF-8"})
         combined = (done.stdout + done.stderr).decode("utf-8", "replace")
         # 先证明这一跑真的走到了那条失败路径 —— 否则下面两条断言是空的。

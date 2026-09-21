@@ -82,6 +82,18 @@ TARGET="$HOME/Library/LaunchAgents"
 ENV_FILE="${KG_HUB_ENV_FILE:-$GITREPO/.env}"
 DOMAIN="gui/$(id -u)"
 
+# launchd 的重载与 plist 校验由 fleet-ops 产物提供（准则 32：机制不能依赖被
+# 安装方自己提供）。**库不在就直接失败**，不回退到手写 bootout+bootstrap ——
+# 回退等于把刚禁掉的那个竞态又放回来。
+LAUNCHD_LIB="${FLEET_OPS_LAUNCHD_LIB:-$HOME/.local/share/fleet-ops/current/platform/darwin/launchd.sh}"
+if [ ! -f "$LAUNCHD_LIB" ]; then
+  echo "缺少 fleet-ops 的 launchd 库：$LAUNCHD_LIB" >&2
+  echo "  先装 fleet-ops： sh ~/workspace_claudeCode/fleet-ops/platform/darwin/install.sh" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+. "$LAUNCHD_LIB"
+
 mode=install
 labels=()
 for arg in "$@"; do
@@ -158,12 +170,17 @@ for template in "$AGENTS"/com.*.plist; do
   tmp=$(mktemp "$TARGET/.$label.XXXXXX")
   printf '%s\n' "$rendered" > "$tmp"
   chmod 600 "$tmp"
-  plutil -lint "$tmp" >/dev/null || { say "  ✗ ${label}：渲染出的 plist 不合法"; rm -f "$tmp"; rc=1; continue; }
+  # 校验用真解析器，不用 plutil -lint —— 后者对一份非法 plist 报过「合法」
+  # （XML 注释里出现 `--`），而 python 的 plistlib 当场拒绝（准则 27）。
+  # launchd_label 本身就是一次 plistlib 解析，校验和取 Label 一次做完。
+  # 位置不变：**先验再就位**，非法的那份不许 mv 进 ${installed}。
+  launchd_label "$tmp" >/dev/null || { say "  ✗ ${label}：渲染出的 plist 不合法"; rm -f "$tmp"; rc=1; continue; }
   mv -f "$tmp" "$installed"
-  # bootout 再 bootstrap 才会重读文件；单纯 kickstart 用的还是旧定义。
-  launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
-  launchctl bootstrap "$DOMAIN" "$installed" 2>/dev/null \
-    || { say "  ✗ ${label}：bootstrap 失败"; rc=1; continue; }
+  # 重载走 fleet-ops 的公共实现：bootout 返回**不等于**作业已退干净，
+  # 紧跟着 bootstrap 会失败且不重试，结果是旧的已卸、新的没装
+  # （准则 29 的推论，fleet-ops T-0142：批量切 4 个作业时四个全灭）。
+  launchd_reload "$installed" \
+    || { say "  ✗ ${label}：重载失败（原因见上）"; rc=1; continue; }
   say "  ✓ $label 已安装并重载"
 done
 
