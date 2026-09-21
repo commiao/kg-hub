@@ -79,7 +79,8 @@ from utils.predigest import (  # noqa: E402
 )
 from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
-from model_gateway_client import model_operation, stable_operation_id  # noqa: E402
+from model_gateway_client import (  # noqa: E402
+    envelope_repairs_total, model_operation, stable_operation_id)
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -511,11 +512,17 @@ def active_extractions() -> int:
 
 async def health(request: Request) -> JSONResponse:
     left = drain_seconds_left()
+    # envelope_repairs:模型结构化输出的外壳被就地修正过多少次(按形态)。
+    # 放在 /health 而不是 /api/queue_stats,因为后者要全表扫 IngestedKey,而这个数
+    # 是进程内计数器、取它零成本;refinery 每轮抄一份进 status.json。
+    # **必须对外可见**:那两条修正规则会连带把「模型真的少答了」也放过去,看不见
+    # 次数的话,它就是一个静默修补(本项目反复消灭的东西)。只有计数,没有内容。
     return JSONResponse({"status": "ok", "service": "kg_hub_server",
                          "active_extractions": active_extractions(),
                          # 发布方要能看出「计数不降是因为还有人在写」还是「真的在排空」。
                          "draining": left > 0,
-                         "drain_seconds_left": int(left)})
+                         "drain_seconds_left": int(left),
+                         "envelope_repairs": envelope_repairs_total()})
 
 
 async def drain(request: Request) -> JSONResponse:

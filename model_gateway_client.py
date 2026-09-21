@@ -11,6 +11,7 @@ import contextvars
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import sys
@@ -49,9 +50,99 @@ _operation: contextvars.ContextVar[tuple[str, str] | None] = contextvars.Context
 )
 
 
+# —— 结构化外壳修正 ——
+#
+# 2026-09-21 实测:图里 17 条非 503 的 error 键里约 10 条**载荷是对的、外壳错了**:
+#
+#   形态 A  extracted_entities 该是 list,模型给的是一个内容正确的 JSON **字符串**
+#           ValidationError: Input should be a valid list [type=list_type,
+#             input_value='\n[{"name": "192.168.10...", "episode_indices": [0]}]\n']
+#   形态 B  列表被多包了一层:{"edges": [{"edges": [ ...真正的边... ]}]}
+#           ValidationError: edges.0.source_entity_name Field required,
+#             input_value={'edges': [...]}
+#
+# 抽取结果本身没问题,却因为外壳被 pydantic 拒掉,于是整条观测落成 error 键、按
+# 24h 锁住、重推撞 409。修在这里而不是各调用点,与断路器同一个理由:这是 kg-hub
+# **唯一的模型出口**。
+#
+# 两条规则都刻意极窄:只在「否则必定校验失败」的形状上动手。代价必须说清 ——
+# 它们同时会把「模型真的少答了」也一起放过去(比如本该 20 个实体只给了字符串形式
+# 的 3 个,修正后会静默入图)。所以**每次修正都要计数并对外可见**,否则这就是一个
+# 没人看得见的静默修补 —— 那正是本项目反复消灭的东西。
+_repairs: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
+    "kg_hub_envelope_repairs", default=None
+)
+_REPAIRS_TOTAL: dict[str, int] = {}
+
+
+def envelope_repairs_total() -> dict[str, int]:
+    """进程累计的外壳修正次数(按形态)。/health 对外播这个。"""
+    return dict(_REPAIRS_TOTAL)
+
+
+def _note_repair(shape: str) -> None:
+    _REPAIRS_TOTAL[shape] = _REPAIRS_TOTAL.get(shape, 0) + 1
+    current = _repairs.get()
+    if current is not None:
+        current[shape] = current.get(shape, 0) + 1
+
+
+def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
+    """返回 (修好的值, 形态名);不认识的形状原样返回、形态名 None。"""
+    # A:整个列表/对象被序列化成字符串。只认能解析出 list/dict 的,别把普通文本
+    #   字段(比如某个 summary)误当成 JSON。
+    if isinstance(value, str):
+        text = value.strip()
+        # 首字符就是那道闸,别再在后面加一个 isinstance(parsed, (list, dict)) ——
+        # 有了这一句,json.loads 要么抛,要么只能得出 list / dict,那个 isinstance
+        # 永远为真。**写一个走不到的分支比不写更坏:它看起来像在处理一种情况**
+        # (2026-09-21 变异验证抓到的:摘掉它没有任何用例转红)。
+        #
+        # 闸挡住的是标量:一个正当的字符串字段写着 "123" 或 "null",不该被悄悄
+        # 换成整数 123 或 None —— 那是改类型,不是修外壳。
+        if text[:1] not in ("[", "{"):
+            return value, None
+        try:
+            return json.loads(text), "json_string"
+        except ValueError:
+            return value, None
+    # B:外壳多包一层,且内层用的是同一个字段名 —— 同名是关键,它把「多包一层」
+    #   和「一个正当的单元素列表」区分开。
+    if (isinstance(value, list) and len(value) == 1
+            and isinstance(value[0], dict) and set(value[0]) == {key}
+            and isinstance(value[0][key], list)):
+        return value[0][key], "double_wrapped"
+    return value, None
+
+
+def repair_structured_envelopes(response: Any) -> None:
+    """就地修正响应里 tool_use 块的 input。
+
+    只改 dict 的内容,不给 SDK 模型对象赋属性(那些 pydantic 对象可能不可变)。
+    任何异常都吞掉:修正是锦上添花,绝不能让它把一次已经付过费的调用弄失败。
+    """
+    try:
+        for block in getattr(response, "content", None) or []:
+            if getattr(block, "type", None) != "tool_use":
+                continue
+            payload = getattr(block, "input", None)
+            if not isinstance(payload, dict):
+                continue
+            for key in list(payload):
+                fixed, shape = _repair_field(key, payload[key])
+                if shape is not None:
+                    payload[key] = fixed
+                    _note_repair(shape)
+    except Exception:  # noqa: BLE001
+        logging.getLogger("kg_hub.gateway").warning(
+            "[envelope_repair] skipped (non-fatal)", exc_info=True)
+
+
 @contextmanager
 def model_operation(namespace: str, operation_id: str):
-    """Bind paid substeps to a durable business operation identity."""
+    """Bind paid substeps to a durable business operation identity.
+
+    yield 出来的 dict 是**本次操作**的外壳修正计数,调用方要的话可以落账。"""
     namespace = str(namespace).strip()
     operation_id = str(operation_id).strip()
     if (_OPERATION_PART_PATTERN.fullmatch(namespace) is None
@@ -59,10 +150,13 @@ def model_operation(namespace: str, operation_id: str):
             or any(ord(ch) < 0x20 for ch in operation_id)):
         raise RuntimeError("invalid durable model operation identity")
     token = _operation.set((namespace, operation_id))
+    tally: dict[str, int] = {}
+    repairs_token = _repairs.set(tally)
     try:
-        yield
+        yield tally
     finally:
         _operation.reset(token)
+        _repairs.reset(repairs_token)
 
 
 def stable_operation_id(*parts: object) -> str:
@@ -233,6 +327,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                         await asyncio.sleep(wait)
                     last_call["at"] = time.monotonic()
             result = await original_create(*args, **kwargs)
+            # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
+            repair_structured_envelopes(result)
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()

@@ -749,12 +749,37 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
             cur.get("log_dropped_total"), cur.get("log_last_drop_at"))
         cur["log_dropped_total"] = log_total
         cur["log_last_drop_at"] = log_last_drop_at
+        # 和上面两个一样:在这里注入,而不是让四条写状态的路径各自记得带。
+        # 2026-09-21 刚因为"每条路径各带一部分"修过一次(见 _MOMENTARY_DEFAULTS)。
+        cur["envelope_repairs"] = dict(_envelope_repairs)
         tmp = STATUS.with_suffix(".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False))
         tmp.replace(STATUS)
         REFINERY_LOG_HANDLER.mark_status_persisted(log_total, dropped_snapshot)
     except Exception:  # noqa: BLE001
         log.exception("[status] write failed (non-fatal)")
+
+
+# 服务端的「外壳修正」累计计数(按形态)。它产生在 kg_hub_server 的模型出口,而
+# refinery 是这份状态文件的唯一写入方(server 只读挂载 refinery-state),所以由
+# refinery 每轮抄一份过来 —— 让分类信息走到做展示/判断的那一侧(准则 23)。
+#
+# 为什么必须露出来:那两条修正规则会连带把「模型真的少答了」也放过去。看不见次数,
+# 它就是一个静默修补。这是累计量,取不到时**保留上一个值**,绝不归零 —— 归零会
+# 让一个真实发生过的修正看起来没发生过。
+_envelope_repairs: dict[str, int] = {}
+
+
+def refresh_envelope_repairs() -> None:
+    """每轮抄一次服务端计数。取不到就沿用上一份,不抛。"""
+    code, d = _http("GET", f"{KG_HUB_URL}/health", timeout=10)
+    if code != 200 or not isinstance(d, dict):
+        return
+    counts = d.get("envelope_repairs")
+    if isinstance(counts, dict):
+        _envelope_repairs.clear()
+        _envelope_repairs.update(
+            {str(k): int(v) for k, v in counts.items() if isinstance(v, int)})
 
 
 def in_backlog_window() -> bool:
@@ -994,6 +1019,9 @@ async def main() -> int:
     while True:
         cycle += 1
         try:
+            # 放在所有门控之前:窗口外 refinery 不干活,但 ingester / task-hub 桥
+            # 仍在往服务端写,外壳修正照样会发生。门控之后取就看不到那些。
+            refresh_envelope_repairs()
             # —— 人工断路器:排在所有门控最前面 ——
             # 这是**停流**,不是拒绝。开关一关本轮一条都不选、一条都不提交,所以
             # 既不产生请求也不产生错误——不会出现"关了开关却一直撞墙报错、把
