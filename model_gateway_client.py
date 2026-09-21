@@ -75,6 +75,58 @@ _repairs: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar
 _REPAIRS_TOTAL: dict[str, int] = {}
 
 
+# —— 脱稿:请求里**强制**要求调工具,模型却回了一段文本 ——
+#
+# 2026-09-21 实测 4 条 `ValueError: Could not extract JSON from model response`,
+# 文本长这样(取自线上 error_message):
+#
+#     =
+#     <parameter=path>
+#     /private/tmp/openclaw-skill-sync-validate/.../openclaw-inventory.json
+#     </parameter>
+#     </function>
+#
+# 一开始以为是观测正文里含这种标记、模型顺着续写。**查了:28184 条观测里只有 1 条
+# 含 `<parameter=`,而且那条正是记录本次排查的产物**。所以不是正文污染 —— 是模型
+# 自己编了一段 XML 风格的函数调用去"读文件"(那些路径来自观测的 files_read 字段,
+# 而且它编出来的路径还和观测里的不是同一个:观测是 wave7,它写的是 wave8)。
+#
+# 判据不靠文案:graphiti 传的是 `tool_choice={'type':'tool','name':...}`,**强制**
+# 调那一个工具。强制之下回来没有 tool_use 块,就只有一种解释。这样判还有个好处 ——
+# 不必去 match 第三方库的那句英文报错(准则 22:别拿"关于实现的一段话"当判据)。
+#
+# 不把它当成"这条观测有毛病":84 条观测提到 HANDOVER.md,只有其中一两条踩到,
+# 说明是采样噪声而非内容决定 —— 和 5xx 同类,该按 1h 释放而不是锁 24h。
+_OFFSCRIPT_TOTAL = [0]
+
+
+def offscript_total() -> int:
+    """进程累计:模型被强制调工具却回了文本的次数。"""
+    return _OFFSCRIPT_TOTAL[0]
+
+
+def _note_offscript() -> None:
+    _OFFSCRIPT_TOTAL[0] += 1
+    current = _repairs.get()
+    if current is not None:
+        current["offscript"] = current.get("offscript", 0) + 1
+
+
+def note_offscript_if_missing_tool_use(kwargs: dict, response: Any) -> None:
+    """强制调工具却没回 tool_use → 记一次脱稿。任何异常都吞掉。"""
+    try:
+        choice = kwargs.get("tool_choice")
+        if not (isinstance(choice, dict) and choice.get("type") in ("tool", "any")):
+            return
+        for block in getattr(response, "content", None) or []:
+            if getattr(block, "type", None) == "tool_use":
+                return
+        _note_offscript()
+    except Exception:  # noqa: BLE001
+        logging.getLogger("kg_hub.gateway").warning(
+            "[offscript_check] skipped (non-fatal)", exc_info=True)
+
+
 def envelope_repairs_total() -> dict[str, int]:
     """进程累计的外壳修正次数(按形态)。/health 对外播这个。"""
     return dict(_REPAIRS_TOTAL)
@@ -329,6 +381,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             result = await original_create(*args, **kwargs)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
             repair_structured_envelopes(result)
+            note_offscript_if_missing_tool_use(kwargs, result)
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()

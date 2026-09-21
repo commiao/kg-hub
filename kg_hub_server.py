@@ -80,7 +80,7 @@ from utils.predigest import (  # noqa: E402
 from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from model_gateway_client import (  # noqa: E402
-    envelope_repairs_total, model_operation, stable_operation_id)
+    envelope_repairs_total, model_operation, offscript_total, stable_operation_id)
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -243,7 +243,7 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         "                        'gateway_unavailable', 'breaker_open', "
         # upstream_error:网关/供应商回的 5xx。同属"与观测内容无关",没有理由比
         # 连不上网关多锁 23 小时。
-        "                        'upstream_error'] "
+        "                        'upstream_error', 'model_offscript'] "
         "       OR k.error_message CONTAINS '每日请求数已达到回滚见证上限' "
         "       OR k.error_message CONTAINS '网关本地配置不可用' "
         "       OR k.error_message STARTS WITH 'RateLimitError' "
@@ -304,7 +304,7 @@ async def merge_or_get_ingested_key(
     }
 
 
-def classify_extract_error(exc: BaseException) -> str | None:
+def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> str | None:
     """机器可读的失败类别。
 
     网关配额和上游限流都会在抽取前拒绝；两者都与观察内容无关，但保持不同
@@ -348,6 +348,14 @@ def classify_extract_error(exc: BaseException) -> str | None:
         # 一个 5xx」。两者的运维动作不同——把后者报成前者,值班的第一反应会是去重启
         # 网关,而那恰恰是准则 29 说的、会制造孤儿付费记录的那个动作。
         return "upstream_error"
+    # 脱稿:强制调工具却回了一段文本(判据在 model_gateway_client,按 tool_choice +
+    # 有没有 tool_use 块,不 match 第三方库的报错文案)。graphiti 随后会落到
+    # `_extract_json_from_text` 并抛 ValueError —— 那个 ValueError 本身区分不出
+    # "模型脱稿"和"这条观测真有问题",所以判据只能来自上游那一层。
+    # 归 1h 释放而不是 24h:84 条观测提到 HANDOVER.md、只有一两条踩到,是采样噪声,
+    # 不是这条观测的毛病。
+    if offscript:
+        return "model_offscript"
     return None
 
 
@@ -543,7 +551,8 @@ async def health(request: Request) -> JSONResponse:
                          "draining": left > 0,
                          "drain_seconds_left": int(left),
                          "drain_refused": drain_refused(),
-                         "envelope_repairs": envelope_repairs_total()})
+                         "envelope_repairs": envelope_repairs_total(),
+                         "offscript_responses": offscript_total()})
 
 
 async def drain(request: Request) -> JSONResponse:
@@ -908,6 +917,10 @@ async def _do_extract_inner(
                 except Exception:  # noqa: BLE001
                     pass
                 return
+    # 本次抽取的模型契约计数。`with model_operation(...) as t` 进块即绑定,所以哪怕
+    # add_episode 抛出去了,外层 except 仍拿得到这一份(准则 23:分类信息要跟着数据
+    # 走到做判断的那一侧)。
+    model_tally: dict[str, int] = {}
     try:
         result = None
         attempt = 0
@@ -924,7 +937,8 @@ async def _do_extract_inner(
                     operation_id = stable_operation_id(
                         sd, sid, body.name, body.episode_body, epoch
                     )
-                    with model_operation("ingest.episode", operation_id):
+                    with model_operation("ingest.episode", operation_id) as op_tally:
+                        model_tally = op_tally
                         result = await graphiti.add_episode(
                             name=body.name,
                             episode_body=body.episode_body,
@@ -1004,7 +1018,8 @@ async def _do_extract_inner(
             await update_ingested_key_status(
                 graphiti, sd, sid, "error",
                 error_message=f"{type(exc).__name__}: {exc}",
-                error_kind=classify_extract_error(exc),
+                error_kind=classify_extract_error(
+                    exc, offscript=bool(model_tally.get("offscript"))),
             )
         except Exception:
             pass

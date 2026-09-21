@@ -752,6 +752,7 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
         # 和上面两个一样:在这里注入,而不是让四条写状态的路径各自记得带。
         # 2026-09-21 刚因为"每条路径各带一部分"修过一次(见 _MOMENTARY_DEFAULTS)。
         cur["envelope_repairs"] = dict(_envelope_repairs)
+        cur["offscript_responses"] = _offscript[0]
         tmp = STATUS.with_suffix(".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False))
         tmp.replace(STATUS)
@@ -768,6 +769,7 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
 # 它就是一个静默修补。这是累计量,取不到时**保留上一个值**,绝不归零 —— 归零会
 # 让一个真实发生过的修正看起来没发生过。
 _envelope_repairs: dict[str, int] = {}
+_offscript = [0]
 
 
 def refresh_envelope_repairs() -> None:
@@ -780,6 +782,11 @@ def refresh_envelope_repairs() -> None:
         _envelope_repairs.clear()
         _envelope_repairs.update(
             {str(k): int(v) for k, v in counts.items() if isinstance(v, int)})
+    # 脱稿次数和外壳修正是两回事:前者没有任何东西被救回来,那条观测这一轮就是废的。
+    # 分开数,免得"修好了几条"和"彻底废了几条"混成一个数。
+    offscript = d.get("offscript_responses")
+    if isinstance(offscript, int):
+        _offscript[0] = offscript
 
 
 def in_backlog_window() -> bool:

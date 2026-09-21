@@ -204,3 +204,66 @@ class VisibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OffscriptTests(unittest.TestCase):
+    """模型被**强制**调工具却回了一段文本 —— 判据取自请求/响应本身，不 match 报错文案。
+
+    2026-09-21 的 4 条 `Could not extract JSON from model response`，文本是模型自己
+    编的一段 XML 风格函数调用（去"读"观测 files_read 里的路径，而且编出来的路径和
+    观测里的还不是同一个）。最初以为是观测正文含标记、模型顺着续写 —— 查了：
+    28184 条观测里只有 1 条含 `<parameter=`，而且那条正是记录这次排查的产物。
+    所以**假设是错的**，escape 正文什么也修不了。
+
+    真正能判的地方在模型出口：graphiti 传 `tool_choice={'type':'tool',...}` 强制调
+    那一个工具，强制之下没有 tool_use 块就只有一种解释。这样判还避开了去 match
+    第三方库那句英文报错（准则 22）。
+    """
+
+    def setUp(self):
+        gw._OFFSCRIPT_TOTAL[0] = 0
+
+    def check(self, kwargs, *types):
+        gw.note_offscript_if_missing_tool_use(
+            kwargs, _Response(*[_Block(t, {}) for t in types]))
+        return gw.offscript_total()
+
+    def test_forced_tool_answered_with_text_is_offscript(self):
+        self.assertEqual(self.check({"tool_choice": {"type": "tool", "name": "X"}},
+                                    "text"), 1)
+
+    def test_forced_tool_actually_used_is_not(self):
+        self.assertEqual(self.check({"tool_choice": {"type": "tool", "name": "X"}},
+                                    "text", "tool_use"), 0)
+
+    def test_without_a_forced_choice_text_is_a_legitimate_answer(self):
+        """没强制就回文本是正常的，记成脱稿会把计数变得没意义。"""
+        self.assertEqual(self.check({}, "text"), 0)
+        self.assertEqual(self.check({"tool_choice": {"type": "auto"}}, "text"), 0)
+
+    def test_the_check_cannot_fail_a_paid_call(self):
+        class Hostile:
+            @property
+            def content(self):
+                raise RuntimeError("boom")
+        gw.note_offscript_if_missing_tool_use(
+            {"tool_choice": {"type": "tool", "name": "X"}}, Hostile())
+
+    def test_classifier_names_it_and_the_sweep_releases_it_in_an_hour(self):
+        """脱稿是采样噪声，不是这条观测的毛病 —— 不该按 24h 锁住。"""
+        self.assertIn('return "model_offscript"', SERVER_SRC)
+        sweep = SERVER_SRC.split("quota_threshold = ", 1)[1][:1200]
+        self.assertIn("'model_offscript'", sweep, "没进 1h 快清名单，等于没改")
+
+    def test_the_verdict_travels_from_the_model_exit_to_the_key(self):
+        """判据产生在模型出口，落账在 do_extract 的 except —— 中间不能断（准则 23）。"""
+        self.assertIn("with model_operation(\"ingest.episode\", operation_id) as op_tally",
+                      SERVER_SRC)
+        self.assertIn("model_tally = op_tally", SERVER_SRC)
+        self.assertIn('offscript=bool(model_tally.get("offscript"))', SERVER_SRC)
+
+    def test_status_keeps_the_two_counts_apart(self):
+        """外壳修正=救回来了，脱稿=这一轮彻底废了。混成一个数就没法用。"""
+        refinery_src = (ROOT / "kg_refinery.py").read_text("utf-8")
+        self.assertIn('cur["offscript_responses"] = _offscript[0]', refinery_src)
+        self.assertIn('"offscript_responses": offscript_total()', SERVER_SRC)
