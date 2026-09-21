@@ -14,6 +14,7 @@ import re
 import os
 import shutil
 import subprocess
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -206,18 +207,69 @@ class InstallScriptTests(unittest.TestCase):
                  if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]", line)]
         self.assertEqual(glued, [], f"变量紧贴非 ASCII 字符：{glued}")
 
-    def test_the_failure_branch_survives_a_stripped_locale(self):
-        """失败分支必须能在被剥干净的环境里跑完，而不是自己崩掉。
+    # 触发准则 31 那个缺陷的 locale。**C / 空 / 未设都不触发**，用它们跑等于没跑。
+    # 决定性的是 UTF-8 的 LC_CTYPE：bash 3.2 在那之下才会把多字节字符的首字节
+    # 吃进变量名。
+    TRIGGERING_LOCALE = {"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}
+
+    def test_the_failure_branch_survives_the_locale_that_actually_breaks_it(self):
+        """失败分支必须能在**会触发这个缺陷的** locale 下跑完，而不是自己崩掉。
 
         上一条钉的是写法，这一条钉的是**行为** —— 光看源码看不出 bash 会怎么解析。
+
+        ⚠️ 这条用例此前是**双重落空**的：
+        一、用 `LANG=C` 跑，而 **C 恰恰不触发**；
+        二、调用的是 `--check com.kg-hub.does-not-exist`，实测输出
+        「机器上的服务定义与仓库一致」、**退出 0** —— 它走的是成功路径，
+        一个失败分支都没碰到。而准则 31 的全部要害就是「它只在失败路径上炸」。
+        现在改用临时 HOME：仓库里每个 label 在那儿都没装，确定地走到
+        `✗ …：仓库里有，机器上没装` 这一支，且不依赖本机状态。
+        2026-09-21 变异验证当场证实：往失败分支插一处 `$label，`，
+        「钉写法」那条红了，而这条照样 OK —— **一条自称在验行为、却对它要防的
+        缺陷完全无感的用例，比没有用例更坏**：它让人以为这一半已经被看住了。
+
+        同源的更大教训：agent 工具 shell 的 LANG 通常是空的，所以
+        「我这儿跑过了」对 locale 相关的缺陷等于没验；而用户终端默认 UTF-8，
+        同一个脚本在我这儿全绿、在人手上第一步就死（report-portal 实测 11 处）。
         """
-        done = subprocess.run(
-            ["bash", str(INSTALL), "--check", "com.kg-hub.does-not-exist"],
-            capture_output=True, timeout=60,
-            env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LANG": "C"})
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "Library/LaunchAgents").mkdir(parents=True)
+            done = subprocess.run(
+                ["bash", str(INSTALL), "--check"],
+                capture_output=True, timeout=60,
+                env={"PATH": "/usr/bin:/bin", "HOME": home,
+                     **self.TRIGGERING_LOCALE})
         stderr = done.stderr.decode("utf-8", "replace")
+        # 先确认真的**走到了**失败分支，再谈它有没有崩。
+        # 不确认的话，一次「什么都没发生」会被读成「跑完了没崩」——
+        # 这正是原用例的第二处落空。
+        self.assertIn("✗", stderr,
+                      f"没走到任何失败分支，这条用例什么都没验：{stderr[:200]}")
         self.assertNotIn("unbound variable", stderr)
         self.assertNotIn("\ufffd", stderr, "输出里有解不出来的字节")
+
+    def test_the_chosen_locale_really_is_the_one_that_breaks_things(self):
+        """钉住上一条用的 locale **真的会触发** —— 不然它随时可能悄悄变回永远绿。
+
+        不是断言常量长什么样，是拿一段必然会崩的脚本真跑两次：
+        触发档必须崩、C 档必须不崩。两边都断言，少一边就说明夹具本身有问题。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            boom = Path(tmp) / "boom.sh"
+            boom.write_text('set -u\nSHA=abc\necho "发布 $SHA（完成）"\n',
+                            encoding="utf-8")
+            base = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+            # errors="replace" 是必需的：bash 吐的是 `SHA\xef: unbound variable`，
+            # 那个 \xef 正是被吃进变量名的首字节，不是合法 UTF-8。
+            run = lambda env: subprocess.run(   # noqa: E731
+                ["bash", str(boom)], capture_output=True, text=True,
+                errors="replace", timeout=30, env=env)
+            hot = run({**base, **self.TRIGGERING_LOCALE})
+            cold = run({**base, "LC_ALL": "C"})
+            self.assertIn("unbound variable", hot.stderr,
+                          f"选的 locale 不触发这个病：{self.TRIGGERING_LOCALE}")
+            self.assertNotIn("unbound variable", cold.stderr,
+                             "对照组：C 本该不触发；不成立说明夹具有问题")
 
     def test_check_mode_runs_clean_against_this_machine(self):
         # 模板必须能逐字节还原出机器上正在跑的那份，否则「进仓库」这件事本身就
