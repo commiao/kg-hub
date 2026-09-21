@@ -350,6 +350,24 @@ rollback_to_previous_image() {
 #
 # 令牌只在 NAS 上取用：不回传到本机 stdout、日志或命令插值（与本脚本处理
 # KG_HUB_MODEL_GATEWAY_TOKEN 的做法一致）。
+# 把排空窗口写成 NAS 上的持久证据。
+#
+# 为什么必须持久：排空发生在**旧容器**上，而发布的最后一步就是换掉它 ——
+# 2026-09-21 实测两次，想复盘 12:16 那个窗口时日志已随容器重建消失，
+# 事后没有第二次机会（T-0117 量不到外部到达率，就是卡在这里）。
+#
+# 落在点目录 `.release-history/` 下，不是根上的点文件：漂移检测对根下**点目录**
+# 整体豁免，而根上的点**文件**会被报成「只在 NAS 上，git 未跟踪」——
+# 那是这个检查里最响的一档，用它报一个自己刚造的文件就是在花可信度。
+# prune 同样碰不到点目录（它的清单来自同一个豁免规则）。
+DRAIN_LOG="$SRC/.release-history/drain.log"
+drain_note() {
+  [ "${DRY_RUN:-0}" = 1 ] && { say "  [dry-run] 会记一行排空证据：$*"; return 0; }
+  on_nas "mkdir -p $(printf %q "$SRC/.release-history") && printf '%s %s\n' \
+    \"\$(date -Iseconds)\" $(printf %q "$*") >> $(printf %q "$DRAIN_LOG")" \
+    >/dev/null 2>&1 || say "  ⚠ 排空证据没记下（不影响发布，但这次窗口将无法复盘）"
+}
+
 set_drain() {
   local seconds="$1"
   [ "${DRY_RUN:-0}" = 1 ] && { say "  [dry-run] 会把 kg-hub 排空态设为 ${seconds}s"; return 0; }
@@ -578,6 +596,7 @@ say "  排空预算 ${DRAIN_BUDGET_S}s（服务端一次 ingest 的最坏用时�
 # 终点就可能永远到不了（T-0117）。
 if set_drain "$DRAIN_BUDGET_S"; then
   say "  已让 kg-hub 拒收新写入（外部写入方会在各自的下一轮重试，不丢）"
+  drain_note "enter sha=${SHA} budget=${DRAIN_BUDGET_S}s"
 else
   say "  ⚠ 没能让 kg-hub 进入排空态；继续等，但外部写入方仍在推，可能等不到归零"
 fi
@@ -619,7 +638,15 @@ except Exception: pass' 2>/dev/null || true)
     say "  线上版本还没有 active_extractions，改为盲等 180s（下次发布起就精确了）"
     sleep 180; drained=1; break
   fi
-  if [ "$n" = 0 ]; then say "  在飞抽取已归零"; drained=1; break; fi
+  if [ "$n" = 0 ]; then
+    refused=$(printf '%s' "$body" | python3 -c '
+import json,sys
+try: print(json.load(sys.stdin).get("drain_refused", "?"))
+except Exception: print("?")' 2>/dev/null || echo "?")
+    say "  在飞抽取已归零（等了 ${waited}s，期间挡下 ${refused} 次外部写入）"
+    drain_note "drained waited=${waited}s refused=${refused}"
+    drained=1; break
+  fi
   say "  还有 $n 条在飞，等…（已等 ${waited}s / ${DRAIN_BUDGET_S}s）"
   sleep 5
   waited=$((waited + 5))
@@ -629,6 +656,7 @@ if [ "$drained" != 1 ]; then
   # 那正是这一步要避免的东西，为了赶一次发布去制造它不划算。此刻源码已同步、
   # 镜像已构建，但容器还没换，中止是干净的：过会儿重跑即可。
   restore_producers
+  drain_note "abort waited=${waited}s budget=${DRAIN_BUDGET_S}s"
   die "${DRAIN_BUDGET_S}s 没排空干净，已中止（生产者已恢复）"
 fi
 

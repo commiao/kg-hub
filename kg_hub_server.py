@@ -469,6 +469,10 @@ _active_extractions_lock = threading.Lock()
 # 一个再也没人来清的排空态，那就成了永久拒写。到期自动解除，代价上限是可算的。
 _drain_until = 0.0
 _drain_lock = threading.Lock()
+# 本次排空窗口内挡下了多少次写入。这正是 T-0117 想量而量不到的那个数：
+# 12:16 那次窗口的日志随容器重建消失了，事后没有第二次机会。
+# 计数随**进入**排空态清零，所以它只描述这一次窗口。
+_drain_refused = 0
 
 
 def set_drain(seconds: float) -> float:
@@ -477,13 +481,17 @@ def set_drain(seconds: float) -> float:
     上限取自 `utils.ingest_budget` —— 和排空预算同源。不另写一个数：
     2026-09-20 同一件事上有三个互不相同的常数，谁也不知道另外两个存在。
     """
-    global _drain_until
+    global _drain_until, _drain_refused
     try:
         from utils.ingest_budget import ingest_ceiling_sec
         cap = float(ingest_ceiling_sec())
     except Exception:            # noqa: BLE001 —— 算不出上限时给一个保守的小值，
         cap = 600.0              # 宁可提前解除也不要无界拒写
     with _drain_lock:
+        if seconds > 0:
+            # 每次进入窗口都从零开始数：跨窗口累加的话，发布方读到的是
+            # 「开机以来挡了多少」，那回答不了「这次窗口进来多少外部写入」。
+            _drain_refused = 0
         _drain_until = 0.0 if seconds <= 0 else time.time() + min(float(seconds), cap)
         return max(0.0, _drain_until - time.time())
 
@@ -491,6 +499,18 @@ def set_drain(seconds: float) -> float:
 def drain_seconds_left() -> float:
     with _drain_lock:
         return max(0.0, _drain_until - time.time())
+
+
+def note_drain_refusal() -> int:
+    global _drain_refused
+    with _drain_lock:
+        _drain_refused += 1
+        return _drain_refused
+
+
+def drain_refused() -> int:
+    with _drain_lock:
+        return _drain_refused
 
 
 def _extraction_started() -> None:
@@ -522,6 +542,7 @@ async def health(request: Request) -> JSONResponse:
                          # 发布方要能看出「计数不降是因为还有人在写」还是「真的在排空」。
                          "draining": left > 0,
                          "drain_seconds_left": int(left),
+                         "drain_refused": drain_refused(),
                          "envelope_repairs": envelope_repairs_total()})
 
 
@@ -543,7 +564,8 @@ async def drain(request: Request) -> JSONResponse:
     left = set_drain(seconds)
     logger.info("[drain] %s，剩余 %.0fs", "进入排空态" if left > 0 else "解除排空态", left)
     return JSONResponse({"status": "ok", "draining": left > 0,
-                         "drain_seconds_left": int(left)})
+                         "drain_seconds_left": int(left),
+                         "drain_refused": drain_refused()})
 
 
 def bounded_search_episode_uuids(candidate: dict, limit: int = 8) -> list[str]:
@@ -1028,6 +1050,8 @@ async def ingest(request: Request) -> JSONResponse:
     # 那正是 utils/ingest_budget 那份文档里记的「假 timeout 造出真 409」。
     left = drain_seconds_left()
     if left > 0:
+        refused = note_drain_refusal()
+        logger.info("[drain] 挡下第 %d 次写入，剩余 %.0fs", refused, left)
         return JSONResponse(
             {"status": "error", "code": "draining",
              "message": f"kg-hub 正在为发布排空，{int(left)}s 后恢复；请稍后重试",

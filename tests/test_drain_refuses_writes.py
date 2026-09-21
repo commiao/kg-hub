@@ -99,6 +99,17 @@ class ServerWiringTests(unittest.TestCase):
         self.assertIn("Retry-After", body,
                       "拒收却不告诉对方什么时候回来 —— 重试只能靠猜")
 
+    def test_the_refusal_path_actually_increments_the_counter(self):
+        """钉调用点，不只钉函数。
+
+        变异验证当场发现：把 ingest 里的 `note_drain_refusal()` 换成 `0`，
+        上面那些「计数器自己是对的」的用例照样全绿 ——
+        **一个函数正确，不等于有人在用它。**
+        """
+        body = self._body("ingest")
+        self.assertIn("note_drain_refusal()", body,
+                      "拒收时没有计数，那个数永远是 0，等于没量")
+
     def test_status_polling_is_never_refused(self):
         """只拦新写入。拦住状态查询，在飞的那些就问不到终态，调用方会以为自己
         超时了而重推 —— 那正是 utils/ingest_budget 记的「假 timeout 造出真 409」。
@@ -163,6 +174,81 @@ class ReleaseScriptOrderTests(unittest.TestCase):
         # 取到的值必须留在远端那段脚本里：本机侧不得出现赋值给本地变量的写法。
         self.assertNotRegex(body, r"^\s*tok=\$\(ssh", "令牌被取回了本机")
 
+
+
+
+class RefusalCountingTests(unittest.TestCase):
+    """排空期间挡下了多少次写入 —— T-0117 原本量不到的那个数。"""
+
+    def setUp(self):
+        self.m = load_server_symbols()
+        self.addCleanup(lambda: self.m.set_drain(0))
+
+    def test_it_counts(self):
+        self.m.set_drain(60)
+        self.assertEqual(self.m.note_drain_refusal(), 1)
+        self.assertEqual(self.m.note_drain_refusal(), 2)
+        self.assertEqual(self.m.drain_refused(), 2)
+
+    def test_each_window_starts_from_zero(self):
+        """跨窗口累加的话，发布方读到的是「开机以来挡了多少」——
+        那回答不了「这次窗口进来多少外部写入」，而后者才是要量的。"""
+        self.m.set_drain(60)
+        self.m.note_drain_refusal(); self.m.note_drain_refusal()
+        self.m.set_drain(0)          # 解除不清零：那一次窗口的结论还要被读走
+        self.assertEqual(self.m.drain_refused(), 2)
+        self.m.set_drain(60)         # 再次进入才清零
+        self.assertEqual(self.m.drain_refused(), 0)
+
+
+class DrainEvidenceTests(unittest.TestCase):
+    """排空窗口要留下能活过容器重建的证据。"""
+
+    def setUp(self):
+        out, buf = [], ""
+        for raw in RELEASE.read_text("utf-8").splitlines():
+            if raw.lstrip().startswith("#"):
+                continue
+            buf += raw.rstrip()
+            if buf.endswith("\\"):
+                buf = buf[:-1] + " "
+                continue
+            out.append(buf.strip()); buf = ""
+        self.lines = out
+        self.text = "\n".join(out)
+
+    def test_the_log_lives_under_a_dot_directory(self):
+        """落错地方会反过来制造漂移。
+
+        `is_allowed_untracked` 只豁免根下的点**目录**（`rest` 非空才返回 True）；
+        根上的点**文件**照样被报成「只在 NAS 上，git 未跟踪」——那是这个检查里
+        最响的一档，拿它报一个自己刚造的文件，就是在花掉警报的可信度（准则 28）。
+        """
+        line = next(x for x in self.lines if x.startswith("DRAIN_LOG="))
+        path = line.split("=", 1)[1].strip('"')
+        rel = path.replace("$SRC/", "")
+        self.assertIn("/", rel, f"证据落在根上而不是点目录里：{rel}")
+        self.assertTrue(rel.split("/")[0].startswith("."),
+                        f"证据不在点目录下，会被报成漂移：{rel}")
+
+    def test_both_outcomes_are_recorded(self):
+        """失败的那次窗口比成功的更值得复盘 —— 只记成功等于只留下好消息。"""
+        self.assertIn('drain_note "drained waited=', self.text)
+        self.assertIn('drain_note "abort waited=', self.text)
+
+    def test_the_drained_line_carries_the_refusal_count(self):
+        """记「等了多久」还不够：等得久是因为自己的抽取慢，还是因为外部一直在写，
+        是两个不同的病，而它们在「等了 1260s」这一个数字上长得一模一样。"""
+        line = next(x for x in self.lines if 'drain_note "drained' in x)
+        self.assertIn("refused=", line)
+
+    def test_failing_to_record_does_not_fail_the_release(self):
+        """证据没记下是遗憾，不是事故 —— 但必须出声，否则下次复盘时
+        「没有记录」会被读成「没有发生」。"""
+        i = next(k for k, x in enumerate(self.lines) if x.startswith("drain_note() {"))
+        body = "\n".join(self.lines[i:i + 10])
+        self.assertIn("⚠", body)
+        self.assertNotIn("die", body)
 
 if __name__ == "__main__":
     unittest.main()
