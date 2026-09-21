@@ -480,8 +480,9 @@ fi
 # 过期不能证明供应商没扣过钱），每一条都挡住下一次发布。2026-09-10 六小时攒了
 # 171 条正是这么来的：发布本身会制造挡住下次发布的东西。
 # 排空等的是**在飞的抽取**，不是积压。积压躺在库里和水印里，refinery 停了就停，
-# 回来接着跑，一条不丢。在飞的条数由 INGEST_CONCURRENCY 封顶（现为 2），每条约
-# 3 分钟，所以正常情况下最坏等 3 分钟左右。
+# 回来接着跑，一条不丢。在飞的条数由 INGEST_CONCURRENCY 封顶（现为 2）。
+# **别再按「每条约 3 分钟」估**：2026-09-20 实测最长一次成功入图 1091.8s，而光是
+# 等写锁最坏就要 1155s。预算改为从 utils/ingest_budget.py 派生（见下）。
 say "[4/6] 排空：停生产者，等在飞的抽取归零（等的是在飞，不是积压）"
 producers_stopped=0
 # 生产者一旦停下，就必须保证它们能起回来：发布在这之后任何一步失败而没人管，
@@ -498,8 +499,18 @@ if on_nas "cd $SRC && $DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE 
 else
   say "  （生产者没停成，继续——最坏是多等一会儿）"
 fi
+# 排空预算与 refinery 的轮询上限、服务端的写锁上限同源（utils/ingest_budget.py）。
+# 原先是写死的 60 轮 × 5s = 300s，依据是上面那句「每条约 3 分钟」—— 2026-09-20 实测
+# 一次**成功**入图 elapsed=1091.8s，那个假设不成立，于是窗口期内发布几乎必然先撞
+# 一次中止再重来。预算是**上限不是固定等待**：归零就立刻继续，正常情况代价为零。
+DRAIN_BUDGET_S=$(cd "$REPO" && python3 -m utils.ingest_budget) || DRAIN_BUDGET_S=""
+case "$DRAIN_BUDGET_S" in
+  ''|*[!0-9]*) die "排空预算算不出来（utils/ingest_budget.py）——不猜一个数就发" ;;
+esac
+say "  排空预算 ${DRAIN_BUDGET_S}s（服务端一次 ingest 的最坏用时；归零即继续）"
 drained=0
-for _ in $(seq 1 60); do
+waited=0
+while [ "$waited" -lt "$DRAIN_BUDGET_S" ]; do
   [ "${DRY_RUN:-0}" = 1 ] && { drained=1; break; }
   # 用 python 解 JSON 而不是 sed 抠字符串：字段缺失和值为 0 必须能分清，
   # 前者说明线上还是旧版本（要盲等），后者才是真的排空了。
@@ -513,15 +524,16 @@ except Exception: pass' 2>/dev/null || true)
     sleep 180; drained=1; break
   fi
   if [ "$n" = 0 ]; then say "  在飞抽取已归零"; drained=1; break; fi
-  say "  还有 $n 条在飞，等…"
+  say "  还有 $n 条在飞，等…（已等 ${waited}s / ${DRAIN_BUDGET_S}s）"
   sleep 5
+  waited=$((waited + 5))
 done
 if [ "$drained" != 1 ]; then
   # 排空不掉就**别发**。硬换会掐断在飞的流式抽取，在网关留下永不过期的记录 ——
   # 那正是这一步要避免的东西，为了赶一次发布去制造它不划算。此刻源码已同步、
   # 镜像已构建，但容器还没换，中止是干净的：过会儿重跑即可。
   restore_producers
-  die "5 分钟没排空干净，已中止（生产者已恢复）"
+  die "${DRAIN_BUDGET_S}s 没排空干净，已中止（生产者已恢复）"
 fi
 
 # ---- 5. 切标签 + 起容器 ----------------------------------------------------

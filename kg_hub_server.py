@@ -70,6 +70,7 @@ from topology import (  # noqa: E402
 )
 from dashboard_status import pipeline_signal
 from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
+from utils import ingest_budget  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
@@ -577,9 +578,12 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
 # an ingest to 'error' the first time it can't grab the writer.lock, retry with
 # linear backoff. Concurrent batch ingests then serialize cleanly behind whichever
 # writer currently holds the lock, instead of all timing out and silently erroring.
-INGEST_LOCK_TIMEOUT_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_TIMEOUT_SEC", "180.0"))
-INGEST_LOCK_RETRIES = int(os.environ.get("KG_HUB_INGEST_LOCK_RETRIES", "5"))
-INGEST_LOCK_BACKOFF_SEC = float(os.environ.get("KG_HUB_INGEST_LOCK_BACKOFF_SEC", "5.0"))
+# 这三个数同时决定了**等待方**（refinery 的轮询、发布脚本的排空）该等多久，
+# 所以它们和派生公式一起住在 utils/ingest_budget.py —— 三处从同一个源取
+# （2026-09-20：此前三处各写一个数，600/300 都短于真实上限 2355s，详见该文件）。
+INGEST_LOCK_TIMEOUT_SEC = ingest_budget.INGEST_LOCK_TIMEOUT_SEC
+INGEST_LOCK_RETRIES = ingest_budget.INGEST_LOCK_RETRIES
+INGEST_LOCK_BACKOFF_SEC = ingest_budget.INGEST_LOCK_BACKOFF_SEC
 # Phase B' 长文档预拆开关(REFINERY-DESIGN §3')。默认关,灰度经 compose env 打开。
 PREDIGEST_ENABLED = os.environ.get("KG_HUB_PREDIGEST", "0").lower() in ("1", "true", "yes")
 
@@ -841,7 +845,10 @@ async def _do_extract_inner(
                         graphiti, sd, sid, "error",
                         error_message=(
                             f"writer.lock busy after {INGEST_LOCK_RETRIES} retries "
-                            f"(~{int(INGEST_LOCK_RETRIES * INGEST_LOCK_TIMEOUT_SEC)}s) — "
+                            # 原先这里自己算 RETRIES × TIMEOUT，少算了第一次尝试
+                            # （attempt 从 0 起），把 1155s 报成 900s。数字也要从
+                            # 唯一来源取，否则报错文案自己就是第四个不一致的数。
+                            f"(~{int(ingest_budget.lock_wait_ceiling_sec())}s) — "
                             "contention too high"
                         ),
                     )

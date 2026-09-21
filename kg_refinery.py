@@ -51,6 +51,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import breakers  # noqa: E402
+from utils.ingest_budget import ingest_ceiling_sec  # noqa: E402
 from utils.ingest_filter import (  # noqa: E402
     QuotaTracker, evaluate, load_config, log_decision,
 )
@@ -627,7 +628,13 @@ def _http(method: str, url: str, body: dict | None = None, timeout: int = 30):
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
-async def poll_until_done(sd: str, sid: str, max_wait: int = 600) -> str:
+# 轮询上限:不许比服务端自己的上限先放弃(utils/ingest_budget.py)。
+# 2026-09-20 之前这里写死 600s,而服务端最坏要 2355s —— 于是 refinery 在别人还在
+# 正常干活时记一次假 timeout,下一轮重推撞上自己刚建的键,换来 409 和指数退避。
+POLL_MAX_WAIT_S = int(ingest_ceiling_sec())
+
+
+async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) -> str:
     import urllib.parse
     q = urllib.parse.urlencode({"source_description": sd, "source_obs_id": sid})
     waited = 0
