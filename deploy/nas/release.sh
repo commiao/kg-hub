@@ -317,7 +317,14 @@ discard_refinery_window_backup() {
 
 rollback_to_previous_image() {
   local reason="$1"
-  say "$reason —— 自动回到 $PREV"
+  # 没有回滚目标就别假装回滚。PREV 为空只有一种来源：首次发布，.env 里本来就
+  # 没有 KG_HUB_IMAGE_TAG（读不到的那种在上面已经 die 掉了）。
+  # 这里若照常往下走，会把 .env 写成 `KG_HUB_IMAGE_TAG=` 然后 compose up ——
+  # 等于把线上切到一个空标签，比不回滚坏得多。
+  if [ -z "${PREV:-}" ]; then
+    die "$reason —— 但没有可回滚的上一版（首次发布）；新容器保持现状，需要人工介入"
+  fi
+  say "$reason —— 自动回到 ${PREV}"
   # 这是刻意排在 compose 前面的：窗口变更和镜像切换是同一事务。
   restore_refinery_window_env || die "无法在镜像回滚前恢复旧 .env；停止自动回滚"
   on_nas "set -eu
@@ -411,9 +418,30 @@ ensure_compose_parses
 prepare_refinery_window_change
 
 # ---- 2. 记下当前标签，作为回滚点 ------------------------------------------
-PREV=$(on_nas "grep '^KG_HUB_IMAGE_TAG=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
-PREV=${PREV:-latest}
-say "当前线上标签：$PREV"
+# 读「线上当前是哪个标签」。这个值是**自动回滚的目标**，所以它必须要么是真的，
+# 要么就承认读不到 —— 不能填一个看起来合理的默认值。
+#
+# 原来是 `|| true` 吃掉 ssh 失败、再 `${PREV:-latest}` 补上，于是把两件完全不同的
+# 事压成了一件：
+#   .env 里没有这一行  → 首次发布，本来就没有「上一个」，回滚无从谈起
+#   这次没读到         → ssh 挂了 / 文件读不了，**线上其实有一个上一版，只是我们不知道**
+# 后者填成 `latest` 的后果是：真要自动回滚时，会把线上切到一个可变标签指向的
+# 镜像 —— 而 latest 恰恰是本脚本存在的理由（T-0046：可变标签一 build 就把旧镜像
+# 覆盖成悬空层，于是回滚时压根不存在「旧版本」这个东西）。
+set +e
+PREV=$(on_nas "grep '^KG_HUB_IMAGE_TAG=' $SRC/.env 2>/dev/null | cut -d= -f2-")
+prev_rc=$?
+set -e
+PREV=$(printf '%s' "$PREV" | tr -d '[:space:]')
+if [ "$prev_rc" != 0 ] && [ "${DRY_RUN:-0}" != 1 ]; then
+  die "读不到线上当前标签（ssh 退出 ${prev_rc}）；不发 —— 没有回滚目标的发布不叫可回滚"
+fi
+if [ -z "$PREV" ]; then
+  # 读到了，确实没有这一行：首次发布。说清楚，别假装有个「上一个」。
+  say "当前线上标签：（.env 里没有 KG_HUB_IMAGE_TAG —— 首次发布，本次没有回滚目标）"
+else
+  say "当前线上标签：$PREV"
+fi
 
 if [ "$mode" = rollback ]; then
   PRIOR=$(on_nas "grep '^KG_HUB_IMAGE_TAG_PREV=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
@@ -451,15 +479,24 @@ fi
 # 所以源码落地后立刻把当前正在跑的标签补进 .env —— 值不变、行为不变，只是把窗口
 # 关掉。真正的切换仍在第 4 步。
 say "[2/6] 兜住 .env（关掉「变量缺失」窗口）+ 准备数据目录"
-on_nas "set -eu
-  cd $SRC
-  grep -q '^KG_HUB_IMAGE_TAG=' .env 2>/dev/null || {
-    tmp=\$(mktemp '$SRC/.env.XXXXXX')
-    cat .env > \"\$tmp\" 2>/dev/null || true
-    printf 'KG_HUB_IMAGE_TAG=%s\n' '$PREV' >> \"\$tmp\"
-    chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
-    echo '      .env 已补上当前标签 $PREV'
-  }"
+# PREV 为空时这一步无事可做，而且**不能硬做**：这个分支恰恰只在 .env 缺这一行时
+# 触发，也正是 PREV 为空的那种情形（首次发布）。写一个空值等于没关窗口 ——
+# `${KG_HUB_IMAGE_TAG:?}` 把空值也当未设。原来这里写的是 `latest`，既关不上窗口
+# （latest 指向的镜像是悬空的旧层），又把「首次发布」伪装成「有个上一版」。
+if [ -z "${PREV:-}" ]; then
+  say "      首次发布：.env 里本来就没有当前标签，这个窗口关不掉 ——"
+  say "      在第 4 步写入新标签之前，任何人跑 docker compose 都会因变量缺失而失败（这是对的）"
+else
+  on_nas "set -eu
+    cd $SRC
+    grep -q '^KG_HUB_IMAGE_TAG=' .env 2>/dev/null || {
+      tmp=\$(mktemp '$SRC/.env.XXXXXX')
+      cat .env > \"\$tmp\" 2>/dev/null || true
+      printf 'KG_HUB_IMAGE_TAG=%s\n' '$PREV' >> \"\$tmp\"
+      chmod 600 \"\$tmp\"; mv -f \"\$tmp\" .env
+      echo '      .env 已补上当前标签 $PREV'
+    }"
+fi
 
 # ---- 4. 新卷 + 构建不可变镜像 ---------------------------------------------
 on_nas "mkdir -p '$DATA/breakers' && chmod 700 '$DATA/breakers'"
@@ -512,14 +549,37 @@ drained=0
 waited=0
 while [ "$waited" -lt "$DRAIN_BUDGET_S" ]; do
   [ "${DRY_RUN:-0}" = 1 ] && { drained=1; break; }
-  # 用 python 解 JSON 而不是 sed 抠字符串：字段缺失和值为 0 必须能分清，
-  # 前者说明线上还是旧版本（要盲等），后者才是真的排空了。
-  n=$(on_nas "curl -fsS -m 5 '$HEALTH' 2>/dev/null" 2>/dev/null | python3 -c '
+  # 三种情况必须分清，**不能都看成「没拿到值」**：
+  #
+  #   够不到线上        ssh 挂了 / curl 超时 / 非 2xx → 什么都不知道，不许当成排空
+  #   拿到了但没这个字段 线上还是旧版本            → 盲等一个路由超时 + 余量
+  #   拿到了值           这才是真的在回答问题
+  #
+  # 原来是把这三种压成一个「$n 为空」，然后**打印一句关于线上版本的诊断**、置
+  # drained=1 继续切换 —— 于是一次网络抖动就能绕过下面那条「排空不掉就别发」的闸，
+  # 而操作者被告知的是一件假事。Mac↔NAS 这条链路有据可查地会抖（T-0077/T-0083）。
+  #
+  # 讽刺的是上面那条注释本来就写着「字段缺失和值为 0 必须能分清」—— 缺字段和 0
+  # 确实分清了，唯独把「压根没够到」并进了「缺字段」。
+  #
+  # 判据一律写成「只有明确的成功才配走成功路径」：够不到就继续轮询，预算耗尽自然
+  # 落到那条闸上中止，而不是替它做一个乐观的决定。
+  # DRY_RUN 在循环第一行就 break 了，这里不用再管它 —— 写一个到不了的分支，
+  # 比不写更坏：它看起来像在处理一种情况。
+  body=$(ssh "${SSH_OPTS[@]}" "$NAS" "curl -fsS -m 5 '$HEALTH'" 2>/dev/null); probe_rc=$?
+  if [ "$probe_rc" != 0 ]; then
+    say "  够不到线上 /health（ssh/curl 退出 ${probe_rc}）；**不当作已排空**，继续等（已等 ${waited}s / ${DRAIN_BUDGET_S}s）"
+    sleep 5
+    waited=$((waited + 5))
+    continue
+  fi
+  # 用 python 解 JSON 而不是 sed 抠字符串：字段缺失和值为 0 必须能分清。
+  n=$(printf '%s' "$body" | python3 -c '
 import json,sys
 try: print(json.load(sys.stdin)["active_extractions"])
 except Exception: pass' 2>/dev/null || true)
   if [ -z "$n" ]; then
-    # 线上还是旧版本，没有这个字段。只能盲等一个路由超时（150s）+ 余量。
+    # 够到了，但没有这个字段 —— 线上确实还是旧版本。只能盲等一个路由超时（150s）+ 余量。
     say "  线上版本还没有 active_extractions，改为盲等 180s（下次发布起就精确了）"
     sleep 180; drained=1; break
   fi
