@@ -2,7 +2,9 @@
 #
 # 补丁内容：观测提示带上队列行 id，让下游 forwarder 能证明「字节相同 = 同一条
 # 观测的重投」，从而复用同一把幂等键、不再重复付费。
-# 源码：commiao/claude-mem 主干 b9f9263a（= upstream adce0fd / 13.25.2 + 补丁）
+# 源码：commiao/claude-mem 主干 d03b78ef（= upstream adce0fd / 13.25.2 + 补丁）
+#       b9f9263a 只改了 src/，没有重建 bundle；生产跑的这份 bundle 是 d03b78ef
+#       提交进来的。发布物可从 git 复现：git show d03b78ef:plugin/scripts/worker-service.cjs
 #       准则 18：生产跑的提交必须在 origin/main 上 —— 2026-09-20 已收口
 #
 # version 必须与目标安装的 package.json 对得上。对不上说明插件升级了：
