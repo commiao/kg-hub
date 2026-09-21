@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import types
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -31,6 +32,80 @@ class FakeMessages:
 class FakeClient:
     def __init__(self):
         self.messages = FakeMessages()
+
+
+def production_py_files(root):
+    """仓库里属于「这个检出的生产代码」的 .py 文件。
+
+    为什么要单独一个函数：`root.rglob("*.py")` 会走进**嵌套的 git 工作树**。
+    2026-09-20 实测代价：`.claude/worktrees/view-assigned-tasks-91de86/` 里的
+    文件被扫进来，`test_every_production_paid_call_is_lexically_operation_bound`
+    一次报出 23 条 offender，全是假的；排除它花了三轮（先拿 git archive 做基线，
+    基线自身因为没有 .git 而脏；换 git worktree 才准；最后同目录切主干代码
+    对照才定案）。而假红花掉的是这条检查以后还有没有人信（准则 28）。
+
+    判据取「自带 .git 的子目录」而不是排除 `.claude` 这个具体名字：
+    worktree 放在哪儿都挡得住，语义也更准——**嵌套工作树里的文件本来就不属于
+    这个检出**，它们有自己的 HEAD、自己的分支，是另一份代码。
+
+    两处扫全树的用例共用它：同一个病修一次，不会只修一处（准则 28 的形状）。
+    """
+    nested = {q.parent for q in root.rglob(".git")}
+    for path in sorted(root.rglob("*.py")):
+        if any(n in path.parents for n in nested):
+            continue
+        yield path
+
+
+class ProductionFileScanTests(unittest.TestCase):
+    """扫全树的用例必须跳过嵌套 git 工作树，否则报的是别人的代码。
+
+    出处：2026-09-20，`.claude/worktrees/view-assigned-tasks-91de86/` 被扫进来，
+    一次报出 23 条假 offender。前后对照在同一条件下做过：造出嵌套工作树后，
+    旧写法 FAILED（23 条），改用 production_py_files 后 OK。
+    """
+
+    def _tree(self, tmp):
+        root = Path(tmp)
+        (root / "prod.py").write_text("x = 1\n", encoding="utf-8")
+        nested = root / ".claude" / "worktrees" / "sess"
+        nested.mkdir(parents=True)
+        # 真实工作树里 .git 是**文件**（gitdir: 指针），不是目录 —— 判据必须两种都认
+        (nested / ".git").write_text("gitdir: /somewhere/.git/worktrees/sess\n",
+                                     encoding="utf-8")
+        (nested / "ghost.py").write_text("y = 2\n", encoding="utf-8")
+        return root, nested
+
+    def test_nested_worktree_files_are_not_production_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, nested = self._tree(tmp)
+            got = {p.relative_to(root).as_posix()
+                   for p in production_py_files(root)}
+            self.assertIn("prod.py", got)
+            self.assertNotIn(".claude/worktrees/sess/ghost.py", got,
+                             "嵌套工作树里的文件不属于这个检出")
+
+    def test_a_nested_repo_anywhere_is_skipped_not_just_dot_claude(self):
+        # 判据是「自带 .git 的子目录」，不是某个具体目录名——worktree 放哪儿都挡得住
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "prod.py").write_text("x = 1\n", encoding="utf-8")
+            odd = root / "vendor" / "someclone"
+            odd.mkdir(parents=True)
+            (odd / ".git").mkdir()
+            (odd / "theirs.py").write_text("y = 2\n", encoding="utf-8")
+            got = {p.relative_to(root).as_posix() for p in production_py_files(root)}
+            self.assertEqual(got, {"prod.py"}, got)
+
+    def test_an_ordinary_tree_loses_nothing(self):
+        # 反向：没有嵌套树时一个文件都不能少，否则这个跳过就成了新的假绿
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.py").write_text("", encoding="utf-8")
+            (root / "sub").mkdir()
+            (root / "sub" / "b.py").write_text("", encoding="utf-8")
+            got = {p.relative_to(root).as_posix() for p in production_py_files(root)}
+            self.assertEqual(got, {"a.py", "sub/b.py"}, got)
 
 
 class GatewayClientContractTests(unittest.TestCase):
@@ -255,7 +330,7 @@ class GatewayClientContractTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         offenders = []
         pattern = re.compile(r"create_gateway_client\([^)]*timeout\s*=\s*([0-9.]+)")
-        for path in root.rglob("*.py"):
+        for path in production_py_files(root):
             if "/tests/" in str(path) or path.name == "model_gateway_client.py":
                 continue
             for value in pattern.findall(path.read_text("utf-8", errors="ignore")):
@@ -316,7 +391,7 @@ class GatewayClientContractTests(unittest.TestCase):
                     offenders.append(f"{self.path.relative_to(root)}:{node.lineno}")
                 self.generic_visit(node)
 
-        for path in root.rglob("*.py"):
+        for path in production_py_files(root):
             relative = path.relative_to(root)
             if (relative.parts[0] in {"tests", "spike-graphiti"}
                     or relative.parts[:2] == ("tools", "experimental")):
