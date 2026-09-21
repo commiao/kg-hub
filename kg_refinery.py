@@ -698,13 +698,51 @@ async def ingest_via_api(obs: dict) -> str:
 
 # ---------- 状态外露 ----------
 
+# 描述「此刻」的字段:本轮没显式写过就必须回到默认值,不许沿用上一轮/上一个容器。
+#
+# write_status 是 `cur.update(kw)`,而写状态有四条路径(人工断路 / 温度歇工 /
+# 窗口外 / 正常一轮),每条各带一部分字段。于是没带到的那些就被**一个新鲜的 ts
+# 盖着一个旧结论**继续对外播 —— 准则 9 第三条那个形态。
+#
+# 2026-09-21 实测两例:
+#   upstream_error_paused  昨夜窗口内因网关 5xx 置 True,窗口一关就再没人刷它,
+#                          于是 refinery 明明空闲,拓扑的 gates 里仍列着「上游
+#                          5xx 停发」(幸好 halted 判定另有 window_open 兜住,
+#                          没变成误告警,但看板和人读到的是假的)
+#   live_processed         停在上一个容器留下的 deferred=200 / halted=143,而
+#                          live_per_cycle 已经是 30 —— 这组数在当前配置下不可能
+#                          发生。我自己就被它误导过一次。
+#
+# 修法不是「记得在那三条路径上也写一遍」(per_cycle 就是这么漏的,补过一次又漏),
+# 而是**把默认值集中成一份**:以后新增闸门只要进这张表,四条路径自动都对。
+_MOMENTARY_DEFAULTS: dict[str, object] = {
+    "quota_paused": False,
+    "rate_limited": False,
+    "upstream_error_paused": False,
+    "thermal_hold": False,
+    "idle_outside_window": False,
+    "breaker_open": False,
+    "breaker_reason": "",
+    # 这两个是「本轮这条线干了什么」。本轮没跑就该是空,不是上一轮的数字。
+    "live_processed": None,
+    "backlog_processed": None,
+}
+
+
 def write_status(*, heartbeat_only: bool = False, **kw) -> None:
-    """原子更新状态。heartbeat_at 是存活信号；ts 是最近一轮处理状态。"""
+    """原子更新状态。heartbeat_at 是存活信号；ts 是最近一轮处理状态。
+
+    ts 一旦前进,`_MOMENTARY_DEFAULTS` 里的字段就必须全部是本轮的结论 ——
+    要么本次调用带了它,要么它回到默认值。
+    """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         cur = json.loads(STATUS.read_text()) if STATUS.exists() else {}
         now = datetime.now(tz=timezone.utc).isoformat()
         if not heartbeat_only:
+            for key, default in _MOMENTARY_DEFAULTS.items():
+                if key not in kw:
+                    cur[key] = default
             cur.update(kw, ts=now)
         cur["heartbeat_at"] = now
         log_total, log_last_drop_at, dropped_snapshot = REFINERY_LOG_HANDLER.status_fields(
@@ -993,9 +1031,12 @@ async def main() -> int:
                             "(今日已歇 %s 次/%s 分钟;各盘 %s)",
                             dtemp, MAX_DISK_TEMP, thermal["holds"],
                             thermal["minutes"], temps)
+                # 窗口外又过热时两件事都成立,显式带上——否则复位会把它抹成 False,
+                # 那就又是一个"新鲜时间戳盖着假结论"。
                 write_status(disk_temp=dtemp, thermal_hold=True, thermal=thermal,
-                             backlog_window_open=in_backlog_window(), last_error=None,
-                             **cycle_budget_fields())
+                             backlog_window_open=in_backlog_window(),
+                             idle_outside_window=not in_backlog_window(),
+                             last_error=None, **cycle_budget_fields())
                 await asyncio.sleep(INTERVAL)
                 continue
             # —— 工作窗口门控(默认北京时间 22:00-08:00):窗口外新 obs 与
