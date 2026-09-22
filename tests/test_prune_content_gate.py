@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import os
+import shutil
 import unittest
 from pathlib import Path
 
@@ -290,3 +292,67 @@ class ReleaseScriptWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PruneLoopDeletesEveryCandidateTests(unittest.TestCase):
+    """清单有 N 个就要删 N 个 —— 这条只有让循环真跑才测得出来。
+
+    2026-09-22 生产首跑：清单 3 个，只删掉第一个，然后安静退出并打印
+    「已清理 1 个」。17 条既有用例全绿，因为它们从不真的发 ssh。
+
+    根因：`ssh` 默认从 stdin 读并转发给远端，放在 `while read` 循环里会把剩下的
+    输入全吞掉。此前每次发布的可删清单都是 0 或 1 个，这个 bug 一直没机会现形 ——
+    「一次只做一个时藏着的缺陷，批量做就现形」（准则 29 推论）。
+
+    所以这条**不钉 `-n` 这个字面量**，而是造一个「像真 ssh 那样吃 stdin」的桩，
+    把源码里的 on_nas 与 prune 循环原样抠出来跑。换成别的写法（`< /dev/null`、
+    改用 xargs…）只要行为对，它照样绿。
+    """
+
+    def _extract(self, start: str, end: str) -> str:
+        src = RELEASE.read_text("utf-8")
+        i = src.index(start)
+        j = src.index(end, i) + len(end)
+        return src[i:j]
+
+    def _run(self, fake_ssh_eats_stdin: bool) -> subprocess.CompletedProcess:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        # 桩：真 ssh 的定义性特征是「不给 -n 就读光 stdin」。
+        # fake_ssh_eats_stdin=False 时它谁的 stdin 都不读 —— 那是用来证明
+        # 本用例确实是被 stdin 行为钉住的，而不是被别的东西弄绿的。
+        eat = 'nflag=0\nfor a in "$@"; do [ "$a" = "-n" ] && nflag=1; done\n[ "$nflag" = 1 ] || cat >/dev/null\n' \
+            if fake_ssh_eats_stdin else ""
+        (bin_dir / "ssh").write_text("#!/bin/sh\n" + eat + "exit 0\n", encoding="utf-8")
+        (bin_dir / "ssh").chmod(0o755)
+
+        on_nas = self._extract("on_nas() {", "\n}")
+        loop = self._extract("  pruned=0\n", "\nEOF\n")
+        script = (
+            "set -eu\n"
+            'SSH_OPTS=(-o BatchMode=yes)\n'
+            'NAS=nas\nSRC=/srv\nDRY_RUN=0\n'
+            'say() { printf "%s\\n" "$*" >&2; }\n'
+            + on_nas + "\n"
+            'extra=$(printf "a.md\\nb.md\\nc.md")\n'
+            + loop + "\n"
+            'printf "PRUNED=%s\\n" "$pruned"\n'
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"})
+
+    def test_all_three_candidates_are_deleted_when_ssh_eats_stdin(self):
+        done = self._run(fake_ssh_eats_stdin=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("PRUNED=3", done.stdout,
+                      f"清单 3 个却没删满：{done.stdout!r}\n{done.stderr}")
+
+    def test_the_fixture_itself_is_what_makes_it_hard(self):
+        """反向：桩不吃 stdin 时，坏写法也会显绿 —— 证明上一条靠的是桩的保真度。
+
+        少了这条，上一条即便在 on_nas 丢掉 -n 之后也可能因为桩太宽松而绿。
+        """
+        done = self._run(fake_ssh_eats_stdin=False)
+        self.assertIn("PRUNED=3", done.stdout, done.stderr)
