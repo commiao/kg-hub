@@ -185,6 +185,20 @@ ensure_compose_model_gateway_token() {
 # and a kg-hub business key.  A legacy direct-provider value can keep /health
 # green while every ingest fails during lazy Graphiti construction, so reject
 # it before stopping either producer or building a candidate image.
+#
+# 判据取**生效值**而不是 .env 里那一行（2026-09-22，T-0084 发布时撞上）。
+# 原写法要求这两个键在 .env 里恰好出现一次。但它们在 override 里自带默认值
+# （`${ANTHROPIC_BASE_URL:-http://model-gateway:39000}`），所以「不在 .env 里」
+# 是完全正常的状态 —— 而同一个仓库的 check_env_drift.py 正是这么建议的：
+# 「与 git 默认相同的冗余覆盖，建议从 .env 删掉」。
+#
+# 09-21 17:05 有人照着做了，于是**这道闸从那一刻起让 kg-hub 完全发不了版**，
+# 十七小时没人知道（服务照常，因为 compose 的默认值就是受控值）。
+# 两个检查在同一个仓库里要求正好相反：一个说「删掉」，一个说「不在就不许发」。
+#
+# 根子是这道闸问错了对象：它查文件，而决定生效值的是 compose。改成问
+# compose 自己（准则 27：要判断就用会真正解析它的那个解析器）。这样值住在
+# .env 还是 override 都不影响判断，下次再搬一次也不会锁死发布。
 ensure_compose_gateway_route() {
   if [ "${DRY_RUN:-0}" = 1 ]; then
     say "  [dry-run] 会校验 ANTHROPIC_BASE_URL 与 ANTHROPIC_MODEL 的受控网关路由"
@@ -194,12 +208,16 @@ ensure_compose_gateway_route() {
   on_nas "set -eu
     cd '$SRC'
     test -f .env
-    base_count=\$(grep -c '^ANTHROPIC_BASE_URL=' .env || true)
-    model_count=\$(grep -c '^ANTHROPIC_MODEL=' .env || true)
-    test \"\$base_count\" = 1
-    test \"\$model_count\" = 1
-    base=\$(sed -n 's/^ANTHROPIC_BASE_URL=//p' .env)
-    model=\$(sed -n 's/^ANTHROPIC_MODEL=//p' .env)
+    # .env 里重复定义是歧义（compose 只会取一个），仍然拦掉；但「零次」是正常的。
+    test \$(grep -c '^ANTHROPIC_BASE_URL=' .env || true) -le 1
+    test \$(grep -c '^ANTHROPIC_MODEL=' .env || true) -le 1
+    # 不落临时文件：compose config 的输出含 .env 里的机密，不该写到盘上。
+    base=\$($DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT config \
+      | sed -n 's/^ *ANTHROPIC_BASE_URL: *//p' | sort -u)
+    model=\$($DK compose -f $COMPOSE_BASE -f $COMPOSE_GATEWAY_OVERRIDE -p $PROJECT config \
+      | sed -n 's/^ *ANTHROPIC_MODEL: *//p' | sort -u)
+    # sort -u：override 给三个服务各设一份。值一致时塌成一行；有哪个服务被单独
+    # 改成别的值，这里就是两行，下面的等值判断当场挂 —— 比原写法更严。
     test \"\$base\" = 'http://model-gateway:39000'
     test \"\$model\" = 'kg_hub.entity_extract'
   " || die "模型网关路由缺失、重复或不是受控的本地业务路由"

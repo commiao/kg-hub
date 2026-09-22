@@ -140,6 +140,45 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertIn("deploy/model-gateway-network.override.yml", self.code)
         self.assertIn("ensure_model_gateway_private_network", self.code)
 
+    def _gateway_route_gate(self) -> str:
+        """只取那道闸的函数体，且已去掉注释 —— 注释里引着旧写法当反面教材。"""
+        lines = self.code.splitlines()
+        start = next(i for i, l in enumerate(lines)
+                     if l.startswith("ensure_compose_gateway_route()"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+        return "\n".join(lines[start:end + 1])
+
+    def test_gateway_route_gate_asks_compose_not_the_env_file(self):
+        """判据取生效值。2026-09-22：原写法查 .env，而值住在 override 的默认里。
+
+        同一个仓库的 check_env_drift.py 判「与 git 默认相同的冗余覆盖，建议从
+        .env 删掉」；有人照做之后，这道闸让 kg-hub 十七小时发不了版而没人知道。
+        两个检查要求正好相反，根子是这道闸问错了对象（准则 27）。
+        """
+        body = self._gateway_route_gate()
+        # 钉的是「真的发出了那条命令」。只查 "compose" 会被函数名
+        # ensure_compose_gateway_route 满足 —— 第一版就是这么写的，变异验证
+        # 时才发现它不承重（同一形状今天在别处栽过四次）。
+        self.assertIn("$DK compose", body, "闸没有真的调用 compose")
+        self.assertIn("-p $PROJECT config", body, "调了 compose 但没要 config 的输出")
+        self.assertNotIn("sed -n 's/^ANTHROPIC_BASE_URL=//p' .env", body,
+                         "又回去读 .env 那一行了")
+
+    def test_gateway_route_gate_treats_absent_as_normal_but_duplicate_as_error(self):
+        """零次正常、多次报错 —— 这两半缺一不可。
+
+        只放宽不拦重复，.env 里写两遍不同的值就会静悄悄取其一；
+        只拦重复不放宽，就是回到把 kg-hub 锁死的那个写法。
+        """
+        body = self._gateway_route_gate()
+        for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"):
+            self.assertRegex(
+                body, rf"grep -c '\^{key}=' \.env[^\n]*\)? -le 1",
+                f"{key} 的出现次数不是按「至多一次」判的")
+            self.assertNotRegex(
+                body, rf"{key}=' \.env \|\| true\)\\?\"? = 1",
+                f"{key} 仍然要求恰好出现一次")
+
 
 class GuardrailTests(unittest.TestCase):
     def test_the_unsafe_script_stays_disabled(self):
