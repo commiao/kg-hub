@@ -1,0 +1,23 @@
+# kg-hub 的 MCP 客户端（mcp_server.py）在**任何设备上**跑起来所需的三方依赖。
+#
+# 为什么要有这个文件（2026-09-22，T-0152）
+# ------------------------------------------------------------------
+# 这三个版本此前只以**散文形式**存在于 T-0050 的 body 里（当初写给 Windows 的
+# 接入步骤），仓库里没有任何钉子。后果在 muxcp 那条线上现形：kg_hub 后端跑的是
+# 开发工作树里的 `spike-graphiti/.venv`，而发布产物是 `git archive` 出来的、
+# 带不了 `.venv` —— 于是「把后端切到发布产物」这件事卡在「用哪个解释器」上，
+# 而没人说得出「装哪几个、什么版本」的可信答案。
+#
+# 实测同机三份不一样：
+#   工作树 venv   mcp 1.27.1  httpx 0.28.1  python-dotenv 1.2.2   ← 线上后端在用
+#   pyenv 3.13.2  mcp 1.27.2  httpx 0.28.1  python-dotenv 1.2.1
+#   产物          没有 venv
+# 钉的是第一行 —— 那是已经在跑、且 Windows 侧按同样版本验收过的组合。
+#
+# 清单与代码一致由机器检查保证：tests/test_mcp_requirements.py 按 ast 推导
+# mcp_server.py 的**传递** import 图，再比对这份清单，多一个少一个都报红。
+# 注意 python-dotenv 是 `kg_hub_env.py` 里的**函数内延迟 import** ——
+# grep 顶格的 import 行看不见它，所以那条检查必须走 ast，不能走 grep。
+mcp==1.27.1
+httpx==0.28.1
+python-dotenv==1.2.2
