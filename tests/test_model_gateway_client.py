@@ -221,7 +221,7 @@ class GatewayClientContractTests(unittest.TestCase):
             ))
         self.assertEqual(original.__self__.calls, [])
 
-    def test_caller_idempotency_header_cannot_bypass_durable_context(self):
+    def test_caller_identity_and_scenario_headers_cannot_bypass_central_context(self):
         client = FakeClient()
         original = client.messages.create
         mgc.install_gateway_request_contract(client)
@@ -230,18 +230,22 @@ class GatewayClientContractTests(unittest.TestCase):
         ):
             asyncio.run(client.messages.create(
                 model="kg_hub.entity_extract", messages=[],
-                extra_headers={"idempotency-key": "caller-chosen-key"},
+                extra_headers={"idempotency-key": "caller-chosen-key",
+                               "x-model-gateway-scenario": "forged"},
             ))
         self.assertEqual(original.__self__.calls, [])
 
-        with mgc.model_operation("test.header", "stable-operation"):
-            asyncio.run(client.messages.create(
-                model="kg_hub.entity_extract", messages=[],
-                extra_headers={"Idempotency-Key": "caller-chosen-key"},
-            ))
+        with mgc.model_usage_scenario("live"):
+            with mgc.model_operation("test.header", "stable-operation"):
+                asyncio.run(client.messages.create(
+                    model="kg_hub.entity_extract", messages=[],
+                    extra_headers={"Idempotency-Key": "caller-chosen-key",
+                                   "X-Model-Gateway-Scenario": "forged"},
+                ))
         forwarded = original.__self__.calls[0][1]["extra_headers"]
         self.assertNotEqual(forwarded["Idempotency-Key"], "caller-chosen-key")
         self.assertRegex(forwarded["Idempotency-Key"], r"^kg1-[0-9a-f]{64}$")
+        self.assertEqual(forwarded["X-Model-Gateway-Scenario"], "live")
 
     def test_explicit_development_escape_hatch_ignores_explicit_key(self):
         client = FakeClient()

@@ -611,11 +611,13 @@ def to_payload(obs: dict) -> dict:
 
 # ---------- HTTP(镜像 vps_push_capsules 的 post + poll-drain 纪律) ----------
 
-def _http(method: str, url: str, body: dict | None = None, timeout: int = 30):
+def _http(method: str, url: str, body: dict | None = None, timeout: int = 30,
+          headers: dict[str, str] | None = None):
     req = urllib.request.Request(
         url, method=method,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json",
+                 **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"{}")
@@ -670,10 +672,13 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
     return "timeout"
 
 
-async def ingest_via_api(obs: dict) -> str:
+async def ingest_via_api(obs: dict, scenario: str) -> str:
     """返回终态或无内容的 HTTP 类别，供状态页诊断 deferred。"""
     p = to_payload(obs)
-    code, d = _http("POST", f"{KG_HUB_URL}/api/ingest", p, timeout=60)
+    code, d = _http(
+        "POST", f"{KG_HUB_URL}/api/ingest", p, timeout=60,
+        headers={"X-KG-HUB-Refinery-Scenario": scenario},
+    )
     if code == 0:
         return "net"
     if code == 409:
@@ -969,7 +974,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     stats["deferred"] += 1
                     count("result_counts", "halted")
                     return
-                st = await ingest_via_api(obs)
+                st = await ingest_via_api(obs, kind)
             if (st in ("quota", "rate_limited", "net", "upstream_error")
                     or st.startswith("graphiti_unavailable_")):
                 halt["stop"] = True         # 尚未拿到令牌的条目不再发

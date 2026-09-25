@@ -82,7 +82,8 @@ from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from model_gateway_client import (  # noqa: E402
-    envelope_repairs_total, model_operation, offscript_total, stable_operation_id)
+    envelope_repairs_total, model_operation, model_usage_scenario,
+    offscript_total, stable_operation_id)
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -466,6 +467,12 @@ class IngestBody(BaseModel):
     origin_project: str | None = None
     kind: str | None = None
     durability: str | None = None
+    # Assigned only from the bounded refinery header below. It is reporting
+    # telemetry, never a model-operation identity or route selector.
+    model_usage_scenario: str | None = None
+
+
+REFINERY_MODEL_SCENARIOS = frozenset({"live", "backlog", "reconciliation"})
 
 
 # ---------- Route handlers ----------
@@ -749,7 +756,8 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
 
 async def _locked_add_episode(graphiti, name: str, episode_body: str,
                               sd: str, ref_time: datetime,
-                              attempt_epoch: str | None = None):
+                              attempt_epoch: str | None = None,
+                              usage_scenario: str | None = None):
     """单条 episode 的 加锁→抽取,锁竞争重试策略与整篇路径一致。耗尽则 raise。"""
     attempt = 0
     while True:
@@ -759,12 +767,13 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
                 timeout_seconds=INGEST_LOCK_TIMEOUT_SEC,
             ):
                 operation_id = stable_operation_id(name, sd, episode_body, attempt_epoch)
-                with model_operation("ingest.predigest-child", operation_id):
-                    return await graphiti.add_episode(
-                        name=name, episode_body=episode_body, source=EpisodeType.text,
-                        source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
-                        entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
-                        edge_type_map=EDGE_TYPE_MAP)
+                with model_usage_scenario(usage_scenario):
+                    with model_operation("ingest.predigest-child", operation_id):
+                        return await graphiti.add_episode(
+                            name=name, episode_body=episode_body, source=EpisodeType.text,
+                            source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
+                            entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                            edge_type_map=EDGE_TYPE_MAP)
         except WriterLockBusy:
             attempt += 1
             if attempt > INGEST_LOCK_RETRIES:
@@ -838,7 +847,8 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         try:
             result = await _locked_add_episode(
                 graphiti, child_name, obs_to_episode_body(obs, body.name),
-                f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch)
+                f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch,
+                body.model_usage_scenario)
         except Exception:  # noqa: BLE001
             logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
             continue
@@ -959,19 +969,20 @@ async def _do_extract_inner(
                     operation_id = stable_operation_id(
                         sd, sid, body.name, body.episode_body, epoch
                     )
-                    with model_operation("ingest.episode", operation_id) as op_tally:
-                        model_tally = op_tally
-                        result = await graphiti.add_episode(
-                            name=body.name,
-                            episode_body=body.episode_body,
-                            source=EpisodeType.text,
-                            source_description=sd,
-                            reference_time=ref_time,
-                            group_id=GROUP_ID,
-                            entity_types=ENTITY_TYPES,
-                            edge_types=EDGE_TYPES,
-                            edge_type_map=EDGE_TYPE_MAP,
-                        )
+                    with model_usage_scenario(body.model_usage_scenario):
+                        with model_operation("ingest.episode", operation_id) as op_tally:
+                            model_tally = op_tally
+                            result = await graphiti.add_episode(
+                                name=body.name,
+                                episode_body=body.episode_body,
+                                source=EpisodeType.text,
+                                source_description=sd,
+                                reference_time=ref_time,
+                                group_id=GROUP_ID,
+                                entity_types=ENTITY_TYPES,
+                                edge_types=EDGE_TYPES,
+                                edge_type_map=EDGE_TYPE_MAP,
+                            )
                 break  # lock acquired + extraction completed
             except WriterLockBusy:
                 attempt += 1
@@ -1111,6 +1122,13 @@ async def ingest(request: Request) -> JSONResponse:
             {"status": "error", "code": "bad_schema", "message": exc.errors()},
             status_code=400,
         )
+
+    # This header affects telemetry only.  In particular, it does not alter the
+    # durable model-operation namespace or idempotency key used for paid calls.
+    requested_scenario = request.headers.get("x-kg-hub-refinery-scenario", "").strip()
+    body.model_usage_scenario = (
+        requested_scenario if requested_scenario in REFINERY_MODEL_SCENARIOS else None
+    )
 
     # Validate reference_time eagerly
     try:
@@ -2636,8 +2654,6 @@ PORTAL_REPORTS = [
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
     {"name": "精炼层", "desc": "统一摄入 refinery:claude-mem 复活线吞吐/积压烧进度 + fact 层质量指标",
      "url": "/dashboard/refinery", "icon": "⚗️", "ready": True},
-    {"name": "模型用量与成本", "desc": "按业务 key 的月/日/时调用量(成本代理,非 token 账单)+ 当前待入图积压",
-     "url": "/dashboard/gateway_usage", "icon": "💰", "ready": True},
     {"name": "采集链路吞吐", "desc": "各环节月/日/时**已完成量**与待处理量;live 线与积压线分开,停滞一眼可见",
      "url": "/dashboard/pipeline", "icon": "🚰", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
@@ -4540,8 +4556,8 @@ bars(D.hourly,'hour','hourly',48);
 </script></body></html>"""
 
 
-async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
-    """模型用量与成本:按 business_key 的月/日/时调用量 + 当前积压。
+async def gateway_usage_snapshot(request: Request) -> JSONResponse:
+    """Return the historical aggregate behind the NAS gateway dashboard.
 
     数据来自 tools/export_gateway_usage.py 定时导出的快照(共享卷 ro),**不直接查
     回滚见证库** —— 网关把见证不可用当致命(对外 503「网关本地配置不可用」),任何
@@ -4598,7 +4614,10 @@ async def dashboard_gateway_usage(request: Request) -> HTMLResponse:
         pass
 
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    return HTMLResponse(_DASH_GATEWAY_USAGE_HTML.replace("__DATA__", payload))
+    # This intentionally returns data only. The visual model-usage module lives
+    # exclusively in the NAS model gateway dashboard; keeping a second kg-hub
+    # page made it too easy to compare incompatible units or stale snapshots.
+    return JSONResponse(json.loads(payload))
 
 
 async def dashboard_refinery(request: Request) -> HTMLResponse:
@@ -4703,8 +4722,7 @@ app = Starlette(
         Route("/dashboard/tools", dashboard_tools, methods=["GET"]),
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/refinery", dashboard_refinery, methods=["GET"]),
-        Route("/dashboard/gateway_usage", dashboard_gateway_usage,
-              methods=["GET"]),
+        Route("/api/gateway-usage", gateway_usage_snapshot, methods=["GET"]),
         Route("/dashboard/pipeline", dashboard_pipeline, methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
