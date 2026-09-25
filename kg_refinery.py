@@ -457,11 +457,13 @@ def load_watermark() -> dict:
         wm["ingested"] = set(wm.get("ingested", []))
         wm["rejected"] = set(wm.get("rejected", []))
         wm["failed"] = set(wm.get("failed", []))
+        wm["held"] = set(wm.get("held", []))
         wm.setdefault("live_cursor", None)
         return wm
     # 首轮:迁移旧直连线的水印(防止 526 条已入图的重复入图——旧线直连 add_episode
     # **没有** IngestedKey,服务端幂等键兜不住这批,水印是唯一防线!)
     wm = {"ingested": set(), "rejected": set(), "failed": set(),
+          "held": set(),
           "boundary_id": None, "live_cursor": None}
     for cand in _LEGACY_CANDIDATES:
         if cand.exists():
@@ -483,7 +485,7 @@ def load_watermark() -> dict:
 def save_watermark(wm: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     out = {**wm, "ingested": sorted(wm["ingested"]), "rejected": sorted(wm["rejected"]),
-           "failed": sorted(wm["failed"])}
+           "failed": sorted(wm["failed"]), "held": sorted(wm.get("held", set()))}
     tmp = WATERMARK.with_suffix(".tmp")
     tmp.write_text(json.dumps(out))
     tmp.replace(WATERMARK)
@@ -666,7 +668,7 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
                 # 继续逐条撞只会把整批的模型调用白烧掉(实测 503 打在
                 # resolve_extracted_edges,那时约 20 次调用已经花出去了)。
                 return "upstream_error"
-            if st in ("ok", "skipped", "error"):
+            if st in ("ok", "skipped", "error", "needs_reconciliation"):
                 return st
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
         delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
@@ -686,6 +688,8 @@ async def ingest_via_api(obs: dict, scenario: str = "backlog") -> str:
     if code == 0:
         return "net"
     if code == 409:
+        if d.get("code") == "reconciliation_required":
+            return "needs_reconciliation"
         return "409"
     if code >= 400:
         # 不把响应 message 写进状态：它可能含上游细节。状态码已足够区分
@@ -840,6 +844,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     # 被迫猜测；这两个小计让下一轮状态直接说明哪一层作出了决定。
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0,
              "filter_counts": {}, "result_counts": {}}
+    wm.setdefault("held", set())
 
     def count(bucket: str, label: str) -> None:
         values = stats[bucket]
@@ -848,7 +853,8 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     to_ingest: list[dict] = []
     for obs in rows:
         oid = obs["id"]
-        if oid in wm["ingested"] or oid in wm["rejected"] or oid in wm["failed"]:
+        if (oid in wm["ingested"] or oid in wm["rejected"]
+                or oid in wm["failed"] or oid in wm["held"]):
             continue
         # 409 退避:冷却期内直接跳过,连请求都不发(活锁的根治点)
         bo = backoff.get(oid)
@@ -911,6 +917,12 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             (log.warning if n <= 3 else log.debug)(
                 "[%s] obs-%d → 409(第 %d 次,退避 %d 轮≈%dmin)",
                 kind, oid, n, wait, wait * INTERVAL // 60)
+        elif st == "needs_reconciliation":
+            # A partially persisted business result requires an operator. Keep
+            # the original observation out of the automatic submission loop.
+            wm["held"].add(oid)
+            stats["deferred"] += 1
+            log.warning("[%s] obs-%d → 预拆结果未完成,暂停自动提交并等待人工核实", kind, oid)
         elif st == "quota":
             # 网关日/分上限:请求根本没到供应商,失败与这条观测无关。继续逐条撞只会白烧
             # 每篇前面的调用并堆 error 键(2026-09-06 夜 218 篇败/127 篇成),暂停,
@@ -1132,7 +1144,8 @@ async def main() -> int:
                     breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
-                               "failed": len(wm["failed"])},
+                               "failed": len(wm["failed"]),
+                               "needs_reconciliation": len(wm["held"])},
                     last_error=None, **extra)
 
             # —— backlog 先跑 ——
@@ -1143,7 +1156,7 @@ async def main() -> int:
             s_back = {"ingested": 0, "rejected": 0, "deferred": 0}
             backlog_remaining = 0
             if BACKLOG_ENABLED:
-                seen = wm["ingested"] | wm["rejected"] | wm["failed"]
+                seen = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
                 pending_ids = [i for i in fetch_ids(max_id_inclusive=boundary)
                                if i not in seen]
                 backlog_remaining = len(pending_ids)
@@ -1163,7 +1176,7 @@ async def main() -> int:
                                      "pending_this_cycle": True})
 
             # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累超过一批后永久卡死)
-            terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
+            terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
             cursor = wm.get("live_cursor") or boundary
             live_ids = [i for i in fetch_ids(min_id_exclusive=cursor)
                         if i not in terminal][:LIVE_PER_CYCLE]
@@ -1174,7 +1187,7 @@ async def main() -> int:
                     live_processed=dict(st), backlog_processed=s_back,
                     backlog_remaining=backlog_remaining))
             # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
-            terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
+            terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
             new_cursor = cursor
             for i in fetch_ids(min_id_exclusive=cursor):
                 if i in terminal:

@@ -450,7 +450,9 @@ async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
         "       k.source_obs_id AS source_obs_id, "
         "       k.created_at AS created_at, k.updated_at AS updated_at, "
         "       k.nodes AS nodes, k.edges AS edges, "
-        "       k.error_message AS error_message "
+        "       k.error_message AS error_message, k.error_kind AS error_kind, "
+        "       k.predigest_children AS predigest_children, "
+        "       k.failed_children AS failed_children "
         "LIMIT 1",
         uuid=episode_uuid,
     )
@@ -845,6 +847,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", parent_uuid)
 
     total_nodes, total_edges, ok_children = 1, 0, 0
+    failed_children: list[str] = []
     for i, obs in enumerate(obs_list, 1):
         child_name = f"{body.name}--obs-{i:02d}"
         try:
@@ -864,6 +867,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
                 body.model_usage_scenario)
         except Exception:  # noqa: BLE001
             logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
+            failed_children.append(child_name)
             continue
         ok_children += 1
         # 键保活:预拆串行跑 N 个片段可超 30min stuck 阈值,刷 created_at 防清理器
@@ -890,21 +894,29 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
     # 父节点+子片段已写入,此后**绝不 return False / 绝不外抛**(do_extract 的
     # never-raise 契约;抛出→键卡pending→清理器删键→重推双份。2026-07-28 审查 F2)。
     try:
-        await update_ingested_key_status(graphiti, sd, sid, "ok",
-                                         episode_uuid=parent_uuid,
-                                         nodes=total_nodes, edges=total_edges)
+        complete = not failed_children and ok_children == len(obs_list)
+        await update_ingested_key_status(
+            graphiti, sd, sid, "ok" if complete else "needs_reconciliation",
+            episode_uuid=parent_uuid, nodes=total_nodes, edges=total_edges,
+            error_kind=None if complete else "predigest_incomplete",
+            error_message=None if complete else (
+                f"predigest children {ok_children}/{len(obs_list)}; "
+                f"failed: {', '.join(failed_children)}"
+            ),
+        )
         # 降级可观测:子片段成功率写上键,精炼层看板/排障可见(审查 F5)
         await graphiti.driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "SET k.predigest_children = $pc",
-            sd=sd, sid=sid, pc=f"{ok_children}/{len(obs_list)}")
+                "SET k.predigest_children = $pc, k.failed_children = $failed",
+            sd=sd, sid=sid, pc=f"{ok_children}/{len(obs_list)}",
+            failed=failed_children)
     except Exception:  # noqa: BLE001
         logger.exception("[ingest:predigest_status_failed] name=%s(内容已入图,键留pending)", body.name)
     elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
     logger.info("[ingest:predigest_done] name=%s children=%d/%d elapsed=%.1fs "
                 "nodes=%d edges=%d%s",
                 body.name, ok_children, len(obs_list), elapsed, total_nodes, total_edges,
-                "" if ok_children else " ⚠ 全部子片段失败,仅父文档可搜(降级)")
+                "" if not failed_children else " ⚠ 子片段未全部完成,需人工核实")
     return True
 
 
@@ -1277,6 +1289,14 @@ async def ingest(request: Request) -> JSONResponse:
                  "poll_url": poll_url},
                 status_code=202,
             )
+        if existing_status == "needs_reconciliation":
+            return JSONResponse(
+                {"status": "needs_reconciliation",
+                 "code": "reconciliation_required",
+                 "source_description": sd, "source_obs_id": sid,
+                 "poll_url": poll_url},
+                status_code=409,
+            )
         # existing_status == 'error'
         return JSONResponse(
             {"status": "error", "code": "previous_attempt_failed",
@@ -1347,7 +1367,9 @@ async def ingest_status(request: Request) -> JSONResponse:
             "       k.source_obs_id AS source_obs_id, "
             "       k.created_at AS created_at, k.updated_at AS updated_at, "
             "       k.nodes AS nodes, k.edges AS edges, "
-            "       k.error_message AS error_message, k.error_kind AS error_kind "
+            "       k.error_message AS error_message, k.error_kind AS error_kind, "
+            "       k.predigest_children AS predigest_children, "
+            "       k.failed_children AS failed_children "
             "LIMIT 1",
             sd=sd, sid=sid,
         )
@@ -1378,6 +1400,8 @@ async def ingest_status(request: Request) -> JSONResponse:
         "edges": row.get("edges"),
         "error_message": row.get("error_message"),
         "error_kind": row.get("error_kind"),
+        "predigest_children": row.get("predigest_children"),
+        "failed_children": row.get("failed_children"),
     })
 
 
@@ -1415,7 +1439,8 @@ async def queue_stats(request: Request) -> JSONResponse:
         quarantined_count = int(qrows[0].get("c") or 0) if qrows else 0
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
-    pending = ok = errored = 0
+    pending = ok = errored = needs_reconciliation = 0
+    reconciliation_samples: list[dict] = []
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
     ok_last_1h = errored_last_1h = 0
@@ -1448,6 +1473,14 @@ async def queue_stats(request: Request) -> JSONResponse:
                     })
             except Exception:
                 pass
+        elif s == "needs_reconciliation":
+            needs_reconciliation += 1
+            if len(reconciliation_samples) < 20:
+                reconciliation_samples.append({
+                    "source_description": r.get("sd"),
+                    "source_obs_id": r.get("sid"),
+                    "reason": (r.get("error_message") or "")[:200],
+                })
 
     oldest_pending_age_seconds: float | None = None
     if oldest_pending:
@@ -1464,6 +1497,8 @@ async def queue_stats(request: Request) -> JSONResponse:
         "pending": pending,
         "ok_total": ok,
         "errored_total": errored,
+        "needs_reconciliation": needs_reconciliation,
+        "reconciliation_samples": reconciliation_samples,
         "ok_last_1h": ok_last_1h,
         "errored_last_1h": errored_last_1h,
         "oldest_pending_at": oldest_pending,
