@@ -698,8 +698,9 @@ async def quality_summary(request: Request) -> JSONResponse:
 def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
     """Append the raw episode to KG_HUB_INGEST_BACKUP_PATH (jsonl) before extraction.
 
-    Best-effort and never raises — a backup failure must not break ingestion.
-    Captures the otherwise-unrecoverable content of sourceless /api/ingest writes.
+    A server that has acknowledged a recoverable task must retain its input.
+    The caller writes this before claiming the task, so backup failures leave
+    the task eligible for a later submission without starting model work.
     """
     if not INGEST_BACKUP_PATH:
         return
@@ -716,8 +717,11 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception:
-        logger.warning("[ingest:backup] backup write failed (non-fatal)", exc_info=True)
+        logger.exception("[ingest:backup] refusing task without durable input")
+        raise
 
 
 # Writer-lock contention handling (see 2026-06-13 incident): instead of dropping
@@ -932,8 +936,7 @@ async def _do_extract_inner(
     # 同一次尝试内钥匙仍稳定(在飞合并/网关缓存重放不受影响);error 键清理后的
     # 下一次尝试是新操作、新钥匙、重新计费——上次那次的结果确实没有拿到。
     epoch = attempt_epoch or started.isoformat()
-    # Durable backup BEFORE extraction — survives even if extraction or the graph fails.
-    _backup_episode(body, ref_time)
+    # The request handler durably saved the input before claiming this task.
     logger.info(
         "[ingest:start] source=%s sobsid=%s body_len=%d",
         sd, sid, len(body.episode_body),
@@ -1217,6 +1220,16 @@ async def ingest(request: Request) -> JSONResponse:
              "review_url": "/dashboard/inbox",
              "source_description": body.source_description,
              "source_obs_id": body.source_obs_id})
+
+    # Acknowledging a task without its original input would make manual recovery
+    # impossible. Save it before creating the claim or starting model work.
+    try:
+        _backup_episode(body, ref_time)
+    except Exception:
+        return JSONResponse(
+            {"status": "error", "code": "ingest_backup_unavailable"},
+            status_code=503,
+        )
 
     # 1. Piggyback cleanup of stuck-pending IngestedKey rows. Cheap when none stuck.
     try:
