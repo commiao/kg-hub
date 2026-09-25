@@ -45,8 +45,12 @@ DEFAULT_BUSINESS_MODEL = "kg_hub.entity_extract"
 DEFAULT_GATEWAY_URL = "http://model-gateway:39000"
 BUSINESS_MODEL_PATTERN = re.compile(r"kg_hub\.[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
 _OPERATION_PART_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+_USAGE_SCENARIO_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _operation: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
     "kg_hub_model_operation", default=None
+)
+_usage_scenario: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "kg_hub_model_usage_scenario", default=None
 )
 
 
@@ -211,6 +215,20 @@ def model_operation(namespace: str, operation_id: str):
         _repairs.reset(repairs_token)
 
 
+@contextmanager
+def model_usage_scenario(scenario: str | None):
+    """Attach a reporting-only scenario without changing durable idempotency."""
+    if scenario is not None:
+        scenario = str(scenario).strip()
+        if _USAGE_SCENARIO_PATTERN.fullmatch(scenario) is None:
+            raise RuntimeError("invalid model usage scenario")
+    token = _usage_scenario.set(scenario)
+    try:
+        yield
+    finally:
+        _usage_scenario.reset(token)
+
+
 def stable_operation_id(*parts: object) -> str:
     payload = json.dumps(parts, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":"), default=str).encode("utf-8")
@@ -341,10 +359,11 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
         breakers.assert_closed(str(kwargs.get("model") or gateway_model()))
         headers = dict(kwargs.get("extra_headers") or {})
         # Business callers cannot supply or preserve their own paid-operation
-        # identity. Remove every casing variant before digesting and forwarding;
-        # the central layer remains the sole authority for this header.
+        # identity or usage scenario. Remove every casing variant before
+        # digesting and forwarding; the central layer remains the sole authority
+        # for both fields.
         for name in list(headers):
-            if name.lower() == "idempotency-key":
+            if name.lower() in {"idempotency-key", "x-model-gateway-scenario"}:
                 del headers[name]
         key_kwargs = dict(kwargs)
         key_kwargs["extra_headers"] = headers
@@ -353,6 +372,12 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             headers["Idempotency-Key"] = _durable_idempotency_key(
                 operation[0], operation[1], args, key_kwargs
             )
+            # The namespace is application-owned, bounded by
+            # _OPERATION_PART_PATTERN, and remains a reporting label only. It
+            # cannot select a route, credential, model, or billing policy.
+            scenario = _usage_scenario.get() or operation[0]
+            if _USAGE_SCENARIO_PATTERN.fullmatch(scenario) is not None:
+                headers["X-Model-Gateway-Scenario"] = scenario
         elif not _allow_ephemeral_operation():
             raise RuntimeError(
                 "durable model operation_id is required"
