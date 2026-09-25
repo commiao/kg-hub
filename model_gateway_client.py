@@ -20,6 +20,9 @@ import uuid
 from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from utils.model_attempt_journal import (
+    NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
+)
 
 
 # credvault 路由的 `timeout`(routes.json 里每个 business_key 一个,现为 150s):网关
@@ -52,6 +55,42 @@ _operation: contextvars.ContextVar[tuple[str, str] | None] = contextvars.Context
 _usage_scenario: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "kg_hub_model_usage_scenario", default=None
 )
+_business_task: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "kg_hub_business_task", default=None
+)
+_resume: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "kg_hub_manual_resume", default=None
+)
+
+
+@contextmanager
+def model_business_task(source_description: str, source_obs_id: str):
+    """Bind every Graphiti model subcall to its original ingest identity."""
+    token = _business_task.set((source_description, source_obs_id))
+    try:
+        yield
+    finally:
+        _business_task.reset(token)
+
+
+@contextmanager
+def model_manual_resume(source_description: str, source_obs_id: str,
+                        step_id: str, grant_id: str):
+    """Bind exactly one already authorized failed step to a business run."""
+    journal = journal_from_backup_env()
+    if journal is None:
+        raise RuntimeError("manual resume requires a durable model journal")
+    cached_steps = {row["step_id"] for row in
+                    journal.find_task(source_description, source_obs_id)
+                    if row["phase"] == "completed" and row["result_json"]}
+    state = {"task": (source_description, source_obs_id), "step_id": step_id,
+             "grant_id": grant_id, "consumed": False,
+             "cached_pending": cached_steps}
+    token = _resume.set(state)
+    try:
+        yield
+    finally:
+        _resume.reset(token)
 
 
 # —— 结构化外壳修正 ——
@@ -390,12 +429,50 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             extra_body.setdefault("thinking", {"type": "disabled"})
             kwargs["extra_body"] = extra_body
         key = headers["Idempotency-Key"]
+        task = _business_task.get()
+        journal = journal_from_backup_env() if task else None
+        request_digest = ""
+        step_id = ""
+        if journal and task:
+            request_kwargs = dict(kwargs)
+            request_headers = dict(request_kwargs.get("extra_headers") or {})
+            request_headers.pop("Idempotency-Key", None)
+            request_kwargs["extra_headers"] = request_headers
+            request_digest = hashlib.sha256(json.dumps(
+                _canonical({"args": args, "kwargs": request_kwargs}),
+                ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            step_id = hashlib.sha256(
+                f"{task[0]}\x00{task[1]}\x00{request_digest}".encode("utf-8")
+            ).hexdigest()
+        resume = _resume.get()
+        reserved_by_grant = False
+        if resume is not None:
+            if not journal or task != resume["task"]:
+                raise RuntimeError("manual resume has no durable task journal")
+            if not resume["consumed"]:
+                if step_id == resume["step_id"]:
+                    key = journal.claim_retry(
+                        resume["grant_id"], source_description=task[0],
+                        source_obs_id=task[1], step_id=step_id,
+                        request_digest=request_digest,
+                        business_key=str(kwargs.get("model") or gateway_model()),
+                        base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+                    headers["Idempotency-Key"] = key
+                    resume["consumed"] = True
+                    reserved_by_grant = True
+                elif not any(row["step_id"] == step_id for row in journal.find_task(*task)):
+                    raise NeedsReconciliation(step_id, "resume_input_drift", None)
+            elif (step_id not in {row["step_id"] for row in journal.find_task(*task)}
+                  and resume["cached_pending"]):
+                raise NeedsReconciliation(step_id, "resume_unreplayed_paid_steps", None)
         pending = inflight.get(key)
         if pending is not None:
             # shield:等待方被取消不能连带取消发起方的结果
             return await asyncio.shield(pending)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         inflight[key] = future
+        prepared = False
         try:
             if min_interval > 0:
                 async with throttle_lock:
@@ -403,19 +480,54 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     if wait > 0:
                         await asyncio.sleep(wait)
                     last_call["at"] = time.monotonic()
+            if journal and task and not reserved_by_grant:
+                cached_result = journal.prepare(
+                    key=key, business_key=str(kwargs.get("model") or gateway_model()),
+                    source_description=task[0], source_obs_id=task[1],
+                    step_id=step_id, request_digest=request_digest,
+                )
+                if cached_result is not None:
+                    from anthropic.types import Message
+                    result = Message.model_validate_json(cached_result)
+                    if resume is not None:
+                        resume["cached_pending"].discard(step_id)
+                    future.set_result(result)
+                    return result
+                prepared = True
+            elif reserved_by_grant:
+                prepared = True
+            if journal and prepared:
+                # Commit the local HTTP-start boundary before entering the SDK.
+                # A crash/timeout after this point is one failed business
+                # model attempt once the maximum timeout expires, even when
+                # gateway provider admission remains unknown.
+                journal.start_http(key)
             result = await original_create(*args, **kwargs)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
             repair_structured_envelopes(result)
             note_offscript_if_missing_tool_use(kwargs, result)
+            if journal and prepared:
+                journal.complete(key, result.model_dump_json())
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
             raise
         except Exception as exc:
+            if journal and prepared:
+                try:
+                    status = await asyncio.to_thread(
+                        query_gateway_attempt_status, gateway_base_url(), gateway_token(),
+                        str(kwargs.get("model") or gateway_model()), key,
+                    )
+                except Exception:
+                    status = {"phase": "unknown", "provider_call_started": None}
+                reconciliation = journal.update_gateway_status(key, status)
+                if reconciliation.provider_call_started is not False:
+                    exc = reconciliation
             if not future.done():
                 future.set_exception(exc)
                 future.exception()  # 本处已 raise;避免无等待方时的 never-retrieved 噪音
-            raise
+            raise exc
         else:
             if not future.done():
                 future.set_result(result)

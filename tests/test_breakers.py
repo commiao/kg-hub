@@ -335,7 +335,8 @@ class RefineryGateTests(unittest.TestCase):
     def test_sdk_rate_limit_without_status_code_is_retryable(self):
         server = Path(__file__).resolve().parent.parent.joinpath(
             "kg_hub_server.py").read_text("utf-8")
-        classifier = server.split("def classify_extract_error", 1)[1][:1400]
+        classifier = server.split("def classify_extract_error", 1)[1].split(
+            "async def update_ingested_key_status", 1)[0]
         self.assertIn('"RateLimitError"', classifier)
         self.assertIn('"rate_limited"', classifier)
         self.assertIn("'rate_limited'", server)

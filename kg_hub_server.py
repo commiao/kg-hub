@@ -82,8 +82,14 @@ from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from model_gateway_client import (  # noqa: E402
-    envelope_repairs_total, model_operation, model_usage_scenario,
+    MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
+    model_business_task, model_operation, model_usage_scenario,
     offscript_total, stable_operation_id)
+from utils.model_attempt_journal import (
+    NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
+    summarize_attempts,
+)
+from utils.graphiti_episode_checkpoint import add_episode_with_context_checkpoint
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -215,28 +221,80 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 async def cleanup_stuck_jobs(graphiti) -> int:
-    """Delete IngestedKey rows stuck in 'pending' older than STUCK_THRESHOLD_MIN.
-    Returns number deleted. Called at the top of every /api/ingest to avoid
-    needing a separate cron — piggybacks on existing traffic."""
+    """Reconcile stale claims before considering them safe to remove.
+
+    A parent/child episode or a model request intent means extraction may have
+    reached the provider. Keep that task for an operator; never let cleanup
+    silently create a fresh paid operation for it.
+    """
     threshold = (
         datetime.now(tz=timezone.utc) - timedelta(minutes=STUCK_THRESHOLD_MIN)
     ).isoformat()
-    rows, _, _ = await graphiti.driver.execute_query(
+    stale, _, _ = await graphiti.driver.execute_query(
         "MATCH (k:IngestedKey) "
         "WHERE k.status = 'pending' AND k.created_at < $threshold "
-        "WITH k, k.source_description AS sd, k.source_obs_id AS sid, "
-        "     k.episode_uuid AS uuid "
-        "DELETE k "
-        "RETURN count(*) AS cleaned, "
-        "       collect({sd:sd, sid:sid, uuid:uuid}) AS removed",
+        "RETURN k.source_description AS sd, k.source_obs_id AS sid, "
+        "       k.name AS name, k.created_at AS epoch, k.stage AS stage",
         threshold=threshold,
     )
-    cleaned = int(rows[0].get("cleaned", 0)) if rows else 0
-    if cleaned:
-        logger.warning(
-            "[ingest:cleanup] removed %d stuck pending keys (older than %d min): %s",
-            cleaned, STUCK_THRESHOLD_MIN, rows[0].get("removed", []),
+    cleaned = 0
+    from utils.model_attempt_journal import journal_from_backup_env
+    try:
+        journal = journal_from_backup_env()
+    except Exception:
+        logger.exception("[ingest:cleanup] model journal unavailable; preserving stale claims")
+        journal = None
+        journal_unavailable = True
+    else:
+        journal_unavailable = False
+    for claim in stale:
+        sd, sid, name, epoch = (claim.get("sd"), claim.get("sid"),
+                                claim.get("name"), claim.get("epoch"))
+        if not sd or not sid or not epoch:
+            continue
+        try:
+            graph_rows, _, _ = await graphiti.driver.execute_query(
+                "MATCH (e:Episodic) "
+                "WHERE (e.name = $name AND e.source_description = $sd) "
+                "   OR (e.name STARTS WITH $child_prefix "
+                "       AND e.source_description STARTS WITH $sd) "
+                "RETURN count(e) AS c",
+                name=name or "\x00", child_prefix=f"{name}--obs-" if name else "\x00",
+                sd=sd,
+            )
+            # Legacy claims lack the episode name, so this graph query cannot
+            # prove absence for them. Preserve those claims for manual review.
+            graph_exists = not name or bool(graph_rows and int(graph_rows[0].get("c") or 0))
+            attempts = journal.find_task(sd, sid) if journal else []
+            model_evidence = bool(claim.get("stage")) or any(
+                a["provider_call_started"] != 0 for a in attempts)
+        except Exception:
+            logger.exception("[ingest:cleanup] evidence check failed; preserving %s/%s", sd, sid)
+            graph_exists, model_evidence = True, True
+        if graph_exists or model_evidence or journal_unavailable:
+            rows, _, _ = await graphiti.driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "WHERE k.status = 'pending' AND k.created_at = $epoch "
+                "SET k.status = 'needs_reconciliation', k.updated_at = $now, "
+                "    k.error_kind = 'stale_pending_with_evidence', "
+                "    k.error_message = 'pending task interrupted after model or graph activity' "
+                "RETURN count(k) AS c",
+                sd=sd, sid=sid, epoch=epoch,
+                now=datetime.now(tz=timezone.utc).isoformat(),
+            )
+            if rows and int(rows[0].get("c") or 0):
+                logger.warning("[ingest:cleanup] held stale task %s/%s for reconciliation", sd, sid)
+            continue
+        rows, _, _ = await graphiti.driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status = 'pending' AND k.created_at = $epoch "
+            "DELETE k RETURN count(*) AS c",
+            sd=sd, sid=sid, epoch=epoch,
         )
+        cleaned += int(rows[0].get("c") or 0) if rows else 0
+    if cleaned:
+        logger.warning("[ingest:cleanup] removed %d pending claims with no model/graph evidence",
+                       cleaned)
     # error 键 24h 后自动清理(REFINERY-DESIGN Phase C 项,2026-07-28 提前):
     # 此前 error 键永驻 → 重推方永远撞 409 → 瞬时抽取失败(LLM限频/图抖动)被
     # 永久化。清掉后下一次重推可正常重试;24h 窗口内 409 仍挡住无脑快速重试。
@@ -288,6 +346,7 @@ async def merge_or_get_ingested_key(
     source_description: str,
     source_obs_id: str,
     request_id: str,
+    name: str | None = None,
 ) -> dict:
     """
     Atomic check-and-insert: if (sd, sid) doesn't exist, create with 'pending'.
@@ -308,6 +367,7 @@ async def merge_or_get_ingested_key(
         "  k.status = 'pending', "
         "  k.created_at = $now, "
         "  k.updated_at = $now, "
+        "  k.name = $name, "
         "  k.created_by_request = $request_id "
         "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
         "       k.error_message AS error_message, k.created_at AS created_at, "
@@ -316,6 +376,7 @@ async def merge_or_get_ingested_key(
         sid=source_obs_id,
         now=now,
         request_id=request_id,
+        name=name,
     )
     if not rows:
         raise RuntimeError("MERGE returned no rows — should never happen")
@@ -339,6 +400,8 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
     # (根本不提交);走到这里说明有别的路径漏过来了,兜底挡住并如实归类。
     if type(exc).__name__ == "BreakerOpen":
         return "breaker_open"
+    if isinstance(exc, NeedsReconciliation):
+        return "model_outcome_unknown"
     # A gateway provider circuit refusal occurs before any provider call.  The
     # Anthropic error body carries the gateway's machine code; do not infer this
     # from a 503 or localized message, because other 503s may follow paid work.
@@ -450,7 +513,9 @@ async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
         "       k.source_obs_id AS source_obs_id, "
         "       k.created_at AS created_at, k.updated_at AS updated_at, "
         "       k.nodes AS nodes, k.edges AS edges, "
-        "       k.error_message AS error_message "
+        "       k.error_message AS error_message, k.error_kind AS error_kind, "
+        "       k.predigest_children AS predigest_children, "
+        "       k.failed_children AS failed_children "
         "LIMIT 1",
         uuid=episode_uuid,
     )
@@ -698,8 +763,9 @@ async def quality_summary(request: Request) -> JSONResponse:
 def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
     """Append the raw episode to KG_HUB_INGEST_BACKUP_PATH (jsonl) before extraction.
 
-    Best-effort and never raises — a backup failure must not break ingestion.
-    Captures the otherwise-unrecoverable content of sourceless /api/ingest writes.
+    A server that has acknowledged a recoverable task must retain its input.
+    The caller writes this before claiming the task, so backup failures leave
+    the task eligible for a later submission without starting model work.
     """
     if not INGEST_BACKUP_PATH:
         return
@@ -716,8 +782,11 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except Exception:
-        logger.warning("[ingest:backup] backup write failed (non-fatal)", exc_info=True)
+        logger.exception("[ingest:backup] refusing task without durable input")
+        raise
 
 
 # Writer-lock contention handling (see 2026-06-13 incident): instead of dropping
@@ -766,7 +835,9 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
 async def _locked_add_episode(graphiti, name: str, episode_body: str,
                               sd: str, ref_time: datetime,
                               attempt_epoch: str | None = None,
-                              usage_scenario: str | None = None):
+                              usage_scenario: str | None = None,
+                              task_sd: str | None = None,
+                              task_sid: str | None = None):
     """单条 episode 的 加锁→抽取,锁竞争重试策略与整篇路径一致。耗尽则 raise。"""
     attempt = 0
     while True:
@@ -778,16 +849,35 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
                 operation_id = stable_operation_id(name, sd, episode_body, attempt_epoch)
                 with model_usage_scenario(usage_scenario):
                     with model_operation("ingest.predigest-child", operation_id):
-                        return await graphiti.add_episode(
-                            name=name, episode_body=episode_body, source=EpisodeType.text,
-                            source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
-                            entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
-                            edge_type_map=EDGE_TYPE_MAP)
+                        return await _optional_checkpointed_add_episode(
+                            graphiti, name, episode_body, sd, ref_time, operation_id,
+                            task_sd or sd, task_sid or name)
         except WriterLockBusy:
             attempt += 1
             if attempt > INGEST_LOCK_RETRIES:
                 raise
             await asyncio.sleep(INGEST_LOCK_BACKOFF_SEC * attempt)
+
+
+async def _optional_checkpointed_add_episode(graphiti, name: str,
+                                             episode_body: str, sd: str,
+                                             ref_time: datetime, operation_id: str,
+                                             task_sd: str, task_sid: str):
+    """Use pinned Graphiti context only when explicitly enabled after canary."""
+    kwargs = dict(name=name, episode_body=episode_body, source=EpisodeType.text,
+                  source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
+                  entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                  edge_type_map=EDGE_TYPE_MAP)
+    if os.environ.get("KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT") != "1":
+        return await graphiti.add_episode(**kwargs)
+    journal = journal_from_backup_env()
+    if journal is None:
+        raise RuntimeError("Graphiti checkpoint requires a durable model journal")
+    from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
+    return await add_episode_with_context_checkpoint(
+        graphiti, journal, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, relevant_schema_limit=RELEVANT_SCHEMA_LIMIT,
+        **kwargs)
 
 
 async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
@@ -822,6 +912,11 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         prompt = PREDIGEST_PROMPT.format(max_obs=MAX_OBS, body=body.episode_body[:16000])
         raw = await _llm_complete(prompt, max_tokens=3200)
         obs_list = parse_observations(raw)
+    except NeedsReconciliation as exc:
+        await update_ingested_key_status(
+            graphiti, sd, sid, "needs_reconciliation",
+            error_kind="model_outcome_unknown", error_message=str(exc))
+        return True
     except Exception:  # noqa: BLE001
         logger.exception("[ingest:predigest_llm_failed] name=%s → 回退整篇", body.name)
         return False
@@ -829,6 +924,12 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         logger.warning("[ingest:predigest_empty] name=%s LLM 拆不出 → 回退整篇", body.name)
         return False
 
+    # The split model call has completed. Persist the next stage before any
+    # graph write so a process crash cannot make the parent an invisible orphan.
+    await graphiti.driver.execute_query(
+        "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+        "SET k.stage = 'predigest_parent_started', k.updated_at = $now",
+        sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
     try:
         parent_uuid = await _bare_episode_node(graphiti, body, ref_time,
                                                prov=prov, predigested=True)
@@ -841,6 +942,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", parent_uuid)
 
     total_nodes, total_edges, ok_children = 1, 0, 0
+    failed_children: list[str] = []
     for i, obs in enumerate(obs_list, 1):
         child_name = f"{body.name}--obs-{i:02d}"
         try:
@@ -854,12 +956,19 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         except Exception:  # noqa: BLE001 — 查重失败不阻塞,最坏重复一条
             pass
         try:
+            await graphiti.driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "SET k.stage = 'predigest_child_started', k.active_child = $child, "
+                "    k.updated_at = $now",
+                sd=sd, sid=sid, child=child_name,
+                now=datetime.now(tz=timezone.utc).isoformat())
             result = await _locked_add_episode(
                 graphiti, child_name, obs_to_episode_body(obs, body.name),
                 f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch,
-                body.model_usage_scenario)
+                usage_scenario=body.model_usage_scenario, task_sd=sd, task_sid=sid)
         except Exception:  # noqa: BLE001
             logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
+            failed_children.append(child_name)
             continue
         ok_children += 1
         # 键保活:预拆串行跑 N 个片段可超 30min stuck 阈值,刷 created_at 防清理器
@@ -886,21 +995,29 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
     # 父节点+子片段已写入,此后**绝不 return False / 绝不外抛**(do_extract 的
     # never-raise 契约;抛出→键卡pending→清理器删键→重推双份。2026-07-28 审查 F2)。
     try:
-        await update_ingested_key_status(graphiti, sd, sid, "ok",
-                                         episode_uuid=parent_uuid,
-                                         nodes=total_nodes, edges=total_edges)
+        complete = not failed_children and ok_children == len(obs_list)
+        await update_ingested_key_status(
+            graphiti, sd, sid, "ok" if complete else "needs_reconciliation",
+            episode_uuid=parent_uuid, nodes=total_nodes, edges=total_edges,
+            error_kind=None if complete else "predigest_incomplete",
+            error_message=None if complete else (
+                f"predigest children {ok_children}/{len(obs_list)}; "
+                f"failed: {', '.join(failed_children)}"
+            ),
+        )
         # 降级可观测:子片段成功率写上键,精炼层看板/排障可见(审查 F5)
         await graphiti.driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "SET k.predigest_children = $pc",
-            sd=sd, sid=sid, pc=f"{ok_children}/{len(obs_list)}")
+                "SET k.predigest_children = $pc, k.failed_children = $failed",
+            sd=sd, sid=sid, pc=f"{ok_children}/{len(obs_list)}",
+            failed=failed_children)
     except Exception:  # noqa: BLE001
         logger.exception("[ingest:predigest_status_failed] name=%s(内容已入图,键留pending)", body.name)
     elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
     logger.info("[ingest:predigest_done] name=%s children=%d/%d elapsed=%.1fs "
                 "nodes=%d edges=%d%s",
                 body.name, ok_children, len(obs_list), elapsed, total_nodes, total_edges,
-                "" if ok_children else " ⚠ 全部子片段失败,仅父文档可搜(降级)")
+                "" if not failed_children else " ⚠ 子片段未全部完成,需人工核实")
     return True
 
 
@@ -932,8 +1049,7 @@ async def _do_extract_inner(
     # 同一次尝试内钥匙仍稳定(在飞合并/网关缓存重放不受影响);error 键清理后的
     # 下一次尝试是新操作、新钥匙、重新计费——上次那次的结果确实没有拿到。
     epoch = attempt_epoch or started.isoformat()
-    # Durable backup BEFORE extraction — survives even if extraction or the graph fails.
-    _backup_episode(body, ref_time)
+    # The request handler durably saved the input before claiming this task.
     logger.info(
         "[ingest:start] source=%s sobsid=%s body_len=%d",
         sd, sid, len(body.episode_body),
@@ -952,7 +1068,7 @@ async def _do_extract_inner(
                 logger.exception("[ingest:predigest_unexpected] sd=%s sid=%s", sd, sid)
                 try:
                     await update_ingested_key_status(
-                        graphiti, sd, sid, "error",
+                        graphiti, sd, sid, "needs_reconciliation",
                         error_message=f"predigest: {type(exc).__name__}: {exc}",
                         error_kind=classify_extract_error(exc))
                 except Exception:  # noqa: BLE001
@@ -981,17 +1097,9 @@ async def _do_extract_inner(
                     with model_usage_scenario(body.model_usage_scenario):
                         with model_operation("ingest.episode", operation_id) as op_tally:
                             model_tally = op_tally
-                            result = await graphiti.add_episode(
-                                name=body.name,
-                                episode_body=body.episode_body,
-                                source=EpisodeType.text,
-                                source_description=sd,
-                                reference_time=ref_time,
-                                group_id=GROUP_ID,
-                                entity_types=ENTITY_TYPES,
-                                edge_types=EDGE_TYPES,
-                                edge_type_map=EDGE_TYPE_MAP,
-                            )
+                            result = await _optional_checkpointed_add_episode(
+                                graphiti, body.name, body.episode_body, sd, ref_time,
+                                operation_id, sd, sid)
                 break  # lock acquired + extraction completed
             except WriterLockBusy:
                 attempt += 1
@@ -1058,7 +1166,8 @@ async def _do_extract_inner(
     except Exception as exc:  # noqa: BLE001
         try:
             await update_ingested_key_status(
-                graphiti, sd, sid, "error",
+                graphiti, sd, sid,
+                "needs_reconciliation" if isinstance(exc, NeedsReconciliation) else "error",
                 error_message=f"{type(exc).__name__}: {exc}",
                 error_kind=classify_extract_error(
                     exc, offscript=bool(model_tally.get("offscript"))),
@@ -1081,7 +1190,9 @@ async def do_extract(*args, **kwargs) -> None:
     """
     _extraction_started()
     try:
-        return await _do_extract_inner(*args, **kwargs)
+        body = args[1] if len(args) > 1 else kwargs["body"]
+        with model_business_task(body.source_description, body.source_obs_id):
+            return await _do_extract_inner(*args, **kwargs)
     finally:
         _extraction_finished()
 
@@ -1218,6 +1329,16 @@ async def ingest(request: Request) -> JSONResponse:
              "source_description": body.source_description,
              "source_obs_id": body.source_obs_id})
 
+    # Acknowledging a task without its original input would make manual recovery
+    # impossible. Save it before creating the claim or starting model work.
+    try:
+        _backup_episode(body, ref_time)
+    except Exception:
+        return JSONResponse(
+            {"status": "error", "code": "ingest_backup_unavailable"},
+            status_code=503,
+        )
+
     # 1. Piggyback cleanup of stuck-pending IngestedKey rows. Cheap when none stuck.
     try:
         await cleanup_stuck_jobs(g)
@@ -1229,6 +1350,7 @@ async def ingest(request: Request) -> JSONResponse:
     try:
         merge_result = await merge_or_get_ingested_key(
             g, body.source_description, body.source_obs_id, request_id,
+            body.name,
         )
     except Exception as exc:
         return JSONResponse(
@@ -1263,6 +1385,14 @@ async def ingest(request: Request) -> JSONResponse:
                  "source_description": sd, "source_obs_id": sid,
                  "poll_url": poll_url},
                 status_code=202,
+            )
+        if existing_status == "needs_reconciliation":
+            return JSONResponse(
+                {"status": "needs_reconciliation",
+                 "code": "reconciliation_required",
+                 "source_description": sd, "source_obs_id": sid,
+                 "poll_url": poll_url},
+                status_code=409,
             )
         # existing_status == 'error'
         return JSONResponse(
@@ -1334,7 +1464,9 @@ async def ingest_status(request: Request) -> JSONResponse:
             "       k.source_obs_id AS source_obs_id, "
             "       k.created_at AS created_at, k.updated_at AS updated_at, "
             "       k.nodes AS nodes, k.edges AS edges, "
-            "       k.error_message AS error_message, k.error_kind AS error_kind "
+            "       k.error_message AS error_message, k.error_kind AS error_kind, "
+            "       k.predigest_children AS predigest_children, "
+            "       k.failed_children AS failed_children "
             "LIMIT 1",
             sd=sd, sid=sid,
         )
@@ -1365,7 +1497,219 @@ async def ingest_status(request: Request) -> JSONResponse:
         "edges": row.get("edges"),
         "error_message": row.get("error_message"),
         "error_kind": row.get("error_kind"),
+        "predigest_children": row.get("predigest_children"),
+        "failed_children": row.get("failed_children"),
     })
+
+
+def _reconciliation_task_view(row: dict, journal) -> dict:
+    sd, sid = row.get("source_description"), row.get("source_obs_id")
+    attempts = journal.find_task(sd, sid) if journal else []
+    summary = summarize_attempts(attempts, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    return {
+        "source_description": sd,
+        "source_obs_id": sid,
+        "status": row.get("status"),
+        "episode_uuid": row.get("episode_uuid"),
+        "error_kind": row.get("error_kind"),
+        "error_message": row.get("error_message"),
+        "predigest_children": row.get("predigest_children"),
+        "failed_children": row.get("failed_children") or [],
+        "updated_at": row.get("updated_at"),
+        **summary,
+    }
+
+
+async def ingest_reconciliation(request: Request) -> JSONResponse:
+    """Bearer protected local task list/detail; this endpoint never calls a model."""
+    sd = request.query_params.get("source_description", "").strip()
+    sid = request.query_params.get("source_obs_id", "").strip()
+    driver = get_status_driver()
+    try:
+        journal = journal_from_backup_env()
+    except Exception:
+        return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+    projection = (
+        "k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
+        "k.status AS status, k.episode_uuid AS episode_uuid, "
+        "k.error_kind AS error_kind, k.error_message AS error_message, "
+        "k.predigest_children AS predigest_children, "
+        "k.failed_children AS failed_children, k.updated_at AS updated_at, "
+        "k.name AS name, k.stage AS stage"
+    )
+    if sd and sid:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            f"RETURN {projection} LIMIT 1", sd=sd, sid=sid)
+        if not rows:
+            return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
+        return JSONResponse({"status": "ok", "task": _reconciliation_task_view(rows[0], journal)})
+    if bool(sd) != bool(sid):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    try:
+        limit = min(max(int(request.query_params.get("limit", "50")), 1), 100)
+        offset = max(int(request.query_params.get("offset", "0")), 0)
+    except ValueError:
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+        f"RETURN {projection} ORDER BY k.updated_at DESC SKIP $offset LIMIT $limit",
+        offset=offset, limit=limit)
+    count_rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status IN ['needs_reconciliation', 'failed'] RETURN count(k) AS c")
+    return JSONResponse({"status": "ok", "items": [
+        _reconciliation_task_view(row, journal) for row in rows],
+        "total": int(count_rows[0].get("c") or 0) if count_rows else 0,
+        "limit": limit, "offset": offset})
+
+
+async def _persisted_business_result(driver, row: dict) -> bool:
+    """Require the exact persisted episode and every expected split child."""
+    uuid = row.get("episode_uuid")
+    if not uuid or not row.get("name") or not row.get("source_description"):
+        return False
+    rows, _, _ = await driver.execute_query(
+        "MATCH (e:Episodic {uuid: $uuid}) "
+        "WHERE e.name = $name AND e.source_description = $sd "
+        "RETURN count(e) AS c",
+        uuid=uuid, name=row.get("name"), sd=row.get("source_description"))
+    if not rows or int(rows[0].get("c") or 0) != 1:
+        return False
+    child_ratio = row.get("predigest_children")
+    if not child_ratio:
+        # A split may have crashed before writing its completion count.
+        return not str(row.get("stage") or "").startswith("predigest_")
+    try:
+        completed_raw, expected_raw = child_ratio.split("/", 1)
+        completed = int(completed_raw)
+        expected = int(expected_raw)
+    except (AttributeError, ValueError):
+        return False
+    if (expected <= 0 or expected > MAX_OBS or completed != expected
+            or row.get("failed_children")):
+        return False
+    child_rows, _, _ = await driver.execute_query(
+        "MATCH (e:Episodic) "
+        "WHERE e.name STARTS WITH $prefix "
+        "  AND e.source_description STARTS WITH $sd "
+        "  AND e.derived_from = $parent AND e.predigest = true "
+        "RETURN e.name AS name",
+        prefix=f"{row['name']}--obs-", sd=f"{row['source_description']} · predigest type=",
+        parent=row["name"])
+    actual = {r.get("name") for r in child_rows}
+    return all(f"{row['name']}--obs-{i:02d}" in actual
+               for i in range(1, expected + 1))
+
+
+async def ingest_reconciliation_check(request: Request) -> JSONResponse:
+    """Read model/graph evidence and settle only a proven business outcome."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "code": "bad_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    sd = str(body.get("source_description") or "").strip()
+    sid = str(body.get("source_obs_id") or "").strip()
+    if not sd or not sid or len(sd) > 2000 or len(sid) > 500:
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+        "RETURN k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
+        "k.status AS status, k.episode_uuid AS episode_uuid, k.name AS name, "
+        "k.stage AS stage, k.predigest_children AS predigest_children, "
+        "k.failed_children AS failed_children, k.error_kind AS error_kind, "
+        "k.error_message AS error_message, k.updated_at AS updated_at LIMIT 1",
+        sd=sd, sid=sid)
+    if not rows:
+        return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
+    row = rows[0]
+    try:
+        journal = journal_from_backup_env()
+        if journal is None:
+            return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+        attempts = journal.find_task(sd, sid)
+    except Exception:
+        return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+    for attempt in attempts:
+        if attempt["result_json"] or attempt["provider_call_started"] == 0:
+            continue
+        if not attempt.get("business_key") or not attempt.get("idempotency_key"):
+            # A malformed durable identity cannot be queried at the gateway.
+            # Its explicit failed-list classification happens below.
+            continue
+        try:
+            evidence = await asyncio.to_thread(
+                query_gateway_attempt_status, gateway_base_url(), gateway_token(),
+                attempt["business_key"], attempt["idempotency_key"])
+            journal.update_gateway_status(attempt["idempotency_key"], evidence)
+        except Exception:
+            # The saved intent is still evidence; failed status reads cannot
+            # turn an unknown model call into a safe retry.
+            pass
+    complete = await _persisted_business_result(driver, row)
+    if complete and row["status"] in {"needs_reconciliation", "failed"}:
+        changed, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+            "  AND k.episode_uuid = $uuid "
+            "SET k.status = 'ok', k.updated_at = $now, k.reconciled_at = $now, "
+            "    k.error_kind = null, k.error_message = null "
+            "RETURN count(k) AS c",
+            sd=sd, sid=sid, uuid=row["episode_uuid"],
+            now=datetime.now(tz=timezone.utc).isoformat())
+        if changed and changed[0].get("c") == 1:
+            row["status"] = "ok"
+    refreshed = journal.find_task(sd, sid)
+    summary = summarize_attempts(refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    if (not complete and summary["max_failed_calls"] >= 3
+            and not summary["in_flight"]
+            and not summary["unknown_without_http_evidence"]):
+        # No more model calls may be authorized for the exhausted step.
+        changed, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status = 'needs_reconciliation' "
+            "SET k.status = 'failed', k.updated_at = $now, "
+            "    k.error_kind = 'model_attempts_exhausted' "
+            "RETURN count(k) AS c",
+            sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
+        if changed and changed[0].get("c") == 1:
+            row["status"] = "failed"
+            row["error_kind"] = "model_attempts_exhausted"
+    elif (not complete and row["status"] == "needs_reconciliation"
+          and not summary["in_flight"]):
+        # Only permanent identity gaps are terminalized here. Gateway status
+        # errors, locally in-flight calls and unproven prepared intents remain
+        # held. A missing exact identity cannot authorize a model retry or
+        # prove the original business write, so surface it in the failed list.
+        missing = None
+        if not row.get("name") or not row.get("source_description") or not row.get("source_obs_id"):
+            missing = "reconciliation_source_identity_missing"
+        elif not refreshed:
+            missing = "reconciliation_model_step_missing"
+        elif any(not all((a.get("idempotency_key"), a.get("business_key"),
+                          a.get("step_id"), a.get("request_digest"))) for a in refreshed):
+            missing = "reconciliation_model_step_identity_missing"
+        if missing:
+            changed, _, _ = await driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "WHERE k.status = 'needs_reconciliation' "
+                "SET k.status = 'failed', k.updated_at = $now, "
+                "    k.error_kind = $reason, "
+                "    k.error_message = 'exact reconciliation identity unavailable' "
+                "RETURN count(k) AS c",
+                sd=sd, sid=sid, reason=missing,
+                now=datetime.now(tz=timezone.utc).isoformat())
+            if changed and changed[0].get("c") == 1:
+                row["status"] = "failed"
+                row["error_kind"] = missing
+                row["error_message"] = "exact reconciliation identity unavailable"
+    return JSONResponse({"status": "ok", "business_result_persisted": complete,
+                         "task": _reconciliation_task_view(row, journal),
+                         "mode": "read_only_model_check"})
 
 
 async def queue_stats(request: Request) -> JSONResponse:
@@ -1402,7 +1746,8 @@ async def queue_stats(request: Request) -> JSONResponse:
         quarantined_count = int(qrows[0].get("c") or 0) if qrows else 0
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
-    pending = ok = errored = 0
+    pending = ok = errored = failed = needs_reconciliation = 0
+    reconciliation_samples: list[dict] = []
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
     ok_last_1h = errored_last_1h = 0
@@ -1435,6 +1780,16 @@ async def queue_stats(request: Request) -> JSONResponse:
                     })
             except Exception:
                 pass
+        elif s == "needs_reconciliation":
+            needs_reconciliation += 1
+            if len(reconciliation_samples) < 20:
+                reconciliation_samples.append({
+                    "source_description": r.get("sd"),
+                    "source_obs_id": r.get("sid"),
+                    "reason": (r.get("error_message") or "")[:200],
+                })
+        elif s == "failed":
+            failed += 1
 
     oldest_pending_age_seconds: float | None = None
     if oldest_pending:
@@ -1451,6 +1806,9 @@ async def queue_stats(request: Request) -> JSONResponse:
         "pending": pending,
         "ok_total": ok,
         "errored_total": errored,
+        "failed_total": failed,
+        "needs_reconciliation": needs_reconciliation,
+        "reconciliation_samples": reconciliation_samples,
         "ok_last_1h": ok_last_1h,
         "errored_last_1h": errored_last_1h,
         "oldest_pending_at": oldest_pending,
@@ -4757,6 +5115,8 @@ app = Starlette(
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
+        Route("/api/ingest/reconciliation", ingest_reconciliation, methods=["GET"]),
+        Route("/api/ingest/reconciliation/check", ingest_reconciliation_check, methods=["POST"]),
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
         Route("/api/search_semantic", search_semantic, methods=["GET"]),
