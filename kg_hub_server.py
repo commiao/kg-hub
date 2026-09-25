@@ -1631,10 +1631,11 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             # turn an unknown model call into a safe retry.
             pass
     complete = await _persisted_business_result(driver, row)
-    if complete and row["status"] == "needs_reconciliation":
+    if complete and row["status"] in {"needs_reconciliation", "failed"}:
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "WHERE k.status = 'needs_reconciliation' AND k.episode_uuid = $uuid "
+            "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+            "  AND k.episode_uuid = $uuid "
             "SET k.status = 'ok', k.updated_at = $now, k.reconciled_at = $now, "
             "    k.error_kind = null, k.error_message = null "
             "RETURN count(k) AS c",
@@ -1695,7 +1696,7 @@ async def queue_stats(request: Request) -> JSONResponse:
         quarantined_count = int(qrows[0].get("c") or 0) if qrows else 0
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
-    pending = ok = errored = needs_reconciliation = 0
+    pending = ok = errored = failed = needs_reconciliation = 0
     reconciliation_samples: list[dict] = []
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
@@ -1737,6 +1738,8 @@ async def queue_stats(request: Request) -> JSONResponse:
                     "source_obs_id": r.get("sid"),
                     "reason": (r.get("error_message") or "")[:200],
                 })
+        elif s == "failed":
+            failed += 1
 
     oldest_pending_age_seconds: float | None = None
     if oldest_pending:
@@ -1753,6 +1756,7 @@ async def queue_stats(request: Request) -> JSONResponse:
         "pending": pending,
         "ok_total": ok,
         "errored_total": errored,
+        "failed_total": failed,
         "needs_reconciliation": needs_reconciliation,
         "reconciliation_samples": reconciliation_samples,
         "ok_last_1h": ok_last_1h,
