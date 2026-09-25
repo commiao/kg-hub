@@ -19,6 +19,49 @@ prompt is a different model step; allowing it through would silently repeat
 paid work and break the operator's one-step authorization. Replaying the whole
 ingest also duplicates predigest parent/child graph writes.
 
+## Pinned 0.29.0 continuation audit (2026-09-26)
+
+The isolated pinned-wheel inspection establishes a concrete unsafe boundary:
+
+- `graphiti_core/graphiti.py:1052-1065` constructs a fresh `EpisodicNode` if
+  `uuid` is absent. Supplying `uuid` instead calls `get_by_uuid`, which requires
+  the episode to have already been written; it cannot inject the saved
+  pre-commit episode into a resumed extraction.
+- `graphiti_core/utils/maintenance/node_operations.py:282-332` converts even
+  a replayed extraction answer into fresh `EntityNode` objects, each with a
+  `uuid4` default (`graphiti_core/nodes.py:93-98`). The node-to-episode map is
+  keyed by these new UUIDs. Thus an exact cached model answer alone cannot
+  reproduce the original intermediate graph objects.
+- `node_operations.py:406-449,626-640` searches the live graph again for
+  semantic dedup candidates. A concurrent graph change, or a partial earlier
+  write, can alter the candidate set and the next resolution prompt. The
+  current context checkpoint pins only `previous_episode_uuids`; it does not
+  pin this candidate search or the extracted/resolved node objects.
+- `graphiti_core/graphiti.py:1074-1131` passes these phase outputs into edge
+  resolution, attribute extraction, and graph commit. The pinned public
+  `add_episode` signature has no stage-output or candidate-snapshot argument.
+
+The isolated orchestration test demonstrates that a *mocked deterministic*
+extract/resolve path replays saved responses, stops on digest drift, and admits
+one granted retry. It does not prove continuation through the real candidate
+search or fresh UUID construction. Therefore the grant and replay primitives
+must stay unconnected to an HTTP retry endpoint or live worker. A one-shot
+grant cannot repair a prompt that no longer addresses the same step.
+
+The minimum safe implementation is a pinned Graphiti adapter/fork that writes
+the episode object and `extract_nodes` output (including UUIDs and attribution
+map) before `resolve_extracted_nodes`; writes the exact ordered candidate
+snapshot plus resolved nodes/UUID map before edge work; then checkpoints edge
+and attribute phase outputs before graph commit. Recovery loads each completed
+stage object verbatim, verifies its input digest and Graphiti/schema version,
+and permits a new HTTP call only at the granted failed step. A commit token on
+the final episode write and predigest child checkpoints are also required.
+Validation must use real 0.29.0 helpers with two runs against deliberately
+changed candidate search results and fresh UUID generation: all saved paid
+steps must be cache hits, exactly one failed step may be admitted, and any
+unsnapshotted drift must freeze before HTTP. Until that gate passes, no
+business-queue retry command is safe to expose.
+
 ## Minimum adapter/fork contract
 
 1. Persist one operation envelope before the first model call: business task ID,
