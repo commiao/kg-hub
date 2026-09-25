@@ -85,7 +85,7 @@ class PredigestFailureTests(IsolatedAsyncioTestCase):
         wm = {"ingested": set(), "rejected": set(), "failed": set()}
         calls = []
 
-        async def submit(_obs):
+        async def submit(_obs, _kind):
             calls.append(17)
             return "needs_reconciliation"
 
