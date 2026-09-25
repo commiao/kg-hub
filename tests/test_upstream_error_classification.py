@@ -58,10 +58,12 @@ def _load_classifier():
 class _Err(Exception):
     """带 status_code 的假异常；类名可改，用来模拟不同 SDK 异常。"""
 
-    def __init__(self, text: str = "", status_code: int | None = None, name: str | None = None):
+    def __init__(self, text: str = "", status_code: int | None = None,
+                 name: str | None = None, body: object | None = None):
         super().__init__(text)
         if status_code is not None:
             self.status_code = status_code
+        self.body = body
         if name:
             self.__class__ = type(name, (_Err,), {})
 
@@ -80,6 +82,16 @@ class ClassifyByStatusCodeTests(unittest.TestCase):
         for code in (500, 502, 503, 504, 599):
             exc = _Err("完全没见过的一句话", status_code=code, name="InternalServerError")
             self.assertEqual(self.classify(exc), "upstream_error", f"HTTP {code}")
+
+    def test_provider_circuit_code_identifies_a_zero_call_refusal(self):
+        exc = _Err("localized text may change", status_code=503,
+                   body={"type": "error", "error": {
+                       "type": "api_error", "code": "provider_circuit_open",
+                       "message": "temporarily unavailable"}})
+        self.assertEqual(self.classify(exc), "provider_circuit_open")
+        self.assertEqual(self.classify(_Err("same text", status_code=503,
+                                            body={"error": {"code": "other"}})),
+                         "upstream_error")
 
     def test_4xx_and_plain_failures_stay_out_of_it(self):
         """4xx 与本地异常可能真是这条观测的问题，不该蹭 1h 快清。"""
@@ -112,6 +124,10 @@ class OneHourCleanupTests(unittest.TestCase):
         self.assertIn("'upstream_error'", sweep,
                       "1h 快清的 error_kind 名单里没有 upstream_error")
 
+    def test_provider_circuit_refusal_joins_one_hour_sweep(self):
+        sweep = SERVER_SRC.split("quota_threshold = ", 1)[1][:1200]
+        self.assertIn("'provider_circuit_open'", sweep)
+
 
 class RefineryReactionTests(unittest.TestCase):
     """1h 快清必须配上停发，否则网关坏着时它变成每小时烧一遍积压。"""
@@ -131,6 +147,22 @@ class RefineryReactionTests(unittest.TestCase):
             refinery._http = original
         self.assertEqual(st, "upstream_error")
         self.assertEqual(len(calls), 1, "认出来就该立刻返回，不该继续轮询到 600s")
+
+    def test_provider_circuit_refusal_halts_batch_without_marking_content_failure(self):
+        calls = []
+
+        def fake_http(method, url, body=None, timeout=30):
+            calls.append(url)
+            return 200, {"status": "error", "error_kind": "provider_circuit_open"}
+
+        original = refinery._http
+        refinery._http = fake_http
+        try:
+            st = asyncio.run(refinery.poll_until_done("claude-mem", "42"))
+        finally:
+            refinery._http = original
+        self.assertEqual(st, "upstream_error")
+        self.assertEqual(len(calls), 1)
 
     def test_the_rest_of_the_batch_is_not_sent(self):
         """halt 名单漏了它，整批剩余条目会继续逐条撞同一个 5xx。"""
