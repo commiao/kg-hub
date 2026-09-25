@@ -58,7 +58,7 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 
 ### 2. Level-1 成品摄入(claude-mem 消费者 = 复活休眠线)
 - 数据源:NAS 侧 db 副本(已在同步,零新客户端);分钟级微批(60-120s)按 `created_at_epoch` 增量读 `observations LEFT JOIN sdk_sessions`(照抄 `ingesters/claude_mem_obs.py:87-110` 的查询)
-- 质量闸:**原样复用 `utils/ingest_filter.py`**(Layer1 硬门/Layer2 平台阈值/Layer3 配额);修补两个已知缺口:QuotaTracker 状态落 refinery-state 文件(日配额变真的)、决策日志继续写 `.ingest_decisions.jsonl`
+- **当前 Phase A 实现（队列策略已更新）**：继续复用 `utils/ingest_filter.py` 的硬门和评分闸；refinery 调用时不启用 Layer3 本地每日观测条数配额。按项目待处理数触发调度：历史积压未清空时阈值 200 条，清空后阈值 10 条；不足阈值的任务由最长等待 900 秒兜底。阈值只决定何时调度，每条观测仍逐条提交 `/api/ingest`；实际模型外呼次数由网关额度限制。
 - 规范化后 POST `/api/ingest`:`name=claude-mem-obs-<id>`(沿用现有命名)、`source_obs_id=content_hash`(表内天然幂等锚)、`sd` 携带 `type=/project=/platform=`(现有 origin 派生正则直接可用)
 - **水印迁移**:导入旧 `data/.ingested.claude_mem.json`(526 ingested + 2471 rejected)为初始状态,防止重复入图
 - **积压回填**(决策④):同一消费者、加 `--backlog` 节流模式(默认仅北京时间 22:00-08:00 跑,LLM 串行限速已有 SEMAPHORE=1+4s 间隔),预计 ~800 条入图,烧数个夜间;进度进日报
