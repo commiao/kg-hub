@@ -672,7 +672,7 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
     return "timeout"
 
 
-async def ingest_via_api(obs: dict, scenario: str) -> str:
+async def ingest_via_api(obs: dict, scenario: str = "backlog") -> str:
     """返回终态或无内容的 HTTP 类别，供状态页诊断 deferred。"""
     p = to_payload(obs)
     code, d = _http(

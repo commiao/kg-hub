@@ -390,6 +390,7 @@ def _run_main(*, alive, stats, prev_anomalies, prev_counters=None, cfg=None):
           patch("tools.watchdog.check_search_probe", return_value=("skip", 0.0, "")),
           patch("tools.watchdog.check_gateway_monitor", return_value={
               name: False for name in W.GATEWAY_ALERTS}),
+          patch("tools.watchdog.check_model_gateway_consumer_contract", return_value="ok"),
           patch("tools.watchdog.emit_alert",
                 side_effect=lambda sev, kind, msg: alerts.append((sev, kind, msg)))):
         W.main()
