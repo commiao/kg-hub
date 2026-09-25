@@ -77,8 +77,15 @@ def model_business_task(source_description: str, source_obs_id: str):
 def model_manual_resume(source_description: str, source_obs_id: str,
                         step_id: str, grant_id: str):
     """Bind exactly one already authorized failed step to a business run."""
+    journal = journal_from_backup_env()
+    if journal is None:
+        raise RuntimeError("manual resume requires a durable model journal")
+    cached_steps = {row["step_id"] for row in
+                    journal.find_task(source_description, source_obs_id)
+                    if row["phase"] == "completed" and row["result_json"]}
     state = {"task": (source_description, source_obs_id), "step_id": step_id,
-             "grant_id": grant_id, "consumed": False}
+             "grant_id": grant_id, "consumed": False,
+             "cached_pending": cached_steps}
     token = _resume.set(state)
     try:
         yield
@@ -456,6 +463,9 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     reserved_by_grant = True
                 elif not any(row["step_id"] == step_id for row in journal.find_task(*task)):
                     raise NeedsReconciliation(step_id, "resume_input_drift", None)
+            elif (step_id not in {row["step_id"] for row in journal.find_task(*task)}
+                  and resume["cached_pending"]):
+                raise NeedsReconciliation(step_id, "resume_unreplayed_paid_steps", None)
         pending = inflight.get(key)
         if pending is not None:
             # shield:等待方被取消不能连带取消发起方的结果
@@ -479,6 +489,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 if cached_result is not None:
                     from anthropic.types import Message
                     result = Message.model_validate_json(cached_result)
+                    if resume is not None:
+                        resume["cached_pending"].discard(step_id)
                     future.set_result(result)
                     return result
                 prepared = True
