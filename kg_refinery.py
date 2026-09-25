@@ -657,6 +657,10 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
                 return "quota"  # 网关配额拒绝:暂停后再探
             if st == "error" and d.get("error_kind") == "rate_limited":
                 return "rate_limited"  # 上游限流:等服务端释放错误键后再探
+            if st == "error" and d.get("error_kind") == "provider_circuit_open":
+                # 网关在供应商调用前拒绝了请求。沿用整窗停发和 1h 错误键释放，
+                # 观测留在原队列，不能把它记成内容失败。
+                return "upstream_error"
             if st == "error" and d.get("error_kind") == "upstream_error":
                 # 网关/供应商回 5xx。和上面两条同类:失败不属于这条观测,
                 # 继续逐条撞只会把整批的模型调用白烧掉(实测 503 打在

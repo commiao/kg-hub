@@ -264,6 +264,7 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         # 有键漏下来,不该让观测为一次运维动作白锁 24h。
         "  AND (k.error_kind IN ['quota_exhausted', 'rate_limited', "
         "                        'gateway_unavailable', 'breaker_open', "
+        "                        'provider_circuit_open', "
         # upstream_error:网关/供应商回的 5xx。同属"与观测内容无关",没有理由比
         # 连不上网关多锁 23 小时。
         "                        'upstream_error', 'model_offscript'] "
@@ -338,6 +339,14 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
     # (根本不提交);走到这里说明有别的路径漏过来了,兜底挡住并如实归类。
     if type(exc).__name__ == "BreakerOpen":
         return "breaker_open"
+    # A gateway provider circuit refusal occurs before any provider call.  The
+    # Anthropic error body carries the gateway's machine code; do not infer this
+    # from a 503 or localized message, because other 503s may follow paid work.
+    if getattr(exc, "status_code", None) == 503:
+        body = getattr(exc, "body", None)
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("code") == "provider_circuit_open":
+            return "provider_circuit_open"
     if getattr(exc, "status_code", None) == 429:
         return "quota_exhausted"
     # Some Anthropic SDK versions expose a 429 as RateLimitError without a
