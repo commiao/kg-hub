@@ -1,9 +1,12 @@
 """A resumed episode uses the exact previous-episode context it first saw."""
 
 from datetime import datetime, timezone
+import ast
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from utils.graphiti_episode_checkpoint import add_episode_with_context_checkpoint
 from utils.model_attempt_journal import ModelAttemptJournal
@@ -30,6 +33,28 @@ class IncompatibleGraphiti(Graphiti):
 
 
 class CheckpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_server_default_path_keeps_existing_graphiti_call(self):
+        source = Path(__file__).resolve().parents[1] / "kg_hub_server.py"
+        tree = ast.parse(source.read_text())
+        function = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+                        and n.name == "_optional_checkpointed_add_episode")
+        module = ast.fix_missing_locations(ast.Module(body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            function,
+        ], type_ignores=[]))
+        namespace = {"os": os, "EpisodeType": type("EpisodeType", (), {"text": "text"}),
+                     "GROUP_ID": "kg_hub", "ENTITY_TYPES": {}, "EDGE_TYPES": {},
+                     "EDGE_TYPE_MAP": {}}
+        exec(compile(module, str(source), "exec"), namespace)
+        graphiti = Graphiti()
+        with patch.dict(os.environ, {"KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT": "0"}):
+            result = await namespace["_optional_checkpointed_add_episode"](
+                graphiti, "name", "body", "source", datetime.now(timezone.utc),
+                "operation", "source", "id-1")
+        self.assertEqual(result, "saved")
+        self.assertEqual(graphiti.retrieves, 0)
+        self.assertIsNone(graphiti.calls[0][0])
+
     async def test_reuses_frozen_context(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")

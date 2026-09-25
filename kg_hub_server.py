@@ -89,6 +89,7 @@ from utils.model_attempt_journal import (
     NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
     summarize_attempts,
 )
+from utils.graphiti_episode_checkpoint import add_episode_with_context_checkpoint
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -834,7 +835,9 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
 async def _locked_add_episode(graphiti, name: str, episode_body: str,
                               sd: str, ref_time: datetime,
                               attempt_epoch: str | None = None,
-                              usage_scenario: str | None = None):
+                              usage_scenario: str | None = None,
+                              task_sd: str | None = None,
+                              task_sid: str | None = None):
     """单条 episode 的 加锁→抽取,锁竞争重试策略与整篇路径一致。耗尽则 raise。"""
     attempt = 0
     while True:
@@ -846,16 +849,35 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
                 operation_id = stable_operation_id(name, sd, episode_body, attempt_epoch)
                 with model_usage_scenario(usage_scenario):
                     with model_operation("ingest.predigest-child", operation_id):
-                        return await graphiti.add_episode(
-                            name=name, episode_body=episode_body, source=EpisodeType.text,
-                            source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
-                            entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
-                            edge_type_map=EDGE_TYPE_MAP)
+                        return await _optional_checkpointed_add_episode(
+                            graphiti, name, episode_body, sd, ref_time, operation_id,
+                            task_sd or sd, task_sid or name)
         except WriterLockBusy:
             attempt += 1
             if attempt > INGEST_LOCK_RETRIES:
                 raise
             await asyncio.sleep(INGEST_LOCK_BACKOFF_SEC * attempt)
+
+
+async def _optional_checkpointed_add_episode(graphiti, name: str,
+                                             episode_body: str, sd: str,
+                                             ref_time: datetime, operation_id: str,
+                                             task_sd: str, task_sid: str):
+    """Use pinned Graphiti context only when explicitly enabled after canary."""
+    kwargs = dict(name=name, episode_body=episode_body, source=EpisodeType.text,
+                  source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
+                  entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
+                  edge_type_map=EDGE_TYPE_MAP)
+    if os.environ.get("KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT") != "1":
+        return await graphiti.add_episode(**kwargs)
+    journal = journal_from_backup_env()
+    if journal is None:
+        raise RuntimeError("Graphiti checkpoint requires a durable model journal")
+    from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
+    return await add_episode_with_context_checkpoint(
+        graphiti, journal, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, relevant_schema_limit=RELEVANT_SCHEMA_LIMIT,
+        **kwargs)
 
 
 async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
@@ -943,7 +965,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
             result = await _locked_add_episode(
                 graphiti, child_name, obs_to_episode_body(obs, body.name),
                 f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch,
-                body.model_usage_scenario)
+                usage_scenario=body.model_usage_scenario, task_sd=sd, task_sid=sid)
         except Exception:  # noqa: BLE001
             logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
             failed_children.append(child_name)
@@ -1075,17 +1097,9 @@ async def _do_extract_inner(
                     with model_usage_scenario(body.model_usage_scenario):
                         with model_operation("ingest.episode", operation_id) as op_tally:
                             model_tally = op_tally
-                            result = await graphiti.add_episode(
-                                name=body.name,
-                                episode_body=body.episode_body,
-                                source=EpisodeType.text,
-                                source_description=sd,
-                                reference_time=ref_time,
-                                group_id=GROUP_ID,
-                                entity_types=ENTITY_TYPES,
-                                edge_types=EDGE_TYPES,
-                                edge_type_map=EDGE_TYPE_MAP,
-                            )
+                            result = await _optional_checkpointed_add_episode(
+                                graphiti, body.name, body.episode_body, sd, ref_time,
+                                operation_id, sd, sid)
                 break  # lock acquired + extraction completed
             except WriterLockBusy:
                 attempt += 1
