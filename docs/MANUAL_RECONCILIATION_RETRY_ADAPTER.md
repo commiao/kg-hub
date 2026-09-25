@@ -10,10 +10,15 @@ ordered semantic candidate sets, and resolved nodes. It rejects input/UUID
 drift and provides a one-way durable
 `begin_graph_commit` fence. `tests/test_graphiti_stage_adapter.py` exercises
 candidate changes and process-style restoration against real pinned Graphiti
-node types and resolver helpers. This adapter is **not wired into live ingest**:
-edge/attribute phase outputs and the business graph commit/result still lack
-full recovery checkpoints. A repeated commit attempt freezes rather than
-writing again, so the partial adapter cannot yet guarantee a terminal task.
+node types and resolver helpers. It now also stores complete edge and attribute
+stage outputs and a typed graph commit receipt. An edge or attribute stage that
+started but did not save its output freezes on continuation, since Graphiti
+may have made multiple subcalls or read changing graph state inside that stage.
+The graph write has a durable one-way fence; a crash after the graph write but
+before the receipt also freezes. The adapter is **not wired into live ingest**:
+these uncertainty windows require finer internal checkpoints or an atomic
+business graph commit receipt before a manual retry endpoint can safely promise
+a terminal outcome. A repeated commit attempt never writes again.
 
 The pinned dependency is `graphiti-core==0.29.0`. Its `Graphiti.add_episode`
 reads recent episodes, creates an in-memory episode, runs `extract_nodes`,

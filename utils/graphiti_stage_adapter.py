@@ -1,10 +1,10 @@
-"""Isolated Graphiti 0.29 node-stage snapshot adapter; not wired to production.
+"""Isolated Graphiti 0.29 stage snapshot adapter; not wired to production.
 
 The pinned upstream resolver re-queries live semantic candidates on every run.
 This module persists their exact order before the dedupe model can be called.
-A caller must also persist and restore the extracted EntityNode objects, including
-UUIDs, before using this resolver. The later edge and graph-write stages still
-need checkpoints before any manual retry can be exposed.
+Completed edge and attribute stages are replayed from immutable artifacts.
+An interrupted edge/attribute stage and an uncertain graph commit freeze; there
+is no live manual retry path until every sub-stage can be resumed safely.
 """
 
 from __future__ import annotations
@@ -15,10 +15,34 @@ import json
 from pathlib import Path
 import sqlite3
 from contextlib import contextmanager
+from datetime import date, datetime
+from enum import Enum
 
 
 def _encoded(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _stage_value(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {str(k): _stage_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_stage_value(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise RuntimeError(f"unsupported Graphiti stage input type: {type(value)!r}")
+
+
+def _stage_digest(value) -> str:
+    return hashlib.sha256(_encoded(_stage_value(value)).encode()).hexdigest()
 
 
 class StageArtifactStore:
@@ -83,6 +107,19 @@ class StageArtifactStore:
                      hashlib.sha256(marker.encode()).hexdigest()))
             except sqlite3.IntegrityError as exc:
                 raise RuntimeError("graph commit may already have started; freeze") from exc
+
+    def begin_stage(self, task_sd: str, task_sid: str, operation_id: str,
+                    input_digest: str, stage: str, stage_input_digest: str) -> None:
+        marker = _encoded({"stage_input_digest": stage_input_digest})
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("""INSERT INTO graphiti_stage_artifacts VALUES (?,?,?,?,?,?,?)""",
+                    (task_sd, task_sid, operation_id, input_digest,
+                     stage + "_started", marker,
+                     hashlib.sha256(marker.encode()).hexdigest()))
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError(f"{stage} may already be in flight; freeze") from exc
 
 
 def load_extracted_nodes(store: StageArtifactStore, *, task_sd: str,
@@ -203,3 +240,103 @@ async def resolve_nodes_with_candidate_snapshot(
     if saved_resolved != resolved_json:
         raise RuntimeError("concurrent resolved node artifact drift")
     return result
+
+
+def _stage_record(store, identity, stage, inputs):
+    digest = _stage_digest(inputs)
+    saved = store.save_or_load(*identity, stage)
+    if saved is not None:
+        if saved["stage_input_digest"] != digest:
+            raise RuntimeError(f"{stage} input drift")
+        return saved, digest
+    started = store.save_or_load(*identity, stage + "_started")
+    if started is not None:
+        raise RuntimeError(f"{stage} interrupted without complete artifact; freeze")
+    return None, digest
+
+
+async def extract_and_resolve_edges_with_snapshot(
+    graphiti, episode, extracted_nodes, previous_episodes, edge_type_map,
+    group_id, edge_types, nodes, uuid_map, custom_extraction_instructions,
+    *, store: StageArtifactStore, task_sd: str, task_sid: str,
+    operation_id: str, input_digest: str,
+):
+    """Replay complete edge output; freeze an interrupted upstream edge phase."""
+    from graphiti_core.edges import EntityEdge
+
+    if version("graphiti-core") != "0.29.0":
+        raise RuntimeError("unsupported Graphiti version for edge-stage adapter")
+    identity = (task_sd, task_sid, operation_id, input_digest)
+    inputs = (episode, extracted_nodes, previous_episodes, edge_type_map,
+              group_id, edge_types, nodes, uuid_map,
+              custom_extraction_instructions)
+    saved, digest = _stage_record(store, identity, "edge_phase", inputs)
+    if saved is None:
+        store.begin_stage(*identity, "edge_phase", digest)
+        groups = await graphiti._extract_and_resolve_edges(*inputs)
+        saved = store.save_or_load(*identity, "edge_phase", {
+            "stage_input_digest": digest,
+            "groups": [[edge.model_dump(mode="json") for edge in group]
+                       for group in groups],
+        })
+    return tuple([[EntityEdge.model_validate(edge) for edge in group]
+                  for group in saved["groups"]])
+
+
+async def extract_attributes_with_snapshot(
+    graphiti, nodes, episode, previous_episodes, entity_types, new_edges,
+    *, store: StageArtifactStore, task_sd: str, task_sid: str,
+    operation_id: str, input_digest: str,
+):
+    """Replay complete attributes; freeze an interrupted upstream model phase."""
+    from graphiti_core.nodes import EntityNode
+    from graphiti_core.utils.maintenance import node_operations as ops
+
+    if version("graphiti-core") != "0.29.0":
+        raise RuntimeError("unsupported Graphiti version for attribute-stage adapter")
+    identity = (task_sd, task_sid, operation_id, input_digest)
+    inputs = (nodes, episode, previous_episodes, entity_types, new_edges)
+    saved, digest = _stage_record(store, identity, "attribute_phase", inputs)
+    if saved is None:
+        store.begin_stage(*identity, "attribute_phase", digest)
+        hydrated = await ops.extract_attributes_from_nodes(
+            graphiti.clients, nodes, episode, previous_episodes,
+            entity_types, edges=new_edges)
+        saved = store.save_or_load(*identity, "attribute_phase", {
+            "stage_input_digest": digest,
+            "nodes": [node.model_dump(mode="json") for node in hydrated],
+        })
+    return [EntityNode.model_validate(node) for node in saved["nodes"]]
+
+
+async def commit_episode_with_receipt(
+    graphiti, episode, hydrated_nodes, entity_edges, now, group_id,
+    saga, saga_previous_episode_uuid, node_episode_index_map,
+    *, store: StageArtifactStore, task_sd: str, task_sid: str,
+    operation_id: str, input_digest: str,
+):
+    """Return a durable receipt or freeze any uncertain graph write.
+
+    This does not infer business success from a missing receipt. It deliberately
+    requires external graph verification after a crash between write and receipt.
+    """
+    from graphiti_core.edges import EpisodicEdge
+    from graphiti_core.nodes import EpisodicNode
+
+    if version("graphiti-core") != "0.29.0":
+        raise RuntimeError("unsupported Graphiti version for commit adapter")
+    identity = (task_sd, task_sid, operation_id, input_digest)
+    inputs = (episode, hydrated_nodes, entity_edges, now, group_id,
+              saga, saga_previous_episode_uuid, node_episode_index_map)
+    saved, digest = _stage_record(store, identity, "graph_commit_receipt", inputs)
+    if saved is None:
+        store.begin_graph_commit(*identity)
+        episodic_edges, saved_episode = await graphiti._process_episode_data(*inputs)
+        saved = store.save_or_load(*identity, "graph_commit_receipt", {
+            "stage_input_digest": digest,
+            "episode": saved_episode.model_dump(mode="json"),
+            "episodic_edges": [edge.model_dump(mode="json")
+                               for edge in episodic_edges],
+        })
+    return ([EpisodicEdge.model_validate(edge) for edge in saved["episodic_edges"]],
+            EpisodicNode.model_validate(saved["episode"]))
