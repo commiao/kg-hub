@@ -1,12 +1,15 @@
 """Model attempts are durable before HTTP and unknown outcomes stay frozen."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from utils.model_attempt_journal import ModelAttemptJournal, NeedsReconciliation
+from utils.model_attempt_journal import (
+    ModelAttemptJournal, NeedsReconciliation, summarize_attempts,
+)
 import model_gateway_client as client_module
 
 
@@ -17,6 +20,24 @@ def fields():
 
 
 class JournalTests(unittest.TestCase):
+    def test_attempt_summary_excludes_proven_preflight_and_cached_result(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        old = (now - timedelta(minutes=30)).isoformat()
+        rows = [
+            {"step_id": "step-a", "phase": "failed", "provider_call_started": 1,
+             "result_json": None, "created_at": old},
+            {"step_id": "step-a", "phase": "preflight", "provider_call_started": 0,
+             "result_json": None, "created_at": old},
+            {"step_id": "step-b", "phase": "completed", "provider_call_started": 1,
+             "result_json": "{}", "created_at": old},
+            {"step_id": "step-c", "phase": "absent", "provider_call_started": None,
+             "result_json": None, "created_at": old},
+        ]
+        summary = summarize_attempts(rows, deadline_seconds=60, now=now)
+        self.assertEqual(summary["failed_calls_by_step"], {"step-a": 1, "step-c": 1})
+        self.assertEqual(summary["cached_model_steps"], 1)
+        self.assertTrue(summary["admission_unknown"])
+
     def test_prepared_identity_survives_restart_and_freezes_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "attempts.sqlite3"

@@ -161,3 +161,45 @@ def journal_from_backup_env() -> ModelAttemptJournal | None:
     if not path:
         return None
     return ModelAttemptJournal(Path(path).with_name("model-attempts.sqlite3"))
+
+
+def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
+                       now: datetime | None = None) -> dict:
+    """Read-only attempt counts; unknown admission consumes a conservative slot.
+
+    A gateway HTTP success is only a model result. It does not make the ingest
+    business task successful until the graph result is independently verified.
+    """
+    now = now or datetime.now(timezone.utc)
+    failed_by_step: dict[str, int] = {}
+    in_flight = False
+    unresolved = False
+    cached_steps: set[str] = set()
+    for row in rows:
+        step = row["step_id"]
+        phase = row["phase"]
+        started = row["provider_call_started"]
+        if phase == "completed" and row.get("result_json"):
+            cached_steps.add(step)
+            continue
+        if started == 0:
+            continue
+        try:
+            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+            elapsed = (now - created).total_seconds()
+        except (TypeError, ValueError):
+            elapsed = deadline_seconds
+        if phase == "failed" or elapsed >= deadline_seconds:
+            failed_by_step[step] = failed_by_step.get(step, 0) + 1
+        else:
+            in_flight = True
+        if started is None:
+            unresolved = True
+    return {
+        "failed_calls_by_step": failed_by_step,
+        "max_failed_calls": max(failed_by_step.values(), default=0),
+        "in_flight": in_flight,
+        "admission_unknown": unresolved,
+        "cached_model_steps": len(cached_steps),
+        "attempts_recorded": len(rows),
+    }

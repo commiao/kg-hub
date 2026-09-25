@@ -82,9 +82,13 @@ from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from model_gateway_client import (  # noqa: E402
-    envelope_repairs_total, model_operation, model_usage_scenario,
-    model_business_task, offscript_total, stable_operation_id)
-from utils.model_attempt_journal import NeedsReconciliation
+    MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
+    model_business_task, model_operation, model_usage_scenario,
+    offscript_total, stable_operation_id)
+from utils.model_attempt_journal import (
+    NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
+    summarize_attempts,
+)
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
 PROV_VALUES = ("firsthand", "external-article", "external-community")
@@ -1482,6 +1486,179 @@ async def ingest_status(request: Request) -> JSONResponse:
         "predigest_children": row.get("predigest_children"),
         "failed_children": row.get("failed_children"),
     })
+
+
+def _reconciliation_task_view(row: dict, journal) -> dict:
+    sd, sid = row.get("source_description"), row.get("source_obs_id")
+    attempts = journal.find_task(sd, sid) if journal else []
+    summary = summarize_attempts(attempts, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    return {
+        "source_description": sd,
+        "source_obs_id": sid,
+        "status": row.get("status"),
+        "episode_uuid": row.get("episode_uuid"),
+        "error_kind": row.get("error_kind"),
+        "error_message": row.get("error_message"),
+        "predigest_children": row.get("predigest_children"),
+        "failed_children": row.get("failed_children") or [],
+        "updated_at": row.get("updated_at"),
+        **summary,
+    }
+
+
+async def ingest_reconciliation(request: Request) -> JSONResponse:
+    """Bearer protected local task list/detail; this endpoint never calls a model."""
+    sd = request.query_params.get("source_description", "").strip()
+    sid = request.query_params.get("source_obs_id", "").strip()
+    driver = get_status_driver()
+    try:
+        journal = journal_from_backup_env()
+    except Exception:
+        return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+    projection = (
+        "k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
+        "k.status AS status, k.episode_uuid AS episode_uuid, "
+        "k.error_kind AS error_kind, k.error_message AS error_message, "
+        "k.predigest_children AS predigest_children, "
+        "k.failed_children AS failed_children, k.updated_at AS updated_at, "
+        "k.name AS name, k.stage AS stage"
+    )
+    if sd and sid:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            f"RETURN {projection} LIMIT 1", sd=sd, sid=sid)
+        if not rows:
+            return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
+        return JSONResponse({"status": "ok", "task": _reconciliation_task_view(rows[0], journal)})
+    if bool(sd) != bool(sid):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    try:
+        limit = min(max(int(request.query_params.get("limit", "50")), 1), 100)
+        offset = max(int(request.query_params.get("offset", "0")), 0)
+    except ValueError:
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+        f"RETURN {projection} ORDER BY k.updated_at DESC SKIP $offset LIMIT $limit",
+        offset=offset, limit=limit)
+    count_rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey) "
+        "WHERE k.status IN ['needs_reconciliation', 'failed'] RETURN count(k) AS c")
+    return JSONResponse({"status": "ok", "items": [
+        _reconciliation_task_view(row, journal) for row in rows],
+        "total": int(count_rows[0].get("c") or 0) if count_rows else 0,
+        "limit": limit, "offset": offset})
+
+
+async def _persisted_business_result(driver, row: dict) -> bool:
+    """Require the exact persisted episode and every expected split child."""
+    uuid = row.get("episode_uuid")
+    if not uuid or not row.get("name") or not row.get("source_description"):
+        return False
+    rows, _, _ = await driver.execute_query(
+        "MATCH (e:Episodic {uuid: $uuid}) "
+        "WHERE e.name = $name AND e.source_description = $sd "
+        "RETURN count(e) AS c",
+        uuid=uuid, name=row.get("name"), sd=row.get("source_description"))
+    if not rows or int(rows[0].get("c") or 0) != 1:
+        return False
+    child_ratio = row.get("predigest_children")
+    if not child_ratio:
+        # A split may have crashed before writing its completion count.
+        return not str(row.get("stage") or "").startswith("predigest_")
+    try:
+        completed_raw, expected_raw = child_ratio.split("/", 1)
+        completed = int(completed_raw)
+        expected = int(expected_raw)
+    except (AttributeError, ValueError):
+        return False
+    if (expected <= 0 or expected > MAX_OBS or completed != expected
+            or row.get("failed_children")):
+        return False
+    child_rows, _, _ = await driver.execute_query(
+        "MATCH (e:Episodic) "
+        "WHERE e.name STARTS WITH $prefix "
+        "  AND e.source_description STARTS WITH $sd "
+        "  AND e.derived_from = $parent AND e.predigest = true "
+        "RETURN e.name AS name",
+        prefix=f"{row['name']}--obs-", sd=f"{row['source_description']} · predigest type=",
+        parent=row["name"])
+    actual = {r.get("name") for r in child_rows}
+    return all(f"{row['name']}--obs-{i:02d}" in actual
+               for i in range(1, expected + 1))
+
+
+async def ingest_reconciliation_check(request: Request) -> JSONResponse:
+    """Read model/graph evidence and settle only a proven business outcome."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "code": "bad_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    sd = str(body.get("source_description") or "").strip()
+    sid = str(body.get("source_obs_id") or "").strip()
+    if not sd or not sid or len(sd) > 2000 or len(sid) > 500:
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+        "RETURN k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
+        "k.status AS status, k.episode_uuid AS episode_uuid, k.name AS name, "
+        "k.stage AS stage, k.predigest_children AS predigest_children, "
+        "k.failed_children AS failed_children, k.error_kind AS error_kind, "
+        "k.error_message AS error_message, k.updated_at AS updated_at LIMIT 1",
+        sd=sd, sid=sid)
+    if not rows:
+        return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
+    row = rows[0]
+    try:
+        journal = journal_from_backup_env()
+        attempts = journal.find_task(sd, sid) if journal else []
+    except Exception:
+        return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+    for attempt in attempts:
+        if attempt["result_json"] or attempt["provider_call_started"] == 0:
+            continue
+        try:
+            evidence = await asyncio.to_thread(
+                query_gateway_attempt_status, gateway_base_url(), gateway_token(),
+                attempt["business_key"], attempt["idempotency_key"])
+            journal.update_gateway_status(attempt["idempotency_key"], evidence)
+        except Exception:
+            # The saved intent is still evidence; failed status reads cannot
+            # turn an unknown model call into a safe retry.
+            pass
+    complete = await _persisted_business_result(driver, row)
+    if complete and row["status"] == "needs_reconciliation":
+        changed, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status = 'needs_reconciliation' AND k.episode_uuid = $uuid "
+            "SET k.status = 'ok', k.updated_at = $now, k.reconciled_at = $now, "
+            "    k.error_kind = null, k.error_message = null "
+            "RETURN count(k) AS c",
+            sd=sd, sid=sid, uuid=row["episode_uuid"],
+            now=datetime.now(tz=timezone.utc).isoformat())
+        if changed and changed[0].get("c") == 1:
+            row["status"] = "ok"
+    refreshed = journal.find_task(sd, sid) if journal else []
+    summary = summarize_attempts(refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    if (not complete and summary["max_failed_calls"] >= 3
+            and not summary["in_flight"] and not summary["admission_unknown"]):
+        # No more model calls may be authorized for the exhausted step.
+        changed, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status = 'needs_reconciliation' "
+            "SET k.status = 'failed', k.updated_at = $now, "
+            "    k.error_kind = 'model_attempts_exhausted' "
+            "RETURN count(k) AS c",
+            sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
+        if changed and changed[0].get("c") == 1:
+            row["status"] = "failed"
+    return JSONResponse({"status": "ok", "business_result_persisted": complete,
+                         "task": _reconciliation_task_view(row, journal),
+                         "mode": "read_only_model_check"})
 
 
 async def queue_stats(request: Request) -> JSONResponse:
@@ -4884,6 +5061,8 @@ app = Starlette(
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
+        Route("/api/ingest/reconciliation", ingest_reconciliation, methods=["GET"]),
+        Route("/api/ingest/reconciliation/check", ingest_reconciliation_check, methods=["POST"]),
         Route("/api/queue_stats", queue_stats, methods=["GET"]),
         Route("/api/search", search, methods=["GET"]),
         Route("/api/search_semantic", search_semantic, methods=["GET"]),
