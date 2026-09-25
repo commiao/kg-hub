@@ -12,7 +12,8 @@ from utils.graphiti_stage_adapter import (
     StageArtifactStore, extract_nodes_with_snapshot, load_extracted_nodes,
     resolve_nodes_with_candidate_snapshot,
     extract_and_resolve_edges_with_snapshot, extract_attributes_with_snapshot,
-    commit_episode_with_receipt,
+    commit_episode_with_receipt, inspect_graph_commit_materialization,
+    inspect_started_graph_commit,
 )
 
 HAS_GRAPHITI = importlib.util.find_spec("graphiti_core") is not None
@@ -20,6 +21,66 @@ HAS_GRAPHITI = importlib.util.find_spec("graphiti_core") is not None
 
 @unittest.skipUnless(HAS_GRAPHITI, "requires pinned Graphiti environment")
 class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_readback_proves_only_core_materialization(self):
+        from graphiti_core.edges import EntityEdge
+        from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        episode = EpisodicNode(name="episode", group_id="kg_hub",
+            source=EpisodeType.text, content="body",
+            source_description="source", valid_at=now)
+        node = EntityNode(name="Person", group_id="kg_hub")
+        edge = EntityEdge(name="KNOWS", fact="fact", group_id="kg_hub",
+            source_node_uuid=node.uuid, target_node_uuid=node.uuid,
+            created_at=now)
+
+        class Driver:
+            def __init__(self):
+                self.missing = None
+                self.calls = []
+
+            async def execute_query(self, query, **kwargs):
+                self.calls.append(query)
+                if "MATCH (e:Episodic {uuid: $uuid}) RETURN" in query:
+                    return ([] if self.missing == "episode" else [{
+                        "uuid": episode.uuid, "group_id": "kg_hub",
+                        "name": "episode", "source_description": "source"}], None, None)
+                if "MATCH (n:Entity)" in query:
+                    return ([] if self.missing == "node" else [{
+                        "uuid": node.uuid, "group_id": "kg_hub"}], None, None)
+                if "RELATES_TO" in query:
+                    return ([] if self.missing == "edge" else [{
+                        "uuid": edge.uuid, "group_id": "kg_hub",
+                        "source_uuid": node.uuid, "target_uuid": node.uuid}], None, None)
+                return ([] if self.missing == "mention" else [{
+                    "node_uuid": node.uuid, "group_id": "kg_hub"}], None, None)
+
+        driver = Driver()
+        async def inspect():
+            return await inspect_graph_commit_materialization(
+                driver, episode=episode, nodes=[node], entity_edges=[edge])
+        self.assertEqual((await inspect())["phase"], "core_materialized")
+        driver.missing = "edge"
+        self.assertEqual((await inspect())["missing"]["entity_edges"], [edge.uuid])
+        driver.missing = "episode"
+        self.assertEqual((await inspect())["phase"], "core_absent")
+        self.assertTrue(all("RETURN" in query for query in driver.calls))
+        with tempfile.TemporaryDirectory() as temp:
+            store = StageArtifactStore(Path(temp) / "stages.sqlite3")
+            store.begin_graph_commit("source", "sid", "op", "input", expected={
+                "episode": episode.model_dump(mode="json"),
+                "nodes": [node.model_dump(mode="json")],
+                "entity_edges": [edge.model_dump(mode="json")],
+                "saga_expected": True,
+            })
+            driver.missing = None
+            proof = await inspect_started_graph_commit(
+                driver, store, task_sd="source", task_sid="sid",
+                operation_id="op", input_digest="input")
+            self.assertEqual(proof["phase"], "core_materialized")
+            self.assertTrue(proof["saga_expected"])
+            self.assertFalse(proof["receipt_saved"])
+
     async def test_pinned_edge_attribute_and_commit_receipts_replay(self):
         from graphiti_core import Graphiti
         from graphiti_core.edges import EntityEdge, EpisodicEdge

@@ -20,6 +20,35 @@ these uncertainty windows require finer internal checkpoints or an atomic
 business graph commit receipt before a manual retry endpoint can safely promise
 a terminal outcome. A repeated commit attempt never writes again.
 
+### Crash-window readback and remaining internal hooks
+
+Pinned Graphiti 0.29.0 `_process_episode_data` calls
+`add_nodes_and_edges_bulk` (`graphiti.py:683-690`), whose episode/entity nodes
+and MENTIONS/RELATES_TO relationships run in one graph driver write transaction
+(`bulk_utils.py:128-148,151-259`). Saga association is written in separate
+operations afterwards (`graphiti.py:694-732`). The adapter now persists the
+exact episode, node, and entity-edge identities **before** entering that write.
+`inspect_started_graph_commit` reads them back using only `MATCH/RETURN` and
+reports `core_absent`, `partial`, `core_materialized`, or `unknown`, with the
+saved-receipt and saga-required flags. A core-materialized result is useful
+evidence, but it is not a terminal business receipt: generated MENTIONS UUIDs
+were not pre-snapshotted, and saga links may be missing after a crash. The
+function never writes or promotes a task.
+
+The edge stage contains `extract_edges.edge` plus parallel per-edge resolution
+(`edge_operations.py:116-206,324-534`), with potential dedupe, custom
+attribute, and timestamp model calls (`:597-601,661-669,715-720,777-790`).
+It also re-reads graph edge candidates (`:364-415`). The attribute stage runs
+per-node model calls in parallel and later batched summary model calls
+(`node_operations.py:725-765,875-890,959-965`). The existing model SDK hook
+journals individual HTTP requests, but it cannot checkpoint these changing
+in-memory per-edge/per-node inputs or all concurrent results. The safe next
+fork point is before each per-edge/per-node work item: persist its typed inputs,
+ordered graph candidates, output and subcall IDs, then resume only the failed
+item after all prior successful outputs are restored. `asyncio.gather` may
+leave sibling calls running after one exception, so recovery must also wait
+for or explicitly account for every sibling's journal state.
+
 The pinned dependency is `graphiti-core==0.29.0`. Its `Graphiti.add_episode`
 reads recent episodes, creates an in-memory episode, runs `extract_nodes`,
 `resolve_extracted_nodes`, `_extract_and_resolve_edges`, and
