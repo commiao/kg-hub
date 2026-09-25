@@ -58,6 +58,9 @@ _usage_scenario: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _business_task: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
     "kg_hub_business_task", default=None
 )
+_resume: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "kg_hub_manual_resume", default=None
+)
 
 
 @contextmanager
@@ -68,6 +71,19 @@ def model_business_task(source_description: str, source_obs_id: str):
         yield
     finally:
         _business_task.reset(token)
+
+
+@contextmanager
+def model_manual_resume(source_description: str, source_obs_id: str,
+                        step_id: str, grant_id: str):
+    """Bind exactly one already authorized failed step to a business run."""
+    state = {"task": (source_description, source_obs_id), "step_id": step_id,
+             "grant_id": grant_id, "consumed": False}
+    token = _resume.set(state)
+    try:
+        yield
+    finally:
+        _resume.reset(token)
 
 
 # —— 结构化外壳修正 ——
@@ -422,6 +438,24 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             step_id = hashlib.sha256(
                 f"{task[0]}\x00{task[1]}\x00{request_digest}".encode("utf-8")
             ).hexdigest()
+        resume = _resume.get()
+        reserved_by_grant = False
+        if resume is not None:
+            if not journal or task != resume["task"]:
+                raise RuntimeError("manual resume has no durable task journal")
+            if not resume["consumed"]:
+                if step_id == resume["step_id"]:
+                    key = journal.claim_retry(
+                        resume["grant_id"], source_description=task[0],
+                        source_obs_id=task[1], step_id=step_id,
+                        request_digest=request_digest,
+                        business_key=str(kwargs.get("model") or gateway_model()),
+                        base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+                    headers["Idempotency-Key"] = key
+                    resume["consumed"] = True
+                    reserved_by_grant = True
+                elif not any(row["step_id"] == step_id for row in journal.find_task(*task)):
+                    raise NeedsReconciliation(step_id, "resume_input_drift", None)
         pending = inflight.get(key)
         if pending is not None:
             # shield:等待方被取消不能连带取消发起方的结果
@@ -436,7 +470,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     if wait > 0:
                         await asyncio.sleep(wait)
                     last_call["at"] = time.monotonic()
-            if journal and task:
+            if journal and task and not reserved_by_grant:
                 cached_result = journal.prepare(
                     key=key, business_key=str(kwargs.get("model") or gateway_model()),
                     source_description=task[0], source_obs_id=task[1],
@@ -447,6 +481,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     result = Message.model_validate_json(cached_result)
                     future.set_result(result)
                     return result
+                prepared = True
+            elif reserved_by_grant:
                 prepared = True
             result = await original_create(*args, **kwargs)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。

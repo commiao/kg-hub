@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import hashlib
+import uuid
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
@@ -52,6 +54,19 @@ class ModelAttemptJournal:
             )""")
             db.execute("""CREATE INDEX IF NOT EXISTS model_attempts_task
                 ON model_attempts(source_description, source_obs_id)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS model_retry_grants (
+                grant_id TEXT PRIMARY KEY,
+                source_description TEXT NOT NULL,
+                source_obs_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                consumed_at TEXT
+            )""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS model_retry_grant_open
+                ON model_retry_grants(source_description, source_obs_id, step_id)
+                WHERE state = 'granted'""")
 
     @contextmanager
     def _connect(self):
@@ -73,9 +88,20 @@ class ModelAttemptJournal:
                 "SELECT phase, provider_call_started, step_id, request_digest, result_json "
                 "FROM model_attempts WHERE idempotency_key = ?", (key,)
             ).fetchone()
+            if row and row[2:4] != (step_id, request_digest):
+                raise RuntimeError("model idempotency key reused for different input")
+            # A successful human retry has a fresh HTTP key. Future process
+            # restarts still reach the original deterministic key; replay that
+            # exact step's saved answer rather than trying the old failed key.
+            completed = db.execute("""SELECT result_json FROM model_attempts
+                WHERE source_description = ? AND source_obs_id = ?
+                  AND step_id = ? AND request_digest = ?
+                  AND phase = 'completed' AND result_json IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1""",
+                (source_description, source_obs_id, step_id, request_digest)).fetchone()
+            if completed:
+                return completed[0]
             if row:
-                if row[2:4] != (step_id, request_digest):
-                    raise RuntimeError("model idempotency key reused for different input")
                 if row[0] == "completed" and row[4]:
                     return row[4]
                 if row[0] == "preflight" and row[1] == 0:
@@ -140,6 +166,80 @@ class ModelAttemptJournal:
                   "phase", "provider_call_started", "gateway_identity",
                   "gateway_http_status", "result_json", "created_at", "updated_at")
         return [dict(zip(fields, row)) for row in rows]
+
+    def authorize_retry(self, source_description: str, source_obs_id: str,
+                        step_id: str, request_digest: str, *,
+                        deadline_seconds: float) -> str:
+        """Record one human decision; this never calls a model or queues work."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            records = db.execute("""SELECT idempotency_key, business_key, step_id,
+                request_digest, phase, provider_call_started, gateway_identity,
+                gateway_http_status, result_json, created_at, updated_at
+                FROM model_attempts WHERE source_description = ? AND source_obs_id = ?
+                  AND step_id = ? ORDER BY created_at, idempotency_key""",
+                (source_description, source_obs_id, step_id)).fetchall()
+            fields = ("idempotency_key", "business_key", "step_id", "request_digest",
+                      "phase", "provider_call_started", "gateway_identity",
+                      "gateway_http_status", "result_json", "created_at", "updated_at")
+            rows = [dict(zip(fields, record)) for record in records]
+            if not rows or any(row["request_digest"] != request_digest for row in rows):
+                raise RuntimeError("model step input changed")
+            summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
+            failed = summary["failed_calls_by_step"].get(step_id, 0)
+            if (failed < 1 or failed >= 3 or summary["in_flight"]
+                    or summary["admission_unknown"]
+                    or any(row["result_json"] for row in rows)):
+                raise RuntimeError("model step is not eligible for manual retry")
+            grant_id = str(uuid.uuid4())
+            db.execute("""INSERT INTO model_retry_grants
+                (grant_id, source_description, source_obs_id, step_id,
+                 request_digest, state, created_at)
+                 VALUES (?, ?, ?, ?, ?, 'granted', ?)""",
+                (grant_id, source_description, source_obs_id, step_id,
+                 request_digest, _now()))
+        return grant_id
+
+    def claim_retry(self, grant_id: str, *, source_description: str,
+                    source_obs_id: str, step_id: str, request_digest: str,
+                    business_key: str, base_key: str, deadline_seconds: float) -> str:
+        """Consume a grant and reserve a fresh exact-call identity atomically."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            grant = db.execute("""SELECT source_description, source_obs_id, step_id,
+                request_digest, state FROM model_retry_grants WHERE grant_id = ?""",
+                (grant_id,)).fetchone()
+            if grant != (source_description, source_obs_id, step_id,
+                         request_digest, "granted"):
+                raise RuntimeError("manual retry grant absent, consumed, or mismatched")
+            records = db.execute("""SELECT phase, provider_call_started, result_json,
+                created_at, request_digest FROM model_attempts
+                WHERE source_description = ? AND source_obs_id = ? AND step_id = ?""",
+                (source_description, source_obs_id, step_id)).fetchall()
+            rows = [{"step_id": step_id, "phase": r[0], "provider_call_started": r[1],
+                     "result_json": r[2], "created_at": r[3]} for r in records]
+            summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
+            failed = summary["failed_calls_by_step"].get(step_id, 0)
+            if (failed < 1 or failed >= 3 or summary["in_flight"]
+                    or summary["admission_unknown"]
+                    or any(r[2] or r[4] != request_digest for r in records)):
+                raise RuntimeError("model retry no longer safe")
+            ordinal = failed + 1
+            key = "kg1-" + hashlib.sha256(
+                f"{base_key}:{ordinal}:{grant_id}".encode("utf-8")).hexdigest()
+            now = _now()
+            db.execute("""INSERT INTO model_attempts
+                (idempotency_key, business_key, source_description, source_obs_id,
+                 step_id, request_digest, phase, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)""",
+                (key, business_key, source_description, source_obs_id,
+                 step_id, request_digest, now, now))
+            changed = db.execute("""UPDATE model_retry_grants SET state = 'consumed',
+                consumed_at = ? WHERE grant_id = ? AND state = 'granted'""",
+                (now, grant_id))
+            if changed.rowcount != 1:
+                raise RuntimeError("manual retry grant raced")
+        return key
 
 
 def query_gateway_attempt_status(base_url: str, token: str, business_key: str,
