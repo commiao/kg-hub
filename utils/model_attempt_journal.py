@@ -67,6 +67,24 @@ class ModelAttemptJournal:
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS model_retry_grant_open
                 ON model_retry_grants(source_description, source_obs_id, step_id)
                 WHERE state = 'granted'""")
+            db.execute("""CREATE TABLE IF NOT EXISTS episode_contexts (
+                source_description TEXT NOT NULL,
+                source_obs_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                previous_episode_uuids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(source_description, source_obs_id, operation_id)
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS episode_contexts (
+                source_description TEXT NOT NULL,
+                source_obs_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                previous_episode_uuids_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(source_description, source_obs_id, operation_id)
+            )""")
 
     @contextmanager
     def _connect(self):
@@ -166,6 +184,76 @@ class ModelAttemptJournal:
                   "phase", "provider_call_started", "gateway_identity",
                   "gateway_http_status", "result_json", "created_at", "updated_at")
         return [dict(zip(fields, row)) for row in rows]
+
+    def read_episode_context(self, source_description: str, source_obs_id: str,
+                             operation_id: str, input_digest: str) -> list[str] | None:
+        with self._connect() as db:
+            row = db.execute("""SELECT input_digest, previous_episode_uuids_json
+                FROM episode_contexts WHERE source_description = ? AND source_obs_id = ?
+                  AND operation_id = ?""",
+                (source_description, source_obs_id, operation_id)).fetchone()
+        if row is None:
+            return None
+        if row[0] != input_digest:
+            raise RuntimeError("episode input changed since model operation began")
+        value = json.loads(row[1])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise RuntimeError("episode context checkpoint is invalid")
+        return value
+
+    def save_episode_context(self, source_description: str, source_obs_id: str,
+                             operation_id: str, input_digest: str,
+                             previous_episode_uuids: list[str]) -> list[str]:
+        if not all(isinstance(v, str) for v in previous_episode_uuids):
+            raise RuntimeError("episode context contains invalid UUIDs")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT OR IGNORE INTO episode_contexts
+                (source_description, source_obs_id, operation_id, input_digest,
+                 previous_episode_uuids_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)""",
+                (source_description, source_obs_id, operation_id, input_digest,
+                 json.dumps(previous_episode_uuids), _now()))
+        saved = self.read_episode_context(source_description, source_obs_id,
+                                          operation_id, input_digest)
+        if saved is None:
+            raise RuntimeError("episode context checkpoint vanished")
+        return saved
+
+    def read_episode_context(self, source_description: str, source_obs_id: str,
+                             operation_id: str, input_digest: str) -> list[str] | None:
+        with self._connect() as db:
+            row = db.execute("""SELECT input_digest, previous_episode_uuids_json
+                FROM episode_contexts WHERE source_description = ? AND source_obs_id = ?
+                  AND operation_id = ?""",
+                (source_description, source_obs_id, operation_id)).fetchone()
+        if row is None:
+            return None
+        if row[0] != input_digest:
+            raise RuntimeError("episode input changed since model operation began")
+        value = json.loads(row[1])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise RuntimeError("episode context checkpoint is invalid")
+        return value
+
+    def save_episode_context(self, source_description: str, source_obs_id: str,
+                             operation_id: str, input_digest: str,
+                             previous_episode_uuids: list[str]) -> list[str]:
+        if not all(isinstance(v, str) for v in previous_episode_uuids):
+            raise RuntimeError("episode context contains invalid UUIDs")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT OR IGNORE INTO episode_contexts
+                (source_description, source_obs_id, operation_id, input_digest,
+                 previous_episode_uuids_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)""",
+                (source_description, source_obs_id, operation_id, input_digest,
+                 json.dumps(previous_episode_uuids), _now()))
+        saved = self.read_episode_context(source_description, source_obs_id,
+                                          operation_id, input_digest)
+        if saved is None:
+            raise RuntimeError("episode context checkpoint vanished")
+        return saved
 
     def authorize_retry(self, source_description: str, source_obs_id: str,
                         step_id: str, request_digest: str, *,

@@ -20,6 +20,20 @@ def fields():
 
 
 class JournalTests(unittest.TestCase):
+    def test_episode_context_is_immutable_across_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            self.assertIsNone(journal.read_episode_context(
+                "source", "id-1", "operation", "input"))
+            self.assertEqual(journal.save_episode_context(
+                "source", "id-1", "operation", "input", ["episode-1"]),
+                ["episode-1"])
+            self.assertEqual(journal.save_episode_context(
+                "source", "id-1", "operation", "input", ["episode-2"]),
+                ["episode-1"])
+            with self.assertRaises(RuntimeError):
+                journal.read_episode_context("source", "id-1", "operation", "changed")
+
     def test_manual_grant_is_single_use_and_three_real_calls_are_cap(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
