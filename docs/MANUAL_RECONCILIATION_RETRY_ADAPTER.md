@@ -37,8 +37,12 @@ ingest also duplicates predigest parent/child graph writes.
    operator grant. The grant is consumed atomically before HTTP admission and
    records the attempt ordinal. Proven gateway preflight refusal consumes no
    *actual-call* slot; admitted, timed-out, or admission-unknown attempts do.
-   After three actual calls with no usable result, close the step and move the
-   business task to `failed`. Unknown admission remains frozen for review.
+   A locally persisted HTTP-start marker with no usable response counts as a
+   failed business attempt after the maximum timeout, even if gateway/provider
+   admission remains unknown. A prepared intent with no local HTTP-start marker
+   and no gateway admission proof stays frozen. Proven pre-provider refusal
+   counts as zero. After three counted calls with no usable result, close the
+   step and move the business task to `failed`.
 4. During resume, any uncheckpointed or different model request before the
    granted failed step must stop without HTTP. After that step succeeds, new
    downstream steps may execute only as part of the same authorized business

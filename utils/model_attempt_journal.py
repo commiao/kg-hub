@@ -37,6 +37,7 @@ class ModelAttemptJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS model_attempts (
                 idempotency_key TEXT PRIMARY KEY,
                 business_key TEXT NOT NULL,
@@ -49,9 +50,14 @@ class ModelAttemptJournal:
                 result_json TEXT,
                 gateway_identity TEXT,
                 gateway_http_status INTEGER,
+                http_started_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
+            # Existing NAS journals predate the local HTTP-start marker.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
+            if "http_started_at" not in columns:
+                db.execute("ALTER TABLE model_attempts ADD COLUMN http_started_at TEXT")
             db.execute("""CREATE INDEX IF NOT EXISTS model_attempts_task
                 ON model_attempts(source_description, source_obs_id)""")
             db.execute("""CREATE TABLE IF NOT EXISTS model_retry_grants (
@@ -67,15 +73,6 @@ class ModelAttemptJournal:
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS model_retry_grant_open
                 ON model_retry_grants(source_description, source_obs_id, step_id)
                 WHERE state = 'granted'""")
-            db.execute("""CREATE TABLE IF NOT EXISTS episode_contexts (
-                source_description TEXT NOT NULL,
-                source_obs_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                input_digest TEXT NOT NULL,
-                previous_episode_uuids_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(source_description, source_obs_id, operation_id)
-            )""")
             db.execute("""CREATE TABLE IF NOT EXISTS episode_contexts (
                 source_description TEXT NOT NULL,
                 source_obs_id TEXT NOT NULL,
@@ -126,7 +123,8 @@ class ModelAttemptJournal:
                     # Gateway proved no provider call started. Reusing this
                     # identity later remains the first actual attempt.
                     db.execute("""UPDATE model_attempts SET phase = 'prepared',
-                        provider_call_started = NULL, updated_at = ?
+                        provider_call_started = NULL, http_started_at = NULL,
+                        updated_at = ?
                         WHERE idempotency_key = ?""", (_now(), key))
                     return None
                 raise NeedsReconciliation(step_id, row[0],
@@ -148,6 +146,17 @@ class ModelAttemptJournal:
                 WHERE idempotency_key = ?""", (result_json, _now(), key))
             if changed.rowcount != 1:
                 raise RuntimeError("model attempt intent vanished before response persistence")
+
+    def start_http(self, key: str) -> None:
+        """Durably mark the SDK HTTP-call boundary before invoking the SDK."""
+        with self._connect() as db:
+            now = _now()
+            changed = db.execute("""UPDATE model_attempts
+                SET phase = 'http_started', http_started_at = ?, updated_at = ?
+                WHERE idempotency_key = ? AND phase = 'prepared'
+                  AND http_started_at IS NULL""", (now, now, key))
+            if changed.rowcount != 1:
+                raise RuntimeError("model HTTP start marker missing or duplicated")
 
     def update_gateway_status(self, key: str, status: dict) -> NeedsReconciliation:
         started = status.get("provider_call_started")
@@ -176,13 +185,15 @@ class ModelAttemptJournal:
         with self._connect() as db:
             rows = db.execute("""SELECT idempotency_key, business_key, step_id,
                 request_digest, phase, provider_call_started, gateway_identity,
-                gateway_http_status, result_json, created_at, updated_at
+                gateway_http_status, result_json, created_at, updated_at,
+                http_started_at
                 FROM model_attempts WHERE source_description = ? AND source_obs_id = ?
                 ORDER BY created_at, idempotency_key""",
                 (source_description, source_obs_id)).fetchall()
         fields = ("idempotency_key", "business_key", "step_id", "request_digest",
                   "phase", "provider_call_started", "gateway_identity",
-                  "gateway_http_status", "result_json", "created_at", "updated_at")
+                  "gateway_http_status", "result_json", "created_at", "updated_at",
+                  "http_started_at")
         return [dict(zip(fields, row)) for row in rows]
 
     def read_episode_context(self, source_description: str, source_obs_id: str,
@@ -263,20 +274,22 @@ class ModelAttemptJournal:
             db.execute("BEGIN IMMEDIATE")
             records = db.execute("""SELECT idempotency_key, business_key, step_id,
                 request_digest, phase, provider_call_started, gateway_identity,
-                gateway_http_status, result_json, created_at, updated_at
+                gateway_http_status, result_json, created_at, updated_at,
+                http_started_at
                 FROM model_attempts WHERE source_description = ? AND source_obs_id = ?
                   AND step_id = ? ORDER BY created_at, idempotency_key""",
                 (source_description, source_obs_id, step_id)).fetchall()
             fields = ("idempotency_key", "business_key", "step_id", "request_digest",
                       "phase", "provider_call_started", "gateway_identity",
-                      "gateway_http_status", "result_json", "created_at", "updated_at")
+                      "gateway_http_status", "result_json", "created_at", "updated_at",
+                      "http_started_at")
             rows = [dict(zip(fields, record)) for record in records]
             if not rows or any(row["request_digest"] != request_digest for row in rows):
                 raise RuntimeError("model step input changed")
             summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
             failed = summary["failed_calls_by_step"].get(step_id, 0)
             if (failed < 1 or failed >= 3 or summary["in_flight"]
-                    or summary["admission_unknown"]
+                    or summary["unknown_without_http_evidence"]
                     or any(row["result_json"] for row in rows)):
                 raise RuntimeError("model step is not eligible for manual retry")
             grant_id = str(uuid.uuid4())
@@ -301,15 +314,16 @@ class ModelAttemptJournal:
                          request_digest, "granted"):
                 raise RuntimeError("manual retry grant absent, consumed, or mismatched")
             records = db.execute("""SELECT phase, provider_call_started, result_json,
-                created_at, request_digest FROM model_attempts
+                created_at, request_digest, http_started_at FROM model_attempts
                 WHERE source_description = ? AND source_obs_id = ? AND step_id = ?""",
                 (source_description, source_obs_id, step_id)).fetchall()
             rows = [{"step_id": step_id, "phase": r[0], "provider_call_started": r[1],
-                     "result_json": r[2], "created_at": r[3]} for r in records]
+                     "result_json": r[2], "created_at": r[3],
+                     "http_started_at": r[5]} for r in records]
             summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
             failed = summary["failed_calls_by_step"].get(step_id, 0)
             if (failed < 1 or failed >= 3 or summary["in_flight"]
-                    or summary["admission_unknown"]
+                    or summary["unknown_without_http_evidence"]
                     or any(r[2] or r[4] != request_digest for r in records)):
                 raise RuntimeError("model retry no longer safe")
             ordinal = failed + 1
@@ -353,7 +367,7 @@ def journal_from_backup_env() -> ModelAttemptJournal | None:
 
 def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
                        now: datetime | None = None) -> dict:
-    """Read-only attempt counts; unknown admission consumes a conservative slot.
+    """Count each locally started model HTTP call once after its deadline.
 
     A gateway HTTP success is only a model result. It does not make the ingest
     business task successful until the graph result is independently verified.
@@ -361,7 +375,8 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
     now = now or datetime.now(timezone.utc)
     failed_by_step: dict[str, int] = {}
     in_flight = False
-    unresolved = False
+    admission_unknown = False
+    unknown_without_http_evidence = False
     cached_steps: set[str] = set()
     for row in rows:
         step = row["step_id"]
@@ -371,9 +386,19 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
             cached_steps.add(step)
             continue
         if started == 0:
+            # Gateway proved pre-provider refusal. It is not a model call.
+            continue
+        local_http_start = row.get("http_started_at")
+        if started is None:
+            admission_unknown = True
+        if started is None and not local_http_start:
+            # Old or interrupted prepared intent: no durable proof the SDK
+            # HTTP boundary was crossed. Do not count it as a real call.
+            unknown_without_http_evidence = True
             continue
         try:
-            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+            created = datetime.fromisoformat(
+                (local_http_start or row["created_at"]).replace("Z", "+00:00"))
             elapsed = (now - created).total_seconds()
         except (TypeError, ValueError):
             elapsed = deadline_seconds
@@ -381,13 +406,12 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
             failed_by_step[step] = failed_by_step.get(step, 0) + 1
         else:
             in_flight = True
-        if started is None:
-            unresolved = True
     return {
         "failed_calls_by_step": failed_by_step,
         "max_failed_calls": max(failed_by_step.values(), default=0),
         "in_flight": in_flight,
-        "admission_unknown": unresolved,
+        "admission_unknown": admission_unknown,
+        "unknown_without_http_evidence": unknown_without_http_evidence,
         "cached_model_steps": len(cached_steps),
         "attempts_recorded": len(rows),
     }

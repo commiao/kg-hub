@@ -496,6 +496,12 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 prepared = True
             elif reserved_by_grant:
                 prepared = True
+            if journal and prepared:
+                # Commit the local HTTP-start boundary before entering the SDK.
+                # A crash/timeout after this point is one failed business
+                # model attempt once the maximum timeout expires, even when
+                # gateway provider admission remains unknown.
+                journal.start_http(key)
             result = await original_create(*args, **kwargs)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
             repair_structured_envelopes(result)

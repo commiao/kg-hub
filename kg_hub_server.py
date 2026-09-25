@@ -1660,7 +1660,8 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     refreshed = journal.find_task(sd, sid) if journal else []
     summary = summarize_attempts(refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
     if (not complete and summary["max_failed_calls"] >= 3
-            and not summary["in_flight"] and not summary["admission_unknown"]):
+            and not summary["in_flight"]
+            and not summary["unknown_without_http_evidence"]):
         # No more model calls may be authorized for the exhausted step.
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "

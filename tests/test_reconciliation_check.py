@@ -101,6 +101,17 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.data["task"]["admission_unknown"])
         self.assertEqual(driver.writes, [])
 
+    async def test_three_locally_started_timeouts_are_terminal_without_gateway_arm(self):
+        driver = Driver()
+        attempts = [attempt(i, None) for i in range(3)]
+        for row in attempts:
+            row["http_started_at"] = "2026-09-25T00:00:00+00:00"
+        response = await self.run_check(driver, Journal(attempts))
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["max_failed_calls"], 3)
+        self.assertTrue(response.data["task"]["admission_unknown"])
+        self.assertFalse(response.data["task"]["unknown_without_http_evidence"])
+
 
 if __name__ == "__main__":
     unittest.main()

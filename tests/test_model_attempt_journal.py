@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,6 +21,26 @@ def fields():
 
 
 class JournalTests(unittest.TestCase):
+    def test_existing_journal_adds_http_start_column_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "attempts.sqlite3"
+            with sqlite3.connect(path) as db:
+                db.execute("""CREATE TABLE model_attempts (
+                    idempotency_key TEXT PRIMARY KEY, business_key TEXT,
+                    source_description TEXT, source_obs_id TEXT, step_id TEXT,
+                    request_digest TEXT, phase TEXT, provider_call_started INTEGER,
+                    result_json TEXT, gateway_identity TEXT,
+                    gateway_http_status INTEGER, created_at TEXT, updated_at TEXT)""")
+                db.execute("""INSERT INTO model_attempts
+                    VALUES ('old', 'kg_hub.entity_extract', 'source', 'id-1',
+                            'step-1', 'hash', 'unknown', NULL, NULL, NULL, NULL,
+                            '2026-09-25T00:00:00+00:00',
+                            '2026-09-25T00:00:00+00:00')""")
+            journal = ModelAttemptJournal(path)
+            old = journal.find_task("source", "id-1")[0]
+            self.assertEqual(old["idempotency_key"], "old")
+            self.assertIsNone(old["http_started_at"])
+
     def test_episode_context_is_immutable_across_resume(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
@@ -94,6 +115,22 @@ class JournalTests(unittest.TestCase):
                     "source", "id-1", "step-1", "request-hash",
                     deadline_seconds=0)
 
+    def test_timed_out_local_http_call_can_receive_one_manual_grant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            journal.prepare(**fields())
+            journal.start_http("key-1")
+            journal.update_gateway_status(
+                "key-1", {"phase": "absent", "provider_call_started": None})
+            with self.assertRaises(RuntimeError):
+                journal.authorize_retry(
+                    "source", "id-1", "step-1", "request-hash",
+                    deadline_seconds=3600)
+            grant = journal.authorize_retry(
+                "source", "id-1", "step-1", "request-hash",
+                deadline_seconds=0)
+            self.assertTrue(grant)
+
     def test_attempt_summary_excludes_proven_preflight_and_cached_result(self):
         now = datetime(2026, 9, 26, tzinfo=timezone.utc)
         old = (now - timedelta(minutes=30)).isoformat()
@@ -108,9 +145,32 @@ class JournalTests(unittest.TestCase):
              "result_json": None, "created_at": old},
         ]
         summary = summarize_attempts(rows, deadline_seconds=60, now=now)
-        self.assertEqual(summary["failed_calls_by_step"], {"step-a": 1, "step-c": 1})
+        self.assertEqual(summary["failed_calls_by_step"], {"step-a": 1})
         self.assertEqual(summary["cached_model_steps"], 1)
         self.assertTrue(summary["admission_unknown"])
+        self.assertTrue(summary["unknown_without_http_evidence"])
+
+    def test_local_http_start_times_out_even_if_gateway_admission_unknown(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        old = (now - timedelta(minutes=30)).isoformat()
+        rows = [{"step_id": "step-a", "phase": "unknown",
+                 "provider_call_started": None, "result_json": None,
+                 "created_at": old, "http_started_at": old}]
+        summary = summarize_attempts(rows, deadline_seconds=180, now=now)
+        self.assertEqual(summary["failed_calls_by_step"], {"step-a": 1})
+        self.assertTrue(summary["admission_unknown"])
+        self.assertFalse(summary["unknown_without_http_evidence"])
+        self.assertFalse(summary["in_flight"])
+
+    def test_local_http_start_stays_in_flight_until_deadline(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        recent = (now - timedelta(seconds=30)).isoformat()
+        summary = summarize_attempts([{"step_id": "step-a", "phase": "unknown",
+            "provider_call_started": None, "result_json": None,
+            "created_at": recent, "http_started_at": recent}],
+            deadline_seconds=180, now=now)
+        self.assertEqual(summary["failed_calls_by_step"], {})
+        self.assertTrue(summary["in_flight"])
 
     def test_prepared_identity_survives_restart_and_freezes_replay(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -228,6 +288,7 @@ class ClientJournalTests(unittest.IsolatedAsyncioTestCase):
             row = journal.find_task("source", "id-1")[0]
             self.assertEqual(row["phase"], "absent")
             self.assertIsNone(row["provider_call_started"])
+            self.assertIsNotNone(row["http_started_at"])
 
 
 if __name__ == "__main__":
