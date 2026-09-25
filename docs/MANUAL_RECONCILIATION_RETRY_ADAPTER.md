@@ -3,6 +3,18 @@
 Status: design gap. The read-only reconciliation API is implemented; **manual
 retry is not implemented and must not be exposed or deployed as if it were**.
 
+An isolated partial adapter now exists in `utils/graphiti_stage_adapter.py`.
+It wraps the pinned 0.29.0 extraction helper and stores immutable serialized
+`EntityNode` objects (including their generated UUIDs and attribution map),
+ordered semantic candidate sets, and resolved nodes. It rejects input/UUID
+drift and provides a one-way durable
+`begin_graph_commit` fence. `tests/test_graphiti_stage_adapter.py` exercises
+candidate changes and process-style restoration against real pinned Graphiti
+node types and resolver helpers. This adapter is **not wired into live ingest**:
+edge/attribute phase outputs and the business graph commit/result still lack
+full recovery checkpoints. A repeated commit attempt freezes rather than
+writing again, so the partial adapter cannot yet guarantee a terminal task.
+
 The pinned dependency is `graphiti-core==0.29.0`. Its `Graphiti.add_episode`
 reads recent episodes, creates an in-memory episode, runs `extract_nodes`,
 `resolve_extracted_nodes`, `_extract_and_resolve_edges`, and
