@@ -32,6 +32,11 @@ def prepare_task_report(store: MailboxStore, journal, row: dict,
     raw_status = row.get("status")
     state = {"needs_reconciliation": "reconciliation", "failed": "failed",
              "ok": "succeeded"}.get(raw_status, "reconciliation")
+    if raw_status == "failed" and row.get("error_kind") in {
+            "reconciliation_source_identity_missing",
+            "reconciliation_model_step_missing",
+            "reconciliation_model_step_identity_missing"}:
+        state = "unrecoverable"
     return store.prepare_report(
         sd, sid, step_id=step, state=state,
         failed_attempts=failed, retryable=False,

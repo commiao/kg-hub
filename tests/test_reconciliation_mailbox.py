@@ -6,10 +6,21 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from utils.reconciliation_mailbox import MailboxStore, task_uuid, ZERO_STEP
-from utils.reconciliation_worker import process_command
+from utils.reconciliation_worker import prepare_task_report, process_command
 
 
 class MailboxTests(unittest.TestCase):
+    def test_missing_step_is_reported_as_unrecoverable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            report = prepare_task_report(store, None, {
+                "source_description": "source", "source_obs_id": "id-1",
+                "status": "failed", "error_kind": "reconciliation_model_step_missing",
+            }, deadline_seconds=180)
+            self.assertEqual(report["state"], "unrecoverable")
+            self.assertEqual(report["reason"], "reconciliation_model_step_missing")
+            self.assertEqual(report["model_step_id"], ZERO_STEP)
+
     def test_task_identity_is_unambiguous_and_versioned(self):
         self.assertNotEqual(task_uuid("a:b", "c"), task_uuid("a", "b:c"))
         with tempfile.TemporaryDirectory() as temp:

@@ -1629,11 +1629,17 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     row = rows[0]
     try:
         journal = journal_from_backup_env()
-        attempts = journal.find_task(sd, sid) if journal else []
+        if journal is None:
+            return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
+        attempts = journal.find_task(sd, sid)
     except Exception:
         return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
     for attempt in attempts:
         if attempt["result_json"] or attempt["provider_call_started"] == 0:
+            continue
+        if not attempt.get("business_key") or not attempt.get("idempotency_key"):
+            # A malformed durable identity cannot be queried at the gateway.
+            # Its explicit failed-list classification happens below.
             continue
         try:
             evidence = await asyncio.to_thread(
@@ -1657,7 +1663,7 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
             row["status"] = "ok"
-    refreshed = journal.find_task(sd, sid) if journal else []
+    refreshed = journal.find_task(sd, sid)
     summary = summarize_attempts(refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
     if (not complete and summary["max_failed_calls"] >= 3
             and not summary["in_flight"]
@@ -1672,6 +1678,35 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
             row["status"] = "failed"
+            row["error_kind"] = "model_attempts_exhausted"
+    elif (not complete and row["status"] == "needs_reconciliation"
+          and not summary["in_flight"]):
+        # Only permanent identity gaps are terminalized here. Gateway status
+        # errors, locally in-flight calls and unproven prepared intents remain
+        # held. A missing exact identity cannot authorize a model retry or
+        # prove the original business write, so surface it in the failed list.
+        missing = None
+        if not row.get("name") or not row.get("source_description") or not row.get("source_obs_id"):
+            missing = "reconciliation_source_identity_missing"
+        elif not refreshed:
+            missing = "reconciliation_model_step_missing"
+        elif any(not all((a.get("idempotency_key"), a.get("business_key"),
+                          a.get("step_id"), a.get("request_digest"))) for a in refreshed):
+            missing = "reconciliation_model_step_identity_missing"
+        if missing:
+            changed, _, _ = await driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "WHERE k.status = 'needs_reconciliation' "
+                "SET k.status = 'failed', k.updated_at = $now, "
+                "    k.error_kind = $reason, "
+                "    k.error_message = 'exact reconciliation identity unavailable' "
+                "RETURN count(k) AS c",
+                sd=sd, sid=sid, reason=missing,
+                now=datetime.now(tz=timezone.utc).isoformat())
+            if changed and changed[0].get("c") == 1:
+                row["status"] = "failed"
+                row["error_kind"] = missing
+                row["error_message"] = "exact reconciliation identity unavailable"
     return JSONResponse({"status": "ok", "business_result_persisted": complete,
                          "task": _reconciliation_task_view(row, journal),
                          "mode": "read_only_model_check"})

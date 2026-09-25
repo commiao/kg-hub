@@ -29,15 +29,16 @@ class Request:
 
 
 class Driver:
-    def __init__(self, *, episode_uuid=None):
+    def __init__(self, *, episode_uuid=None, name="episode"):
         self.episode_uuid = episode_uuid
+        self.name = name
         self.writes = []
 
     async def execute_query(self, query, **params):
         if "RETURN k.source_description AS source_description" in query:
             return [{"source_description": "source", "source_obs_id": "id-1",
                      "status": "needs_reconciliation", "episode_uuid": self.episode_uuid,
-                     "name": "episode", "stage": None, "predigest_children": None}], None, None
+                     "name": self.name, "stage": None, "predigest_children": None}], None, None
         if "MATCH (e:Episodic {uuid:" in query:
             return [{"c": 1}], None, None
         self.writes.append(query)
@@ -57,7 +58,8 @@ class Journal:
 
 def attempt(index, started):
     return {"idempotency_key": f"key-{index}", "business_key": "kg_hub.entity_extract",
-            "step_id": "same-step", "phase": "failed" if started else "unknown",
+            "step_id": "same-step", "request_digest": "request-hash",
+            "phase": "failed" if started else "unknown",
             "provider_call_started": started, "result_json": None,
             "created_at": "2026-09-25T00:00:00+00:00"}
 
@@ -122,6 +124,46 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["task"]["status"], "needs_reconciliation")
         self.assertFalse(response.data["business_result_persisted"])
         self.assertEqual(response.data["task"]["max_failed_calls"], 0)
+        self.assertEqual(driver.writes, [])
+
+    async def test_missing_model_step_is_unrecoverable_failed_list_item(self):
+        driver = Driver()
+        response = await self.run_check(driver, Journal([]))
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["error_kind"],
+                         "reconciliation_model_step_missing")
+        self.assertIn("$reason", driver.writes[0])
+
+    async def test_unconfigured_journal_is_service_unavailable_not_unrecoverable(self):
+        driver = Driver()
+        response = await self.run_check(driver, None)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["code"], "journal_unavailable")
+        self.assertEqual(driver.writes, [])
+
+    async def test_missing_source_name_is_unrecoverable(self):
+        driver = Driver(name=None)
+        response = await self.run_check(driver, Journal([attempt(1, 1)]))
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["error_kind"],
+                         "reconciliation_source_identity_missing")
+
+    async def test_invalid_step_identity_is_unrecoverable(self):
+        row = attempt(1, None)
+        row["step_id"] = ""
+        driver = Driver()
+        response = await self.run_check(driver, Journal([row]))
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["error_kind"],
+                         "reconciliation_model_step_identity_missing")
+
+    async def test_in_flight_call_keeps_missing_source_held(self):
+        row = attempt(1, 1)
+        row["phase"] = "admitted"
+        row["created_at"] = datetime.now(timezone.utc).isoformat()
+        driver = Driver(name=None)
+        response = await self.run_check(driver, Journal([row]))
+        self.assertEqual(response.data["task"]["status"], "needs_reconciliation")
         self.assertEqual(driver.writes, [])
 
 
