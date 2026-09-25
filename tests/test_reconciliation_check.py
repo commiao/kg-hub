@@ -112,6 +112,18 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.data["task"]["admission_unknown"])
         self.assertFalse(response.data["task"]["unknown_without_http_evidence"])
 
+    async def test_saved_model_answer_does_not_mark_business_success_or_failure(self):
+        driver = Driver()
+        rows = [attempt(1, 1)]
+        rows[0]["phase"] = "completed"
+        rows[0]["result_json"] = '{"answer":"saved"}'
+        rows[0]["http_started_at"] = "2026-09-25T00:00:00+00:00"
+        response = await self.run_check(driver, Journal(rows))
+        self.assertEqual(response.data["task"]["status"], "needs_reconciliation")
+        self.assertFalse(response.data["business_result_persisted"])
+        self.assertEqual(response.data["task"]["max_failed_calls"], 0)
+        self.assertEqual(driver.writes, [])
+
 
 if __name__ == "__main__":
     unittest.main()

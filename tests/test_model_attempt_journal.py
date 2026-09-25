@@ -172,6 +172,17 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(summary["failed_calls_by_step"], {})
         self.assertTrue(summary["in_flight"])
 
+    def test_saved_model_response_is_not_failed_when_business_graph_is_pending(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        old = (now - timedelta(minutes=30)).isoformat()
+        summary = summarize_attempts([{"step_id": "step-a", "phase": "unknown",
+            "provider_call_started": None, "result_json": '{"answer":"saved"}',
+            "created_at": old, "http_started_at": old}],
+            deadline_seconds=180, now=now)
+        self.assertEqual(summary["failed_calls_by_step"], {})
+        self.assertEqual(summary["cached_model_steps"], 1)
+        self.assertFalse(summary["in_flight"])
+
     def test_prepared_identity_survives_restart_and_freezes_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "attempts.sqlite3"

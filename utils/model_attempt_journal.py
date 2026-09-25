@@ -382,7 +382,10 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
         step = row["step_id"]
         phase = row["phase"]
         started = row["provider_call_started"]
-        if phase == "completed" and row.get("result_json"):
+        if row.get("result_json"):
+            # The exact model response is durable even if a later gateway
+            # status refresh changed the phase. Business graph completion is
+            # checked separately; this paid model step itself did not fail.
             cached_steps.add(step)
             continue
         if started == 0:
