@@ -17,10 +17,10 @@ REAL_INGEST_VIA_API = R.ingest_via_api
 def run(rows, wm, backoff, cycle, verdict="409"):
     """跑一轮 process_batch,ingest 结果由 verdict 决定。"""
     orig = R.ingest_via_api
-    R.ingest_via_api = lambda obs: asyncio.sleep(0, result=verdict)
+    R.ingest_via_api = lambda obs, scenario="backlog": asyncio.sleep(0, result=verdict)
     calls = []
     _real = R.ingest_via_api
-    async def counting(obs):
+    async def counting(obs, scenario="backlog"):
         calls.append(obs["id"])
         return verdict
     R.ingest_via_api = counting
@@ -97,7 +97,7 @@ check("无退避时与旧切片 [:N] 一致", R.select_backlog_batch(pending, {}
 check("名额上限严格", len(R.select_backlog_batch(pending, {}, cycle=1, limit=3)) == 3)
 
 # 配额耗尽:网关 429 时整窗停发,不逐条撞(2026-09-06 夜 218 篇败/127 篇成)
-async def quota_verdict(obs):
+async def quota_verdict(obs, scenario="backlog"):
     quota_calls.append(obs["id"]); return "quota"
 quota_calls = []
 R.ingest_via_api = quota_verdict
@@ -115,7 +115,7 @@ check("stats 区分 quota 与同批停发", stats_q["result_counts"].get("quota"
       and stats_q["result_counts"].get("halted", 0) >= 1)
 
 # SDK 的 RateLimitError 由服务端按一小时释放；恢复探测不得早于这个阈值。
-async def rate_limit_verdict(obs):
+async def rate_limit_verdict(obs, scenario="backlog"):
     rate_limit_calls.append(obs["id"]); return "rate_limited"
 rate_limit_calls = []
 R.ingest_via_api = rate_limit_verdict
@@ -132,7 +132,7 @@ check("stats 暴露 rate_limited 类别", stats_rl["result_counts"].get("rate_li
 # 已在飞的第二条可在限流结果之后才完成；较短的 quota 暂停绝不能覆盖 1 小时暂停。
 async def run_mixed_limits():
     mixed_ready = asyncio.Event()
-    async def mixed_limit_verdict(obs):
+    async def mixed_limit_verdict(obs, scenario="backlog"):
         if obs["id"] == 201:
             await mixed_ready.wait()
             return "rate_limited"
@@ -200,19 +200,29 @@ check("5xx 视为瞬时:轮询到上限而非误判失败", st_5xx == "timeout")
 
 # POST 的非成功响应只外露状态码类别，绝不把服务端 message 写入 refinery 状态。
 _orig_http = R._http
-R._http = lambda method, url, body=None, timeout=30: (500, {"status": "error", "message": "private"})
+captured_headers = {}
+def capture_scenario_header(method, url, body=None, timeout=30, headers=None):
+    captured_headers.update(headers or {})
+    return 500, {"status": "error"}
+R._http = capture_scenario_header
+try:
+    asyncio.run(REAL_INGEST_VIA_API(ROWS[0], "live"))
+finally:
+    R._http = _orig_http
+check("入图请求携带真实场景头", captured_headers == {"X-KG-HUB-Refinery-Scenario": "live"})
+R._http = lambda method, url, body=None, timeout=30, **_kwargs: (500, {"status": "error", "message": "private"})
 try:
     st_post_500 = asyncio.run(REAL_INGEST_VIA_API(ROWS[0]))
 finally:
     R._http = _orig_http
 check("POST 500 → 无内容 http_500 类别", st_post_500 == "http_500")
-R._http = lambda method, url, body=None, timeout=30: (500, {"status": "error", "diagnostic": "ResponseError"})
+R._http = lambda method, url, body=None, timeout=30, **_kwargs: (500, {"status": "error", "diagnostic": "ResponseError"})
 try:
     st_post_diagnostic = asyncio.run(REAL_INGEST_VIA_API(ROWS[0]))
 finally:
     R._http = _orig_http
 check("POST 500 → 受限异常类别", st_post_diagnostic == "http_500_ResponseError")
-R._http = lambda method, url, body=None, timeout=30: (503, {"status": "error", "code": "graphiti_unavailable", "diagnostic": "ResponseError"})
+R._http = lambda method, url, body=None, timeout=30, **_kwargs: (503, {"status": "error", "code": "graphiti_unavailable", "diagnostic": "ResponseError"})
 try:
     st_graphiti = asyncio.run(REAL_INGEST_VIA_API(ROWS[0]))
 finally:
@@ -221,7 +231,7 @@ check("Graphiti 503 → 受限可停发类别", st_graphiti == "graphiti_unavail
 
 # 并发:批内两条同时在飞 → 一条慢抽取不再堵住身后的快速失败
 order = []
-async def slow_then_fast(obs):
+async def slow_then_fast(obs, scenario="backlog"):
     order.append(("start", obs["id"]))
     await _orig_sleep(0.2 if obs["id"] == 301 else 0.01)
     order.append(("end", obs["id"]))
@@ -241,7 +251,7 @@ check("水印两条都落账", wmc["ingested"] == {301, 302})
 saves = []
 _real_save = R.save_watermark
 R.save_watermark = lambda wm: saves.append(len(wm["ingested"]))
-async def one_by_one(obs):
+async def one_by_one(obs, scenario="backlog"):
     await _orig_sleep(0.01)
     return "ok"
 R.ingest_via_api = one_by_one
