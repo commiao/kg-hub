@@ -3,7 +3,7 @@
 REFINERY-DESIGN Phase A:复活休眠的 claude-mem 线。db 副本早已每 15min 同步到
 NAS(sync_claude_mem_to_nas.sh),此前无消费者(4555 条积压)。本进程:
 
-    NAS db 副本(ro) ──90s 微批──▶ ingest_filter 质量闸(复用)
+    NAS db 副本(ro) ──按项目阈值/最长等待调度──▶ ingest_filter 质量闸(复用)
         ──▶ POST /api/ingest(唯一治理写入通道:幂等键/备份/kind链/预拆分流)
              逐条 poll-drain 串行(尊重单写者,模式同 vps_push_capsules)
 
@@ -26,7 +26,11 @@ Env(compose):
   KG_HUB_URL(默认 http://kg_hub_server:8080)  KG_HUB_API_TOKEN
   KG_HUB_REFINERY_DB(默认 /data/claude-mem/claude-mem.db)
   KG_HUB_REFINERY_STATE(默认 /state)
-  KG_HUB_REFINERY_INTERVAL_SEC(默认 90) KG_HUB_REFINERY_BACKLOG_PER_CYCLE(默认 15)
+  KG_HUB_REFINERY_INTERVAL_SEC(默认 90) KG_HUB_REFINERY_BACKLOG_PER_CYCLE(默认 50)
+  KG_HUB_REFINERY_LIVE_PER_CYCLE(默认 50)
+  KG_HUB_REFINERY_BACKLOG_DISPATCH_THRESHOLD(默认 200 条/项目)
+  KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD(默认 10 条/项目,历史清空后)
+  KG_HUB_REFINERY_MAX_WAIT_SEC(默认 900;不足阈值时最久等待)
   KG_HUB_REFINERY_BACKLOG(默认 1;0=只处理 live,不烧积压)
 """
 
@@ -45,6 +49,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -247,6 +252,13 @@ BACKLOG_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE", "50"
 #
 # 两条都可配之后，比例就是一个能被审阅、被测试钉住的决策，而不是藏在切片里的常数。
 LIVE_PER_CYCLE = int(os.environ.get("KG_HUB_REFINERY_LIVE_PER_CYCLE", "50"))
+# These are dispatch triggers, measured in pending observations per project. They
+# do not batch observations into one model request or cap daily admissions.
+BACKLOG_DISPATCH_THRESHOLD = max(1, int(os.environ.get(
+    "KG_HUB_REFINERY_BACKLOG_DISPATCH_THRESHOLD", "200")))
+LIVE_DISPATCH_THRESHOLD = max(1, int(os.environ.get(
+    "KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD", "10")))
+MAX_WAIT_SEC = max(0, int(os.environ.get("KG_HUB_REFINERY_MAX_WAIT_SEC", "900")))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
 # 夜间回填窗口(北京时间 / Asia/Shanghai, UTC+8;含头不含尾;跨午夜写成 start>end)。
 # 默认 22:00-08:00，由环境变量显式覆盖时以覆盖值为准。
@@ -539,6 +551,28 @@ def fetch_ids(min_id_exclusive: int | None = None,
     return ids
 
 
+def fetch_pending_metadata(min_id_exclusive: int | None = None,
+                           max_id_inclusive: int | None = None) -> list[dict]:
+    """Read lightweight queue metadata for all candidates before limiting dispatch.
+
+    Fetching only the first per-cycle rows would prevent a 200-item project from
+    ever reaching its threshold when the per-cycle limit is smaller than 200.
+    """
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    where, params = [], []
+    if min_id_exclusive is not None:
+        where.append("id > ?"); params.append(min_id_exclusive)
+    if max_id_inclusive is not None:
+        where.append("id <= ?"); params.append(max_id_inclusive)
+    sql = ("SELECT id, project, created_at FROM observations "
+           + ("WHERE " + " AND ".join(where) if where else "")
+           + " ORDER BY id ASC")
+    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+    conn.close()
+    return rows
+
+
 def fetch_rows_by_ids(ids: list[int]) -> list[dict]:
     if not ids:
         return []
@@ -551,11 +585,13 @@ def fetch_rows_by_ids(ids: list[int]) -> list[dict]:
         "o.generated_by_model, o.relevance_count, s.platform_source "
         "FROM observations o "
         "LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id "
-        f"WHERE o.id IN ({ph}) ORDER BY o.id ASC"
+        f"WHERE o.id IN ({ph})"
     )
-    rows = [dict(r) for r in conn.execute(sql, ids).fetchall()]
+    by_id = {r["id"]: dict(r) for r in conn.execute(sql, ids).fetchall()}
     conn.close()
-    return rows
+    # SQL IN does not preserve scheduler order. Keep the project round-robin
+    # order even when a gateway pause stops the batch after its first calls.
+    return [by_id[oid] for oid in ids if oid in by_id]
 
 
 # ---------- 正文/payload(镜像 claude_mem_obs.build_episode_body / ingest_one) ----------
@@ -820,14 +856,16 @@ async def heartbeat_loop() -> None:
 # ---------- 主循环 ----------
 
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
-                        quotas: QuotaTracker, decided: dict,
+                        quotas: QuotaTracker | None, decided: dict,
                         backoff: dict[int, list[int]], cycle: int, kind: str,
                         quota_pause: dict | None = None,
                         on_progress=None) -> dict:
-    """decided: 进程内决策缓存 {obs_id: accept}。deferred 条目下轮重评会重复
-    quotas.consume(幻影消耗把日配额烧穿)——缓存决策,每条 obs 只评一次。
+    """decided: 进程内决策缓存 {obs_id: accept}，每条 obs 只评一次。
 
-    三段式:①过滤必须串行(要动日配额且每条只评一次) ②抽取有界并发(消除批内队头
+    ``quotas`` is retained for older callers; refinery deliberately does not
+    apply the filter's legacy daily observation admission limit.
+
+    三段式:①过滤串行 ②抽取有界并发(消除批内队头
     阻塞) ③落账串行(水印/退避表的读改写不能交错)。
 
     on_progress(stats):每条落账后回调一次,用于刷新对外状态。stats 是就地更新的
@@ -859,16 +897,15 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
         if oid in decided:
             accept = decided[oid]
         else:
-            d = evaluate(obs, cfg, quotas)
+            # Refinery's 200/10 values are queue triggers. The filter's legacy
+            # daily_quota_per_project is an admission cap, so omit its tracker
+            # here; the model gateway remains responsible for call limits.
+            d = evaluate(obs, cfg, None)
             count("filter_counts", d.layer or "unknown")
             try:
                 log_decision(d, log_path=DECISIONS_LOG)
             except Exception:  # noqa: BLE001
                 pass
-            if d.layer == "quota" and not d.accept:
-                # 配额拒绝是"今天满了"不是"永不要"——不落水印不缓存,改天再评
-                stats["deferred"] += 1
-                continue
             accept = d.accept
             decided[oid] = accept
         if not accept:
@@ -988,14 +1025,70 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     return stats
 
 
+def select_project_batch(rows: list[dict], terminal: set[int],
+                         backoff: dict[int, list[int]], cycle: int, limit: int,
+                         threshold: int, max_wait_sec: int,
+                         first_seen_at: dict[int, datetime]) -> list[int]:
+    """Dispatch eligible projects fairly, skipping cooling observations.
+
+    A project is ready when it has ``threshold`` runnable observations or its
+    oldest runnable observation has waited ``max_wait_sec``. The threshold is
+    a scheduling trigger, not a daily cap or model request batch size.
+    """
+    if limit <= 0:
+        return []
+    now = datetime.now(tz=timezone.utc)
+    groups: dict[str, deque[int]] = defaultdict(deque)
+    oldest: dict[str, datetime] = {}
+    for row in rows:
+        oid = int(row["id"])
+        if oid in terminal:
+            first_seen_at.pop(oid, None)
+            continue
+        bo = backoff.get(oid)
+        if bo and cycle < bo[1]:
+            continue
+        project = row.get("project") or "(unknown)"
+        groups[project].append(oid)
+        try:
+            created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created > now:
+                # A source clock ahead of this host must not prevent the
+                # maximum-wait fallback from ever becoming eligible.
+                created = first_seen_at.setdefault(oid, now)
+        except (TypeError, ValueError):
+            created = first_seen_at.setdefault(oid, now)
+        if project not in oldest or created < oldest[project]:
+            oldest[project] = created
+
+    ready = [project for project, ids in groups.items()
+             if len(ids) >= threshold
+             or (now - oldest[project]).total_seconds() >= max_wait_sec]
+    if not ready:
+        return []
+    # Rotate starting project each cycle, then take one observation per project
+    # per pass. A large historical project cannot monopolize every slot.
+    ready.sort()
+    offset = cycle % len(ready)
+    ready = ready[offset:] + ready[:offset]
+    picked: list[int] = []
+    while ready and len(picked) < limit:
+        next_ready: list[str] = []
+        for project in ready:
+            picked.append(groups[project].popleft())
+            if groups[project]:
+                next_ready.append(project)
+            if len(picked) >= limit:
+                break
+        ready = next_ready
+    return picked
+
+
 def select_backlog_batch(pending_ids: list[int], backoff: dict[int, list[int]],
                          cycle: int, limit: int = BACKLOG_PER_CYCLE) -> list[int]:
-    """积压窗口取数:冷却中的 id 不占名额。
-
-    2026-09-03→09-06 积压 7919 三天零进展:队头 8 条因网关 425 反复失败,
-    `pending_ids[:8]` 每轮取到的都是它们——退避只是让它们"跳过",名额却仍被占着,
-    身后 7900 条一条也轮不到。这里先排除冷却中的再截前 N 条:失败项退避期间把名额
-    让给后面的,退避到期照常回来重试,不丢数据。"""
+    """Legacy ID-only helper retained for callers that do not need grouping."""
     picked: list[int] = []
     for oid in pending_ids:
         bo = backoff.get(oid)
@@ -1024,9 +1117,9 @@ async def main() -> int:
         save_watermark(wm)
         log.info("[boundary] 首轮启动,boundary_id=%d(≤此为积压,夜间窗口烧)", wm["boundary_id"])
 
-    quotas = QuotaTracker()
-    quota_day = datetime.now(tz=CST).date()
-    decided: dict[int, bool] = {}  # 进程内决策缓存(防 deferred 重评的配额幻影消耗)
+    decided: dict[int, bool] = {}  # 进程内决策缓存
+    decision_day = datetime.now(tz=CST).date()
+    first_seen_at: dict[int, datetime] = {}  # created_at 无效时的最长等待起点
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
     quota_pause: dict = {}               # 网关配额耗尽 → {"until_cycle", "hits"}
     breaker_held = False                 # 只在状态翻转时打日志,不每轮刷屏
@@ -1058,10 +1151,9 @@ async def main() -> int:
             if breaker_held:
                 log.info("[breaker] %s 已恢复,继续提交", BREAKER_KEY)
                 breaker_held = False
-            if datetime.now(tz=CST).date() != quota_day:  # 日配额按天重置
-                quotas = QuotaTracker()
-                quota_day = datetime.now(tz=CST).date()
+            if datetime.now(tz=CST).date() != decision_day:
                 decided.clear()
+                decision_day = datetime.now(tz=CST).date()
             # —— 温度门控:盘温超阈值本轮完全歇工(只写状态心跳),保硬件 ——
             # 判定依据仍是 max(全部盘),一个字没改。变的只是记录:每块盘各记一格、
             # 当日歇工累计成时长。歇工在状态里跟"今天很闲"长得一模一样,不累计
@@ -1144,14 +1236,16 @@ async def main() -> int:
             backlog_remaining = 0
             if BACKLOG_ENABLED:
                 seen = wm["ingested"] | wm["rejected"] | wm["failed"]
-                pending_ids = [i for i in fetch_ids(max_id_inclusive=boundary)
-                               if i not in seen]
-                backlog_remaining = len(pending_ids)
-                if in_backlog_window() and pending_ids:
+                backlog_meta = fetch_pending_metadata(max_id_inclusive=boundary)
+                backlog_remaining = sum(r["id"] not in seen for r in backlog_meta)
+                if backlog_remaining:
+                    selected = select_project_batch(
+                        backlog_meta, seen, backoff, cycle, BACKLOG_PER_CYCLE,
+                        BACKLOG_DISPATCH_THRESHOLD, MAX_WAIT_SEC, first_seen_at)
                     # 每条落账即刷:积压余量随之递减,不必等整批 8 条跑完
                     s_back = await process_batch(
-                        fetch_rows_by_ids(select_backlog_batch(pending_ids, backoff, cycle)),
-                        wm, cfg, quotas, decided, backoff, cycle, "backlog",
+                        fetch_rows_by_ids(selected),
+                        wm, cfg, None, decided, backoff, cycle, "backlog",
                         quota_pause=quota_pause,
                         on_progress=lambda st: snapshot(
                             backlog_processed=dict(st),
@@ -1162,13 +1256,20 @@ async def main() -> int:
                      live_processed={"ingested": 0, "rejected": 0, "deferred": 0,
                                      "pending_this_cycle": True})
 
-            # —— live:游标推进(审查 R1:固定下界+LIMIT 会在积累超过一批后永久卡死)
+            # —— live:按项目调度。历史清空后触发阈值从 200 降到 10；
+            # 两种阶段都保留最长等待兜底，不足阈值不会永久滞留。
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"]
+            for oid in first_seen_at.keys() & terminal:
+                first_seen_at.pop(oid, None)
             cursor = wm.get("live_cursor") or boundary
-            live_ids = [i for i in fetch_ids(min_id_exclusive=cursor)
-                        if i not in terminal][:LIVE_PER_CYCLE]
+            live_meta = fetch_pending_metadata(min_id_exclusive=cursor)
+            live_threshold = (BACKLOG_DISPATCH_THRESHOLD if backlog_remaining
+                              else LIVE_DISPATCH_THRESHOLD)
+            live_ids = select_project_batch(
+                live_meta, terminal, backoff, cycle, LIVE_PER_CYCLE,
+                live_threshold, MAX_WAIT_SEC, first_seen_at)
             s_live = await process_batch(
-                fetch_rows_by_ids(live_ids), wm, cfg, quotas, decided, backoff, cycle, "live",
+                fetch_rows_by_ids(live_ids), wm, cfg, None, decided, backoff, cycle, "live",
                 quota_pause=quota_pause,
                 on_progress=lambda st: snapshot(
                     live_processed=dict(st), backlog_processed=s_back,
