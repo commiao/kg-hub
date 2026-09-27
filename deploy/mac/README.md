@@ -118,3 +118,21 @@ python3 ~/workspace_claudeCode/fleet-ops/bin/mac-release.py kg-hub \
 源在 git 里，任何一版都能 `git archive` 秒级还原且逐字节一致，所以不留 N 份历史
 副本。这一点和 Docker 不同：镜像重建要几分钟且未必产出同样的字节（依赖解析、基础
 镜像都会漂），那边才需要留旧镜像。
+
+## 临时隔离采集（仅显式启用）
+
+`optional/` 中的 `com.claude-mem.capture-next` 和
+`com.kg-hub.claude-mem-dual-ingest` 不随默认安装启用。必须完成
+claude-mem 的隔离交接准备后，按完整 Label 单独安装。
+
+新 worker 使用 `~/.claude-mem-next` 和主干发布产物
+`~/.local/share/claude-mem/current`；没有准备好的数据库世代时拒绝启动。
+双源同步使用 `~/.kg-hub/state/claude-mem-sources.json` 和持久汇总库
+`claude-mem-aggregate.db`。先初始化汇总库，再原子写入
+`claude-mem-dual-active.json`，最后安装双源同步作业。启用标记存在时，
+旧单来源同步脚本在同一互斥锁内退出，防止旧计划任务覆盖新数据。
+该汇总库是编号映射的持久状态，不能删除后自动重建。
+
+旧 worker 不重启；`claude-mem-legacy-preserved.json` 保留期间，补丁守护
+仅维护客户端文件，禁止自动重启。隔离交接流程详见 claude-mem 的
+`deploy/ISOLATED-CAPTURE.md`；任何不确定交付均保留，不自动重试。

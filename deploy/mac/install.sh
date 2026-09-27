@@ -143,7 +143,9 @@ shopt -s nullglob
 # 不限 com.kg-hub.* 前缀：这台 Mac 上要管的服务不都姓 kg-hub。
 # com.claude-mem.worker 就是一例 —— 它的 label 必须保持 claude-mem 自己的
 # 那个名字，否则插件将来重装一份同名 job，两个 job 会各起一份 worker。
-for template in "$AGENTS"/com.*.plist; do
+for template in "$AGENTS"/com.*.plist "$REPO"/deploy/mac/optional/com.*.plist; do
+  [ -f "$template" ] || continue
+  case "$template" in */optional/*) [ ${#labels[@]} -gt 0 ] || continue ;; esac
   label=$(basename "$template" .plist)
   if [ ${#labels[@]} -gt 0 ]; then
     printf '%s\n' "${labels[@]}" | grep -qx "$label" || continue

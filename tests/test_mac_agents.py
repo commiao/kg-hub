@@ -34,6 +34,8 @@ EXPECTED = {
     # 不姓 kg-hub 但同样由本仓库管：保留 claude-mem 自己的 label，这样装上去是
     # **替换**插件那份、而不是与它并存（并存会有两个 job 各起一份 worker）。
     "com.claude-mem.worker",
+    "com.claude-mem.capture-next",
+    "com.kg-hub.claude-mem-dual-ingest",
 }
 SECRETISH = re.compile(r"open\.feishu\.cn/open-apis/bot|xox[bp]-|Bearer\s+\S|[A-Za-z0-9_-]{32,}")
 
@@ -42,7 +44,7 @@ class TemplateTests(unittest.TestCase):
     def templates(self):
         # 与 install.sh 的扫描范围一字不差。写窄了的后果很隐蔽：新模板照样被
         # 安装，却逃过下面所有安全断言（无机密、无绝对路径、plist 合法）。
-        return sorted(AGENTS.glob("com.*.plist"))
+        return sorted(AGENTS.glob("com.*.plist")) + sorted((ROOT / "deploy/mac/optional").glob("com.*.plist"))
 
     def test_every_known_service_is_tracked(self):
         got = {p.stem for p in self.templates()}
