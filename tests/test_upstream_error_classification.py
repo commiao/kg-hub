@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import kg_refinery as refinery  # noqa: E402
 import topology  # noqa: E402
+from utils.model_attempt_journal import NeedsReconciliation  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SRC = (ROOT / "kg_hub_server.py").read_text("utf-8")
@@ -50,7 +51,7 @@ def _load_classifier():
     tree = ast.parse(SERVER_SRC)
     fn = next(n for n in tree.body
               if isinstance(n, ast.FunctionDef) and n.name == "classify_extract_error")
-    ns: dict = {}
+    ns: dict = {"NeedsReconciliation": NeedsReconciliation}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<classifier>", "exec"), ns)
     return ns["classify_extract_error"]
 
