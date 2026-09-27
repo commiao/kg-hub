@@ -36,11 +36,18 @@ class CycleBudgetTests(unittest.TestCase):
         self.assertIn('os.environ.get("KG_HUB_REFINERY_BACKLOG_PER_CYCLE"', SOURCE)
 
     def test_live_batch_is_not_sliced_by_a_literal(self):
-        """`[:200]` 这类字面量切片正是当初藏住 25:1 的地方。"""
-        body = SOURCE.split("live_ids = ", 1)[1][:300]
-        self.assertIn("[:LIVE_PER_CYCLE]", body)
+        """按项目调度仍须受 live 每轮名额约束，不能藏入字面量上限。"""
+        body = SOURCE.split("live_ids = select_project_batch(", 1)[1][:300]
+        self.assertIn("live_meta, terminal, backoff, cycle, LIVE_PER_CYCLE", body)
         self.assertIsNone(re.search(r"\[:\d+\]", body),
                           "live 批量不许用字面量切片——写死的数字没人审得到")
+        rows = [{"id": i, "project": f"p{i % 2}", "created_at": "2020-01-01T00:00:00Z"}
+                for i in range(1, 6)]
+        picked = refinery.select_project_batch(rows, set(), {}, cycle=1, limit=2,
+                                               threshold=10, max_wait_sec=900,
+                                               first_seen_at={})
+        self.assertEqual(len(picked), 2, "按项目调度不能突破每轮名额")
+        self.assertEqual(len(set(picked)), 2)
 
     def test_neither_line_can_starve_the_other(self):
         """默认比例必须是可解释的。

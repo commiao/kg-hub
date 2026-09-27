@@ -304,6 +304,12 @@ services:
       # tests/test_refinery_cycle_budget.py 的饿死线上，不留余量的默认值不算定案。
       - KG_HUB_REFINERY_BACKLOG_PER_CYCLE=${KG_HUB_REFINERY_PER_CYCLE:-70}
       - KG_HUB_REFINERY_LIVE_PER_CYCLE=${KG_HUB_REFINERY_LIVE_PER_CYCLE:-30}
+      # 按项目的待处理条数触发调度：历史积压未清空时用 200，清空后用 10；
+      # 不足阈值的项目由最长等待 900 秒兜底。它们不是每日限额或模型调用批量。
+      # 每轮实际提交数仍由上面 70/30 名额控制，模型调用限额由网关控制。
+      - KG_HUB_REFINERY_BACKLOG_DISPATCH_THRESHOLD=${KG_HUB_REFINERY_BACKLOG_DISPATCH_THRESHOLD:-200}
+      - KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD=${KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD:-10}
+      - KG_HUB_REFINERY_MAX_WAIT_SEC=${KG_HUB_REFINERY_MAX_WAIT_SEC:-900}
       # 批内并发抽取上限。服务端写锁串行化 add_episode,所以这不提高抽取吞吐,
       # 只消除批内队头阻塞(一条 p90 180s 的慢抽取此前会堵住身后的快速失败条目)。
       - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-2}
