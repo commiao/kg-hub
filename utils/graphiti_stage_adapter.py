@@ -1,10 +1,10 @@
-"""Isolated Graphiti 0.29 stage snapshot adapter; not wired to production.
+"""Pinned Graphiti 0.29 stage snapshot adapter for the original ingest worker.
 
 The pinned upstream resolver re-queries live semantic candidates on every run.
 This module persists their exact order before the dedupe model can be called.
 Completed edge and attribute stages are replayed from immutable artifacts.
-An interrupted edge/attribute stage and an uncertain graph commit freeze; there
-is no live manual retry path until every sub-stage can be resumed safely.
+An interrupted model stage requires an exact human grant. Request drift stops
+before HTTP; an uncertain graph commit requires readback before success.
 """
 
 from __future__ import annotations
@@ -99,6 +99,16 @@ class StageArtifactStore:
                  hashlib.sha256(payload.encode()).hexdigest()))
             return json.loads(payload)
 
+    def locate(self, task_sd: str, task_sid: str, operation_id: str, stage: str):
+        """Resolve a saved input digest without guessing a historical operation."""
+        with self._connect() as db:
+            row = db.execute("""SELECT input_digest FROM graphiti_stage_artifacts
+                WHERE task_sd=? AND task_sid=? AND operation_id=? AND stage=?""",
+                (task_sd, task_sid, operation_id, stage)).fetchone()
+        if row is None:
+            return None
+        return row[0], self.save_or_load(task_sd, task_sid, operation_id, row[0], stage)
+
     def begin_graph_commit(self, task_sd: str, task_sid: str,
                            operation_id: str, input_digest: str,
                            expected: dict | None = None) -> None:
@@ -165,6 +175,7 @@ async def extract_nodes_with_snapshot(
 
     if version("graphiti-core") != "0.29.0":
         raise RuntimeError("unsupported Graphiti version for node-stage adapter")
+    from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     identity = (task_sd, task_sid, operation_id, input_digest)
     inputs = (episode, previous_episodes, entity_types,
               excluded_entity_types, custom_extraction_instructions)
@@ -174,7 +185,7 @@ async def extract_nodes_with_snapshot(
     if saved is None:
         store.begin_stage(*identity, "extraction", digest)
         from model_gateway_client import model_stage
-        with model_stage("node_extraction"):
+        with model_stage("node_extraction"), collect_model_steps() as used_steps:
             nodes, attribution = await ops.extract_nodes(
                 clients, episode, previous_episodes, entity_types,
                 excluded_entity_types, custom_extraction_instructions)
@@ -182,7 +193,9 @@ async def extract_nodes_with_snapshot(
             "stage_input_digest": digest,
             "nodes": [node.model_dump(mode="json") for node in nodes],
             "attribution": attribution,
+            "model_step_ids": sorted(used_steps),
         })
+    acknowledge_restored_steps(saved.get("model_step_ids", []))
     return ([EntityNode.model_validate(node) for node in saved["nodes"]],
             saved["attribution"])
 
@@ -205,12 +218,14 @@ async def resolve_nodes_with_candidate_snapshot(
         raise RuntimeError("unsupported Graphiti version for node-stage adapter")
 
     identity = (task_sd, task_sid, operation_id, input_digest)
+    from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     extracted = [node.model_dump(mode="json") for node in extracted_nodes]
     saved = store.save_or_load(*identity, "extracted_nodes", extracted)
     if saved != extracted:
         raise RuntimeError("extracted node UUID/input drift")
     resolved = store.save_or_load(*identity, "resolved_nodes")
     if resolved is not None:
+        acknowledge_restored_steps(resolved.get("model_step_ids", []))
         return (
             [EntityNode.model_validate(node) for node in resolved["nodes"]],
             resolved["uuid_map"],
@@ -260,13 +275,14 @@ async def resolve_nodes_with_candidate_snapshot(
                                    local_state.uuid_map, local_state.duplicate_pairs, idx)
             continue
         state.unresolved_indices.append(idx)
+    used_steps = set()
     if state.unresolved_indices:
         llm_candidates = ops._merge_candidate_nodes(
             [candidate for idx in state.unresolved_indices
              for candidate in candidate_nodes_by_extracted[idx]], None)
         store.begin_stage(*identity, "node_resolution", resolution_digest)
         from model_gateway_client import model_stage
-        with model_stage("node_resolution"):
+        with model_stage("node_resolution"), collect_model_steps() as used_steps:
             await ops._resolve_with_llm(
                 clients.llm_client, extracted_nodes,
                 ops._build_candidate_indexes(llm_candidates), state,
@@ -278,6 +294,7 @@ async def resolve_nodes_with_candidate_snapshot(
     result = ([node for node in state.resolved_nodes if node is not None],
               state.uuid_map, state.duplicate_pairs)
     resolved_json = {
+        "model_step_ids": sorted(used_steps),
         "nodes": [node.model_dump(mode="json") for node in result[0]],
         "uuid_map": result[1],
         "duplicates": [[left.model_dump(mode="json"), right.model_dump(mode="json")]
@@ -320,6 +337,7 @@ async def extract_and_resolve_edges_with_snapshot(
     if version("graphiti-core") != "0.29.0":
         raise RuntimeError("unsupported Graphiti version for edge-stage adapter")
     identity = (task_sd, task_sid, operation_id, input_digest)
+    from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     inputs = (episode, extracted_nodes, previous_episodes, edge_type_map,
               group_id, edge_types, nodes, uuid_map,
               custom_extraction_instructions)
@@ -329,13 +347,15 @@ async def extract_and_resolve_edges_with_snapshot(
     if saved is None:
         store.begin_stage(*identity, "edge_phase", digest)
         from model_gateway_client import model_stage
-        with model_stage("edge_phase"):
+        with model_stage("edge_phase"), collect_model_steps() as used_steps:
             groups = await graphiti._extract_and_resolve_edges(*inputs)
         saved = store.save_or_load(*identity, "edge_phase", {
             "stage_input_digest": digest,
+            "model_step_ids": sorted(used_steps),
             "groups": [[edge.model_dump(mode="json") for edge in group]
                        for group in groups],
         })
+    acknowledge_restored_steps(saved.get("model_step_ids", []))
     return tuple([[EntityEdge.model_validate(edge) for edge in group]
                   for group in saved["groups"]])
 
@@ -352,6 +372,7 @@ async def extract_attributes_with_snapshot(
     if version("graphiti-core") != "0.29.0":
         raise RuntimeError("unsupported Graphiti version for attribute-stage adapter")
     identity = (task_sd, task_sid, operation_id, input_digest)
+    from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     inputs = (nodes, episode, previous_episodes, entity_types, new_edges)
     saved, digest = _stage_record(
         store, identity, "attribute_phase", inputs,
@@ -359,14 +380,16 @@ async def extract_attributes_with_snapshot(
     if saved is None:
         store.begin_stage(*identity, "attribute_phase", digest)
         from model_gateway_client import model_stage
-        with model_stage("attribute_phase"):
+        with model_stage("attribute_phase"), collect_model_steps() as used_steps:
             hydrated = await ops.extract_attributes_from_nodes(
                 graphiti.clients, nodes, episode, previous_episodes,
                 entity_types, edges=new_edges)
         saved = store.save_or_load(*identity, "attribute_phase", {
             "stage_input_digest": digest,
+            "model_step_ids": sorted(used_steps),
             "nodes": [node.model_dump(mode="json") for node in hydrated],
         })
+    acknowledge_restored_steps(saved.get("model_step_ids", []))
     return [EntityNode.model_validate(node) for node in saved["nodes"]]
 
 
@@ -428,8 +451,9 @@ async def add_episode_with_stage_checkpoint(
     from importlib.metadata import version
     from graphiti_core.graphiti import AddEpisodeResults
     from graphiti_core.helpers import (
-        validate_entity_types, validate_excluded_entity_types, validate_group_id,
+        validate_excluded_entity_types, validate_group_id,
     )
+    from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
     from graphiti_core.nodes import EpisodeType, EpisodicNode
     from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
     from graphiti_core.utils.datetime_utils import utc_now

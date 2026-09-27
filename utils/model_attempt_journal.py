@@ -531,7 +531,7 @@ class ModelAttemptJournal:
     def claim_retry(self, grant_id: str, *, source_description: str,
                     source_obs_id: str, step_id: str, request_digest: str,
                     business_key: str, base_key: str, deadline_seconds: float,
-                    stage: str | None = None) -> str:
+                    stage: str | None = None, execution_id: str | None = None) -> str:
         """Consume a grant and reserve a fresh exact-call identity atomically."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -556,11 +556,13 @@ class ModelAttemptJournal:
                 missing_receipt_step_id=step_id)
             failed_for_step = summary["failed_calls_by_step"].get(step_id, 0)
             from utils.reconciliation_mailbox import task_uuid
-            executions = db.execute("""SELECT state FROM task_executions
+            executions = db.execute("""SELECT state, execution_id, manual_command_id FROM task_executions
                 WHERE task_id=? ORDER BY execution_ordinal""",
                 (task_uuid(source_description, source_obs_id),)).fetchall()
             failed_executions = sum(row[0] == "failed" for row in executions)
-            if (not executions or executions[-1][0] != "failed"
+            running_manual = bool(executions and execution_id
+                                  and executions[-1] == ("running", execution_id, execution_id))
+            if (not executions or (executions[-1][0] != "failed" and not running_manual)
                     or failed_executions >= 3):
                 raise RuntimeError("task execution is no longer eligible")
             if (failed_for_step < 1 or failed_for_step >= 3 or summary["in_flight"]

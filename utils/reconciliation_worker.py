@@ -1,8 +1,7 @@
 """Poll human-created mailbox commands without creating automatic retries.
 
-The live Graphiti 0.29.0 path still lacks a proven durable continuation adapter.
-Until that adapter is wired and validated, a human check can settle persisted
-business success or report exact attempt progress, but it cannot replay ingest.
+Only an existing human command may grant one failed-step retry. The original
+worker restores its durable stage outputs and publishes the business result.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from utils.reconciliation_mailbox import (
 
 log = logging.getLogger("kg_hub.reconciliation")
 REPLAYABLE_GRAPHITI_STAGES = frozenset({
-    "node_extraction", "node_resolution", "edge_phase", "attribute_phase",
+    "node_extraction", "node_resolution", "edge_phase", "attribute_phase", "predigest_split",
 })
 
 
@@ -92,6 +91,7 @@ def _task_report_data(journal, row: dict, *, deadline_seconds: float,
     if raw_status == "ok":
         state = "succeeded" if business_result_persisted else "reconciliation"
     if raw_status == "failed" and row.get("error_kind") in {
+            "reconciliation_plan_missing", "task_execution_history_missing",
             "reconciliation_source_identity_missing",
             "reconciliation_model_step_missing",
             "reconciliation_model_step_identity_missing",

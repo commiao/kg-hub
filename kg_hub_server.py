@@ -132,17 +132,12 @@ RECONCILIATION_MAILBOX_ENABLED = os.environ.get(
     "KG_HUB_RECONCILIATION_MAILBOX_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 # Keep replay closed until the gateway's task-attempt cap is keyed to a stable
-# per-call identity. Graphiti 0.29.0 legitimately issues multiple model HTTP
-# requests during one ingest; a task-wide three-start cap would reject normal
-# work. Enabling this flag is an explicit deployment decision after that
-# contract is validated. Mailbox polling remains read/report only while false.
+# per-call identity. Graphiti can perform several distinct model steps during
+# one ingest. Human commands alone authorize recovery; polling cannot grant it.
 MANUAL_RECONCILIATION_REPLAY_ENABLED = os.environ.get(
-    "KG_HUB_MANUAL_RECONCILIATION_REPLAY_ENABLED", "0"
+    "KG_HUB_MANUAL_RECONCILIATION_REPLAY_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-# This adapter is still isolated and does not cover compose's enabled predigest
-# path or the pre-commit receipt/readback wiring. Do not expose retryable mailbox
-# commands until the full production continuation has passed pinned integration.
-GRAPHITI_STAGE_CONTINUATION_AVAILABLE = False
+GRAPHITI_STAGE_CONTINUATION_AVAILABLE = True
 
 # logger for ingest lifecycle events ([ingest:start] / [ingest:done] / [ingest:error])
 logger = logging.getLogger("kg_hub.server")
@@ -386,12 +381,12 @@ async def merge_or_get_ingested_key(
         "MERGE (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
         "ON CREATE SET "
         "  k.status = 'pending', "
-        "  k.created_at = $now, "
+        "  k.created_at = $now, k.execution_epoch = $now, "
         "  k.updated_at = $now, "
         "  k.name = $name, "
         "  k.created_by_request = $request_id "
         "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
-        "       k.error_message AS error_message, k.created_at AS created_at, "
+        "       k.error_message AS error_message, k.created_at AS created_at, k.execution_epoch AS execution_epoch, "
         "       k.created_by_request AS created_by_request, "
         "       k.created_by_request = $request_id AS newly_created",
         sd=source_description,
@@ -406,7 +401,8 @@ async def merge_or_get_ingested_key(
         "status": rows[0].get("status"),
         "episode_uuid": rows[0].get("episode_uuid"),  # may be None for newly_created
         "error_message": rows[0].get("error_message"),
-        "created_at": rows[0].get("created_at"),   # 本次尝试的纪元,见 do_extract
+        "created_at": rows[0].get("created_at"),
+        "execution_epoch": rows[0].get("execution_epoch"),
         "created_by_request": rows[0].get("created_by_request"),
         "newly_created": bool(rows[0].get("newly_created")),
     }
@@ -535,7 +531,7 @@ async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
         "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
         "       k.source_description AS source_description, "
         "       k.source_obs_id AS source_obs_id, "
-        "       k.created_at AS created_at, k.updated_at AS updated_at, "
+        "       k.created_at AS created_at, k.execution_epoch AS execution_epoch, k.updated_at AS updated_at, "
         "       k.nodes AS nodes, k.edges AS edges, "
         "       k.error_message AS error_message, k.error_kind AS error_kind, "
         "       k.predigest_children AS predigest_children, "
@@ -879,7 +875,9 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
     """仅存 Episodic 节点,**不走 graphiti 抽取**(不产 fact/实体)。
     正文进 fulltext 索引 → episode_search 全文可搜(中文洞察承重路径)。
     用于:catalog 类文档、预拆后的父文档(fact 由子 observation 供给)。"""
-    u = str(uuidlib.uuid4())
+    from utils.ingest_workflow import current_workflow
+    workflow = current_workflow()
+    u = (workflow["plan"].get("parent_uuid") if workflow else None) or str(uuidlib.uuid4())
     now = datetime.now(tz=timezone.utc).isoformat()
     # entity_edges: [] 不可省——bare 节点带 source='text'+valid_at 会进 graphiti
     # retrieve_episodes 的"最近10条"抽取上下文,缺该字段 EpisodicNode 校验直接抛
@@ -896,6 +894,9 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
     if predigested:
         cy += ", predigested: true"
     cy += "})"
+    if workflow and workflow["plan"].get("parent_uuid"):
+        cy = cy.replace("CREATE (e:Episodic {",
+                        "MERGE (e:Episodic {uuid: $u}) ON CREATE SET e += {", 1)[:-1]
     await graphiti.driver.execute_query(
         cy, u=u, n=body.name, c=body.episode_body, sd=body.source_description,
         g=GROUP_ID, now=now, vt=ref_time.isoformat(), k=kind, prov=prov)
@@ -938,6 +939,19 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
                   source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
                   entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
                   edge_type_map=EDGE_TYPE_MAP)
+    from utils.ingest_workflow import current_workflow
+    workflow = current_workflow()
+    if workflow is not None:
+        from utils.graphiti_stage_adapter import add_episode_with_stage_checkpoint
+        from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
+        if workflow["plan"]["route"] == "episode":
+            workflow["store"].save_or_load(
+                task_sd, task_sid, "business-task", workflow["digest"],
+                "episode_operation", {"operation_id": operation_id})
+        return await add_episode_with_stage_checkpoint(
+            graphiti, store=workflow["store"], task_sd=task_sd, task_sid=task_sid,
+            operation_id=operation_id, relevant_schema_limit=RELEVANT_SCHEMA_LIMIT,
+            **kwargs)
     if os.environ.get("KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT") != "1":
         return await graphiti.add_episode(**kwargs)
     journal = journal_from_backup_env()
@@ -977,22 +991,36 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         logger.info("[ingest:catalog] name=%s → 仅存不抽取(kind=registry)", body.name)
         return True
 
-    # split:LLM 拆分在写锁外做
+    # Reuse the original split plan; one human command resumes that task.
+    from utils.ingest_workflow import current_workflow, split_observations
+    from model_gateway_client import (
+        model_stage, collect_model_steps)
+    workflow = current_workflow()
     try:
-        prompt = PREDIGEST_PROMPT.format(max_obs=MAX_OBS, body=body.episode_body[:16000])
-        raw = await _llm_complete(prompt, max_tokens=3200)
-        obs_list = parse_observations(raw)
+        obs_list = split_observations()
+        if obs_list is None:
+            prompt = PREDIGEST_PROMPT.format(max_obs=MAX_OBS, body=body.episode_body[:16000])
+            with model_stage("predigest_split"), collect_model_steps() as used_steps:
+                raw = await _llm_complete(prompt, max_tokens=3200)
+            obs_list = parse_observations(raw)
+            if obs_list:
+                obs_list = split_observations(obs_list, step_ids=used_steps)
     except NeedsReconciliation as exc:
         await update_ingested_key_status(
             graphiti, sd, sid, "needs_reconciliation",
             error_kind="model_outcome_unknown", error_message=str(exc))
         return True
-    except Exception:  # noqa: BLE001
-        logger.exception("[ingest:predigest_llm_failed] name=%s → 回退整篇", body.name)
-        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[ingest:predigest_llm_failed] name=%s", body.name)
+        await update_ingested_key_status(
+            graphiti, sd, sid, "needs_reconciliation",
+            error_kind="predigest_model_failed", error_message=str(exc))
+        return True
     if not obs_list:
-        logger.warning("[ingest:predigest_empty] name=%s LLM 拆不出 → 回退整篇", body.name)
-        return False
+        await update_ingested_key_status(
+            graphiti, sd, sid, "needs_reconciliation",
+            error_kind="predigest_empty", error_message="No usable split result")
+        return True
 
     # The split model call has completed. Persist the next stage before any
     # graph write so a process crash cannot make the parent an invisible orphan.
@@ -1019,7 +1047,7 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
             # 幂等:重放(stuck 清理后重推)时按名跳过已入图的子片段,防重复
             drows, _, _ = await graphiti.driver.execute_query(
                 "MATCH (e:Episodic {name: $n}) RETURN count(e) AS c", n=child_name)
-            if drows and int(drows[0].get("c") or 0):
+            if not workflow and drows and int(drows[0].get("c") or 0):
                 ok_children += 1
                 logger.info("[ingest:predigest_child_dup] %s 已在图,跳过", child_name)
                 continue
@@ -1037,9 +1065,9 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
                 f"{sd} · predigest type={obs['type']}", ref_time, attempt_epoch,
                 usage_scenario=body.model_usage_scenario, task_sd=sd, task_sid=sid)
         except Exception:  # noqa: BLE001
-            logger.exception("[ingest:predigest_child_failed] %s (继续其余片段)", child_name)
+            logger.exception("[ingest:predigest_child_failed] %s (等待人工核对)", child_name)
             failed_children.append(child_name)
-            continue
+            break
         ok_children += 1
         # 键保活:预拆串行跑 N 个片段可超 30min stuck 阈值,刷 created_at 防清理器
         # 在半路删键(删了→轮询方 not_found→重推→双份)。
@@ -1249,35 +1277,36 @@ async def _do_extract_inner(
 
 
 async def do_extract(*args, **kwargs) -> None:
-    """给 do_extract 套一层在飞计数。
-
-    发布必须能等到抽取真的归零再换容器：直接换会把在飞的流式请求掐断，而那会在
-    网关留下永不过期的 `unknown` 记录，每一条都挡住下一次发布（2026-09-10 六小时
-    171 条就是这么来的）。计数暴露在 /health 的 active_extractions。
-
-    加减放在薄壳而不是函数体里：内层是 never-raise 契约、出口很多，写在里面迟早
-    漏一条，计数只增不减，发布就永远等不到归零。
-    """
+    """Keep deployment drain accounting around every original-worker exit."""
     _extraction_started()
     try:
-        body = args[1] if len(args) > 1 else kwargs["body"]
-        graphiti = args[0] if args else kwargs["graphiti"]
-        # Preserve the public pending status for existing clients while the
-        # mailbox reports the actual original-worker phase separately.
-        try:
-            await graphiti.driver.execute_query(
-                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-                "WHERE k.status = 'pending' "
-                "SET k.worker_state = 'running', k.updated_at = $now "
-                "RETURN count(k) AS c",
-                sd=body.source_description, sid=body.source_obs_id,
-                now=datetime.now(tz=timezone.utc).isoformat())
-        except Exception:
-            logger.exception("[ingest:worker_state] could not mark task running")
-        with model_business_task(body.source_description, body.source_obs_id):
-            return await _do_extract_inner(*args, **kwargs)
+        return await _run_recorded_extract(*args, **kwargs)
     finally:
         _extraction_finished()
+
+
+async def _run_recorded_extract(*args, **kwargs):
+    from utils.task_execution import run_task_execution
+
+    manual_command_id = kwargs.pop("manual_command_id", None)
+    body = args[1] if len(args) > 1 else kwargs["body"]
+    graphiti = args[0] if args else kwargs["graphiti"]
+
+    async def original_worker():
+        from utils.ingest_workflow import workflow_context
+        ref_time = args[2] if len(args) > 2 else kwargs["ref_time"]
+        epoch = args[3] if len(args) > 3 else kwargs.get("attempt_epoch")
+        route = (predigest_route(body.name, body.episode_body)
+                 if PREDIGEST_ENABLED else None) or "episode"
+        with model_business_task(body.source_description, body.source_obs_id):
+            with workflow_context(body, ref_time, epoch, route, journal_from_backup_env):
+                return await _do_extract_inner(*args, **kwargs)
+
+    return await run_task_execution(
+        driver=graphiti.driver, sd=body.source_description, sid=body.source_obs_id,
+        worker=original_worker, journal_factory=journal_from_backup_env,
+        business_result_persisted=_persisted_business_result,
+        deadline_seconds=MIN_CLIENT_TIMEOUT_SEC, manual_command_id=manual_command_id)
 
 
 async def ingest(request: Request) -> JSONResponse:
@@ -1489,7 +1518,7 @@ async def ingest(request: Request) -> JSONResponse:
     # 4. We own this row — do the extraction.
     if body.sync:
         # Old-callers path: block until done.
-        await do_extract(g, body, ref_time, merge_result.get("created_at"))
+        await do_extract(g, body, ref_time, merge_result.get("execution_epoch") or merge_result.get("created_at"))
         rows, _, _ = await g.driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
             "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
@@ -1517,7 +1546,7 @@ async def ingest(request: Request) -> JSONResponse:
         )
 
     # Default async path: return 202 immediately, background does the work.
-    asyncio.create_task(do_extract(g, body, ref_time, merge_result.get("created_at")))
+    asyncio.create_task(do_extract(g, body, ref_time, (merge_result.get("execution_epoch") or merge_result.get("created_at"))))
     return JSONResponse(
         {"status": "accepted",
          "source_description": sd, "source_obs_id": sid,
@@ -1545,7 +1574,7 @@ async def ingest_status(request: Request) -> JSONResponse:
             "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
             "       k.source_description AS source_description, "
             "       k.source_obs_id AS source_obs_id, "
-            "       k.created_at AS created_at, k.updated_at AS updated_at, "
+            "       k.created_at AS created_at, k.execution_epoch AS execution_epoch, k.updated_at AS updated_at, "
             "       k.nodes AS nodes, k.edges AS edges, "
             "       k.error_message AS error_message, k.error_kind AS error_kind, "
             "       k.predigest_children AS predigest_children, "
@@ -1607,6 +1636,7 @@ def _reconciliation_task_view(row: dict, journal, *,
         "stage": row.get("stage"),
         "created_at": row.get("created_at"),
         "created_by_request": row.get("created_by_request"),
+        "execution_epoch": row.get("execution_epoch"),
         "episode_uuid": row.get("episode_uuid"),
         "error_kind": row.get("error_kind"),
         "error_message": row.get("error_message"),
@@ -1634,7 +1664,7 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
         "k.error_kind AS error_kind, k.error_message AS error_message, "
         "k.predigest_children AS predigest_children, "
         "k.failed_children AS failed_children, k.worker_state AS worker_state, "
-        "k.created_at AS created_at, k.stage AS stage, "
+        "k.created_at AS created_at, k.execution_epoch AS execution_epoch, k.stage AS stage, "
         "k.updated_at AS updated_at, "
         "k.name AS name, k.stage AS stage, "
         "k.manual_resume_command_id AS manual_resume_command_id, "
@@ -1670,6 +1700,11 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
 
 async def _persisted_business_result(driver, row: dict) -> bool:
     """Require the exact persisted episode and every expected split child."""
+    from utils.ingest_workflow import verify_task_plan
+    verified = await verify_task_plan(
+        driver, journal_from_backup_env(), row, observation_body=obs_to_episode_body)
+    if verified is not None:
+        return verified
     uuid = row.get("episode_uuid")
     if not uuid or not row.get("name") or not row.get("source_description"):
         return False
@@ -1728,7 +1763,7 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         "k.stage AS stage, k.worker_state AS worker_state, "
         "k.manual_resume_command_id AS manual_resume_command_id, "
         "k.worker_execution_id AS worker_execution_id, "
-        "k.created_at AS created_at, "
+        "k.created_at AS created_at, k.execution_epoch AS execution_epoch, "
         "k.predigest_children AS predigest_children, "
         "k.failed_children AS failed_children, k.error_kind AS error_kind, "
         "k.error_message AS error_message, k.updated_at AS updated_at LIMIT 1",
@@ -1774,11 +1809,12 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
             "WHERE k.status IN ['pending', 'needs_reconciliation', 'error', 'failed'] "
-            "  AND k.episode_uuid = $uuid "
-            "SET k.status = 'ok', k.updated_at = $now, k.reconciled_at = $now, "
+            "  AND (k.episode_uuid IS NULL OR k.episode_uuid = $uuid) "
+            "  AND k.created_by_request = $request_id "
+            "SET k.status = 'ok', k.episode_uuid = $uuid, k.updated_at = $now, k.reconciled_at = $now, "
             "    k.error_kind = null, k.error_message = null, k.worker_state = null "
             "RETURN count(k) AS c",
-            sd=sd, sid=sid, uuid=row["episode_uuid"],
+            sd=sd, sid=sid, uuid=row["episode_uuid"], request_id=row.get("created_by_request"),
             now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
             row["status"] = "ok"
@@ -1837,6 +1873,10 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         elif any(not all((a.get("idempotency_key"), a.get("business_key"),
                           a.get("step_id"), a.get("request_digest"))) for a in refreshed):
             missing = "reconciliation_model_step_identity_missing"
+        if not missing and not row.get("worker_state"):
+            execution_summary = journal.task_execution_summary(sd, sid)
+            if execution_summary.get("execution_count") == 0:
+                missing = "task_execution_history_missing"
         if missing:
             changed, _, _ = await driver.execute_query(
                 "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
@@ -1912,7 +1952,7 @@ async def _enqueue_manual_resume(command: dict, task: dict, report: dict,
     if (not sd or not sid or task_id != command.get("task_id")
             or wire_step_id != command.get("model_step_id")
             or stage not in {"node_extraction", "node_resolution",
-                             "edge_phase", "attribute_phase"}):
+                             "edge_phase", "attribute_phase", "predigest_split"}):
         raise RuntimeError("manual resume identity is incomplete")
     existing = store.manual_resume_job(command["command_id"])
     if existing:
@@ -1947,8 +1987,22 @@ async def _enqueue_manual_resume(command: dict, task: dict, report: dict,
                 "reason": "manual_retry_queued" if active["state"] == "queued"
                 else "manual_retry_running"}
 
+    from utils.graphiti_stage_adapter import StageArtifactStore
+    plan = StageArtifactStore(journal.path).locate(sd, sid, "business-task", "task_plan")
+    if plan is None:
+        changed, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "WHERE k.status IN ['needs_reconciliation', 'error'] "
+            "AND k.worker_state IS NULL AND k.created_by_request = $request_id "
+            "SET k.status = 'failed', k.error_kind = 'reconciliation_plan_missing' "
+            "RETURN count(k) AS c", sd=sd, sid=sid,
+            request_id=task.get("created_by_request"))
+        if not changed or changed[0].get("c") != 1:
+            raise RuntimeError("original task changed before legacy classification")
+        return {"state": "unrecoverable", "retryable": False,
+                "reason": "reconciliation_plan_missing"}
     request_id = task.get("created_by_request")
-    epoch = _ingest_epoch(task.get("created_at"))
+    epoch = _ingest_epoch(task.get("execution_epoch") or task.get("created_at"))
     snapshot = _load_original_ingest_snapshot(sd, sid, request_id)
     body = IngestBody.model_validate(snapshot)
     if (body.source_description != sd or body.source_obs_id != sid
@@ -2055,8 +2109,10 @@ async def _run_manual_resume_job(job: dict, *, store: MailboxStore,
         graphiti = await get_graphiti()
         with model_manual_resume(body.source_description, body.source_obs_id,
                                  job["journal_step_id"], job["grant_id"],
-                                 job["stage"], gateway_step_id=job["model_step_id"]):
-            await do_extract(graphiti, body, ref_time, epoch)
+                                 job["stage"], gateway_step_id=job["model_step_id"],
+                                 execution_id=command_id):
+            await do_extract(graphiti, body, ref_time, epoch,
+                             manual_command_id=command_id)
         final = await _check_task_from_mailbox(
             job["source_description"], job["source_obs_id"],
             model_step_id=job["model_step_id"])
@@ -2248,7 +2304,7 @@ async def queue_stats(request: Request) -> JSONResponse:
     driver = get_status_driver()
     rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
-        "RETURN k.status AS status, k.created_at AS created_at, "
+        "RETURN k.status AS status, k.created_at AS created_at, k.execution_epoch AS execution_epoch, "
         "       k.updated_at AS updated_at, k.error_message AS error_message, "
         "       k.source_obs_id AS sid, k.source_description AS sd"
     )
@@ -4100,7 +4156,7 @@ async def capsule_requeue(request: Request) -> JSONResponse:
             g, ib.source_description, ib.source_obs_id, str(uuidlib.uuid4()))
         if not merge_result["newly_created"]:
             return JSONResponse({"ok": False, "error": "重试竞争失败,请再点一次"}, status_code=409)
-    asyncio.create_task(do_extract(g, ib, ref_time, merge_result.get("created_at")))
+    asyncio.create_task(do_extract(g, ib, ref_time, (merge_result.get("execution_epoch") or merge_result.get("created_at"))))
     await g.driver.execute_query(
         "MATCH (q:QuarantinedCapsule {source_obs_id: $sid}) DELETE q", sid=sid)
     return JSONResponse({"ok": True, "queued": True, "provenance": prov})

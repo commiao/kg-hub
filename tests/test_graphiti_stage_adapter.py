@@ -247,6 +247,8 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
             journal.start_http("failed-resolution")
             journal.update_gateway_status(
                 "failed-resolution", {"phase": "failed", "provider_call_started": True})
+            journal.begin_task_execution("source", "sid", "initial")
+            journal.finish_task_execution("source", "sid", "initial", state="failed")
             grant_id = journal.authorize_retry(
                 "source", "sid", "resolution-step", "resolution-input",
                 deadline_seconds=180, expected_stage="node_resolution")

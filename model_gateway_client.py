@@ -96,7 +96,8 @@ def model_stage(stage: str):
 def model_manual_resume(source_description: str, source_obs_id: str,
                         step_id: str, grant_id: str,
                         stage: str | None = None, *,
-                        gateway_step_id: str | None = None):
+                        gateway_step_id: str | None = None,
+                        execution_id: str | None = None):
     """Bind exactly one already authorized failed step to a business run."""
     journal = journal_from_backup_env()
     if journal is None:
@@ -107,7 +108,7 @@ def model_manual_resume(source_description: str, source_obs_id: str,
     state = {"task": (source_description, source_obs_id), "step_id": step_id,
              "grant_id": grant_id, "consumed": False,
              "cached_pending": cached_steps, "stage": stage,
-             "gateway_step_id": gateway_step_id}
+             "gateway_step_id": gateway_step_id, "execution_id": execution_id}
     token = _resume.set(state)
     try:
         yield
@@ -119,6 +120,27 @@ def manual_resume_stage() -> str | None:
     """Return the stage authorized by the active human retry, if any."""
     resume = _resume.get()
     return resume.get("stage") if resume is not None else None
+
+
+_stage_steps: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar("kg_hub_stage_steps", default=None)
+
+
+@contextmanager
+def collect_model_steps():
+    """Collect only the model steps invoked inside one persisted stage."""
+    seen = set()
+    token = _stage_steps.set(seen)
+    try:
+        yield seen
+    finally:
+        _stage_steps.reset(token)
+
+
+def acknowledge_restored_steps(step_ids) -> None:
+    """Called only after validating an immutable completed business stage."""
+    resume = _resume.get()
+    if resume is not None:
+        resume["cached_pending"].difference_update(step_ids)
 
 
 async def gateway_task_correlation_request_hook(request: Any) -> None:
@@ -514,6 +536,9 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             step_id = hashlib.sha256(
                 f"{task[0]}\x00{task[1]}\x00{request_digest}".encode("utf-8")
             ).hexdigest()
+        collector = _stage_steps.get()
+        if collector is not None and step_id:
+            collector.add(step_id)
         resume = _resume.get()
         reserved_by_grant = False
         if resume is not None:
@@ -527,7 +552,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                         request_digest=request_digest,
                         business_key=str(kwargs.get("model") or gateway_model()),
                         base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
-                        stage=_model_stage.get())
+                        stage=_model_stage.get(), execution_id=resume.get("execution_id"))
                     headers["Idempotency-Key"] = key
                     resume["consumed"] = True
                     reserved_by_grant = True

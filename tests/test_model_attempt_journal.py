@@ -20,6 +20,15 @@ def fields():
                 step_id="step-1", request_digest="request-hash")
 
 
+
+def record_failed_worker(journal, sd="source", sid="id-1"):
+    count = journal.task_execution_summary(sd, sid)["execution_count"]
+    execution_id = f"worker-{count + 1}"
+    journal.begin_task_execution(sd, sid, execution_id,
+                                 manual_command_id=execution_id if count else None)
+    journal.finish_task_execution(sd, sid, execution_id, state="failed")
+
+
 class JournalTests(unittest.TestCase):
     def test_existing_journal_adds_http_start_column_without_losing_rows(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -63,6 +72,7 @@ class JournalTests(unittest.TestCase):
                 "key-1", {"phase": "failed", "provider_call_started": True})
             keys = ["key-1"]
             for _ in range(2):
+                record_failed_worker(journal)
                 grant = journal.authorize_retry(
                     "source", "id-1", "step-1", "request-hash",
                     deadline_seconds=180)
@@ -93,6 +103,7 @@ class JournalTests(unittest.TestCase):
             journal.prepare(**fields())
             journal.update_gateway_status(
                 "key-1", {"phase": "failed", "provider_call_started": True})
+            record_failed_worker(journal)
             grant = journal.authorize_retry("source", "id-1", "step-1",
                                             "request-hash", deadline_seconds=180)
             key = journal.claim_retry(
@@ -126,12 +137,13 @@ class JournalTests(unittest.TestCase):
                 journal.authorize_retry(
                     "source", "id-1", "step-1", "request-hash",
                     deadline_seconds=3600)
+            record_failed_worker(journal)
             grant = journal.authorize_retry(
                 "source", "id-1", "step-1", "request-hash",
                 deadline_seconds=0)
             self.assertTrue(grant)
 
-    def test_three_failed_http_starts_across_task_are_terminal(self):
+    def test_three_failed_stages_in_one_execution_do_not_exhaust_task(self):
         with tempfile.TemporaryDirectory() as temp:
             journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
             for key, step, stage in (
@@ -149,10 +161,12 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(summary["failed_calls_total"], 3)
             self.assertEqual(summary["failed_calls_by_step"], {
                 "node-step": 1, "resolve-step": 1, "edge-step": 1})
-            with self.assertRaisesRegex(RuntimeError, "not eligible"):
-                journal.authorize_retry(
-                    "source", "id-1", "edge-step", "edge-step-digest",
-                    deadline_seconds=180, expected_stage="edge_phase")
+            record_failed_worker(journal)
+            self.assertTrue(journal.authorize_retry(
+                "source", "id-1", "edge-step", "edge-step-digest",
+                deadline_seconds=180, expected_stage="edge_phase"))
+            self.assertEqual(journal.task_execution_summary(
+                "source", "id-1")["failed_attempts"], 1)
 
     def test_failures_in_distinct_graphiti_calls_do_not_share_retry_cap(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -166,6 +180,7 @@ class JournalTests(unittest.TestCase):
                 journal.start_http(key)
                 journal.update_gateway_status(
                     key, {"phase": "failed", "provider_call_started": True})
+            record_failed_worker(journal)
             grant = journal.authorize_retry(
                 "source", "id-1", "resolve-step", "resolve-step-digest",
                 deadline_seconds=180, expected_stage="node_resolution")
@@ -314,6 +329,7 @@ class JournalTests(unittest.TestCase):
             journal.prepare(**{**fields(), "stage": "node_extraction"})
             journal.update_gateway_status(
                 "key-1", {"phase": "completed", "provider_call_started": True})
+            record_failed_worker(journal)
             grant = journal.authorize_retry(
                 "source", "id-1", "step-1", "request-hash",
                 deadline_seconds=180, expected_stage="node_extraction")
@@ -393,6 +409,7 @@ class ClientJournalTests(unittest.IsolatedAsyncioTestCase):
                             messages=[{"role": "user", "content": "hello"}])
                 journal = ModelAttemptJournal(Path(temp) / "model-attempts.sqlite3")
                 step = journal.find_task("source", "id-1")[0]
+                record_failed_worker(journal)
                 grant = journal.authorize_retry(
                     "source", "id-1", step["step_id"], step["request_digest"],
                     deadline_seconds=180)

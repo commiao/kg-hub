@@ -140,6 +140,8 @@ class PinnedGraphitiResumeTests(unittest.IsolatedAsyncioTestCase):
                         await run()
                 attempts = journal.find_task("source", "id-1")
                 failed = next(row for row in attempts if row["phase"] == "failed")
+                journal.begin_task_execution("source", "id-1", "initial")
+                journal.finish_task_execution("source", "id-1", "initial", state="failed")
                 grant = journal.authorize_retry(
                     "source", "id-1", failed["step_id"], failed["request_digest"],
                     deadline_seconds=180)

@@ -112,11 +112,17 @@ class MailboxTests(unittest.TestCase):
                        "result_json": None, "created_at": now.isoformat(),
                        "http_started_at": now.isoformat()}
             journal = Mock()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 1, "active": False,
+                "executions": [{"state": "failed"}]}
             journal.find_task.return_value = [attempt]
             journal.gateway_step_for_attempt.return_value = "b" * 64
             journal.resolve_gateway_step.return_value = {
                 "local_step_id": attempt["step_id"],
                 "request_digest": attempt["request_digest"], "stage": "node_extraction"}
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 0, "active": True,
+                "executions": [{"state": "running"}]}
             in_flight = prepare_task_report(store, journal, {
                 "source_description": "source", "source_obs_id": "id-1",
                 "status": "needs_reconciliation", "error_kind": None,
@@ -125,12 +131,15 @@ class MailboxTests(unittest.TestCase):
             self.assertEqual(in_flight["reason"], "model_call_in_flight")
 
             attempt["http_started_at"] = (now - timedelta(seconds=181)).isoformat()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 1, "active": False,
+                "executions": [{"state": "failed"}]}
             expired = prepare_task_report(store, journal, {
                 "source_description": "source", "source_obs_id": "id-1",
                 "status": "needs_reconciliation", "error_kind": None,
             }, deadline_seconds=180)
             self.assertEqual(expired["failed_attempts"], 1)
-            self.assertEqual(expired["reason"], "manual_retry_available")
+            self.assertEqual(expired["reason"], "retry_adapter_unavailable")
 
     def test_error_row_and_gateway_completed_without_local_receipt_are_retryable(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -143,6 +152,9 @@ class MailboxTests(unittest.TestCase):
                        "result_json": None, "created_at": "2026-09-25T00:00:00+00:00",
                        "http_started_at": "2026-09-25T00:00:00+00:00"}
             journal = Mock()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 1, "active": False,
+                "executions": [{"state": "failed"}]}
             journal.find_task.return_value = [attempt]
             journal.gateway_step_for_attempt.return_value = step
             journal.resolve_gateway_step.return_value = {
@@ -151,7 +163,7 @@ class MailboxTests(unittest.TestCase):
             report = prepare_task_report(store, journal, {
                 "source_description": "source", "source_obs_id": "id-1",
                 "status": "error", "error_kind": "model_timeout",
-            }, deadline_seconds=180)
+            }, deadline_seconds=180, manual_resume_available=True)
             self.assertEqual(report["state"], "reconciliation")
             self.assertEqual(report["failed_attempts"], 1)
             self.assertTrue(report["retryable"])
@@ -170,6 +182,9 @@ class MailboxTests(unittest.TestCase):
                 "http_started_at": "2026-09-25T00:00:00+00:00",
             } for index in range(3)]
             journal = Mock()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 3, "failed_attempts": 3, "active": False,
+                "executions": [{"state": "failed"}] * 3}
             journal.find_task.return_value = attempts
             journal.gateway_step_for_attempt.return_value = step
             journal.resolve_gateway_step.return_value = {
@@ -303,6 +318,9 @@ class MailboxCommandTests(unittest.IsolatedAsyncioTestCase):
                        "updated_at": "2026-09-01T00:00:00+00:00",
                        "http_started_at": "2026-09-01T00:00:00+00:00"}
             journal = Mock()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 1, "active": False,
+                "executions": [{"state": "failed"}]}
             journal.find_task.return_value = [attempt]
             journal.gateway_step_for_attempt.return_value = step
             journal.resolve_gateway_step.return_value = {
@@ -344,6 +362,9 @@ class MailboxCommandTests(unittest.IsolatedAsyncioTestCase):
                        "result_json": None, "created_at": "2026-09-01T00:00:00+00:00",
                        "http_started_at": "2026-09-01T00:00:00+00:00"}
             journal = Mock()
+            journal.task_execution_summary.return_value = {
+                "execution_count": 1, "failed_attempts": 1, "active": False,
+                "executions": [{"state": "failed"}]}
             journal.find_task.return_value = [attempt]
             journal.gateway_step_for_attempt.return_value = step
             journal.resolve_gateway_step.return_value = {

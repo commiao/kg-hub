@@ -4,6 +4,8 @@ import ast
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
+import tempfile
+from utils.predigest import obs_to_episode_body
 from unittest.mock import Mock
 
 from utils.model_attempt_journal import summarize_attempts
@@ -51,8 +53,12 @@ class Driver:
 
 
 class Journal:
-    def __init__(self, attempts):
+    def __init__(self, attempts, *, failed_executions=0):
         self.attempts = attempts
+        self.failed_executions = failed_executions
+
+    def task_execution_summary(self, sd, sid):
+        return {"failed_attempts": self.failed_executions}
 
     def find_task(self, sd, sid):
         return self.attempts
@@ -75,6 +81,10 @@ def attempt(index, started):
 
 class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
     async def run_check(self, driver, journal, *, model_step_id=None):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        if journal is not None:
+            journal.path = Path(temp.name) / "attempts.sqlite3"
         module = ast.fix_missing_locations(ast.Module(body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
             *FUNCTIONS,
@@ -86,6 +96,7 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
             "MIN_CLIENT_TIMEOUT_SEC": 180,
             "datetime": datetime, "timezone": timezone,
             "MAX_OBS": 20, "asyncio": Mock(),
+            "obs_to_episode_body": obs_to_episode_body,
         }
         exec(compile(module, str(SOURCE), "exec"), namespace)
         return await namespace["ingest_reconciliation_check"](
@@ -101,14 +112,14 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_three_proven_failed_calls_mark_failed(self):
         driver = Driver()
-        response = await self.run_check(driver, Journal([attempt(i, 1) for i in range(3)]))
+        response = await self.run_check(driver, Journal([attempt(i, 1) for i in range(3)], failed_executions=3))
         self.assertEqual(response.data["task"]["status"], "failed")
         self.assertFalse(response.data["business_result_persisted"])
         self.assertEqual(response.data["task"]["max_failed_calls"], 3)
 
     async def test_three_proven_failed_calls_on_error_row_mark_failed(self):
         driver = Driver(status="error")
-        response = await self.run_check(driver, Journal([attempt(i, 1) for i in range(3)]))
+        response = await self.run_check(driver, Journal([attempt(i, 1) for i in range(3)], failed_executions=3))
         self.assertEqual(response.data["task"]["status"], "failed")
         self.assertEqual(response.data["task"]["error_kind"], "model_attempts_exhausted")
         self.assertTrue(any("k.status IN ['needs_reconciliation', 'error']" in query
@@ -126,7 +137,7 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         attempts = [attempt(i, None) for i in range(3)]
         for row in attempts:
             row["http_started_at"] = "2026-09-25T00:00:00+00:00"
-        response = await self.run_check(driver, Journal(attempts))
+        response = await self.run_check(driver, Journal(attempts, failed_executions=3))
         self.assertEqual(response.data["task"]["status"], "failed")
         self.assertEqual(response.data["task"]["max_failed_calls"], 3)
         self.assertTrue(response.data["task"]["admission_unknown"])
@@ -139,9 +150,20 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
             row["phase"] = "completed"
             row["result_json"] = None
         response = await self.run_check(
-            driver, Journal(attempts), model_step_id="b" * 64)
+            driver, Journal(attempts, failed_executions=3), model_step_id="b" * 64)
         self.assertEqual(response.data["task"]["status"], "failed")
         self.assertEqual(response.data["task"]["failed_calls_total"], 3)
+
+    async def test_three_model_failures_in_one_worker_run_are_one_task_failure(self):
+        driver = Driver(status="error")
+        rows = [attempt(i, 1) for i in range(3)]
+        for index, row in enumerate(rows):
+            row["step_id"] = f"different-stage-{index}"
+        response = await self.run_check(driver, Journal(rows, failed_executions=1))
+        self.assertEqual(response.data["task"]["status"], "error")
+        self.assertEqual(response.data["task"]["failed_attempts"], 1)
+        self.assertEqual(response.data["task"]["failed_calls_total"], 3)
+        self.assertEqual(driver.writes, [])
 
     async def test_saved_model_answer_does_not_mark_business_success_or_failure(self):
         driver = Driver()

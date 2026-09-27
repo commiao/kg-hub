@@ -1,160 +1,41 @@
-# Manual model-step retry: Graphiti 0.29.0 adapter boundary
+# 人工核对与原业务恢复
 
-Status: design gap. The authoritative reconciliation check and durable
-human-command mailbox polling are implemented; **business retry remains
-unavailable and must not be exposed as if it were** until the adapter below
-is wired into the live ingest path and passes continuation validation.
+## 当前实现
 
-The mailbox worker claims only commands already created by the dashboard. Its
-`reconcile` command rechecks the exact graph result and journal, publishes a
-monotone report version, and completes the command. It does not create retry
-commands or grants. If the graph result is absent, it reports
-`retry_adapter_unavailable` and leaves the task in reconciliation; the live
-Graphiti path has not yet passed the continuation gate described below.
+网关的人工 `reconcile` 命令由持久邮箱交给 kg-hub。后台轮询只领取已有人工命令、跟踪执行状态，不创建重试命令。`KG_HUB_MANUAL_RECONCILIATION_REPLAY_ENABLED` 控制此人工恢复入口（默认开启，设为 `0` 可停用）。
 
-An isolated partial adapter now exists in `utils/graphiti_stage_adapter.py`.
-It wraps the pinned 0.29.0 extraction helper and stores immutable serialized
-`EntityNode` objects (including their generated UUIDs and attribution map),
-ordered semantic candidate sets, and resolved nodes. It rejects input/UUID
-drift and provides a one-way durable
-`begin_graph_commit` fence. `tests/test_graphiti_stage_adapter.py` exercises
-candidate changes and process-style restoration against real pinned Graphiti
-node types and resolver helpers. It now also stores complete edge and attribute
-stage outputs and a typed graph commit receipt. An edge or attribute stage that
-started but did not save its output freezes on continuation, since Graphiti
-may have made multiple subcalls or read changing graph state inside that stage.
-The graph write has a durable one-way fence; a crash after the graph write but
-before the receipt also freezes. The adapter is **not wired into live ingest**:
-these uncertainty windows require finer internal checkpoints or an atomic
-business graph commit receipt before a manual retry endpoint can safely promise
-a terminal outcome. A repeated commit attempt never writes again.
+1. 核对原任务的图谱结果和调用记录。已实际入库的任务标记成功；仍在执行或未到模型最大超时的任务继续跟踪，不重复投递。
+2. 已失败、具备原始输入和恢复记录的任务，由该次人工命令创建一次授权，重新交给原 `do_extract` 工作函数。
+3. 一个业务执行可以包含多个不同的模型步骤；每个模型步骤最多三次实际调用。持久业务执行记录同时限制原任务最多三次失败执行（首次包含在内）。后台不会补齐剩余次数；再次失败需要下一次人工操作。
+4. 第三次失败进入失败列表。历史任务若缺少执行历史或恢复计划，保留原记录，以具体原因进入无法恢复的失败列表，不虚构调用次数、不猜测成功。
 
-### Crash-window readback and remaining internal hooks
+## 保持原业务身份
 
-Pinned Graphiti 0.29.0 `_process_episode_data` calls
-`add_nodes_and_edges_bulk` (`graphiti.py:683-690`), whose episode/entity nodes
-and MENTIONS/RELATES_TO relationships run in one graph driver write transaction
-(`bulk_utils.py:128-148,151-259`). Saga association is written in separate
-operations afterwards (`graphiti.py:694-732`). The adapter now persists the
-exact episode, node, and entity-edge identities **before** entering that write.
-`inspect_started_graph_commit` reads them back using only `MATCH/RETURN` and
-reports `core_absent`, `partial`, `core_materialized`, or `unknown`, with the
-saved-receipt and saga-required flags. A core-materialized result is useful
-evidence, but it is not a terminal business receipt: generated MENTIONS UUIDs
-were not pre-snapshotted, and saga links may be missing after a crash. The
-function never writes or promotes a task.
+`execution_epoch` 在原任务创建时固定。长文档保活更新 `created_at` 不再改变恢复时的请求身份。
 
-The edge stage contains `extract_edges.edge` plus parallel per-edge resolution
-(`edge_operations.py:116-206,324-534`), with potential dedupe, custom
-attribute, and timestamp model calls (`:597-601,661-669,715-720,777-790`).
-It also re-reads graph edge candidates (`:364-415`). The attribute stage runs
-per-node model calls in parallel and later batched summary model calls
-(`node_operations.py:725-765,875-890,959-965`). The existing model SDK hook
-journals individual HTTP requests, but it cannot checkpoint these changing
-in-memory per-edge/per-node inputs or all concurrent results. The safe next
-fork point is before each per-edge/per-node work item: persist its typed inputs,
-ordered graph candidates, output and subcall IDs, then resume only the failed
-item after all prior successful outputs are restored. `asyncio.gather` may
-leave sibling calls running after one exception, so recovery must also wait
-for or explicitly account for every sibling's journal state.
+`utils/ingest_workflow.py` 保存原输入摘要、路由、参考时间、长文档父节点 UUID 和拆分计划。人工恢复使用同一计划；某个子片段失败后停止后续片段，避免故障期间继续消耗模型调用。
 
-The pinned dependency is `graphiti-core==0.29.0`. Its `Graphiti.add_episode`
-reads recent episodes, creates an in-memory episode, runs `extract_nodes`,
-`resolve_extracted_nodes`, `_extract_and_resolve_edges`, and
-`extract_attributes_from_nodes`, then writes the graph with
-`_process_episode_data`. It exposes no continuation argument or stage output
-injection. Passing `uuid` fetches an existing episode and does not assign a
-fresh stable UUID. See
-https://github.com/getzep/graphiti/blob/v0.29.0/graphiti_core/graphiti.py#L961-L1048.
+`utils/graphiti_stage_adapter.py` 使用固定的 Graphiti 0.29.0 接口，保存：
 
-The kg-hub SDK journal can replay a completed response only when the exact
-request digest matches. Calling `add_episode` again can read a different graph,
-generate new in-memory UUIDs, and produce different downstream prompts. A new
-prompt is a different model step; allowing it through would silently repeat
-paid work and break the operator's one-step authorization. Replaying the whole
-ingest also duplicates predigest parent/child graph writes.
+- 原 episode、最近 episode 上下文和时间；
+- 已抽取节点 UUID、去重候选顺序及节点映射；
+- 已完成的边处理、属性处理输出及对应模型步骤；
+- 写图前的预期节点、关系和写图后的回执。
 
-## Pinned 0.29.0 continuation audit (2026-09-26)
+恢复时直接加载已完成步骤。只有授权的失败模型步骤可获得新调用身份；输入变化或未重放的历史付费步骤会在发出新请求前阻止执行。授权成功后的新业务步骤仍按原流程继续，下一次失败结束本轮执行。
 
-The isolated pinned-wheel inspection establishes a concrete unsafe boundary:
+原工作函数的开始、退出和取消由 `utils/task_execution.py` 记录。普通摄入在观察账本不可用时仍执行原流程；人工恢复必须先取得持久执行记录，避免同一指令运行两次或突破上限。执行结束时还要核对原任务身份，防止旧执行覆盖新任务。
 
-- `graphiti_core/graphiti.py:1052-1065` constructs a fresh `EpisodicNode` if
-  `uuid` is absent. Supplying `uuid` instead calls `get_by_uuid`, which requires
-  the episode to have already been written; it cannot inject the saved
-  pre-commit episode into a resumed extraction.
-- `graphiti_core/utils/maintenance/node_operations.py:282-332` converts even
-  a replayed extraction answer into fresh `EntityNode` objects, each with a
-  `uuid4` default (`graphiti_core/nodes.py:93-98`). The node-to-episode map is
-  keyed by these new UUIDs. Thus an exact cached model answer alone cannot
-  reproduce the original intermediate graph objects.
-- `node_operations.py:406-449,626-640` searches the live graph again for
-  semantic dedup candidates. A concurrent graph change, or a partial earlier
-  write, can alter the candidate set and the next resolution prompt. The
-  current context checkpoint pins only `previous_episode_uuids`; it does not
-  pin this candidate search or the extracted/resolved node objects.
-- `graphiti_core/graphiti.py:1074-1131` passes these phase outputs into edge
-  resolution, attribute extraction, and graph commit. The pinned public
-  `add_episode` signature has no stage-output or candidate-snapshot argument.
+## 成功判定与范围
 
-The isolated orchestration test demonstrates that a *mocked deterministic*
-extract/resolve path replays saved responses, stops on digest drift, and admits
-one granted retry. It does not prove continuation through the real candidate
-search or fresh UUID construction. Therefore the grant and replay primitives
-must stay unconnected to an HTTP retry endpoint or live worker. A one-shot
-grant cannot repair a prompt that no longer addresses the same step.
+模型返回成功不等于业务成功。普通 episode 必须核对预期图谱节点和关系；长文档必须核对父节点以及计划中的全部子片段。本入口不支持 saga 或社区更新，因此可用完整核心图事务的读回结果确认写入完成。写图后进程中断、回执未保存时，也先读回实际结果。
 
-The minimum safe implementation is a pinned Graphiti adapter/fork that writes
-the episode object and `extract_nodes` output (including UUIDs and attribution
-map) before `resolve_extracted_nodes`; writes the exact ordered candidate
-snapshot plus resolved nodes/UUID map before edge work; then checkpoints edge
-and attribute phase outputs before graph commit. Recovery loads each completed
-stage object verbatim, verifies its input digest and Graphiti/schema version,
-and permits a new HTTP call only at the granted failed step. A commit token on
-the final episode write and predigest child checkpoints are also required.
-Validation must use real 0.29.0 helpers with two runs against deliberately
-changed candidate search results and fresh UUID generation: all saved paid
-steps must be cache hits, exactly one failed step may be admitted, and any
-unsnapshotted drift must freeze before HTTP. Until that gate passes, no
-business-queue retry command is safe to expose.
+不确定的写图操作不会直接重写。图查询或账本暂时不可用时保留最后已知状态，不能把观测故障伪装成业务失败。历史缺失记录、输入漂移与真正的模型失败应保留不同原因。
 
-## Minimum adapter/fork contract
+## 验证
 
-1. Persist one operation envelope before the first model call: business task ID,
-   immutable input digest, episode UUID and creation timestamp, reference time,
-   previous episode UUIDs, graph candidate snapshot/version, and Graphiti schema
-   version. For predigest, persist the selected route, observation list, parent
-   UUID, and each child identity before writing a child.
-2. Add a resumable `add_episode` adapter that accepts the envelope and stage
-   checkpoints. Checkpoint the serialized output of each of the four phases
-   above, with input digests, before starting the next phase. A process restart
-   must load completed phases rather than rerun them. The final graph write
-   needs an idempotent commit key tied to the business task/episode UUID.
-3. At every model call, the client must look up the exact step by task ID and
-   request digest. A saved successful response is replayed locally. A previously
-   failed step may receive a new Idempotency-Key only under a durable, one-shot
-   operator grant. The grant is consumed atomically before HTTP admission and
-   records the attempt ordinal. Proven gateway preflight refusal consumes no
-   *actual-call* slot; admitted, timed-out, or admission-unknown attempts do.
-   A locally persisted HTTP-start marker with no usable response counts as a
-   failed business attempt after the maximum timeout, even if gateway/provider
-   admission remains unknown. A prepared intent with no local HTTP-start marker
-   and no gateway admission proof stays frozen. Proven pre-provider refusal
-   counts as zero. After three counted calls with no usable result, close the
-   step and move the business task to `failed`.
-4. During resume, any uncheckpointed or different model request before the
-   granted failed step must stop without HTTP. After that step succeeds, new
-   downstream steps may execute only as part of the same authorized business
-   continuation and each gets its own journal identity/count. A second failure
-   stops the run for another explicit operator action.
-5. The retry endpoint must CAS the task from `needs_reconciliation` into a
-   durable queued/resuming state, persist the grant, and send that same task to
-   the original business worker. It must not call the model inline. The worker
-   must use the checkpointed operation, and only persisted graph/business output
-   may mark `ok`. No scheduler or cleanup job may create a grant.
+`tests/test_ingest_workflow.py` 调用生产恢复入口和固定版本适配器，使用本地模型/图 I/O 替身验证：首次超时、一次人工授权、加载完成阶段、继续下游模型步骤、一次写图及成功读回；另覆盖长文档拆分计划与父 UUID 复用。
 
-Integration points: `graphiti_client.py` builds the pinned Graphiti client;
-`kg_hub_server.py::_do_extract_inner` and `_locked_add_episode` call
-`add_episode`; `model_gateway_client.py::create_with_gateway_contract` owns
-HTTP identity; `utils/model_attempt_journal.py` owns durable attempt evidence.
-The currently exposed `POST /api/ingest/reconciliation/check` performs only
-status/evidence checks and cannot authorize a new paid call.
+`tests/test_task_execution.py` 覆盖三次失败上限、同一人工指令去重、普通任务账本故障不跳过业务、人工记录失败禁止执行、取消与原任务身份约束。其余 Graphiti、邮箱和账本测试覆盖真实固定版本节点类型/去重辅助函数、调用摘要和 CAS 边界。
+
+这些是本地回归验证，不代表已经发布或验证真实模型供应商。发布必须另行通过精确提交的完整测试和部署后状态核对。

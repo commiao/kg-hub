@@ -50,7 +50,7 @@ class PredigestFailureTests(IsolatedAsyncioTestCase):
             "parse_observations": lambda raw: [{"type": "fact"}, {"type": "fact"}],
             "_bare_episode_node": AsyncMock(return_value="parent-uuid"),
             "_tag_schema_fields": AsyncMock(),
-            "_locked_add_episode": fail_child,
+            "_locked_add_episode": AsyncMock(side_effect=fail_child),
             "obs_to_episode_body": lambda obs, name: "fact",
             "update_ingested_key_status": update,
             "logger": Mock(), "datetime": datetime, "timezone": timezone,
@@ -60,7 +60,7 @@ class PredigestFailureTests(IsolatedAsyncioTestCase):
         body = type("Body", (), {
             "source_description": "source", "source_obs_id": "id-1",
             "episode_body": "source content", "name": "episode",
-            "provenance": None,
+            "provenance": None, "model_usage_scenario": None,
         })()
 
         handled = await namespace["_predigest_extract"](
@@ -77,7 +77,8 @@ class PredigestFailureTests(IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["episode_uuid"], "parent-uuid")
         self.assertIn("0/2", kwargs["error_message"])
         self.assertEqual(driver.writes[-1][1]["failed"],
-                         ["episode--obs-01", "episode--obs-02"])
+                         ["episode--obs-01"])
+        namespace["_locked_add_episode"].assert_awaited_once()
 
     async def test_refinery_holds_incomplete_task_without_resubmission(self):
         row = {"id": 17, "content_hash": "hash", "created_at": "2026-09-25T00:00:00Z",
