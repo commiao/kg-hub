@@ -45,6 +45,11 @@ def _stage_digest(value) -> str:
     return hashlib.sha256(_encoded(_stage_value(value)).encode()).hexdigest()
 
 
+def _active_manual_stage() -> str | None:
+    from model_gateway_client import manual_resume_stage
+    return manual_resume_stage()
+
+
 class StageArtifactStore:
     """Immutable, fsynced stage records keyed by original business operation."""
 
@@ -115,6 +120,18 @@ class StageArtifactStore:
         marker = _encoded({"stage_input_digest": stage_input_digest})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("""SELECT input_digest, artifact_json, artifact_digest
+                FROM graphiti_stage_artifacts WHERE task_sd=? AND task_sid=?
+                AND operation_id=? AND stage=?""",
+                (task_sd, task_sid, operation_id, stage + "_started")).fetchone()
+            if prior is not None:
+                if (prior[0] != input_digest or prior[1] != marker
+                        or hashlib.sha256(prior[1].encode()).hexdigest() != prior[2]):
+                    raise RuntimeError(f"{stage} start identity drift; freeze")
+                # `_stage_record` has already required a matching manual grant
+                # before an interrupted stage can reach this point. Treat the
+                # exact marker as the original stage boundary, not a second one.
+                return
             try:
                 db.execute("""INSERT INTO graphiti_stage_artifacts VALUES (?,?,?,?,?,?,?)""",
                     (task_sd, task_sid, operation_id, input_digest,
@@ -149,12 +166,20 @@ async def extract_nodes_with_snapshot(
     if version("graphiti-core") != "0.29.0":
         raise RuntimeError("unsupported Graphiti version for node-stage adapter")
     identity = (task_sd, task_sid, operation_id, input_digest)
-    saved = store.save_or_load(*identity, "extraction")
+    inputs = (episode, previous_episodes, entity_types,
+              excluded_entity_types, custom_extraction_instructions)
+    saved, digest = _stage_record(
+        store, identity, "extraction", inputs,
+        allow_retry=_active_manual_stage() == "node_extraction")
     if saved is None:
-        nodes, attribution = await ops.extract_nodes(
-            clients, episode, previous_episodes, entity_types,
-            excluded_entity_types, custom_extraction_instructions)
+        store.begin_stage(*identity, "extraction", digest)
+        from model_gateway_client import model_stage
+        with model_stage("node_extraction"):
+            nodes, attribution = await ops.extract_nodes(
+                clients, episode, previous_episodes, entity_types,
+                excluded_entity_types, custom_extraction_instructions)
         saved = store.save_or_load(*identity, "extraction", {
+            "stage_input_digest": digest,
             "nodes": [node.model_dump(mode="json") for node in nodes],
             "attribution": attribution,
         })
@@ -203,6 +228,23 @@ async def resolve_nodes_with_candidate_snapshot(
     if len(candidate_nodes_by_extracted) != len(extracted_nodes):
         raise RuntimeError("candidate snapshot length drift")
 
+    resolution_inputs = (episode, previous_episodes, entity_types,
+                         extracted_nodes, candidate_nodes_by_extracted)
+    resolution, resolution_digest = _stage_record(
+        store, identity, "node_resolution",
+        resolution_inputs,
+        allow_retry=_active_manual_stage() == "node_resolution")
+    if resolution is not None:
+        resolved = store.save_or_load(*identity, "resolved_nodes")
+        if resolved is None:
+            raise RuntimeError("node resolution receipt is missing")
+        return (
+            [EntityNode.model_validate(node) for node in resolved["nodes"]],
+            resolved["uuid_map"],
+            [(EntityNode.model_validate(left), EntityNode.model_validate(right))
+             for left, right in resolved["duplicates"]],
+        )
+
     state = ops.DedupResolutionState(
         resolved_nodes=[None] * len(extracted_nodes), uuid_map={}, unresolved_indices=[])
     for idx, (node, candidates) in enumerate(
@@ -222,10 +264,13 @@ async def resolve_nodes_with_candidate_snapshot(
         llm_candidates = ops._merge_candidate_nodes(
             [candidate for idx in state.unresolved_indices
              for candidate in candidate_nodes_by_extracted[idx]], None)
-        await ops._resolve_with_llm(
-            clients.llm_client, extracted_nodes,
-            ops._build_candidate_indexes(llm_candidates), state,
-            episode, previous_episodes, entity_types)
+        store.begin_stage(*identity, "node_resolution", resolution_digest)
+        from model_gateway_client import model_stage
+        with model_stage("node_resolution"):
+            await ops._resolve_with_llm(
+                clients.llm_client, extracted_nodes,
+                ops._build_candidate_indexes(llm_candidates), state,
+                episode, previous_episodes, entity_types)
     for idx, node in enumerate(extracted_nodes):
         if state.resolved_nodes[idx] is None:
             state.resolved_nodes[idx] = node
@@ -241,10 +286,15 @@ async def resolve_nodes_with_candidate_snapshot(
     saved_resolved = store.save_or_load(*identity, "resolved_nodes", resolved_json)
     if saved_resolved != resolved_json:
         raise RuntimeError("concurrent resolved node artifact drift")
+    if state.unresolved_indices:
+        store.save_or_load(*identity, "node_resolution", {
+            "stage_input_digest": resolution_digest,
+            "resolved_nodes_digest": _stage_digest(resolved_json),
+        })
     return result
 
 
-def _stage_record(store, identity, stage, inputs):
+def _stage_record(store, identity, stage, inputs, *, allow_retry: bool = False):
     digest = _stage_digest(inputs)
     saved = store.save_or_load(*identity, stage)
     if saved is not None:
@@ -253,7 +303,8 @@ def _stage_record(store, identity, stage, inputs):
         return saved, digest
     started = store.save_or_load(*identity, stage + "_started")
     if started is not None:
-        raise RuntimeError(f"{stage} interrupted without complete artifact; freeze")
+        if not allow_retry or started.get("stage_input_digest") != digest:
+            raise RuntimeError(f"{stage} interrupted without complete artifact; freeze")
     return None, digest
 
 
@@ -272,10 +323,14 @@ async def extract_and_resolve_edges_with_snapshot(
     inputs = (episode, extracted_nodes, previous_episodes, edge_type_map,
               group_id, edge_types, nodes, uuid_map,
               custom_extraction_instructions)
-    saved, digest = _stage_record(store, identity, "edge_phase", inputs)
+    saved, digest = _stage_record(
+        store, identity, "edge_phase", inputs,
+        allow_retry=_active_manual_stage() == "edge_phase")
     if saved is None:
         store.begin_stage(*identity, "edge_phase", digest)
-        groups = await graphiti._extract_and_resolve_edges(*inputs)
+        from model_gateway_client import model_stage
+        with model_stage("edge_phase"):
+            groups = await graphiti._extract_and_resolve_edges(*inputs)
         saved = store.save_or_load(*identity, "edge_phase", {
             "stage_input_digest": digest,
             "groups": [[edge.model_dump(mode="json") for edge in group]
@@ -298,12 +353,16 @@ async def extract_attributes_with_snapshot(
         raise RuntimeError("unsupported Graphiti version for attribute-stage adapter")
     identity = (task_sd, task_sid, operation_id, input_digest)
     inputs = (nodes, episode, previous_episodes, entity_types, new_edges)
-    saved, digest = _stage_record(store, identity, "attribute_phase", inputs)
+    saved, digest = _stage_record(
+        store, identity, "attribute_phase", inputs,
+        allow_retry=_active_manual_stage() == "attribute_phase")
     if saved is None:
         store.begin_stage(*identity, "attribute_phase", digest)
-        hydrated = await ops.extract_attributes_from_nodes(
-            graphiti.clients, nodes, episode, previous_episodes,
-            entity_types, edges=new_edges)
+        from model_gateway_client import model_stage
+        with model_stage("attribute_phase"):
+            hydrated = await ops.extract_attributes_from_nodes(
+                graphiti.clients, nodes, episode, previous_episodes,
+                entity_types, edges=new_edges)
         saved = store.save_or_load(*identity, "attribute_phase", {
             "stage_input_digest": digest,
             "nodes": [node.model_dump(mode="json") for node in hydrated],
@@ -347,6 +406,138 @@ async def commit_episode_with_receipt(
         })
     return ([EpisodicEdge.model_validate(edge) for edge in saved["episodic_edges"]],
             EpisodicNode.model_validate(saved["episode"]))
+
+
+def operation_input_digest(kwargs: dict) -> str:
+    """Digest every business argument accepted by the supported live path."""
+    return _stage_digest(kwargs)
+
+
+async def add_episode_with_stage_checkpoint(
+    graphiti, *, store: StageArtifactStore, task_sd: str, task_sid: str,
+    operation_id: str, relevant_schema_limit: int, on_episode_identity=None,
+    **kwargs,
+):
+    """Pinned 0.29.0 single-episode continuation for the default kg-hub path.
+
+    This deliberately supports only the non-saga, non-community path used by
+    kg-hub's ordinary ingest. Every Graphiti phase output and its exact inputs
+    are persisted before the next phase. Interrupted edge/attribute/commit
+    phases freeze; only extraction or node-resolution may be manually resumed.
+    """
+    from importlib.metadata import version
+    from graphiti_core.graphiti import AddEpisodeResults
+    from graphiti_core.helpers import (
+        validate_entity_types, validate_excluded_entity_types, validate_group_id,
+    )
+    from graphiti_core.nodes import EpisodeType, EpisodicNode
+    from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
+    from graphiti_core.utils.datetime_utils import utc_now
+
+    if version("graphiti-core") != "0.29.0":
+        raise RuntimeError("unsupported Graphiti version for stage continuation")
+    if relevant_schema_limit != RELEVANT_SCHEMA_LIMIT:
+        raise RuntimeError("Graphiti schema context limit changed")
+    if kwargs.get("uuid") is not None or kwargs.get("saga") is not None:
+        raise RuntimeError("stage continuation only supports new non-saga episodes")
+    if kwargs.get("update_communities", False):
+        raise RuntimeError("stage continuation does not support community updates")
+
+    name = kwargs["name"]
+    episode_body = kwargs["episode_body"]
+    source_description = kwargs["source_description"]
+    reference_time = kwargs["reference_time"]
+    source = kwargs.get("source", EpisodeType.message)
+    group_id = kwargs.get("group_id")
+    entity_types = kwargs.get("entity_types")
+    excluded_entity_types = kwargs.get("excluded_entity_types")
+    edge_types = kwargs.get("edge_types")
+    edge_type_map = kwargs.get("edge_type_map")
+    custom_extraction_instructions = kwargs.get("custom_extraction_instructions")
+    if group_id is None:
+        raise RuntimeError("stage continuation requires an explicit graph group")
+    validate_entity_types(entity_types)
+    validate_excluded_entity_types(excluded_entity_types, entity_types)
+    validate_group_id(group_id)
+    if group_id != graphiti.driver._database:
+        graphiti.driver = graphiti.driver.clone(database=group_id)
+        graphiti.clients.driver = graphiti.driver
+    edge_type_map_default = (
+        {("Entity", "Entity"): list(edge_types.keys())}
+        if edge_types is not None else {("Entity", "Entity"): []}
+    )
+    edge_type_map = edge_type_map or edge_type_map_default
+
+    # Include optional arguments after defaults are resolved, so any behavioral
+    # drift changes the operation identity and stops continuation.
+    operation_args = {
+        "name": name, "episode_body": episode_body,
+        "source_description": source_description,
+        "reference_time": reference_time, "source": source,
+        "group_id": group_id, "entity_types": entity_types,
+        "excluded_entity_types": excluded_entity_types,
+        "edge_types": edge_types, "edge_type_map": edge_type_map,
+        "custom_extraction_instructions": custom_extraction_instructions,
+        "update_communities": False, "saga": None,
+    }
+    input_digest = operation_input_digest(operation_args)
+    identity = (task_sd, task_sid, operation_id, input_digest)
+    envelope = store.save_or_load(*identity, "operation_envelope")
+    if envelope is None:
+        now = utc_now()
+        previous_episodes = await graphiti.retrieve_episodes(
+            reference_time, last_n=relevant_schema_limit,
+            group_ids=[group_id], source=source)
+        episode = EpisodicNode(
+            name=name, group_id=group_id, labels=[], source=source,
+            content=episode_body, source_description=source_description,
+            created_at=now, valid_at=reference_time)
+        envelope_value = {
+            "schema_version": "graphiti-core-0.29.0",
+            "input_digest": input_digest,
+            "now": now.isoformat(),
+            "episode": episode.model_dump(mode="json"),
+            "previous_episodes": [item.model_dump(mode="json")
+                                  for item in previous_episodes],
+        }
+        envelope = store.save_or_load(*identity, "operation_envelope", envelope_value)
+    if (envelope.get("input_digest") != input_digest
+            or envelope.get("schema_version") != "graphiti-core-0.29.0"):
+        raise RuntimeError("stage operation envelope identity drift")
+    episode = EpisodicNode.model_validate(envelope["episode"])
+    previous_episodes = [EpisodicNode.model_validate(item)
+                         for item in envelope["previous_episodes"]]
+    now = datetime.fromisoformat(envelope["now"].replace("Z", "+00:00"))
+    if on_episode_identity is not None:
+        await on_episode_identity(episode.uuid)
+
+    extracted_nodes, node_episode_index_map = await extract_nodes_with_snapshot(
+        graphiti.clients, episode, previous_episodes, entity_types,
+        excluded_entity_types, custom_extraction_instructions,
+        store=store, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, input_digest=input_digest)
+    nodes, uuid_map, _ = await resolve_nodes_with_candidate_snapshot(
+        graphiti.clients, extracted_nodes, episode, previous_episodes,
+        entity_types, store=store, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, input_digest=input_digest)
+    resolved_edges, invalidated_edges, new_edges = await extract_and_resolve_edges_with_snapshot(
+        graphiti, episode, extracted_nodes, previous_episodes, edge_type_map,
+        group_id, edge_types, nodes, uuid_map, custom_extraction_instructions,
+        store=store, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, input_digest=input_digest)
+    entity_edges = resolved_edges + invalidated_edges
+    hydrated_nodes = await extract_attributes_with_snapshot(
+        graphiti, nodes, episode, previous_episodes, entity_types, new_edges,
+        store=store, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, input_digest=input_digest)
+    episodic_edges, episode = await commit_episode_with_receipt(
+        graphiti, episode, hydrated_nodes, entity_edges, now, group_id,
+        None, None, node_episode_index_map,
+        store=store, task_sd=task_sd, task_sid=task_sid,
+        operation_id=operation_id, input_digest=input_digest)
+    return AddEpisodeResults(
+        episode=episode, episodic_edges=episodic_edges, nodes=hydrated_nodes,
+        edges=entity_edges, communities=[], community_edges=[])
 
 
 async def inspect_graph_commit_materialization(driver, *, episode, nodes,

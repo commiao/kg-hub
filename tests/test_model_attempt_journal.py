@@ -131,6 +131,114 @@ class JournalTests(unittest.TestCase):
                 deadline_seconds=0)
             self.assertTrue(grant)
 
+    def test_three_failed_http_starts_across_task_are_terminal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            for key, step, stage in (
+                ("node-call", "node-step", "node_extraction"),
+                ("resolve-call", "resolve-step", "node_resolution"),
+                ("edge-call", "edge-step", "edge_phase"),
+            ):
+                journal.prepare(**{**fields(), "key": key, "step_id": step,
+                                   "request_digest": f"{step}-digest", "stage": stage})
+                journal.start_http(key)
+                journal.update_gateway_status(
+                    key, {"phase": "failed", "provider_call_started": True})
+            summary = summarize_attempts(journal.find_task("source", "id-1"),
+                                         deadline_seconds=180)
+            self.assertEqual(summary["failed_calls_total"], 3)
+            self.assertEqual(summary["failed_calls_by_step"], {
+                "node-step": 1, "resolve-step": 1, "edge-step": 1})
+            with self.assertRaisesRegex(RuntimeError, "not eligible"):
+                journal.authorize_retry(
+                    "source", "id-1", "edge-step", "edge-step-digest",
+                    deadline_seconds=180, expected_stage="edge_phase")
+
+    def test_failures_in_distinct_graphiti_calls_do_not_share_retry_cap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            for key, step, stage in (
+                ("node-call", "node-step", "node_extraction"),
+                ("resolve-call", "resolve-step", "node_resolution"),
+            ):
+                journal.prepare(**{**fields(), "key": key, "step_id": step,
+                                   "request_digest": f"{step}-digest", "stage": stage})
+                journal.start_http(key)
+                journal.update_gateway_status(
+                    key, {"phase": "failed", "provider_call_started": True})
+            grant = journal.authorize_retry(
+                "source", "id-1", "resolve-step", "resolve-step-digest",
+                deadline_seconds=180, expected_stage="node_resolution")
+            third_key = journal.claim_retry(
+                grant, source_description="source", source_obs_id="id-1",
+                step_id="resolve-step", request_digest="resolve-step-digest",
+                business_key="kg_hub.entity_extract", base_key="base",
+                deadline_seconds=180, stage="node_resolution")
+            rows = journal.find_task("source", "id-1")
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(rows[-1]["idempotency_key"], third_key)
+            self.assertEqual(rows[-1]["stage"], "node_resolution")
+
+    def test_gateway_wire_step_maps_to_local_request_and_manual_alias(self):
+        from utils.reconciliation_mailbox import task_uuid
+
+        with tempfile.TemporaryDirectory() as temp:
+            backup = Path(temp) / "ingest.jsonl"
+            journal = ModelAttemptJournal(Path(temp) / "model-attempts.sqlite3")
+            journal.prepare(**{**fields(), "stage": "node_extraction"})
+
+            class Request:
+                def __init__(self, content):
+                    self.content = content
+                    self.headers = {}
+
+                async def aread(self):
+                    return self.content
+
+            request = Request(b"serialized request")
+            with patch.dict("os.environ", {
+                    "KG_HUB_INGEST_BACKUP_PATH": str(backup)}):
+                attempt_token = client_module._wire_attempt.set(("key-1", "step-1"))
+                task_token = client_module._business_task.set(("source", "id-1"))
+                try:
+                    asyncio.run(client_module.gateway_task_correlation_request_hook(request))
+                finally:
+                    client_module._business_task.reset(task_token)
+                    client_module._wire_attempt.reset(attempt_token)
+            wire_id = __import__("hashlib").sha256(request.content).hexdigest()
+            self.assertEqual(request.headers["X-Model-Gateway-Task-Ids"],
+                             task_uuid("source", "id-1"))
+            self.assertEqual(request.headers["X-Model-Gateway-Step-Id"], wire_id)
+            self.assertEqual(journal.resolve_gateway_step("source", "id-1", wire_id),
+                             {"local_step_id": "step-1",
+                              "request_digest": "request-hash",
+                              "stage": "node_extraction"})
+
+            journal.prepare(**{**fields(), "key": "key-replay",
+                               "stage": "node_extraction"})
+            replay = Request(b"reserialized request")
+            with patch.dict("os.environ", {
+                    "KG_HUB_INGEST_BACKUP_PATH": str(backup)}):
+                attempt_token = client_module._wire_attempt.set(("key-replay", "step-1"))
+                task_token = client_module._business_task.set(("source", "id-1"))
+                resume_token = client_module._resume.set({
+                    "consumed": True, "step_id": "step-1",
+                    "gateway_step_id": wire_id})
+                try:
+                    asyncio.run(client_module.gateway_task_correlation_request_hook(replay))
+                finally:
+                    client_module._resume.reset(resume_token)
+                    client_module._business_task.reset(task_token)
+                    client_module._wire_attempt.reset(attempt_token)
+            replay_wire = __import__("hashlib").sha256(replay.content).hexdigest()
+            self.assertEqual(replay.headers["X-Model-Gateway-Step-Id"], replay_wire)
+            self.assertNotEqual(replay_wire, wire_id)
+            self.assertEqual(journal.gateway_step_for_attempt("key-replay"), wire_id)
+            self.assertEqual(journal.resolve_gateway_step("source", "id-1", wire_id),
+                             {"local_step_id": "step-1",
+                              "request_digest": "request-hash",
+                              "stage": "node_extraction"})
+
     def test_attempt_summary_excludes_proven_preflight_and_cached_result(self):
         now = datetime(2026, 9, 26, tzinfo=timezone.utc)
         old = (now - timedelta(minutes=30)).isoformat()
@@ -182,6 +290,39 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(summary["failed_calls_by_step"], {})
         self.assertEqual(summary["cached_model_steps"], 1)
         self.assertFalse(summary["in_flight"])
+
+    def test_gateway_completed_without_local_response_receipt_counts_as_failure(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        rows = [
+            {"idempotency_key": "gateway-completed", "step_id": "exact-step",
+             "phase": "completed", "provider_call_started": 1,
+             "result_json": None, "created_at": now.isoformat()},
+            {"idempotency_key": "other-step-completed", "step_id": "other-step",
+             "phase": "completed", "provider_call_started": 1,
+             "result_json": None, "created_at": now.isoformat()},
+        ]
+        summary = summarize_attempts(rows, deadline_seconds=180, now=now,
+                                     missing_receipt_step_id="exact-step")
+        self.assertEqual(summary["failed_calls_by_step"], {"exact-step": 1})
+        self.assertEqual(summary["failed_calls_total"], 1)
+        self.assertEqual(summary["cached_model_steps"], 0)
+        self.assertFalse(summary["in_flight"])
+
+    def test_completed_gateway_step_without_local_receipt_gets_exact_manual_grant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            journal.prepare(**{**fields(), "stage": "node_extraction"})
+            journal.update_gateway_status(
+                "key-1", {"phase": "completed", "provider_call_started": True})
+            grant = journal.authorize_retry(
+                "source", "id-1", "step-1", "request-hash",
+                deadline_seconds=180, expected_stage="node_extraction")
+            replay_key = journal.claim_retry(
+                grant, source_description="source", source_obs_id="id-1",
+                step_id="step-1", request_digest="request-hash",
+                business_key="kg_hub.entity_extract", base_key="base",
+                deadline_seconds=180, stage="node_extraction")
+            self.assertTrue(replay_key)
 
     def test_prepared_identity_survives_restart_and_freezes_replay(self):
         with tempfile.TemporaryDirectory() as temp:

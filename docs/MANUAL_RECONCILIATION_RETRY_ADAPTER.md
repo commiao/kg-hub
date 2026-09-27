@@ -1,7 +1,16 @@
 # Manual model-step retry: Graphiti 0.29.0 adapter boundary
 
-Status: design gap. The read-only reconciliation API is implemented; **manual
-retry is not implemented and must not be exposed or deployed as if it were**.
+Status: design gap. The authoritative reconciliation check and durable
+human-command mailbox polling are implemented; **business retry remains
+unavailable and must not be exposed as if it were** until the adapter below
+is wired into the live ingest path and passes continuation validation.
+
+The mailbox worker claims only commands already created by the dashboard. Its
+`reconcile` command rechecks the exact graph result and journal, publishes a
+monotone report version, and completes the command. It does not create retry
+commands or grants. If the graph result is absent, it reports
+`retry_adapter_unavailable` and leaves the task in reconciliation; the live
+Graphiti path has not yet passed the continuation gate described below.
 
 An isolated partial adapter now exists in `utils/graphiti_stage_adapter.py`.
 It wraps the pinned 0.29.0 extraction helper and stores immutable serialized

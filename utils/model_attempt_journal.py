@@ -51,6 +51,7 @@ class ModelAttemptJournal:
                 gateway_identity TEXT,
                 gateway_http_status INTEGER,
                 http_started_at TEXT,
+                stage TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
@@ -58,18 +59,45 @@ class ModelAttemptJournal:
             columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
             if "http_started_at" not in columns:
                 db.execute("ALTER TABLE model_attempts ADD COLUMN http_started_at TEXT")
+            if "stage" not in columns:
+                db.execute("ALTER TABLE model_attempts ADD COLUMN stage TEXT")
             db.execute("""CREATE INDEX IF NOT EXISTS model_attempts_task
                 ON model_attempts(source_description, source_obs_id)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS gateway_step_mappings (
+                task_id TEXT NOT NULL,
+                wire_step_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                local_step_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                stage TEXT,
+                body_digest TEXT NOT NULL,
+                mailbox_step_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, wire_step_id, idempotency_key)
+            )""")
+            wire_columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(gateway_step_mappings)")}
+            if "body_digest" not in wire_columns:
+                db.execute("ALTER TABLE gateway_step_mappings "
+                           "ADD COLUMN body_digest TEXT NOT NULL DEFAULT ''")
+            if "mailbox_step_id" not in wire_columns:
+                db.execute("ALTER TABLE gateway_step_mappings "
+                           "ADD COLUMN mailbox_step_id TEXT NOT NULL DEFAULT ''")
             db.execute("""CREATE TABLE IF NOT EXISTS model_retry_grants (
                 grant_id TEXT PRIMARY KEY,
                 source_description TEXT NOT NULL,
                 source_obs_id TEXT NOT NULL,
                 step_id TEXT NOT NULL,
                 request_digest TEXT NOT NULL,
+                stage TEXT,
                 state TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 consumed_at TEXT
             )""")
+            grant_columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(model_retry_grants)")}
+            if "stage" not in grant_columns:
+                db.execute("ALTER TABLE model_retry_grants ADD COLUMN stage TEXT")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS model_retry_grant_open
                 ON model_retry_grants(source_description, source_obs_id, step_id)
                 WHERE state = 'granted'""")
@@ -81,6 +109,20 @@ class ModelAttemptJournal:
                 previous_episode_uuids_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(source_description, source_obs_id, operation_id)
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS task_executions (
+                task_id TEXT NOT NULL,
+                execution_ordinal INTEGER NOT NULL,
+                execution_id TEXT NOT NULL,
+                source_description TEXT NOT NULL,
+                source_obs_id TEXT NOT NULL,
+                manual_command_id TEXT,
+                state TEXT NOT NULL,
+                reason TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                PRIMARY KEY(task_id, execution_ordinal),
+                UNIQUE(task_id, execution_id)
             )""")
 
     @contextmanager
@@ -95,16 +137,19 @@ class ModelAttemptJournal:
             db.close()
 
     def prepare(self, *, key: str, business_key: str, source_description: str,
-                source_obs_id: str, step_id: str, request_digest: str) -> str | None:
+                source_obs_id: str, step_id: str, request_digest: str,
+                stage: str | None = None) -> str | None:
         """Commit exact identity before HTTP; return a prior complete response."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT phase, provider_call_started, step_id, request_digest, result_json "
+                "SELECT phase, provider_call_started, step_id, request_digest, result_json, stage "
                 "FROM model_attempts WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if row and row[2:4] != (step_id, request_digest):
                 raise RuntimeError("model idempotency key reused for different input")
+            if row and row[5] not in (None, stage):
+                raise RuntimeError("model stage changed for an existing exact request")
             # A successful human retry has a fresh HTTP key. Future process
             # restarts still reach the original deterministic key; replay that
             # exact step's saved answer rather than trying the old failed key.
@@ -132,10 +177,10 @@ class ModelAttemptJournal:
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
                  (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, now, now))
+                 step_id, request_digest, stage, now, now))
         return None
 
     def complete(self, key: str, result_json: str) -> None:
@@ -186,15 +231,164 @@ class ModelAttemptJournal:
             rows = db.execute("""SELECT idempotency_key, business_key, step_id,
                 request_digest, phase, provider_call_started, gateway_identity,
                 gateway_http_status, result_json, created_at, updated_at,
-                http_started_at
+                http_started_at, stage
                 FROM model_attempts WHERE source_description = ? AND source_obs_id = ?
                 ORDER BY created_at, idempotency_key""",
                 (source_description, source_obs_id)).fetchall()
         fields = ("idempotency_key", "business_key", "step_id", "request_digest",
                   "phase", "provider_call_started", "gateway_identity",
                   "gateway_http_status", "result_json", "created_at", "updated_at",
-                  "http_started_at")
+                  "http_started_at", "stage")
         return [dict(zip(fields, row)) for row in rows]
+
+    def begin_task_execution(self, source_description: str, source_obs_id: str,
+                             execution_id: str, *,
+                             manual_command_id: str | None = None) -> dict:
+        """Durably claim one whole original-worker execution, idempotently."""
+        from utils.reconciliation_mailbox import task_uuid
+
+        if not execution_id:
+            raise RuntimeError("task execution identity is missing")
+        task_id = task_uuid(source_description, source_obs_id)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("""SELECT execution_ordinal, manual_command_id,
+                state, started_at, finished_at FROM task_executions
+                WHERE task_id=? AND execution_id=?""",
+                (task_id, execution_id)).fetchone()
+            if prior:
+                return {"task_id": task_id, "execution_id": execution_id,
+                        "execution_ordinal": prior[0], "manual_command_id": prior[1],
+                        "state": prior[2], "started_at": prior[3],
+                        "finished_at": prior[4], "created": False}
+            rows = db.execute("""SELECT execution_ordinal, state
+                FROM task_executions WHERE task_id=? ORDER BY execution_ordinal""",
+                (task_id,)).fetchall()
+            failed = sum(state == "failed" for _, state in rows)
+            if failed >= 3:
+                raise RuntimeError("task execution limit exhausted")
+            if any(state in {"running", "uncertain"} for _, state in rows):
+                raise RuntimeError("prior task execution is not terminal")
+            if manual_command_id and (not rows or rows[-1][1] != "failed"):
+                raise RuntimeError("manual execution requires a failed prior execution")
+            if not manual_command_id and rows:
+                raise RuntimeError("initial task execution already exists")
+            ordinal = (rows[-1][0] + 1) if rows else 1
+            started = _now()
+            db.execute("""INSERT INTO task_executions
+                (task_id, execution_ordinal, execution_id, source_description,
+                 source_obs_id, manual_command_id, state, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'running', ?)""",
+                (task_id, ordinal, execution_id, source_description,
+                 source_obs_id, manual_command_id, started))
+        return {"task_id": task_id, "execution_id": execution_id,
+                "execution_ordinal": ordinal, "manual_command_id": manual_command_id,
+                "state": "running", "started_at": started,
+                "finished_at": None, "created": True}
+
+    def finish_task_execution(self, source_description: str, source_obs_id: str,
+                              execution_id: str, *, state: str,
+                              reason: str | None = None) -> None:
+        """Settle one whole worker run; sibling HTTP failures cannot double count."""
+        from utils.reconciliation_mailbox import task_uuid
+
+        if state not in {"succeeded", "failed", "uncertain", "unrecoverable"}:
+            raise ValueError("invalid task execution state")
+        task_id = task_uuid(source_description, source_obs_id)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT state FROM task_executions
+                WHERE task_id=? AND execution_id=?""",
+                (task_id, execution_id)).fetchone()
+            if row is None:
+                raise RuntimeError("task execution claim is missing")
+            prior = row[0]
+            if prior == state:
+                return
+            if prior not in {"running", "uncertain"} and not (
+                    prior == "failed" and state == "succeeded"):
+                raise RuntimeError("task execution is already terminal")
+            db.execute("""UPDATE task_executions SET state=?, reason=?, finished_at=?
+                WHERE task_id=? AND execution_id=?""",
+                (state, reason, _now(), task_id, execution_id))
+
+    def task_execution_summary(self, source_description: str,
+                               source_obs_id: str) -> dict:
+        from utils.reconciliation_mailbox import task_uuid
+
+        task_id = task_uuid(source_description, source_obs_id)
+        with self._connect() as db:
+            rows = db.execute("""SELECT execution_ordinal, execution_id,
+                manual_command_id, state, reason, started_at, finished_at
+                FROM task_executions WHERE task_id=? ORDER BY execution_ordinal""",
+                (task_id,)).fetchall()
+        executions = [dict(zip(("execution_ordinal", "execution_id",
+                                "manual_command_id", "state", "reason",
+                                "started_at", "finished_at"), row))
+                      for row in rows]
+        return {"task_id": task_id, "execution_count": len(executions),
+                "failed_attempts": min(3, sum(
+                    row["state"] == "failed" for row in executions)),
+                "active": any(row["state"] in {"running", "uncertain"}
+                              for row in executions),
+                "executions": executions}
+
+    def record_gateway_step(self, source_description: str, source_obs_id: str,
+                            idempotency_key: str, wire_step_id: str,
+                            body_digest: str, *,
+                            mailbox_step_id: str | None = None) -> None:
+        """Persist current wire and stable mailbox identities side by side."""
+        from utils.reconciliation_mailbox import task_uuid
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT source_description, source_obs_id,
+                step_id, request_digest, stage FROM model_attempts
+                WHERE idempotency_key=?""", (idempotency_key,)).fetchone()
+            if row is None or row[:2] != (source_description, source_obs_id):
+                raise RuntimeError("gateway wire identity has no exact local attempt")
+            task_id = task_uuid(source_description, source_obs_id)
+            mailbox_step_id = mailbox_step_id or wire_step_id
+            mapping = (task_id, wire_step_id, idempotency_key,
+                       row[2], row[3], row[4], body_digest, mailbox_step_id)
+            saved = db.execute("""SELECT task_id, wire_step_id, idempotency_key,
+                local_step_id, request_digest, stage, body_digest, mailbox_step_id
+                FROM gateway_step_mappings
+                WHERE task_id=? AND wire_step_id=? AND idempotency_key=?""",
+                mapping[:3]).fetchone()
+            if saved and saved != mapping:
+                raise RuntimeError("gateway wire identity mapping changed")
+            db.execute("""INSERT OR IGNORE INTO gateway_step_mappings
+                (task_id, wire_step_id, idempotency_key, local_step_id,
+                 request_digest, stage, body_digest, mailbox_step_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*mapping, _now()))
+
+    def gateway_step_for_attempt(self, idempotency_key: str) -> str | None:
+        with self._connect() as db:
+            rows = db.execute("""SELECT DISTINCT mailbox_step_id
+                FROM gateway_step_mappings WHERE idempotency_key=?""",
+                (idempotency_key,)).fetchall()
+        values = {row[0] for row in rows}
+        if len(values) > 1:
+            raise RuntimeError("one exact local attempt mapped to multiple gateway steps")
+        return next(iter(values)) if values else None
+
+    def resolve_gateway_step(self, source_description: str, source_obs_id: str,
+                             wire_step_id: str) -> dict:
+        """Resolve one dashboard/wire id to one exact local request identity."""
+        from utils.reconciliation_mailbox import task_uuid
+
+        with self._connect() as db:
+            rows = db.execute("""SELECT DISTINCT local_step_id, request_digest, stage
+                FROM gateway_step_mappings WHERE task_id=? AND mailbox_step_id=?""",
+                (task_uuid(source_description, source_obs_id), wire_step_id)).fetchall()
+        identities = {tuple(row) for row in rows}
+        if len(identities) != 1:
+            raise RuntimeError("gateway step mapping is missing or ambiguous")
+        local_step, request_digest, stage = next(iter(identities))
+        return {"local_step_id": local_step,
+                "request_digest": request_digest, "stage": stage}
 
     def read_episode_context(self, source_description: str, source_obs_id: str,
                              operation_id: str, input_digest: str) -> list[str] | None:
@@ -268,74 +462,123 @@ class ModelAttemptJournal:
 
     def authorize_retry(self, source_description: str, source_obs_id: str,
                         step_id: str, request_digest: str, *,
-                        deadline_seconds: float) -> str:
+                        deadline_seconds: float,
+                        expected_stage: str | None = None) -> str:
         """Record one human decision; this never calls a model or queues work."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             records = db.execute("""SELECT idempotency_key, business_key, step_id,
                 request_digest, phase, provider_call_started, gateway_identity,
                 gateway_http_status, result_json, created_at, updated_at,
-                http_started_at
+                http_started_at, stage
                 FROM model_attempts WHERE source_description = ? AND source_obs_id = ?
-                  AND step_id = ? ORDER BY created_at, idempotency_key""",
-                (source_description, source_obs_id, step_id)).fetchall()
+                ORDER BY created_at, idempotency_key""",
+                (source_description, source_obs_id)).fetchall()
             fields = ("idempotency_key", "business_key", "step_id", "request_digest",
                       "phase", "provider_call_started", "gateway_identity",
                       "gateway_http_status", "result_json", "created_at", "updated_at",
-                      "http_started_at")
-            rows = [dict(zip(fields, record)) for record in records]
+                      "http_started_at", "stage")
+            all_rows = [dict(zip(fields, record)) for record in records]
+            rows = [row for row in all_rows if row["step_id"] == step_id]
             if not rows or any(row["request_digest"] != request_digest for row in rows):
                 raise RuntimeError("model step input changed")
-            summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
-            failed = summary["failed_calls_by_step"].get(step_id, 0)
-            if (failed < 1 or failed >= 3 or summary["in_flight"]
+            if expected_stage is not None and any(
+                    row["stage"] != expected_stage for row in rows):
+                raise RuntimeError("model step stage is not safely checkpointed")
+            summary = summarize_attempts(
+                all_rows, deadline_seconds=deadline_seconds,
+                missing_receipt_step_id=step_id)
+            failed_for_step = summary["failed_calls_by_step"].get(step_id, 0)
+            from utils.reconciliation_mailbox import task_uuid
+            executions = db.execute("""SELECT state FROM task_executions
+                WHERE task_id=? ORDER BY execution_ordinal""",
+                (task_uuid(source_description, source_obs_id),)).fetchall()
+            failed_executions = sum(row[0] == "failed" for row in executions)
+            if (not executions or executions[-1][0] != "failed"
+                    or failed_executions >= 3):
+                raise RuntimeError("task execution is not eligible for manual retry")
+            if (failed_for_step < 1 or failed_for_step >= 3 or summary["in_flight"]
                     or summary["unknown_without_http_evidence"]
                     or any(row["result_json"] for row in rows)):
                 raise RuntimeError("model step is not eligible for manual retry")
+            # The mailbox may lose its worker after the durable grant is
+            # written but before its outbox row is committed. A redelivered
+            # human command must recover that exact grant rather than strand
+            # the task behind the one-open-grant constraint.
+            existing = db.execute("""SELECT grant_id FROM model_retry_grants
+                WHERE source_description=? AND source_obs_id=? AND step_id=?
+                  AND request_digest=? AND stage IS ? AND state='granted'
+                ORDER BY created_at DESC LIMIT 1""",
+                (source_description, source_obs_id, step_id,
+                 request_digest, expected_stage)).fetchone()
+            if existing:
+                return existing[0]
             grant_id = str(uuid.uuid4())
             db.execute("""INSERT INTO model_retry_grants
                 (grant_id, source_description, source_obs_id, step_id,
-                 request_digest, state, created_at)
-                 VALUES (?, ?, ?, ?, ?, 'granted', ?)""",
+                 request_digest, stage, state, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'granted', ?)""",
                 (grant_id, source_description, source_obs_id, step_id,
-                 request_digest, _now()))
+                 request_digest, expected_stage, _now()))
         return grant_id
+
+    def revoke_retry(self, grant_id: str) -> None:
+        """Revoke a human grant when its graph CAS could not be acquired."""
+        with self._connect() as db:
+            db.execute("""UPDATE model_retry_grants SET state='revoked'
+                WHERE grant_id=? AND state='granted'""", (grant_id,))
 
     def claim_retry(self, grant_id: str, *, source_description: str,
                     source_obs_id: str, step_id: str, request_digest: str,
-                    business_key: str, base_key: str, deadline_seconds: float) -> str:
+                    business_key: str, base_key: str, deadline_seconds: float,
+                    stage: str | None = None) -> str:
         """Consume a grant and reserve a fresh exact-call identity atomically."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             grant = db.execute("""SELECT source_description, source_obs_id, step_id,
-                request_digest, state FROM model_retry_grants WHERE grant_id = ?""",
+                request_digest, state, stage FROM model_retry_grants WHERE grant_id = ?""",
                 (grant_id,)).fetchone()
             if grant != (source_description, source_obs_id, step_id,
-                         request_digest, "granted"):
+                         request_digest, "granted", stage):
                 raise RuntimeError("manual retry grant absent, consumed, or mismatched")
-            records = db.execute("""SELECT phase, provider_call_started, result_json,
-                created_at, request_digest, http_started_at FROM model_attempts
-                WHERE source_description = ? AND source_obs_id = ? AND step_id = ?""",
-                (source_description, source_obs_id, step_id)).fetchall()
-            rows = [{"step_id": step_id, "phase": r[0], "provider_call_started": r[1],
-                     "result_json": r[2], "created_at": r[3],
-                     "http_started_at": r[5]} for r in records]
-            summary = summarize_attempts(rows, deadline_seconds=deadline_seconds)
-            failed = summary["failed_calls_by_step"].get(step_id, 0)
-            if (failed < 1 or failed >= 3 or summary["in_flight"]
+            records = db.execute("""SELECT idempotency_key, step_id, phase, provider_call_started,
+                result_json, created_at, request_digest, http_started_at
+                FROM model_attempts WHERE source_description = ? AND source_obs_id = ?""",
+                (source_description, source_obs_id)).fetchall()
+            rows = [{"idempotency_key": r[0], "step_id": r[1],
+                     "phase": r[2], "provider_call_started": r[3],
+                     "result_json": r[4], "created_at": r[5],
+                     "request_digest": r[6], "http_started_at": r[7]}
+                    for r in records]
+            step_rows = [row for row in rows if row["step_id"] == step_id]
+            summary = summarize_attempts(
+                rows, deadline_seconds=deadline_seconds,
+                missing_receipt_step_id=step_id)
+            failed_for_step = summary["failed_calls_by_step"].get(step_id, 0)
+            from utils.reconciliation_mailbox import task_uuid
+            executions = db.execute("""SELECT state FROM task_executions
+                WHERE task_id=? ORDER BY execution_ordinal""",
+                (task_uuid(source_description, source_obs_id),)).fetchall()
+            failed_executions = sum(row[0] == "failed" for row in executions)
+            if (not executions or executions[-1][0] != "failed"
+                    or failed_executions >= 3):
+                raise RuntimeError("task execution is no longer eligible")
+            if (failed_for_step < 1 or failed_for_step >= 3 or summary["in_flight"]
                     or summary["unknown_without_http_evidence"]
-                    or any(r[2] or r[4] != request_digest for r in records)):
+                    or any(row["result_json"]
+                           or row["request_digest"] != request_digest
+                           for row in step_rows)):
                 raise RuntimeError("model retry no longer safe")
-            ordinal = failed + 1
+            ordinal = failed_for_step + 1
             key = "kg1-" + hashlib.sha256(
                 f"{base_key}:{ordinal}:{grant_id}".encode("utf-8")).hexdigest()
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
                 (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, now, now))
+                 step_id, request_digest, stage, now, now))
             changed = db.execute("""UPDATE model_retry_grants SET state = 'consumed',
                 consumed_at = ? WHERE grant_id = ? AND state = 'granted'""",
                 (now, grant_id))
@@ -366,7 +609,8 @@ def journal_from_backup_env() -> ModelAttemptJournal | None:
 
 
 def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
-                       now: datetime | None = None) -> dict:
+                       now: datetime | None = None,
+                       missing_receipt_step_id: str | None = None) -> dict:
     """Count each locally started model HTTP call once after its deadline.
 
     A gateway HTTP success is only a model result. It does not make the ingest
@@ -374,6 +618,7 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
     """
     now = now or datetime.now(timezone.utc)
     failed_by_step: dict[str, int] = {}
+    failed_http_identities: set[str] = set()
     in_flight = False
     admission_unknown = False
     unknown_without_http_evidence = False
@@ -387,6 +632,21 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
             # status refresh changed the phase. Business graph completion is
             # checked separately; this paid model step itself did not fail.
             cached_steps.add(step)
+            continue
+        if (phase == "completed" and step == missing_receipt_step_id):
+            # The gateway confirms the HTTP call returned, but kg-hub never
+            # durably recorded that exact response. It cannot be treated as a
+            # successful business step: reconciliation must count it against
+            # the task-wide limit and let the original flow recover/replay it.
+            failed_by_step[step] = failed_by_step.get(step, 0) + 1
+            failed_http_identities.add(str(
+                row.get("idempotency_key") or
+                f"{step}:completed:{row.get('created_at')}"))
+            continue
+        if phase == "completed":
+            # A response on another logical step is not charged as this
+            # dashboard command's missing-receipt failure. Its own command
+            # report will evaluate that exact step.
             continue
         if started == 0:
             # Gateway proved pre-provider refusal. It is not a model call.
@@ -407,10 +667,14 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
             elapsed = deadline_seconds
         if phase == "failed" or elapsed >= deadline_seconds:
             failed_by_step[step] = failed_by_step.get(step, 0) + 1
+            failed_http_identities.add(str(
+                row.get("idempotency_key") or
+                f"{step}:{local_http_start or row.get('created_at')}"))
         else:
             in_flight = True
     return {
         "failed_calls_by_step": failed_by_step,
+        "failed_calls_total": len(failed_http_identities),
         "max_failed_calls": max(failed_by_step.values(), default=0),
         "in_flight": in_flight,
         "admission_unknown": admission_unknown,

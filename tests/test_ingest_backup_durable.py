@@ -17,7 +17,10 @@ TREE = ast.parse(SOURCE.read_text())
 def isolated_backup(path):
     node = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
                 and n.name == "_backup_episode")
-    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    module = ast.fix_missing_locations(ast.Module(body=[
+        ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+        node,
+    ], type_ignores=[]))
     namespace = {
         "INGEST_BACKUP_PATH": str(path), "Path": Path, "os": os,
         "datetime": datetime, "timezone": timezone, "json": json,
@@ -36,9 +39,14 @@ class BackupTests(unittest.TestCase):
                 "name": "episode", "episode_body": "original content",
             })()
             with patch("os.fsync", wraps=os.fsync) as sync:
-                isolated_backup(path)(body, datetime.now(tz=timezone.utc))
+                isolated_backup(path)(body, datetime.now(tz=timezone.utc), "req-1")
             self.assertEqual(sync.call_count, 1)
             self.assertEqual(json.loads(path.read_text())["episode_body"],
+                             "original content")
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["request_id"], "req-1")
+            self.assertEqual(saved["schema_version"], 2)
+            self.assertEqual(saved["input_snapshot"]["episode_body"],
                              "original content")
 
     def test_backup_failure_refuses_claim(self):
@@ -50,12 +58,12 @@ class BackupTests(unittest.TestCase):
                 "name": "episode", "episode_body": "original content",
             })()
             with self.assertRaises(IsADirectoryError):
-                isolated_backup(path)(body, datetime.now(tz=timezone.utc))
+                isolated_backup(path)(body, datetime.now(tz=timezone.utc), "req-1")
 
     def test_claim_occurs_after_backup(self):
         source = SOURCE.read_text()
         handler = source[source.index("async def ingest(request:"):source.index("async def ingest_status(")]
-        self.assertLess(handler.index("_backup_episode(body, ref_time)"),
+        self.assertLess(handler.index("_backup_episode(body, ref_time, request_id)"),
                         handler.index("merge_or_get_ingested_key("))
 
 

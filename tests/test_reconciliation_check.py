@@ -24,20 +24,25 @@ class Response:
 
 
 class Request:
+    def __init__(self, model_step_id=None):
+        self.model_step_id = model_step_id
+
     async def json(self):
-        return {"source_description": "source", "source_obs_id": "id-1"}
+        return {"source_description": "source", "source_obs_id": "id-1",
+                "model_step_id": self.model_step_id}
 
 
 class Driver:
-    def __init__(self, *, episode_uuid=None, name="episode"):
+    def __init__(self, *, episode_uuid=None, name="episode", status="needs_reconciliation"):
         self.episode_uuid = episode_uuid
         self.name = name
+        self.status = status
         self.writes = []
 
     async def execute_query(self, query, **params):
         if "RETURN k.source_description AS source_description" in query:
             return [{"source_description": "source", "source_obs_id": "id-1",
-                     "status": "needs_reconciliation", "episode_uuid": self.episode_uuid,
+                     "status": self.status, "episode_uuid": self.episode_uuid,
                      "name": self.name, "stage": None, "predigest_children": None}], None, None
         if "MATCH (e:Episodic {uuid:" in query:
             return [{"c": 1}], None, None
@@ -55,6 +60,10 @@ class Journal:
     def update_gateway_status(self, key, status):
         raise AssertionError("gateway status should not be fetched in these cases")
 
+    def resolve_gateway_step(self, sd, sid, wire_step_id):
+        return {"local_step_id": "same-step", "request_digest": "request-hash",
+                "stage": "node_extraction"}
+
 
 def attempt(index, started):
     return {"idempotency_key": f"key-{index}", "business_key": "kg_hub.entity_extract",
@@ -65,7 +74,7 @@ def attempt(index, started):
 
 
 class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
-    async def run_check(self, driver, journal):
+    async def run_check(self, driver, journal, *, model_step_id=None):
         module = ast.fix_missing_locations(ast.Module(body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
             *FUNCTIONS,
@@ -79,7 +88,8 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
             "MAX_OBS": 20, "asyncio": Mock(),
         }
         exec(compile(module, str(SOURCE), "exec"), namespace)
-        return await namespace["ingest_reconciliation_check"](Request())
+        return await namespace["ingest_reconciliation_check"](
+            Request(model_step_id=model_step_id))
 
     async def test_persisted_business_result_marks_success(self):
         driver = Driver(episode_uuid="episode-uuid")
@@ -95,6 +105,14 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["task"]["status"], "failed")
         self.assertFalse(response.data["business_result_persisted"])
         self.assertEqual(response.data["task"]["max_failed_calls"], 3)
+
+    async def test_three_proven_failed_calls_on_error_row_mark_failed(self):
+        driver = Driver(status="error")
+        response = await self.run_check(driver, Journal([attempt(i, 1) for i in range(3)]))
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["error_kind"], "model_attempts_exhausted")
+        self.assertTrue(any("k.status IN ['needs_reconciliation', 'error']" in query
+                            for query in driver.writes))
 
     async def test_unknown_admission_freezes_terminal_transition(self):
         driver = Driver()
@@ -114,6 +132,17 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.data["task"]["admission_unknown"])
         self.assertFalse(response.data["task"]["unknown_without_http_evidence"])
 
+    async def test_three_completed_gateway_calls_missing_local_receipt_are_terminal(self):
+        driver = Driver(status="error")
+        attempts = [attempt(i, 1) for i in range(3)]
+        for row in attempts:
+            row["phase"] = "completed"
+            row["result_json"] = None
+        response = await self.run_check(
+            driver, Journal(attempts), model_step_id="b" * 64)
+        self.assertEqual(response.data["task"]["status"], "failed")
+        self.assertEqual(response.data["task"]["failed_calls_total"], 3)
+
     async def test_saved_model_answer_does_not_mark_business_success_or_failure(self):
         driver = Driver()
         rows = [attempt(1, 1)]
@@ -125,6 +154,14 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response.data["business_result_persisted"])
         self.assertEqual(response.data["task"]["max_failed_calls"], 0)
         self.assertEqual(driver.writes, [])
+
+    async def test_persisted_result_promotes_error_row_to_success(self):
+        driver = Driver(episode_uuid="episode-uuid", status="error")
+        response = await self.run_check(driver, Journal([]))
+        self.assertEqual(response.data["task"]["status"], "ok")
+        self.assertTrue(response.data["business_result_persisted"])
+        self.assertIn("k.status IN ['pending', 'needs_reconciliation', 'error', 'failed']",
+                      driver.writes[0])
 
     async def test_missing_model_step_is_unrecoverable_failed_list_item(self):
         driver = Driver()

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -17,6 +18,18 @@ from utils.graphiti_stage_adapter import (
 )
 
 HAS_GRAPHITI = importlib.util.find_spec("graphiti_core") is not None
+
+
+class StageStoreBoundaryTests(unittest.TestCase):
+    def test_exact_started_marker_can_be_reused_without_changing_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StageArtifactStore(Path(temp) / "stages.sqlite3")
+            identity = ("source", "sid", "op", "input")
+            store.begin_stage(*identity, "node_extraction", "exact-input")
+            # A manually authorized resume reaches the same original marker.
+            store.begin_stage(*identity, "node_extraction", "exact-input")
+            with self.assertRaisesRegex(RuntimeError, "identity drift"):
+                store.begin_stage(*identity, "node_extraction", "changed-input")
 
 
 @unittest.skipUnless(HAS_GRAPHITI, "requires pinned Graphiti environment")
@@ -225,6 +238,18 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
             clients = SimpleNamespace(llm_client=object())
             reads = []
             first = True
+            from utils.model_attempt_journal import ModelAttemptJournal
+            journal = ModelAttemptJournal(Path(temp) / "model-attempts.sqlite3")
+            journal.prepare(key="failed-resolution", business_key="kg_hub.entity_extract",
+                            source_description="source", source_obs_id="sid",
+                            step_id="resolution-step", request_digest="resolution-input",
+                            stage="node_resolution")
+            journal.start_http("failed-resolution")
+            journal.update_gateway_status(
+                "failed-resolution", {"phase": "failed", "provider_call_started": True})
+            grant_id = journal.authorize_retry(
+                "source", "sid", "resolution-step", "resolution-input",
+                deadline_seconds=180, expected_stage="node_resolution")
 
             async def collect(*args):
                 reads.append(1)
@@ -254,7 +279,12 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     operation_id="op", input_digest="input")
                 self.assertEqual(restored[0].uuid, extracted.uuid)
                 first = False
-                nodes, mapping, _ = await run(restored)
+                with patch.dict(os.environ, {
+                        "KG_HUB_INGEST_BACKUP_PATH": str(Path(temp) / "ingest.jsonl")}):
+                    from model_gateway_client import model_manual_resume
+                    with model_manual_resume("source", "sid", "resolution-step",
+                                             grant_id, "node_resolution"):
+                        nodes, mapping, _ = await run(restored)
                 self.assertEqual(nodes[0].uuid, candidate_a.uuid)
                 self.assertEqual(mapping[extracted.uuid], candidate_a.uuid)
                 self.assertEqual(len(reads), 1)

@@ -23,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 from utils.model_attempt_journal import (
     NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
 )
+from utils.reconciliation_mailbox import task_uuid
 
 
 # credvault 路由的 `timeout`(routes.json 里每个 business_key 一个,现为 150s):网关
@@ -58,8 +59,14 @@ _usage_scenario: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _business_task: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
     "kg_hub_business_task", default=None
 )
+_model_stage: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "kg_hub_model_stage", default=None
+)
 _resume: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "kg_hub_manual_resume", default=None
+)
+_wire_attempt: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "kg_hub_wire_attempt", default=None
 )
 
 
@@ -74,8 +81,22 @@ def model_business_task(source_description: str, source_obs_id: str):
 
 
 @contextmanager
+def model_stage(stage: str):
+    """Tag journaled calls with the exact Graphiti stage that issued them."""
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", stage) is None:
+        raise ValueError("invalid model stage")
+    token = _model_stage.set(stage)
+    try:
+        yield
+    finally:
+        _model_stage.reset(token)
+
+
+@contextmanager
 def model_manual_resume(source_description: str, source_obs_id: str,
-                        step_id: str, grant_id: str):
+                        step_id: str, grant_id: str,
+                        stage: str | None = None, *,
+                        gateway_step_id: str | None = None):
     """Bind exactly one already authorized failed step to a business run."""
     journal = journal_from_backup_env()
     if journal is None:
@@ -85,12 +106,57 @@ def model_manual_resume(source_description: str, source_obs_id: str,
                     if row["phase"] == "completed" and row["result_json"]}
     state = {"task": (source_description, source_obs_id), "step_id": step_id,
              "grant_id": grant_id, "consumed": False,
-             "cached_pending": cached_steps}
+             "cached_pending": cached_steps, "stage": stage,
+             "gateway_step_id": gateway_step_id}
     token = _resume.set(state)
     try:
         yield
     finally:
         _resume.reset(token)
+
+
+def manual_resume_stage() -> str | None:
+    """Return the stage authorized by the active human retry, if any."""
+    resume = _resume.get()
+    return resume.get("stage") if resume is not None else None
+
+
+async def gateway_task_correlation_request_hook(request: Any) -> None:
+    """Attach reconciliation identity to the serialized HTTP request.
+
+    The gateway's ``X-Model-Gateway-Step-Id`` contract is the SHA-256 of the
+    exact request body bytes after SDK serialization.  Computing it around
+    ``messages.create`` would hash a different representation, so inject both
+    correlation headers at HTTPX's request event boundary instead.
+    """
+    task = _business_task.get()
+    if task is None:
+        return
+    await request.aread()
+    request.headers["X-Model-Gateway-Task-Ids"] = task_uuid(*task)
+    body_digest = hashlib.sha256(request.content).hexdigest()
+    wire_step_id = body_digest
+    mailbox_step_id = wire_step_id
+    resume = _resume.get()
+    local_attempt = _wire_attempt.get()
+    if (resume is not None and resume.get("consumed")
+            and local_attempt is not None
+            and local_attempt[1] == resume["step_id"]
+            and resume.get("gateway_step_id")):
+        # HTTPX's current body hash remains the wire contract. Keep a separate
+        # stable mailbox alias so dashboard commands can continue following
+        # the originally authorized exact model call after a serialization
+        # change; the local SDK digest/grant must already match.
+        mailbox_step_id = resume["gateway_step_id"]
+    request.headers["X-Model-Gateway-Step-Id"] = wire_step_id
+    local_attempt = _wire_attempt.get()
+    if local_attempt:
+        journal = journal_from_backup_env()
+        if journal is None:
+            raise RuntimeError("gateway wire step has no durable local journal")
+        journal.record_gateway_step(
+            *task, local_attempt[0], wire_step_id, body_digest,
+            mailbox_step_id=mailbox_step_id)
 
 
 # —— 结构化外壳修正 ——
@@ -402,7 +468,10 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
         # digesting and forwarding; the central layer remains the sole authority
         # for both fields.
         for name in list(headers):
-            if name.lower() in {"idempotency-key", "x-model-gateway-scenario"}:
+            if name.lower() in {
+                "idempotency-key", "x-model-gateway-scenario",
+                "x-model-gateway-task-ids", "x-model-gateway-step-id",
+            }:
                 del headers[name]
         key_kwargs = dict(kwargs)
         key_kwargs["extra_headers"] = headers
@@ -457,7 +526,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                         source_obs_id=task[1], step_id=step_id,
                         request_digest=request_digest,
                         business_key=str(kwargs.get("model") or gateway_model()),
-                        base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+                        base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+                        stage=_model_stage.get())
                     headers["Idempotency-Key"] = key
                     resume["consumed"] = True
                     reserved_by_grant = True
@@ -485,6 +555,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     key=key, business_key=str(kwargs.get("model") or gateway_model()),
                     source_description=task[0], source_obs_id=task[1],
                     step_id=step_id, request_digest=request_digest,
+                    stage=_model_stage.get(),
                 )
                 if cached_result is not None:
                     from anthropic.types import Message
@@ -502,7 +573,13 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 # model attempt once the maximum timeout expires, even when
                 # gateway provider admission remains unknown.
                 journal.start_http(key)
-            result = await original_create(*args, **kwargs)
+            wire_token = (_wire_attempt.set((key, step_id))
+                          if journal and task else None)
+            try:
+                result = await original_create(*args, **kwargs)
+            finally:
+                if wire_token is not None:
+                    _wire_attempt.reset(wire_token)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
             repair_structured_envelopes(result)
             note_offscript_if_missing_tool_use(kwargs, result)
@@ -562,6 +639,7 @@ def enforced_client_timeout(timeout: float | None) -> float:
 def create_gateway_client(*, timeout: float | None = None, min_interval: float = 0.0,
                           thinking_disabled: bool = True):
     """Create the sole supported paid-model client (transport retries disabled)."""
+    import httpx
     from anthropic import AsyncAnthropic
 
     timeout = enforced_client_timeout(timeout)
@@ -573,11 +651,16 @@ def create_gateway_client(*, timeout: float | None = None, min_interval: float =
         raise RuntimeError("invalid kg-hub business key")
     auth_token = gateway_token()
 
+    wire_client = httpx.AsyncClient(
+        timeout=timeout,
+        event_hooks={"request": [gateway_task_correlation_request_hook]},
+    )
     client = AsyncAnthropic(
         auth_token=auth_token,
         base_url=base_url,
         max_retries=0,
         timeout=timeout,
+        http_client=wire_client,
     )
     return install_gateway_request_contract(
         client, min_interval=min_interval, thinking_disabled=thinking_disabled

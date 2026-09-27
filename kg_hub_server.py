@@ -83,12 +83,14 @@ from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
-    model_business_task, model_operation, model_usage_scenario,
+    model_business_task, model_operation, model_usage_scenario, model_manual_resume,
     offscript_total, stable_operation_id)
 from utils.model_attempt_journal import (
     NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
     summarize_attempts,
 )
+from utils.reconciliation_mailbox import BUSINESS_KEY, MailboxStore
+from utils.reconciliation_worker import run_mailbox_cycle, _task_report_data
 from utils.graphiti_episode_checkpoint import add_episode_with_context_checkpoint
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
@@ -123,6 +125,24 @@ STUCK_THRESHOLD_MIN = int(os.environ.get("KG_HUB_STUCK_THRESHOLD_MIN", "30"))
 QUALITY_SUMMARY_TTL_SECONDS = max(
     30, int(os.environ.get("KG_HUB_QUALITY_SUMMARY_TTL_SECONDS", "300"))
 )
+RECONCILIATION_MAILBOX_POLL_SECONDS = max(
+    5.0, float(os.environ.get("KG_HUB_RECONCILIATION_POLL_SECONDS", "10"))
+)
+RECONCILIATION_MAILBOX_ENABLED = os.environ.get(
+    "KG_HUB_RECONCILIATION_MAILBOX_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# Keep replay closed until the gateway's task-attempt cap is keyed to a stable
+# per-call identity. Graphiti 0.29.0 legitimately issues multiple model HTTP
+# requests during one ingest; a task-wide three-start cap would reject normal
+# work. Enabling this flag is an explicit deployment decision after that
+# contract is validated. Mailbox polling remains read/report only while false.
+MANUAL_RECONCILIATION_REPLAY_ENABLED = os.environ.get(
+    "KG_HUB_MANUAL_RECONCILIATION_REPLAY_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+# This adapter is still isolated and does not cover compose's enabled predigest
+# path or the pre-commit receipt/readback wiring. Do not expose retryable mailbox
+# commands until the full production continuation has passed pinned integration.
+GRAPHITI_STAGE_CONTINUATION_AVAILABLE = False
 
 # logger for ingest lifecycle events ([ingest:start] / [ingest:done] / [ingest:error])
 logger = logging.getLogger("kg_hub.server")
@@ -276,6 +296,7 @@ async def cleanup_stuck_jobs(graphiti) -> int:
                 "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
                 "WHERE k.status = 'pending' AND k.created_at = $epoch "
                 "SET k.status = 'needs_reconciliation', k.updated_at = $now, "
+                "    k.worker_state = null, "
                 "    k.error_kind = 'stale_pending_with_evidence', "
                 "    k.error_message = 'pending task interrupted after model or graph activity' "
                 "RETURN count(k) AS c",
@@ -371,6 +392,7 @@ async def merge_or_get_ingested_key(
         "  k.created_by_request = $request_id "
         "RETURN k.status AS status, k.episode_uuid AS episode_uuid, "
         "       k.error_message AS error_message, k.created_at AS created_at, "
+        "       k.created_by_request AS created_by_request, "
         "       k.created_by_request = $request_id AS newly_created",
         sd=source_description,
         sid=source_obs_id,
@@ -385,6 +407,7 @@ async def merge_or_get_ingested_key(
         "episode_uuid": rows[0].get("episode_uuid"),  # may be None for newly_created
         "error_message": rows[0].get("error_message"),
         "created_at": rows[0].get("created_at"),   # 本次尝试的纪元,见 do_extract
+        "created_by_request": rows[0].get("created_by_request"),
         "newly_created": bool(rows[0].get("newly_created")),
     }
 
@@ -477,7 +500,8 @@ async def update_ingested_key_status(
         "SET k.status = $status, k.updated_at = $now, "
         "    k.episode_uuid = $episode_uuid, "
         "    k.nodes = $nodes, k.edges = $edges, "
-        "    k.error_message = $error_message, k.error_kind = $error_kind",
+        "    k.error_message = $error_message, k.error_kind = $error_kind, "
+        "    k.worker_state = null",
         sd=source_description,
         sid=source_obs_id,
         status=status,
@@ -760,7 +784,8 @@ async def quality_summary(request: Request) -> JSONResponse:
         return JSONResponse(quality_summary_payload(metrics, generated_at, 0))
 
 
-def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
+def _backup_episode(body: "IngestBody", ref_time: datetime,
+                    request_id: str | None = None) -> None:
     """Append the raw episode to KG_HUB_INGEST_BACKUP_PATH (jsonl) before extraction.
 
     A server that has acknowledged a recoverable task must retain its input.
@@ -770,13 +795,27 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
     if not INGEST_BACKUP_PATH:
         return
     try:
+        snapshot = (body.model_dump(mode="json") if hasattr(body, "model_dump") else {
+            field: getattr(body, field, None) for field in (
+                "name", "episode_body", "source_description", "reference_time",
+                "source_obs_id", "sync", "provenance", "origin_device",
+                "origin_tool", "origin_project", "kind", "durability",
+                "model_usage_scenario",
+            )
+        })
         rec = {
+            "schema_version": 2,
             "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "request_id": request_id,
             "source_description": body.source_description,
             "source_obs_id": body.source_obs_id,
             "name": body.name,
             "reference_time": ref_time.isoformat(),
             "episode_body": body.episode_body,
+            # Preserve every accepted business field for a future exact
+            # continuation. Historical records without this snapshot must be
+            # treated as unrecoverable rather than reconstructed from guesses.
+            "input_snapshot": snapshot,
         }
         p = Path(INGEST_BACKUP_PATH)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -787,6 +826,37 @@ def _backup_episode(body: "IngestBody", ref_time: datetime) -> None:
     except Exception:
         logger.exception("[ingest:backup] refusing task without durable input")
         raise
+
+
+def _load_original_ingest_snapshot(source_description: str, source_obs_id: str,
+                                   request_id: str) -> dict:
+    """Load only the exact request that created this IngestedKey claim."""
+    if not INGEST_BACKUP_PATH or not request_id:
+        raise RuntimeError("original ingest snapshot identity unavailable")
+    found = []
+    with Path(INGEST_BACKUP_PATH).open("r", encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if (record.get("request_id") == request_id
+                    and record.get("source_description") == source_description
+                    and record.get("source_obs_id") == source_obs_id):
+                found.append(record)
+    if len(found) != 1:
+        raise RuntimeError("original ingest snapshot missing or ambiguous")
+    snapshot = found[0].get("input_snapshot")
+    if not isinstance(snapshot, dict) or found[0].get("schema_version") != 2:
+        raise RuntimeError("original ingest snapshot predates exact replay metadata")
+    for field in ("name", "episode_body", "source_description", "source_obs_id"):
+        if snapshot.get(field) != found[0].get(field):
+            raise RuntimeError("original ingest snapshot identity drift")
+    if snapshot.get("source_description") != source_description:
+        raise RuntimeError("original ingest source description changed")
+    if snapshot.get("source_obs_id") != source_obs_id:
+        raise RuntimeError("original ingest source observation id changed")
+    return snapshot
 
 
 # Writer-lock contention handling (see 2026-06-13 incident): instead of dropping
@@ -1191,6 +1261,19 @@ async def do_extract(*args, **kwargs) -> None:
     _extraction_started()
     try:
         body = args[1] if len(args) > 1 else kwargs["body"]
+        graphiti = args[0] if args else kwargs["graphiti"]
+        # Preserve the public pending status for existing clients while the
+        # mailbox reports the actual original-worker phase separately.
+        try:
+            await graphiti.driver.execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "WHERE k.status = 'pending' "
+                "SET k.worker_state = 'running', k.updated_at = $now "
+                "RETURN count(k) AS c",
+                sd=body.source_description, sid=body.source_obs_id,
+                now=datetime.now(tz=timezone.utc).isoformat())
+        except Exception:
+            logger.exception("[ingest:worker_state] could not mark task running")
         with model_business_task(body.source_description, body.source_obs_id):
             return await _do_extract_inner(*args, **kwargs)
     finally:
@@ -1331,8 +1414,9 @@ async def ingest(request: Request) -> JSONResponse:
 
     # Acknowledging a task without its original input would make manual recovery
     # impossible. Save it before creating the claim or starting model work.
+    request_id = str(uuidlib.uuid4())
     try:
-        _backup_episode(body, ref_time)
+        _backup_episode(body, ref_time, request_id)
     except Exception:
         return JSONResponse(
             {"status": "error", "code": "ingest_backup_unavailable"},
@@ -1346,7 +1430,6 @@ async def ingest(request: Request) -> JSONResponse:
         logger.exception("[ingest:cleanup_failed] continuing anyway")
 
     # 2. Atomic check-and-create IngestedKey (episode_uuid filled later by graphiti)
-    request_id = str(uuidlib.uuid4())
     try:
         merge_result = await merge_or_get_ingested_key(
             g, body.source_description, body.source_obs_id, request_id,
@@ -1502,20 +1585,35 @@ async def ingest_status(request: Request) -> JSONResponse:
     })
 
 
-def _reconciliation_task_view(row: dict, journal) -> dict:
+def _reconciliation_task_view(row: dict, journal, *,
+                              missing_receipt_step_id: str | None = None) -> dict:
     sd, sid = row.get("source_description"), row.get("source_obs_id")
     attempts = journal.find_task(sd, sid) if journal else []
-    summary = summarize_attempts(attempts, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    summary = summarize_attempts(
+        attempts, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+        missing_receipt_step_id=missing_receipt_step_id)
+    try:
+        failed_attempts = journal.task_execution_summary(sd, sid)["failed_attempts"]
+    except Exception:
+        failed_attempts = 0
     return {
         "source_description": sd,
         "source_obs_id": sid,
+        "name": row.get("name"),
         "status": row.get("status"),
+        "worker_state": row.get("worker_state"),
+        "manual_resume_command_id": row.get("manual_resume_command_id"),
+        "worker_execution_id": row.get("worker_execution_id"),
+        "stage": row.get("stage"),
+        "created_at": row.get("created_at"),
+        "created_by_request": row.get("created_by_request"),
         "episode_uuid": row.get("episode_uuid"),
         "error_kind": row.get("error_kind"),
         "error_message": row.get("error_message"),
         "predigest_children": row.get("predigest_children"),
         "failed_children": row.get("failed_children") or [],
         "updated_at": row.get("updated_at"),
+        "failed_attempts": min(3, int(failed_attempts)),
         **summary,
     }
 
@@ -1532,10 +1630,15 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
     projection = (
         "k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
         "k.status AS status, k.episode_uuid AS episode_uuid, "
+        "k.created_by_request AS created_by_request, "
         "k.error_kind AS error_kind, k.error_message AS error_message, "
         "k.predigest_children AS predigest_children, "
-        "k.failed_children AS failed_children, k.updated_at AS updated_at, "
-        "k.name AS name, k.stage AS stage"
+        "k.failed_children AS failed_children, k.worker_state AS worker_state, "
+        "k.created_at AS created_at, k.stage AS stage, "
+        "k.updated_at AS updated_at, "
+        "k.name AS name, k.stage AS stage, "
+        "k.manual_resume_command_id AS manual_resume_command_id, "
+        "k.worker_execution_id AS worker_execution_id"
     )
     if sd and sid:
         rows, _, _ = await driver.execute_query(
@@ -1553,12 +1656,12 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
     rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
-        "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+        "WHERE k.status IN ['needs_reconciliation', 'error', 'failed'] "
         f"RETURN {projection} ORDER BY k.updated_at DESC SKIP $offset LIMIT $limit",
         offset=offset, limit=limit)
     count_rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
-        "WHERE k.status IN ['needs_reconciliation', 'failed'] RETURN count(k) AS c")
+        "WHERE k.status IN ['needs_reconciliation', 'error', 'failed'] RETURN count(k) AS c")
     return JSONResponse({"status": "ok", "items": [
         _reconciliation_task_view(row, journal) for row in rows],
         "total": int(count_rows[0].get("c") or 0) if count_rows else 0,
@@ -1613,6 +1716,7 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
     sd = str(body.get("source_description") or "").strip()
     sid = str(body.get("source_obs_id") or "").strip()
+    wire_step_id = str(body.get("model_step_id") or "").strip()
     if not sd or not sid or len(sd) > 2000 or len(sid) > 500:
         return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
     driver = get_status_driver()
@@ -1620,7 +1724,12 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
         "RETURN k.source_description AS source_description, k.source_obs_id AS source_obs_id, "
         "k.status AS status, k.episode_uuid AS episode_uuid, k.name AS name, "
-        "k.stage AS stage, k.predigest_children AS predigest_children, "
+        "k.created_by_request AS created_by_request, "
+        "k.stage AS stage, k.worker_state AS worker_state, "
+        "k.manual_resume_command_id AS manual_resume_command_id, "
+        "k.worker_execution_id AS worker_execution_id, "
+        "k.created_at AS created_at, "
+        "k.predigest_children AS predigest_children, "
         "k.failed_children AS failed_children, k.error_kind AS error_kind, "
         "k.error_message AS error_message, k.updated_at AS updated_at LIMIT 1",
         sd=sd, sid=sid)
@@ -1650,30 +1759,65 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             # The saved intent is still evidence; failed status reads cannot
             # turn an unknown model call into a safe retry.
             pass
+    missing_receipt_step_id = None
+    if wire_step_id:
+        try:
+            mapping = journal.resolve_gateway_step(sd, sid, wire_step_id)
+            missing_receipt_step_id = mapping.get("local_step_id")
+        except Exception:
+            # Missing/ambiguous sidecar identity fails closed: this check may
+            # still report other exact HTTP failures but cannot assign a
+            # completed response without its dashboard step identity.
+            pass
     complete = await _persisted_business_result(driver, row)
-    if complete and row["status"] in {"needs_reconciliation", "failed"}:
+    if complete and row["status"] in {"pending", "needs_reconciliation", "error", "failed"}:
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "WHERE k.status IN ['needs_reconciliation', 'failed'] "
+            "WHERE k.status IN ['pending', 'needs_reconciliation', 'error', 'failed'] "
             "  AND k.episode_uuid = $uuid "
             "SET k.status = 'ok', k.updated_at = $now, k.reconciled_at = $now, "
-            "    k.error_kind = null, k.error_message = null "
+            "    k.error_kind = null, k.error_message = null, k.worker_state = null "
             "RETURN count(k) AS c",
             sd=sd, sid=sid, uuid=row["episode_uuid"],
             now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
             row["status"] = "ok"
     refreshed = journal.find_task(sd, sid)
-    summary = summarize_attempts(refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
-    if (not complete and summary["max_failed_calls"] >= 3
-            and not summary["in_flight"]
-            and not summary["unknown_without_http_evidence"]):
-        # No more model calls may be authorized for the exhausted step.
+    summary = summarize_attempts(
+        refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+        missing_receipt_step_id=missing_receipt_step_id)
+    execution_id = row.get("worker_execution_id")
+    if execution_id:
+        try:
+            if complete:
+                journal.finish_task_execution(sd, sid, execution_id,
+                                              state="succeeded",
+                                              reason="business_result_persisted")
+            elif (row.get("status") not in {"pending", "running"}
+                  and row.get("worker_state") != "running"):
+                execution_state = ("uncertain" if summary["in_flight"]
+                                   or summary["unknown_without_http_evidence"]
+                                   else "failed")
+                journal.finish_task_execution(
+                    sd, sid, execution_id, state=execution_state,
+                    reason=("model_call_outcome_unknown" if execution_state == "uncertain"
+                            else "business_result_missing"))
+        except RuntimeError:
+            # A settled execution is immutable; the exact graph receipt may
+            # still promote an uncertain record to succeeded.
+            pass
+    try:
+        execution_summary = journal.task_execution_summary(sd, sid)
+    except Exception:
+        execution_summary = {"failed_attempts": 0}
+    if not complete and execution_summary["failed_attempts"] >= 3:
+        # Terminal business failure is based on three whole failed worker runs,
+        # never on the number of normal Graphiti stage requests in those runs.
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "WHERE k.status = 'needs_reconciliation' "
+            "WHERE k.status IN ['needs_reconciliation', 'error'] "
             "SET k.status = 'failed', k.updated_at = $now, "
-            "    k.error_kind = 'model_attempts_exhausted' "
+            "    k.error_kind = 'model_attempts_exhausted', k.worker_state = null "
             "RETURN count(k) AS c",
             sd=sd, sid=sid, now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
@@ -1699,7 +1843,8 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
                 "WHERE k.status = 'needs_reconciliation' "
                 "SET k.status = 'failed', k.updated_at = $now, "
                 "    k.error_kind = $reason, "
-                "    k.error_message = 'exact reconciliation identity unavailable' "
+                "    k.error_message = 'exact reconciliation identity unavailable', "
+                "    k.worker_state = null "
                 "RETURN count(k) AS c",
                 sd=sd, sid=sid, reason=missing,
                 now=datetime.now(tz=timezone.utc).isoformat())
@@ -1708,8 +1853,389 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
                 row["error_kind"] = missing
                 row["error_message"] = "exact reconciliation identity unavailable"
     return JSONResponse({"status": "ok", "business_result_persisted": complete,
-                         "task": _reconciliation_task_view(row, journal),
+                         "task": _reconciliation_task_view(
+                             row, journal,
+                             missing_receipt_step_id=missing_receipt_step_id),
                          "mode": "read_only_model_check"})
+
+
+class _MailboxCheckRequest:
+    """Small request adapter so mailbox checks reuse the same local verifier."""
+
+    def __init__(self, source_description: str, source_obs_id: str,
+                 model_step_id: str | None = None):
+        self.payload = {"source_description": source_description,
+                        "source_obs_id": source_obs_id,
+                        "model_step_id": model_step_id}
+
+    async def json(self) -> dict:
+        return self.payload
+
+
+async def _check_task_from_mailbox(source_description: str, source_obs_id: str,
+                                   *, model_step_id: str | None = None) -> dict:
+    """Run the same authoritative graph/journal check without an HTTP loopback."""
+    response = await ingest_reconciliation_check(
+        _MailboxCheckRequest(source_description, source_obs_id, model_step_id))
+    try:
+        payload = json.loads(response.body)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("local reconciliation check returned invalid response") from exc
+    if response.status_code != 200 or not isinstance(payload, dict):
+        raise RuntimeError("local reconciliation check unavailable")
+    return payload
+
+
+def _ingest_epoch(value) -> str:
+    if isinstance(value, datetime):
+        value = value.isoformat()
+    epoch = str(value or "")
+    parsed = datetime.fromisoformat(epoch.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise RuntimeError("original ingest epoch has no timezone")
+    return epoch
+
+
+async def _enqueue_manual_resume(command: dict, task: dict, report: dict,
+                                 *, store: MailboxStore, journal,
+                                 driver) -> dict:
+    """Persist one human-authorized resume and CAS the original graph claim."""
+    if not GRAPHITI_STAGE_CONTINUATION_AVAILABLE:
+        raise RuntimeError("production Graphiti continuation is not wired")
+    if (command.get("action") != "reconcile" or not report.get("retryable")
+            or task.get("status") not in {"needs_reconciliation", "error"}):
+        raise RuntimeError("manual resume gate changed after authoritative check")
+    sd, sid = task.get("source_description"), task.get("source_obs_id")
+    wire_step_id = report.get("model_step_id")
+    step_id, stage = report.get("journal_step_id"), report.get("stage")
+    task_id = report.get("task_id")
+    if (not sd or not sid or task_id != command.get("task_id")
+            or wire_step_id != command.get("model_step_id")
+            or stage not in {"node_extraction", "node_resolution",
+                             "edge_phase", "attribute_phase"}):
+        raise RuntimeError("manual resume identity is incomplete")
+    existing = store.manual_resume_job(command["command_id"])
+    if existing:
+        if (existing["task_id"] != task_id
+                or existing["model_step_id"] != wire_step_id
+                or existing.get("journal_step_id") != step_id):
+            raise RuntimeError("manual resume command identity collision")
+        if existing["state"] in {"queued", "running"}:
+            if existing["state"] == "queued":
+                ok = await _cas_manual_resume_claim(
+                    driver, sd=sd, sid=sid,
+                    request_id=existing.get("created_by_request"),
+                    command_id=command["command_id"])
+                if not ok:
+                    raise RuntimeError("manual resume claim could not be recovered")
+            return {"state": existing["state"], "retryable": False,
+                    "reason": "manual_retry_queued" if existing["state"] == "queued"
+                    else "manual_retry_running"}
+        return {"state": existing.get("result_state") or "reconciliation",
+                "retryable": False,
+                "reason": existing.get("result_reason") or "manual_retry_finished"}
+    active = store.active_manual_resume_job(task_id, wire_step_id)
+    if active:
+        if active["state"] == "queued":
+            ok = await _cas_manual_resume_claim(
+                driver, sd=sd, sid=sid,
+                request_id=active.get("created_by_request"),
+                command_id=active["command_id"])
+            if not ok:
+                raise RuntimeError("active manual resume claim could not be recovered")
+        return {"state": active["state"], "retryable": False,
+                "reason": "manual_retry_queued" if active["state"] == "queued"
+                else "manual_retry_running"}
+
+    request_id = task.get("created_by_request")
+    epoch = _ingest_epoch(task.get("created_at"))
+    snapshot = _load_original_ingest_snapshot(sd, sid, request_id)
+    body = IngestBody.model_validate(snapshot)
+    if (body.source_description != sd or body.source_obs_id != sid
+            or body.name != task.get("name")):
+        raise RuntimeError("original ingest snapshot does not match graph claim")
+    ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
+    attempts = journal.find_task(sd, sid)
+    matching = [row for row in attempts if row.get("step_id") == step_id
+                and row.get("stage") == stage and not row.get("result_json")]
+    if not matching:
+        raise RuntimeError("failed exact model step is absent from journal")
+    target = matching[-1]
+    if (target.get("business_key") != BUSINESS_KEY
+            or not target.get("request_digest")):
+        raise RuntimeError("failed exact model request identity is incomplete")
+    wire_mapping = journal.resolve_gateway_step(sd, sid, wire_step_id)
+    if (wire_mapping.get("local_step_id") != step_id
+            or wire_mapping.get("request_digest") != target["request_digest"]
+            or wire_mapping.get("stage") != stage):
+        raise RuntimeError("dashboard wire step does not resolve to the failed local request")
+    grant_id = journal.authorize_retry(
+        sd, sid, step_id, target["request_digest"],
+        deadline_seconds=MIN_CLIENT_TIMEOUT_SEC, expected_stage=stage)
+    job = store.enqueue_manual_resume(
+        command, stage=stage, grant_id=grant_id, attempt_epoch=epoch,
+        input_snapshot=body.model_dump(mode="json"),
+        created_by_request=request_id, journal_step_id=step_id)
+    ok = await _cas_manual_resume_claim(
+        driver, sd=sd, sid=sid, request_id=request_id,
+        command_id=command["command_id"])
+    if not ok:
+        store.discard_queued_manual_resume(command["command_id"])
+        journal.revoke_retry(grant_id)
+        raise RuntimeError("original IngestedKey claim changed before manual enqueue")
+    return {"state": "queued", "retryable": False,
+            "reason": "manual_retry_queued"}
+
+
+async def _cas_manual_resume_claim(driver, *, sd: str, sid: str,
+                                   request_id: str | None,
+                                   command_id: str) -> bool:
+    if not request_id:
+        return False
+    changed, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+        "WHERE k.status IN ['needs_reconciliation', 'error'] "
+        "  AND k.worker_state IS NULL AND k.created_by_request = $request_id "
+        "SET k.status = 'pending', k.worker_state = 'queued', "
+        "    k.manual_resume_command_id = $command_id, "
+        "    k.error_kind = null, k.error_message = null, k.updated_at = $now "
+        "RETURN count(k) AS c",
+        sd=sd, sid=sid, request_id=request_id,
+        command_id=command_id,
+        now=datetime.now(tz=timezone.utc).isoformat())
+    count = int(changed[0].get("c") or 0) if changed else 0
+    if count != 1:
+        # Redelivery after the CAS may observe the already-queued original job.
+        rows, _, _ = await driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "RETURN k.status AS status, k.worker_state AS worker_state, "
+            "k.manual_resume_command_id AS command_id, "
+            "k.created_by_request AS request_id LIMIT 1", sd=sd, sid=sid)
+        row = rows[0] if rows else {}
+        return bool(row.get("status") == "pending"
+                    and row.get("worker_state") in {"queued", "running"}
+                    and row.get("command_id") == command_id
+                    and row.get("request_id") == request_id)
+    return True
+
+
+_manual_resume_tasks: set[asyncio.Task] = set()
+
+
+async def _run_manual_resume_job(job: dict, *, store: MailboxStore,
+                                 journal) -> None:
+    """Run one outboxed human request through the original do_extract worker."""
+    command_id = job["command_id"]
+    terminal_state, reason = "reconciliation", "manual_retry_interrupted"
+    finish_job = True
+    try:
+        result = await _check_task_from_mailbox(
+            job["source_description"], job["source_obs_id"],
+            model_step_id=job["model_step_id"])
+        if (result.get("status") != "ok" or not isinstance(result.get("task"), dict)
+                or not isinstance(result.get("business_result_persisted"), bool)):
+            raise RuntimeError("business status check unavailable before worker resume")
+        current = result["task"]
+        if result["business_result_persisted"]:
+            terminal_state, reason = "succeeded", "business_result_persisted"
+            return
+        if (current.get("status") != "pending"
+                or current.get("worker_state") != "queued"
+                or current.get("manual_resume_command_id") != command_id
+                or current.get("created_by_request") is None):
+            raise RuntimeError("original worker claim is no longer queued")
+        if current.get("created_by_request") != job.get("created_by_request"):
+            raise RuntimeError("original worker request identity changed")
+        body = IngestBody.model_validate(job["input_snapshot"])
+        if (body.source_description != job["source_description"]
+                or body.source_obs_id != job["source_obs_id"]):
+            raise RuntimeError("manual resume input identity changed")
+        epoch = _ingest_epoch(job["attempt_epoch"])
+        ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
+        graphiti = await get_graphiti()
+        with model_manual_resume(body.source_description, body.source_obs_id,
+                                 job["journal_step_id"], job["grant_id"],
+                                 job["stage"], gateway_step_id=job["model_step_id"]):
+            await do_extract(graphiti, body, ref_time, epoch)
+        final = await _check_task_from_mailbox(
+            job["source_description"], job["source_obs_id"],
+            model_step_id=job["model_step_id"])
+        if final.get("business_result_persisted") is True:
+            terminal_state, reason = "succeeded", "business_result_persisted"
+        elif isinstance(final.get("task"), dict):
+            report = _task_report_data(
+                journal, final["task"], deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+                business_result_persisted=False)
+            terminal_state, reason = report["state"], report["reason"]
+    except asyncio.CancelledError:
+        # Leave the durable lease running. The mailbox loop will verify graph
+        # state and close it after the cancellation settles or after restart.
+        finish_job = False
+        raise
+    except Exception as exc:
+        logger.exception("[reconciliation:manual_resume_failed] command=%s", command_id)
+        terminal_state = "reconciliation"
+        reason = "manual_retry_worker_error"
+        try:
+            journal.revoke_retry(job["grant_id"])
+        except Exception:
+            logger.exception("[reconciliation:manual_resume_grant_revoke_failed] command=%s",
+                             command_id)
+        try:
+            await get_status_driver().execute_query(
+                "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                "WHERE k.status = 'pending' "
+                "  AND k.manual_resume_command_id = $command_id "
+                "SET k.status = 'needs_reconciliation', k.worker_state = null, "
+                "    k.error_kind = 'manual_retry_worker_error', "
+                "    k.error_message = 'manual continuation could not be completed', "
+                "    k.updated_at = $now RETURN count(k) AS c",
+                sd=job["source_description"], sid=job["source_obs_id"],
+                command_id=command_id,
+                now=datetime.now(tz=timezone.utc).isoformat())
+        except Exception:
+            logger.exception("[reconciliation:manual_resume_recover_failed] command=%s",
+                             command_id)
+    finally:
+        if finish_job:
+            try:
+                store.finish_manual_resume_job(command_id, state=terminal_state,
+                                               reason=reason)
+            except Exception:
+                logger.exception("[reconciliation:manual_resume_finish_failed] command=%s",
+                                 command_id)
+
+
+async def _dispatch_manual_resume(store: MailboxStore, journal) -> None:
+    job = store.claim_manual_resume_job()
+    if job is None:
+        return
+    task = asyncio.create_task(_run_manual_resume_job(job, store=store, journal=journal),
+                               name=f"manual-resume-{job['command_id']}")
+    _manual_resume_tasks.add(task)
+    task.add_done_callback(_manual_resume_tasks.discard)
+
+
+async def _recover_interrupted_manual_resumes(store: MailboxStore, journal) -> None:
+    """Close worker leases after restart without replaying their model call."""
+    driver = get_status_driver()
+    for job in store.list_manual_resume_jobs(state="running"):
+        if any(task.get_name() == f"manual-resume-{job['command_id']}"
+               for task in _manual_resume_tasks):
+            continue
+        try:
+            result = await _check_task_from_mailbox(
+                job["source_description"], job["source_obs_id"],
+                model_step_id=job["model_step_id"])
+            if (result.get("status") != "ok" or not isinstance(result.get("task"), dict)
+                    or not isinstance(result.get("business_result_persisted"), bool)):
+                continue
+            current = result["task"]
+            if result["business_result_persisted"]:
+                state, reason = "succeeded", "business_result_persisted"
+            elif current.get("status") in {"failed", "ok"}:
+                settled = _task_report_data(
+                    journal, current, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+                    business_result_persisted=False)
+                state, reason = settled["state"], settled["reason"]
+            else:
+                if (current.get("status") == "pending"
+                        and current.get("manual_resume_command_id") == job["command_id"]
+                        and current.get("created_by_request") == job.get("created_by_request")):
+                    await driver.execute_query(
+                        "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+                        "WHERE k.status = 'pending' "
+                        "  AND k.manual_resume_command_id = $command_id "
+                        "  AND k.created_by_request = $request_id "
+                        "SET k.status = 'needs_reconciliation', k.worker_state = null, "
+                        "    k.error_kind = 'manual_retry_interrupted', "
+                        "    k.error_message = 'manual worker stopped before terminal result', "
+                        "    k.updated_at = $now RETURN count(k) AS c",
+                        sd=job["source_description"], sid=job["source_obs_id"],
+                        command_id=job["command_id"],
+                        request_id=job["created_by_request"],
+                        now=datetime.now(tz=timezone.utc).isoformat())
+                state, reason = "reconciliation", "manual_retry_interrupted"
+            journal.revoke_retry(job["grant_id"])
+            store.finish_manual_resume_job(job["command_id"], state=state,
+                                           reason=reason)
+        except Exception:
+            # Keep the durable running row as a fail-closed lease when graph or
+            # journal evidence is unavailable; a later cycle can re-check it.
+            logger.exception("[reconciliation:manual_resume_recovery_failed] command=%s",
+                             job["command_id"])
+
+
+_reconciliation_mailbox_task: asyncio.Task | None = None
+
+
+async def _reconciliation_mailbox_loop() -> None:
+    """Consume only mailbox commands created by a human dashboard action.
+
+    Polling only publishes current evidence and claims an already-created
+    command. It never creates a retry command or grants model work by itself.
+    """
+    if not RECONCILIATION_MAILBOX_ENABLED or not INGEST_BACKUP_PATH:
+        return
+    journal = journal_from_backup_env()
+    if journal is None:
+        logger.error("[reconciliation-mailbox] disabled: durable journal unavailable")
+        return
+    store = MailboxStore(Path(INGEST_BACKUP_PATH).with_name(
+        "reconciliation-mailbox.sqlite3"))
+    await _recover_interrupted_manual_resumes(store, journal)
+    sent_versions: dict[str, int] = {}
+    while True:
+        try:
+            await _recover_interrupted_manual_resumes(store, journal)
+            enqueue_manual_resume = None
+            dispatch_manual_resume = None
+            if (MANUAL_RECONCILIATION_REPLAY_ENABLED
+                    and GRAPHITI_STAGE_CONTINUATION_AVAILABLE):
+                async def enqueue_manual_resume(command, task, report):
+                    return await _enqueue_manual_resume(
+                        command, task, report, store=store, journal=journal,
+                        driver=get_status_driver())
+
+                async def dispatch_manual_resume():
+                    await _dispatch_manual_resume(store, journal)
+            await run_mailbox_cycle(
+                driver=get_status_driver(), store=store, journal=journal,
+                check_task=_check_task_from_mailbox,
+                base_url=gateway_base_url(), token=gateway_token(),
+                deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
+                sent_versions=sent_versions,
+                enqueue_manual_resume=enqueue_manual_resume,
+                dispatch_manual_resume=dispatch_manual_resume,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[reconciliation-mailbox] cycle failed")
+        await asyncio.sleep(RECONCILIATION_MAILBOX_POLL_SECONDS)
+
+
+async def _start_reconciliation_mailbox() -> None:
+    global _reconciliation_mailbox_task
+    if not RECONCILIATION_MAILBOX_ENABLED or not INGEST_BACKUP_PATH:
+        logger.info("[reconciliation-mailbox] disabled by configuration")
+        return
+    if _reconciliation_mailbox_task is None or _reconciliation_mailbox_task.done():
+        _reconciliation_mailbox_task = asyncio.create_task(
+            _reconciliation_mailbox_loop(), name="kg-hub-reconciliation-mailbox")
+
+
+async def _stop_reconciliation_mailbox() -> None:
+    global _reconciliation_mailbox_task
+    task = _reconciliation_mailbox_task
+    _reconciliation_mailbox_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def queue_stats(request: Request) -> JSONResponse:
@@ -5078,6 +5604,8 @@ async def dashboard_translate(request: Request) -> JSONResponse:
 
 app = Starlette(
     debug=False,
+    on_startup=[_start_reconciliation_mailbox],
+    on_shutdown=[_stop_reconciliation_mailbox],
     routes=[
         Route("/", portal, methods=["GET"]),
         Route("/portal", portal, methods=["GET"]),

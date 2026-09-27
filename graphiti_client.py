@@ -14,6 +14,7 @@ lock (Phase 1 → Phase 2 requires concurrent ingest + MCP read).
 """
 
 import asyncio
+from contextlib import nullcontext
 import os
 import threading
 import typing
@@ -40,7 +41,10 @@ from graphiti_core.llm_client import LLMConfig
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.client import ModelSize
 from graphiti_core.prompts.models import Message
-from model_gateway_client import create_gateway_client, gateway_model, gateway_token
+from model_gateway_client import (
+    create_gateway_client, gateway_model, gateway_token, model_stage,
+)
+from utils.graphiti_stage_names import graphiti_model_stage
 from pydantic import BaseModel
 
 # --- Perf fix (task #7): make EDGE dedup vector-only ---------------------------
@@ -100,9 +104,12 @@ class SingleAttemptAnthropicClient(AnthropicClient):
         del group_id  # retained for graphiti-core's public method contract
         if max_tokens is None:
             max_tokens = self.max_tokens
-        response, input_tokens, output_tokens = await self._generate_response(
-            messages, response_model, max_tokens, model_size
-        )
+        stage = graphiti_model_stage(prompt_name)
+        stage_scope = model_stage(stage) if stage else nullcontext()
+        with stage_scope:
+            response, input_tokens, output_tokens = await self._generate_response(
+                messages, response_model, max_tokens, model_size
+            )
         self.token_tracker.record(prompt_name, input_tokens, output_tokens)
         if response_model is not None:
             # Validation errors intentionally propagate.  In particular, never

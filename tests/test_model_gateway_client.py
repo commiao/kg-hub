@@ -298,7 +298,17 @@ class GatewayClientContractTests(unittest.TestCase):
                 captured.update(kwargs)
 
         fake_module = types.SimpleNamespace(AsyncAnthropic=Constructor)
+        wire_clients = []
+
+        class WireClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                wire_clients.append(self)
+
+        fake_httpx = types.SimpleNamespace(AsyncClient=WireClient)
         with mock.patch.dict(sys.modules, {"anthropic": fake_module}), mock.patch.dict(
+            sys.modules, {"httpx": fake_httpx}
+        ), mock.patch.dict(
             os.environ,
             {
                 "KG_HUB_MODEL_GATEWAY_TOKEN": "gateway-caller-token",
@@ -314,6 +324,29 @@ class GatewayClientContractTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], mgc.MIN_CLIENT_TIMEOUT_SEC)
         self.assertEqual(captured["auth_token"], "gateway-caller-token")
         self.assertEqual(captured["base_url"], "http://model-gateway:39000")
+        self.assertEqual(len(wire_clients), 1)
+        hook = wire_clients[0].kwargs["event_hooks"]["request"][0]
+        self.assertIs(hook, mgc.gateway_task_correlation_request_hook)
+
+        body = b'{"model":"kg_hub.entity_extract","messages":[]}'
+
+        class Request:
+            content = body
+
+            def __init__(self):
+                self.headers = {}
+
+            async def aread(self):
+                return self.content
+
+        request = Request()
+        with mgc.model_business_task("source", "obs-1"):
+            asyncio.run(hook(request))
+        from utils.reconciliation_mailbox import task_uuid
+        self.assertEqual(request.headers["X-Model-Gateway-Task-Ids"],
+                         task_uuid("source", "obs-1"))
+        self.assertEqual(request.headers["X-Model-Gateway-Step-Id"],
+                         __import__("hashlib").sha256(body).hexdigest())
 
     def test_client_timeout_must_outlast_the_gateway_route_timeout(self):
         """客户端提前放弃 = 白烧一次付费调用 + 可能留下永久 unknown 幂等记录。
