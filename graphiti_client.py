@@ -63,6 +63,10 @@ from utils.batched_node_attributes import extract_attributes_from_nodes as _batc
 # Graphiti imports this helper into its pipeline module. Bind that actual call
 # site; rebinding node_operations alone leaves add_episode on the old helper.
 _graphiti_pipeline.extract_attributes_from_nodes = _batch_attributes
+# Durable stage recovery calls the maintenance entry point directly. Keep its
+# original and restored executions on the same batch implementation too.
+from graphiti_core.utils.maintenance import node_operations as _node_ops  # noqa: E402
+_node_ops.extract_attributes_from_nodes = _batch_attributes
 
 _vec_only = _copy.deepcopy(_edge_ops.EDGE_HYBRID_SEARCH_RRF)
 _cosine_methods = [

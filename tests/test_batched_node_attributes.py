@@ -1,5 +1,6 @@
 """Exercise the Graphiti entry point, including its unchanged summary tail."""
 import json
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -59,6 +60,30 @@ class BatchAttributesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summaries.call_args.kwargs["skip_fact_appending"])
         self.assertEqual(nodes[0].attributes, {"old": "kept", "path": "/entity_0"})
         self.assertEqual(nodes[1].attributes["path"], "/entity_1")
+
+    async def test_checkpointed_original_and_recovery_keep_batching(self):
+        from utils.graphiti_stage_adapter import extract_attributes_with_snapshot
+        from utils.graphiti_stage_adapter import StageArtifactStore
+        nodes = self.nodes(9)
+        async def generate(messages, **kwargs):
+            return {key: {"path": "/saved"}
+                    for key in json.loads(messages[1].content)["entities"]}
+        generate = AsyncMock(side_effect=generate)
+        clients = SimpleNamespace(llm_client=SimpleNamespace(generate_response=generate),
+                                  embedder=object())
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(upstream, "_extract_entity_summaries_batch", AsyncMock()), \
+                patch.object(upstream, "create_entity_node_embeddings", AsyncMock()):
+            store = StageArtifactStore(Path(temp) / "stages.sqlite3")
+            inputs = [node.model_copy(deep=True) for node in nodes]
+            kwargs = dict(store=store, task_sd="source", task_sid="task",
+                          operation_id="operation", input_digest="input")
+            first = await extract_attributes_with_snapshot(
+                SimpleNamespace(clients=clients), nodes, None, [], {"File": FileAttrs}, [], **kwargs)
+            second = await extract_attributes_with_snapshot(
+                SimpleNamespace(clients=clients), inputs, None, [], {"File": FileAttrs}, [], **kwargs)
+            self.assertEqual(generate.await_count, 2)
+            self.assertEqual([node.attributes for node in first], [node.attributes for node in second])
 
     async def test_mixed_types_and_duplicate_names_map_by_required_keys(self):
         nodes = self.nodes(2)
