@@ -26,6 +26,7 @@ Launch:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hmac
 import json
 import logging
@@ -5658,10 +5659,18 @@ async def dashboard_translate(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "zh": zh.strip()})
 
 
+@asynccontextmanager
+async def _application_lifespan(app):
+    await _start_reconciliation_mailbox()
+    try:
+        yield
+    finally:
+        await _stop_reconciliation_mailbox()
+
+
 app = Starlette(
     debug=False,
-    on_startup=[_start_reconciliation_mailbox],
-    on_shutdown=[_stop_reconciliation_mailbox],
+    lifespan=_application_lifespan,
     routes=[
         Route("/", portal, methods=["GET"]),
         Route("/portal", portal, methods=["GET"]),
