@@ -339,7 +339,8 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         # 有键漏下来,不该让观测为一次运维动作白锁 24h。
         "  AND (k.error_kind IN ['quota_exhausted', 'rate_limited', "
         "                        'gateway_unavailable', 'breaker_open', "
-        "                        'provider_circuit_open', "
+        "                        'provider_circuit_open', 'terminal_write_unavailable', "
+        "                        'daily_quota_exhausted', "
         # upstream_error:网关/供应商回的 5xx。同属"与观测内容无关",没有理由比
         # 连不上网关多锁 23 小时。
         "                        'upstream_error', 'model_offscript'] "
@@ -428,9 +429,19 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
     if getattr(exc, "status_code", None) == 503:
         body = getattr(exc, "body", None)
         error = body.get("error") if isinstance(body, dict) else None
-        if isinstance(error, dict) and error.get("code") == "provider_circuit_open":
-            return "provider_circuit_open"
+        if isinstance(error, dict):
+            if error.get("code") == "provider_circuit_open":
+                return "provider_circuit_open"
+            if error.get("code") == "idempotency_terminal_write_unavailable":
+                return "terminal_write_unavailable"
     if getattr(exc, "status_code", None) == 429:
+        body = getattr(exc, "body", None)
+        error = body.get("error") if isinstance(body, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if code in {"daily_quota_exhausted", "package_quota_exhausted"}:
+            return "daily_quota_exhausted"
+        if code in {"rate_limit_exceeded", "concurrency_limit_exceeded"}:
+            return "rate_limited"
         return "quota_exhausted"
     # Some Anthropic SDK versions expose a 429 as RateLimitError without a
     # status_code attribute. It is still a transient pre-extraction rejection,
@@ -677,6 +688,19 @@ async def health(request: Request) -> JSONResponse:
                          "drain_refused": drain_refused(),
                          "envelope_repairs": envelope_repairs_total(),
                          "offscript_responses": offscript_total()})
+
+
+async def model_readiness(request: Request) -> JSONResponse:
+    """Authenticated, no-charge availability probe for refinery recovery."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+            response = await client.get(f"{gateway_base_url()}/health/ready")
+            ready = response.status_code == 200 and response.json().get("status") == "ok"
+    except Exception:  # no upstream content or credentials in the response
+        ready = False
+    return JSONResponse({"status": "ok" if ready else "unavailable"},
+                        status_code=200 if ready else 503)
 
 
 async def drain(request: Request) -> JSONResponse:
@@ -5705,6 +5729,7 @@ app = Starlette(
         Route("/dashboard/monitor/status", monitor_status, methods=["GET"]),
         Route("/api/knowledge_feedback", knowledge_feedback, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
+        Route("/api/model-readiness", model_readiness, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
