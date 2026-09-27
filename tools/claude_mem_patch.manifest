@@ -2,14 +2,14 @@
 #
 # 补丁内容：观测提示带上队列行 id，让下游 forwarder 能证明「字节相同 = 同一条
 # 观测的重投」，从而复用同一把幂等键、不再重复付费。
-# 源码：commiao/claude-mem 主干 34eaf89860c27153b58381d8cdc47e64e86ba5d5。
+# 源码：commiao/claude-mem 提交 54c400cf69c47b7bc1b6578b38bb1a25f162e2b4（发布前须已合入主干）。
 # 包含人工核实、原业务重跑、持久终态及三次调用上限；版本仍为 13.25.2。
 # 发布产物由 deploy/release-patch.sh 从该提交读取并校验。
 #
 # version 必须与目标安装的 package.json 对得上。对不上说明插件升级了：
 # **那时绝不能把这份盖回去** —— 那是静默降级。要在新版本上重做补丁。
 version=13.25.2
-sha256=a0bd3c2cebc223ae7b835ba18fffbd1762eae7801679a9d3c71f545ae8f95def
+sha256=cb72773c1053ab7fd8461eca2475a2fbed5a73a2deec91e7886665f301789b0d
 marker=cm-op
 # 补丁产物的稳定位置。**不指向开发工作树** —— 准则 20。
 # 2026-09-20：原来写的是 `../claude-mem-fork/plugin/scripts/worker-service.cjs`
