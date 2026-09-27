@@ -57,6 +57,12 @@ from pydantic import BaseModel
 # the recipes module directly and is unaffected.
 import copy as _copy  # noqa: E402
 import graphiti_core.utils.maintenance.edge_operations as _edge_ops  # noqa: E402
+import graphiti_core.graphiti as _graphiti_pipeline  # noqa: E402
+from utils.batched_node_attributes import extract_attributes_from_nodes as _batch_attributes  # noqa: E402
+
+# Graphiti imports this helper into its pipeline module. Bind that actual call
+# site; rebinding node_operations alone leaves add_episode on the old helper.
+_graphiti_pipeline.extract_attributes_from_nodes = _batch_attributes
 
 _vec_only = _copy.deepcopy(_edge_ops.EDGE_HYBRID_SEARCH_RRF)
 _cosine_methods = [
