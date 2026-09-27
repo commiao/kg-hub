@@ -34,6 +34,8 @@ EXPECTED = {
     # 不姓 kg-hub 但同样由本仓库管：保留 claude-mem 自己的 label，这样装上去是
     # **替换**插件那份、而不是与它并存（并存会有两个 job 各起一份 worker）。
     "com.claude-mem.worker",
+    "com.claude-mem.capture-next",
+    "com.kg-hub.claude-mem-dual-ingest",
 }
 SECRETISH = re.compile(r"open\.feishu\.cn/open-apis/bot|xox[bp]-|Bearer\s+\S|[A-Za-z0-9_-]{32,}")
 
