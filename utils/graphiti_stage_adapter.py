@@ -24,6 +24,11 @@ def _encoded(value: object) -> str:
 
 
 def _stage_value(value):
+    if isinstance(value, type):
+        name = f"{value.__module__}.{value.__qualname__}"
+        if hasattr(value, "model_json_schema"):
+            return {"type": name, "schema": value.model_json_schema()}
+        return name
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     if isinstance(value, dict):
@@ -34,8 +39,6 @@ def _stage_value(value):
         return value.isoformat()
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, type):
-        return f"{value.__module__}.{value.__qualname__}"
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise RuntimeError(f"unsupported Graphiti stage input type: {type(value)!r}")
