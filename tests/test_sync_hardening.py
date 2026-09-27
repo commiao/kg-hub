@@ -182,6 +182,19 @@ class SyncSafety(unittest.TestCase):
         self.assertIn(b'synced +1', second.stdout)
         self.assertEqual(self.nas_max(), 3, 'the deferred row must arrive next cycle')
 
+    def test_legacy_job_cannot_overwrite_dual_source_nas_state(self):
+        source = self.root / 'source.db'
+        self.make_db(source, 2)
+        local, env = self.mac_script(source, self.root / 'local-inbox')
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / 'claude-mem-dual-active.json').write_text('{"generation":"next"}')
+        before = self.db.read_bytes()
+        result = subprocess.run(['/bin/sh', str(local)], env=env, capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'legacy-only sync fenced', result.stdout)
+        self.assertEqual(self.db.read_bytes(), before)
+
     def test_local_sync_drive_fallback_and_next_cycle(self):
         source = self.root / 'source.db'
         self.make_db(source, 2)

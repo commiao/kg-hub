@@ -54,6 +54,12 @@ if [ "${1:-}" != "--guarded" ]; then
   exec python3 "$(dirname "$0")/sync_guard.py" "$STATE/sync.flock" 600 /bin/sh "$0" --guarded "$@"
 fi
 shift
+# The old scheduled job may still exist. Once dual capture is activated it
+# must never overwrite the aggregate's newer NAS identity space with old-only data.
+if [ -f "$STATE/claude-mem-dual-active.json" ] && [ -z "${CLAUDE_MEM_SYNC_SOURCES_CONFIG:-}" ]; then
+  echo "$(ts) skip: legacy-only sync fenced by dual capture activation"
+  exit 0
+fi
 FORCE_REBUILD=""
 [ "${1:-}" = "--rebuild" ] && FORCE_REBUILD=1
 TMP=""
