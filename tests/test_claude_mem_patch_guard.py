@@ -80,6 +80,15 @@ class PatchGuardTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         return self.log.read_text("utf-8") if self.log.exists() else ""
 
+    def test_preserved_legacy_queue_prevents_restart_even_without_health(self):
+        state = Path(self.tmp.name) / "state"
+        state.mkdir()
+        (state / "claude-mem-legacy-preserved.json").write_text('{"pid":123}')
+        log = self.run_guard()
+        self.assertEqual(self.bundle.read_bytes(), PATCHED)
+        self.assertIn("automatic restart disabled", log)
+        self.assertFalse((state / ("patch-worker-restarted-" + sha(PATCHED))).exists())
+
     # ── 核心那一条 ──────────────────────────────────────────────────
     def test_a_version_bump_is_never_overwritten(self):
         """插件真升级了就一个字节都不写。**这是本文件最重要的一条。**
