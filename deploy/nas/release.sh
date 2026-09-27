@@ -651,7 +651,13 @@ while [ "$waited" -lt "$DRAIN_BUDGET_S" ]; do
   # 落到那条闸上中止，而不是替它做一个乐观的决定。
   # DRY_RUN 在循环第一行就 break 了，这里不用再管它 —— 写一个到不了的分支，
   # 比不写更坏：它看起来像在处理一种情况。
-  body=$(ssh "${SSH_OPTS[@]}" "$NAS" "curl -fsS -m 5 '$HEALTH'" 2>/dev/null); probe_rc=$?
+  # Keep the fallible assignment inside a conditional: a standalone assignment
+  # exits under set -e before probe_rc can reach the retry branch below.
+  if body=$(ssh "${SSH_OPTS[@]}" "$NAS" "curl -fsS -m 5 '$HEALTH'" 2>/dev/null); then
+    probe_rc=0
+  else
+    probe_rc=$?
+  fi
   if [ "$probe_rc" != 0 ]; then
     say "  够不到线上 /health（ssh/curl 退出 ${probe_rc}）；**不当作已排空**，继续等（已等 ${waited}s / ${DRAIN_BUDGET_S}s）"
     sleep 5

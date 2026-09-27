@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -317,6 +318,27 @@ class DrainFailureTests(unittest.TestCase):
         branch = tail[1][:600]
         self.assertIn("die ", branch)
         self.assertIn("restore_producers", branch)
+
+    def test_transient_probe_timeout_reaches_retry_under_errexit(self):
+        start = self.raw.index('  body=$(ssh', self.raw.index('while [ "$waited"')) if '  body=$(ssh' in self.raw else self.raw.index('  if body=$(ssh')
+        end = self.raw.index('  # 用 python 解 JSON', start)
+        probe = self.raw[start:end]
+        script = '''set -euo pipefail
+SSH_OPTS=(-o BatchMode=yes); NAS=fixture; HEALTH=http://fixture; waited=0; DRAIN_BUDGET_S=20
+say() { :; }
+sleep() { :; }
+ssh() { if [ "$attempt" = 1 ]; then return 28; fi; printf '{"active_extractions":0}'; }
+for attempt in 1 2; do
+''' + probe + '''
+printf 'probe-reached:%s\\n' "$attempt"
+done
+printf 'waited:%s\\n' "$waited"
+'''
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('probe-reached:1', result.stdout)
+        self.assertIn('probe-reached:2', result.stdout)
+        self.assertIn('waited:5', result.stdout)
 
     def test_drain_failure_has_no_force_swap_escape_hatch(self):
         # 即使操作者环境里设了同名变量，发布器也必须中止，不能掐断在飞请求。
