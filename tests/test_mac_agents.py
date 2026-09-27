@@ -42,7 +42,7 @@ class TemplateTests(unittest.TestCase):
     def templates(self):
         # 与 install.sh 的扫描范围一字不差。写窄了的后果很隐蔽：新模板照样被
         # 安装，却逃过下面所有安全断言（无机密、无绝对路径、plist 合法）。
-        return sorted(AGENTS.glob("com.*.plist"))
+        return sorted(AGENTS.glob("com.*.plist")) + sorted((ROOT / "deploy/mac/optional").glob("com.*.plist"))
 
     def test_every_known_service_is_tracked(self):
         got = {p.stem for p in self.templates()}
