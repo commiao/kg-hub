@@ -311,14 +311,14 @@ class RefineryGateTests(unittest.TestCase):
         # body.index() 抛 ValueError，报出来只有"substring not found"，看不出
         # 是顺序坏了还是名字变了。红着的断言等于没有断言。
         for later in ("temps = disk_temps()", "in_backlog_window()",
-                      'quota_pause.get("until_cycle"'):
+                      'quota_pause.get("reason"'):
             self.assertIn(later, body, f"循环里找不到 {later}——改过名就同步改这里")
             self.assertLess(gate, body.index(later), later)
 
     def test_gate_skips_the_cycle_instead_of_submitting(self):
         source = Path(__file__).resolve().parent.parent.joinpath(
             "kg_refinery.py").read_text("utf-8")
-        body = source.split("breakers.is_tripped(BREAKER_KEY)", 1)[1][:600]
+        body = source.split("tripped, reason = breakers.is_tripped(BREAKER_KEY)", 1)[1][:600]
         self.assertIn("breaker_open=True", body)
         self.assertIn("continue", body)
         # 不能把它记成一次错误——那就等于每轮给观测扣一次重试。
