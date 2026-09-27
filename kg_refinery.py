@@ -47,6 +47,7 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
@@ -54,6 +55,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from utils import refinery_recovery as recovery  # noqa: E402
 
 import breakers  # noqa: E402
 from utils.ingest_budget import ingest_ceiling_sec  # noqa: E402
@@ -691,19 +694,14 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
         if code == 400:
             return "error"      # 参数问题:重试也不会变好
         if code == 200:
-            if st == "error" and d.get("error_kind") == "quota_exhausted":
-                return "quota"  # 网关配额拒绝:暂停后再探
-            if st == "error" and d.get("error_kind") == "rate_limited":
-                return "rate_limited"  # 上游限流:等服务端释放错误键后再探
-            if st == "error" and d.get("error_kind") == "provider_circuit_open":
-                # 网关在供应商调用前拒绝了请求。沿用整窗停发和 1h 错误键释放，
-                # 观测留在原队列，不能把它记成内容失败。
-                return "upstream_error"
-            if st == "error" and d.get("error_kind") == "upstream_error":
-                # 网关/供应商回 5xx。和上面两条同类:失败不属于这条观测,
-                # 继续逐条撞只会把整批的模型调用白烧掉(实测 503 打在
-                # resolve_extracted_edges,那时约 20 次调用已经花出去了)。
-                return "upstream_error"
+            if st == "error":
+                kind = d.get("error_kind")
+                if kind == "quota_exhausted":
+                    return "quota"
+                if kind == "daily_quota_exhausted":
+                    return "daily_quota"
+                if kind in recovery.INFRA_FAILURES or kind == "rate_limited":
+                    return kind
             if st in ("ok", "skipped", "error", "needs_reconciliation"):
                 return st
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
@@ -768,6 +766,9 @@ _MOMENTARY_DEFAULTS: dict[str, object] = {
     "quota_paused": False,
     "rate_limited": False,
     "upstream_error_paused": False,
+    "recovery_reason": None,
+    "recovery_retry_at": None,
+    "recovery_probe_attempt": 0,
     "thermal_hold": False,
     "idle_outside_window": False,
     "breaker_open": False,
@@ -863,7 +864,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                         quotas: QuotaTracker | None, decided: dict,
                         backoff: dict[int, list[int]], cycle: int, kind: str,
                         quota_pause: dict | None = None,
-                        on_progress=None) -> dict:
+                        on_progress=None, can_submit=None) -> dict:
     """decided: 进程内决策缓存 {obs_id: accept}，每条 obs 只评一次。
 
     ``quotas`` is retained for older callers; refinery deliberately does not
@@ -896,7 +897,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             continue
         # 409 退避:冷却期内直接跳过,连请求都不发(活锁的根治点)
         bo = backoff.get(oid)
-        if bo and cycle < bo[1]:
+        if recovery.cooling(bo, cycle):
             stats["backoff_skipped"] += 1
             count("result_counts", "backoff")
             continue
@@ -932,7 +933,11 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     # 水印:网关明明在被调用,而 backlog_remaining / watermark 半小时一动不动,既没有
     # 增量进度也没有崩溃后的durability。settle() 是纯同步函数,asyncio 单线程且它内部
     # 没有 await ⇒ 与其他任务不会交错,可以安全地在每个任务里就地落账。
-    halt = {"stop": False}
+    halt = {"stop": bool(quota_pause and quota_pause.get("reason"))}
+
+    def stopped() -> bool:
+        return (halt["stop"] or bool(quota_pause and quota_pause.get("reason"))
+                or (can_submit is not None and not can_submit()))
 
     def settle(obs: dict, st: str) -> None:
         oid = obs["id"]
@@ -960,50 +965,21 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             wm["held"].add(oid)
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → 预拆结果未完成,暂停自动提交并等待人工核实", kind, oid)
-        elif st == "quota":
-            # 网关日/分上限:请求根本没到供应商,失败与这条观测无关。继续逐条撞只会白烧
-            # 每篇前面的调用并堆 error 键(2026-09-06 夜 218 篇败/127 篇成),暂停,
-            # QUOTA_PAUSE_CYCLES 轮后再探一条。
+        elif st in recovery.PAUSING_FAILURES:
+            # The error key can remain for an hour. Cool down this observation,
+            # not every unrelated observation that is still eligible to run.
+            backoff[oid] = [backoff.get(oid, [0, 0])[0] + 1,
+                            cycle + RATE_LIMIT_PAUSE_CYCLES,
+                            time.time() + RATE_LIMIT_PAUSE_CYCLES * INTERVAL]
             if quota_pause is not None:
-                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
-                candidate_until = cycle + QUOTA_PAUSE_CYCLES
-                # 一批最多两条已在飞。较短的配额暂停不能覆盖同批刚落下的
-                # 更长上游限流暂停，否则会在错误键释放前又撞上 409。
-                if candidate_until >= quota_pause.get("until_cycle", 0):
-                    quota_pause["until_cycle"] = candidate_until
-                    quota_pause["reason"] = "quota_exhausted"
-            stats["quota_paused"] = 1
+                recovery.record_failure(
+                    quota_pause, st, cycle=cycle, interval=INTERVAL,
+                    quota_delay=QUOTA_PAUSE_CYCLES * INTERVAL)
+            stats["quota_paused" if st in {"quota", "daily_quota"} else
+                  "rate_limited" if st == "rate_limited" else "upstream_error"] = 1
             stats["deferred"] += 1
-            log.warning("[%s] obs-%d → 网关配额耗尽,停发 %d 轮(≈%dmin)后再探",
-                        kind, oid, QUOTA_PAUSE_CYCLES, QUOTA_PAUSE_CYCLES * INTERVAL // 60)
-        elif st == "rate_limited":
-            # 服务端对这类键按 1 小时快清；暂停必须长于该阈值，否则下一次探测
-            # 仍是同一把 error 键的 409，反而将无关的限流变成单条指数退避。
-            if quota_pause is not None:
-                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
-                candidate_until = cycle + RATE_LIMIT_PAUSE_CYCLES
-                if candidate_until >= quota_pause.get("until_cycle", 0):
-                    quota_pause["until_cycle"] = candidate_until
-                    quota_pause["reason"] = "rate_limited"
-            stats["rate_limited"] = 1
-            stats["deferred"] += 1
-            log.warning("[%s] obs-%d → 上游限流,停发 %d 轮(≈%dmin)后再探",
-                        kind, oid, RATE_LIMIT_PAUSE_CYCLES,
-                        RATE_LIMIT_PAUSE_CYCLES * INTERVAL // 60)
-        elif st == "upstream_error":
-            # 网关活着但回 5xx。服务端对这类键同样按 1 小时清理,所以暂停节奏跟
-            # rate_limited 走同一个常数——它就是按「盖住那 1 小时」算出来的。
-            if quota_pause is not None:
-                quota_pause["hits"] = quota_pause.get("hits", 0) + 1
-                candidate_until = cycle + RATE_LIMIT_PAUSE_CYCLES
-                if candidate_until >= quota_pause.get("until_cycle", 0):
-                    quota_pause["until_cycle"] = candidate_until
-                    quota_pause["reason"] = "upstream_error"
-            stats["upstream_error"] = 1
-            stats["deferred"] += 1
-            log.warning("[%s] obs-%d → 上游 5xx,停发 %d 轮(≈%dmin)后再探",
-                        kind, oid, RATE_LIMIT_PAUSE_CYCLES,
-                        RATE_LIMIT_PAUSE_CYCLES * INTERVAL // 60)
+            log.warning("[%s] obs-%d → %s; observation cooling, queue awaits readiness",
+                        kind, oid, st)
         else:  # error/timeout/net → 不记水印,下轮重试
             stats["deferred"] += 1
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
@@ -1018,17 +994,17 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
         gate = asyncio.Semaphore(INGEST_CONCURRENCY)
 
         async def run(obs: dict) -> None:
-            if halt["stop"]:
+            if stopped():
                 stats["deferred"] += 1      # 没发出去,下轮重试
                 count("result_counts", "halted")
                 return
             async with gate:
-                if halt["stop"]:
+                if stopped():
                     stats["deferred"] += 1
                     count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs, kind)
-            if (st in ("quota", "rate_limited", "net", "upstream_error")
+            if (st in recovery.PAUSING_FAILURES
                     or st.startswith("graphiti_unavailable_")):
                 halt["stop"] = True         # 尚未拿到令牌的条目不再发
             settle(obs, st)
@@ -1058,7 +1034,7 @@ def select_project_batch(rows: list[dict], terminal: set[int],
             first_seen_at.pop(oid, None)
             continue
         bo = backoff.get(oid)
-        if bo and cycle < bo[1]:
+        if recovery.cooling(bo, cycle):
             continue
         project = row.get("project") or "(unknown)"
         groups[project].append(oid)
@@ -1104,7 +1080,7 @@ def select_backlog_batch(pending_ids: list[int], backoff: dict[int, list[int]],
     picked: list[int] = []
     for oid in pending_ids:
         bo = backoff.get(oid)
-        if bo and cycle < bo[1]:
+        if recovery.cooling(bo, cycle):
             continue
         picked.append(oid)
         if len(picked) >= limit:
@@ -1133,7 +1109,25 @@ async def main() -> int:
     decision_day = datetime.now(tz=CST).date()
     first_seen_at: dict[int, datetime] = {}  # created_at 无效时的最长等待起点
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
-    quota_pause: dict = {}               # 网关配额耗尽 → {"until_cycle", "hits"}
+    recovery_path = STATE_DIR / "recovery.json"
+    try:
+        quota_pause = json.loads(recovery_path.read_text()) if recovery_path.exists() else {}
+        if not isinstance(quota_pause, dict):
+            raise ValueError("invalid recovery state")
+        if quota_pause.get("reason") and not isinstance(quota_pause.get("retry_at"), (int, float)):
+            raise ValueError("invalid recovery deadline")
+    except (OSError, ValueError):
+        quota_pause = {}
+        recovery.record_failure(quota_pause, "gateway_unavailable", cycle=0,
+                                interval=INTERVAL, quota_delay=QUOTA_PAUSE_CYCLES * INTERVAL)
+
+    def save_recovery():
+        tmp = recovery_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(quota_pause))
+        os.replace(tmp, recovery_path)
+
+    def can_submit():
+        return in_backlog_window() and not breakers.is_tripped(BREAKER_KEY)[0]
     breaker_held = False                 # 只在状态翻转时打日志,不每轮刷屏
     cycle = 0
 
@@ -1197,17 +1191,19 @@ async def main() -> int:
                 await asyncio.sleep(INTERVAL)
                 continue
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
-            if cycle < quota_pause.get("until_cycle", 0):
-                pause_reason = quota_pause.get("reason", "quota_exhausted")
-                write_status(quota_paused=pause_reason == "quota_exhausted",
-                             rate_limited=pause_reason == "rate_limited",
-                             upstream_error_paused=pause_reason == "upstream_error",
-                             rate_limit_paused_until_cycle=quota_pause["until_cycle"],
-                             rate_limit_hits=quota_pause.get("hits", 0),
-                             quota_paused_until_cycle=quota_pause["until_cycle"],
-                             quota_hits=quota_pause.get("hits", 0), last_error=None)
-                await asyncio.sleep(INTERVAL)
-                continue
+            if quota_pause.get("reason"):
+                if recovery.probe_due(quota_pause):
+                    # No model request is used as a health check. A real durable
+                    # terminal-write failure must remain paused until repaired.
+                    code, health = await asyncio.to_thread(
+                        _http, "GET", f"{KG_HUB_URL}/api/model-readiness", None, 8)
+                    recovery.probe_result(quota_pause,
+                                          code == 200 and health.get("status") == "ok")
+                    save_recovery()
+                if quota_pause.get("reason"):
+                    write_status(**recovery.status_fields(quota_pause), last_error=None)
+                    await asyncio.sleep(max(1, min(30, quota_pause["retry_at"] - time.time())))
+                    continue
             boundary = wm["boundary_id"]
 
             def snapshot(**extra):
@@ -1219,6 +1215,7 @@ async def main() -> int:
                 过一次:以为 refinery 没在干活,实际正在跑)。存活有独立 heartbeat,
                 但**进度**必须增量可见 —— 与今天修的"200 条一批才落一次账"同一类。
                 """
+                save_recovery()
                 write_status(
                     disk_temp=dtemp, thermal_hold=False, thermal=thermal,
                     idle_outside_window=False,
@@ -1226,13 +1223,7 @@ async def main() -> int:
                     backlog_window_open=in_backlog_window(),
                     **cycle_budget_fields(),
                     backoff_pending=len(backoff),
-                    quota_paused=False,
-                    rate_limited=False,
-                    upstream_error_paused=False,
-                    rate_limit_paused_until_cycle=quota_pause.get("until_cycle"),
-                    rate_limit_hits=quota_pause.get("hits", 0),
-                    quota_paused_until_cycle=quota_pause.get("until_cycle"),
-                    quota_hits=quota_pause.get("hits", 0),
+                    **recovery.status_fields(quota_pause),
                     breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
@@ -1259,7 +1250,7 @@ async def main() -> int:
                     s_back = await process_batch(
                         fetch_rows_by_ids(selected),
                         wm, cfg, None, decided, backoff, cycle, "backlog",
-                        quota_pause=quota_pause,
+                        quota_pause=quota_pause, can_submit=can_submit,
                         on_progress=lambda st: snapshot(
                             backlog_processed=dict(st),
                             backlog_remaining=backlog_remaining
@@ -1283,7 +1274,7 @@ async def main() -> int:
                 live_threshold, MAX_WAIT_SEC, first_seen_at)
             s_live = await process_batch(
                 fetch_rows_by_ids(live_ids), wm, cfg, None, decided, backoff, cycle, "live",
-                quota_pause=quota_pause,
+                quota_pause=quota_pause, can_submit=can_submit,
                 on_progress=lambda st: snapshot(
                     live_processed=dict(st), backlog_processed=s_back,
                     backlog_remaining=backlog_remaining))
@@ -1308,7 +1299,9 @@ async def main() -> int:
         except Exception as exc:  # noqa: BLE001 — 单轮失败不倒进程
             log.exception("[cycle] failed")
             write_status(last_error=f"{type(exc).__name__}: {exc}")
-        await asyncio.sleep(INTERVAL)
+        delay = (max(1, min(INTERVAL, quota_pause["retry_at"] - time.time()))
+                 if quota_pause.get("reason") else INTERVAL)
+        await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":

@@ -162,14 +162,12 @@ class RefineryReactionTests(unittest.TestCase):
             st = asyncio.run(refinery.poll_until_done("claude-mem", "42"))
         finally:
             refinery._http = original
-        self.assertEqual(st, "upstream_error")
+        self.assertEqual(st, "provider_circuit_open")
         self.assertEqual(len(calls), 1)
 
     def test_the_rest_of_the_batch_is_not_sent(self):
         """halt 名单漏了它，整批剩余条目会继续逐条撞同一个 5xx。"""
-        body = REFINERY_SRC.split("halt[\"stop\"] = True", 1)[0][-400:]
-        self.assertIn('"upstream_error"', body,
-                      "upstream_error 不在 halt 名单里——同批剩余会继续发")
+        self.assertIn("upstream_error", refinery.recovery.PAUSING_FAILURES)
 
     def test_the_pause_covers_the_server_side_sweep(self):
         """服务端 1h 清键；暂停短于它，下一次探测撞到的还是同一把 error 键的 409。"""
@@ -197,10 +195,9 @@ class HaltIsVisibleTests(unittest.TestCase):
 
     def test_refinery_writes_the_field_the_alarm_reads(self):
         """判决方读 upstream_error_paused，产出方就必须写它，两端同名才算接上线。"""
-        self.assertIn("upstream_error_paused=pause_reason == \"upstream_error\"",
-                      REFINERY_SRC, "暂停时没写 upstream_error_paused")
-        self.assertIn("upstream_error_paused=False", REFINERY_SRC,
-                      "恢复后没把 upstream_error_paused 清回 False——告警会一直亮")
+        self.assertTrue(refinery.recovery.status_fields({"reason": "upstream_error"})["upstream_error_paused"])
+        self.assertFalse(refinery.recovery.status_fields({})["upstream_error_paused"])
+
 
 
 if __name__ == "__main__":

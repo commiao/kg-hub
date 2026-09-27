@@ -125,11 +125,11 @@ stats_rl = asyncio.run(R.process_batch(rows2, wmrl, {"shadow_mode": True, "globa
                                         quota_pause=rlp))
 check("上游限流后本批立即停发", len(rate_limit_calls) <= R.INGEST_CONCURRENCY and 203 not in rate_limit_calls)
 check("上游限流等待超过一小时", R.RATE_LIMIT_PAUSE_CYCLES * R.INTERVAL > 3600)
-check("记录上游限流到期轮次", rlp.get("until_cycle") == 7 + R.RATE_LIMIT_PAUSE_CYCLES and rlp.get("reason") == "rate_limited")
+check("记录上游限流到期轮次", rlp.get("until_cycle") == 8 and rlp.get("reason") == "rate_limited")
 check("stats 暴露 rate_limited", stats_rl.get("rate_limited") == 1)
 check("stats 暴露 rate_limited 类别", stats_rl["result_counts"].get("rate_limited") == 1)
 
-# 已在飞的第二条可在限流结果之后才完成；较短的 quota 暂停绝不能覆盖 1 小时暂停。
+# 已在飞的第二条晚完成时，较短的速率等待不能覆盖更长的额度等待。
 async def run_mixed_limits():
     mixed_ready = asyncio.Event()
     async def mixed_limit_verdict(obs, scenario="backlog"):
@@ -146,8 +146,8 @@ async def run_mixed_limits():
                           quota_pause=mixed_pause)
     return mixed_pause
 mixed_pause = asyncio.run(run_mixed_limits())
-check("并发短暂停不停覆盖长暂停", mixed_pause.get("until_cycle") == 7 + R.RATE_LIMIT_PAUSE_CYCLES
-      and mixed_pause.get("reason") == "rate_limited")
+check("并发短恢复探测不得覆盖更长的额度等待", mixed_pause.get("until_cycle") == 7 + R.QUOTA_PAUSE_CYCLES
+      and mixed_pause.get("reason") == "quota")
 
 # 轮询节奏:先密后疏。固定 8s 让"1 秒内就失败"的条目白等一整周期(实测中位 8.1s)
 slept = []
