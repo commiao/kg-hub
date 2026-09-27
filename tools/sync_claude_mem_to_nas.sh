@@ -29,7 +29,7 @@
 # NAS 被重置/回滚也能自动补齐,天然自愈。
 #
 # 整库全量保留为兜底通道(见 full_rebuild):首次接入、NAS 库缺失或损坏时自动回退。
-SRC="/Users/mac/.claude-mem/claude-mem.db"
+SRC="${CLAUDE_MEM_SYNC_SOURCE_DB:-/Users/mac/.claude-mem/claude-mem.db}"
 NAS="commiao@100.123.208.32"
 NAS_DIR="/volume2/4T/kg-hub-data/claude-mem"
 DST="$NAS_DIR/claude-mem.db"
@@ -44,7 +44,7 @@ ts() { date '+%F %T'; }
 # 没有 keepalive 的 ssh 会无限期挂着(2026-08-21 实测挂了 23 分钟)。
 SSHOPT="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
-[ -f "$SRC" ] || { echo "$(ts) no source db"; exit 0; }
+[ -f "$SRC" ] || { echo "$(ts) ERROR no source db: $SRC"; exit 1; }
 
 # --rebuild:强制走兜底重建。兜底本来只在副本损坏/格式不符时触发,属于罕用路径
 # —— 而罕用路径的通病是"用到时才发现早就坏了"。给它一个能随时手动走一遍的入口,
@@ -64,6 +64,12 @@ trap 'exit 130' INT
 
 # 被 SIGKILL 打断时 trap 不会跑,临时库会留在 /tmp。开工先扫。
 find /tmp -maxdepth 1 \( -name 'cm-snap.*' -o -name 'cm-delta.*' \) -type f -mmin +30 -delete 2>/dev/null
+
+# Dual capture sources are opt-in. The durable aggregate is never rebuilt here.
+if [ -n "${CLAUDE_MEM_SYNC_SOURCES_CONFIG:-}" ]; then
+  python3 "$(dirname "$0")/merge_claude_mem_sources.py" \
+    --config "$CLAUDE_MEM_SYNC_SOURCES_CONFIG" --output "$SRC" || exit 1
+fi
 
 # ── 本地 watermark ─────────────────────────────────────────────────────
 # 用 sqlite3 查而不是 shasum 文件:claude-mem 是 journal_mode=wal,新写入全在

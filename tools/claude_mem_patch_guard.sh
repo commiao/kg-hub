@@ -116,6 +116,12 @@ wait_until_drained() {
 }
 
 restart_worker_once() {
+  # An explicitly preserved legacy process owns RAM-only work. Never infer
+  # permission to stop it from health/session counts or a missing endpoint.
+  if [ -f "$STATE_DIR/claude-mem-legacy-preserved.json" ]; then
+    note "legacy RAM queue preservation is active; automatic restart disabled"
+    return 0
+  fi
   sha=$1
   mark="$STATE_DIR/patch-worker-restarted-$sha"
   [ -f "$mark" ] && return 0
