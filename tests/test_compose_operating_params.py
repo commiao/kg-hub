@@ -29,7 +29,7 @@ COMPOSE = (ROOT / "docker-compose.yml").read_text("utf-8")
 # 值 → 这个值是怎么定下来的。没有出处的数字迟早被人当成手滑改掉。
 DECIDED = {
     "KG_HUB_REFINERY_MAX_DISK_TEMP": ("59", "用户 2026-09-17 拍板上调；DSM 约 61°C 强制关机"),
-    "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "抽取并发；与 INGEST_CONCURRENCY 保持 2 同源"),
+    "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "模型外呼并发保持 2；业务任务并发独立设为 4"),
     "KG_HUB_LLM_MIN_INTERVAL_SEC":   ("2.0", "两次模型调用的最小间隔"),
     "KG_HUB_PREDIGEST":              ("1",  "预消化开关，线上开启"),
     "KG_HUB_REFINERY_DATA_DISK":     ("sata3", "承载数据卷那块盘；仅用于遥测单列一栏，判定仍取 max(全部盘)"),

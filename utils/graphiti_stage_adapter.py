@@ -442,7 +442,31 @@ def operation_input_digest(kwargs: dict) -> str:
 async def add_episode_with_stage_checkpoint(
     graphiti, *, store: StageArtifactStore, task_sd: str, task_sid: str,
     operation_id: str, relevant_schema_limit: int, on_episode_identity=None,
-    **kwargs,
+    parallel: bool = False, **kwargs,
+):
+    from utils.writer_lock import async_writer_lock
+    mode_identity = (task_sd, task_sid, operation_id, "execution-mode-v1")
+    mode = store.save_or_load(*mode_identity, "execution_mode")
+    if parallel and mode is None:
+        # Existing paid artifacts retain the original serial continuation path.
+        legacy = store.locate(task_sd, task_sid, operation_id, "operation_envelope")
+        mode = store.save_or_load(*mode_identity, "execution_mode",
+                                 {"parallel": legacy is None})
+    if not parallel and mode and mode["parallel"]:
+        raise RuntimeError("parallel operation cannot resume through legacy executor")
+    arguments = dict(store=store, task_sd=task_sd, task_sid=task_sid,
+                     operation_id=operation_id, relevant_schema_limit=relevant_schema_limit,
+                     on_episode_identity=on_episode_identity, **kwargs)
+    if parallel and not mode["parallel"]:
+        async with async_writer_lock(owner="legacy-stage-continuation", timeout_seconds=180):
+            return await _run_stage_checkpoint(graphiti, **arguments)
+    return await _run_stage_checkpoint(graphiti, optimistic=parallel, **arguments)
+
+
+async def _run_stage_checkpoint(
+    graphiti, *, store: StageArtifactStore, task_sd: str, task_sid: str,
+    operation_id: str, relevant_schema_limit: int, on_episode_identity=None,
+    optimistic: bool = False, **kwargs,
 ):
     """Pinned 0.29.0 single-episode continuation for the default kg-hub path.
 
@@ -487,8 +511,10 @@ async def add_episode_with_stage_checkpoint(
     validate_excluded_entity_types(excluded_entity_types, entity_types)
     validate_group_id(group_id)
     if group_id != graphiti.driver._database:
+        import copy
+        graphiti = copy.copy(graphiti)
         graphiti.driver = graphiti.driver.clone(database=group_id)
-        graphiti.clients.driver = graphiti.driver
+        graphiti.clients = graphiti.clients.model_copy(update={"driver": graphiti.driver})
     edge_type_map_default = (
         {("Entity", "Entity"): list(edge_types.keys())}
         if edge_types is not None else {("Entity", "Entity"): []}
@@ -509,6 +535,8 @@ async def add_episode_with_stage_checkpoint(
     }
     input_digest = operation_input_digest(operation_args)
     identity = (task_sd, task_sid, operation_id, input_digest)
+    schema_version = ("graphiti-core-0.29.0-parallel-v1" if optimistic
+                      else "graphiti-core-0.29.0")
     envelope = store.save_or_load(*identity, "operation_envelope")
     if envelope is None:
         now = utc_now()
@@ -520,7 +548,7 @@ async def add_episode_with_stage_checkpoint(
             content=episode_body, source_description=source_description,
             created_at=now, valid_at=reference_time)
         envelope_value = {
-            "schema_version": "graphiti-core-0.29.0",
+            "schema_version": schema_version,
             "input_digest": input_digest,
             "now": now.isoformat(),
             "episode": episode.model_dump(mode="json"),
@@ -529,7 +557,7 @@ async def add_episode_with_stage_checkpoint(
         }
         envelope = store.save_or_load(*identity, "operation_envelope", envelope_value)
     if (envelope.get("input_digest") != input_digest
-            or envelope.get("schema_version") != "graphiti-core-0.29.0"):
+            or envelope.get("schema_version") != schema_version):
         raise RuntimeError("stage operation envelope identity drift")
     episode = EpisodicNode.model_validate(envelope["episode"])
     previous_episodes = [EpisodicNode.model_validate(item)
@@ -543,6 +571,15 @@ async def add_episode_with_stage_checkpoint(
         excluded_entity_types, custom_extraction_instructions,
         store=store, task_sd=task_sd, task_sid=task_sid,
         operation_id=operation_id, input_digest=input_digest)
+    if optimistic:
+        from utils.graphiti_parallel import finish_optimistic_episode
+        return await finish_optimistic_episode(
+            graphiti, store=store, identity=identity, episode=episode,
+            previous_episodes=previous_episodes, extracted_nodes=extracted_nodes,
+            node_episode_index_map=node_episode_index_map, now=now,
+            entity_types=entity_types, edge_type_map=edge_type_map,
+            group_id=group_id, edge_types=edge_types,
+            custom_extraction_instructions=custom_extraction_instructions)
     nodes, uuid_map, _ = await resolve_nodes_with_candidate_snapshot(
         graphiti.clients, extracted_nodes, episode, previous_episodes,
         entity_types, store=store, task_sd=task_sd, task_sid=task_sid,

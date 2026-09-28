@@ -1231,53 +1231,63 @@ async def main() -> int:
                                "needs_reconciliation": len(wm["held"])},
                     last_error=None, **extra)
 
-            # —— backlog 先跑 ——
-            # 顺序在 2026-09-07 夜间实测后调换:live 线自己积压 1006 条、每轮取 200 条,
-            # 一轮就吃掉整个 12 小时窗口,排在它后面的积压那 8 个名额**整夜拿不到**
-            # (backlog_remaining 连续 4 天恒为 7786)。积压先跑保证每轮必得名额;
-            # 代价只是新观测入图晚一轮(90 秒),而积压已经等了几个月。
-            s_back = {"ingested": 0, "rejected": 0, "deferred": 0}
-            backlog_remaining = 0
-            if BACKLOG_ENABLED:
-                seen = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
-                backlog_meta = fetch_pending_metadata(max_id_inclusive=boundary)
-                backlog_remaining = sum(r["id"] not in seen for r in backlog_meta)
-                if backlog_remaining:
-                    selected = select_project_batch(
-                        backlog_meta, seen, backoff, cycle, BACKLOG_PER_CYCLE,
-                        BACKLOG_DISPATCH_THRESHOLD, MAX_WAIT_SEC, first_seen_at)
-                    # 每条落账即刷:积压余量随之递减,不必等整批 8 条跑完
-                    s_back = await process_batch(
-                        fetch_rows_by_ids(selected),
-                        wm, cfg, None, decided, backoff, cycle, "backlog",
-                        quota_pause=quota_pause, can_submit=can_submit,
-                        on_progress=lambda st: snapshot(
-                            backlog_processed=dict(st),
-                            backlog_remaining=backlog_remaining
-                            - st["ingested"] - st["rejected"]))
-                    backlog_remaining -= s_back["ingested"] + s_back["rejected"]
-            snapshot(backlog_processed=s_back, backlog_remaining=backlog_remaining,
-                     live_processed={"ingested": 0, "rejected": 0, "deferred": 0,
-                                     "pending_this_cycle": True})
+            # A completion immediately frees a shared consumer slot. The old
+            # 70/30 knobs bound each metadata fetch, not an hours-long barrier.
+            from utils.refinery_scheduler import consume_fairly, ProgressLedger
+            ledger = ProgressLedger()
+            totals = ledger.totals
+            cursor = wm.get("live_cursor") or boundary
+            initial_backlog = fetch_pending_metadata(max_id_inclusive=boundary) if BACKLOG_ENABLED else []
+            terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
+            backlog_remaining = sum(r["id"] not in terminal for r in initial_backlog)
 
-            # —— live:按项目调度。历史清空后触发阈值从 200 降到 10；
-            # 两种阶段都保留最长等待兜底，不足阈值不会永久滞留。
+            def refill(kind, attempted):
+                terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
+                excluded = terminal | attempted
+                if kind == "backlog":
+                    if not BACKLOG_ENABLED:
+                        return []
+                    metadata = fetch_pending_metadata(max_id_inclusive=boundary)
+                    ids = select_project_batch(
+                        metadata, excluded, backoff, cycle, BACKLOG_PER_CYCLE,
+                        BACKLOG_DISPATCH_THRESHOLD, MAX_WAIT_SEC, first_seen_at)
+                else:
+                    metadata = fetch_pending_metadata(min_id_exclusive=cursor)
+                    threshold = BACKLOG_DISPATCH_THRESHOLD if backlog_remaining else LIVE_DISPATCH_THRESHOLD
+                    ids = select_project_batch(
+                        metadata, excluded, backoff, cycle, LIVE_PER_CYCLE,
+                        threshold, MAX_WAIT_SEC, first_seen_at)
+                return fetch_rows_by_ids(ids)
+
+            async def consume(kind, row):
+                nonlocal backlog_remaining
+                oid = row["id"]
+                def progress(stats):
+                    nonlocal backlog_remaining
+                    delta = ledger.update(kind, oid, stats)
+                    budget = note_budget(kind, delta)
+                    # Held tasks are excluded from the runnable queue but never
+                    # counted as successful graph ingestion.
+                    terminal_now = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
+                    backlog_remaining = sum(r["id"] not in terminal_now for r in initial_backlog)
+                    snapshot(backlog_processed=totals["backlog"], live_processed=totals["live"],
+                             backlog_remaining=backlog_remaining, budget_today=budget)
+                stats = await process_batch(
+                    [row], wm, cfg, None, decided, backoff, cycle, kind,
+                    quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
+                progress(stats)
+
+            await consume_fairly(
+                refill, consume,
+                can_submit=lambda: can_submit() and not quota_pause.get("reason"),
+                concurrency=INGEST_CONCURRENCY,
+                backlog_weight=int(os.environ.get("KG_HUB_REFINERY_BACKLOG_WEIGHT", "4")),
+                live_weight=int(os.environ.get("KG_HUB_REFINERY_LIVE_WEIGHT", "1")),
+                active_seconds=900)
+            s_back, s_live = totals["backlog"], totals["live"]
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
             for oid in first_seen_at.keys() & terminal:
                 first_seen_at.pop(oid, None)
-            cursor = wm.get("live_cursor") or boundary
-            live_meta = fetch_pending_metadata(min_id_exclusive=cursor)
-            live_threshold = (BACKLOG_DISPATCH_THRESHOLD if backlog_remaining
-                              else LIVE_DISPATCH_THRESHOLD)
-            live_ids = select_project_batch(
-                live_meta, terminal, backoff, cycle, LIVE_PER_CYCLE,
-                live_threshold, MAX_WAIT_SEC, first_seen_at)
-            s_live = await process_batch(
-                fetch_rows_by_ids(live_ids), wm, cfg, None, decided, backoff, cycle, "live",
-                quota_pause=quota_pause, can_submit=can_submit,
-                on_progress=lambda st: snapshot(
-                    live_processed=dict(st), backlog_processed=s_back,
-                    backlog_remaining=backlog_remaining))
             # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
             terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
             new_cursor = cursor
@@ -1290,12 +1300,11 @@ async def main() -> int:
                 wm["live_cursor"] = new_cursor
                 save_watermark(wm)
 
-            # 当日去向累计:每轮每条线只累一次,传的是整批合计。
-            # 放在这里而不是 on_progress 里 —— 那个是按条回调的,会重复累加。
-            note_budget("backlog", s_back)
-            budget = note_budget("live", s_live)
+            # Per-item deltas were booked at completion time, including partial
+            # progress, so do not count the pass a second time here.
             snapshot(live_processed=s_live, backlog_processed=s_back,
-                     backlog_remaining=backlog_remaining, budget_today=budget)
+                     backlog_remaining=backlog_remaining,
+                     budget_today=note_budget("live", {}))
         except Exception as exc:  # noqa: BLE001 — 单轮失败不倒进程
             log.exception("[cycle] failed")
             write_status(last_error=f"{type(exc).__name__}: {exc}")

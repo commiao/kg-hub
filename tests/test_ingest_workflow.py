@@ -126,7 +126,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
                       and n.name == "_optional_checkpointed_add_episode")
             ns = dict(EpisodeType=EpisodeType, GROUP_ID="kg_hub", ENTITY_TYPES=None,
-                      EDGE_TYPES=None, EDGE_TYPE_MAP=None, datetime=datetime)
+                      EDGE_TYPES=None, EDGE_TYPE_MAP=None, datetime=datetime,
+                      _parallel_ingest_enabled=lambda: False)
             exec(compile(ast.Module(body=[fn], type_ignores=[]), "kg_hub_server.py", "exec"), ns)
             body = SimpleNamespace(name="episode", episode_body="content",
                                    source_description="source", source_obs_id="one")
