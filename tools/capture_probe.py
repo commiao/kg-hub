@@ -103,7 +103,7 @@ KNOWN_TOOLS = [
 # OpenClaw 不走 claude-mem：它在 oc-vps 上产 markdown 胶囊，由 Mac 侧
 # sync_openclaw 拉回再入图。所以它是一条独立支线，单独建模。
 OPENCLAW_SYNC_LOG = HOME / ".kg-hub" / "logs" / "openclaw-sync.out.log"
-OPENCLAW_SNAPSHOT = Path("/Users/mac/workspace_claudeCode/kg-hub/data")
+OPENCLAW_SNAPSHOT = Path("/Users/mac/work-ai/kg-hub/data")
 
 # 设备维度：来自 tailscale status。探针只能看清自己所在的那台，
 # 其它设备只报可达性 —— 但"有哪些设备"这个清单必须完整。

@@ -15,7 +15,7 @@ ENVF=${KG_HUB_ENV_FILE:-"$SCRIPT_DIR/../.env"}
 URL=$(grep '^KG_HUB_URL=' "$ENVF" 2>/dev/null | cut -d= -f2- | tr -d '"')
 TOK=$(grep '^KG_HUB_API_TOKEN=' "$ENVF" 2>/dev/null | cut -d= -f2- | tr -d '"')
 DB="$HOME/.claude-mem/claude-mem.db"
-PLOG="$HOME/workspace_claudeCode/kg-hub/data/.push_hook.log"
+PLOG="$HOME/work-ai/kg-hub/data/.push_hook.log"
 CMHOOK='/Users/mac/.claude/plugins/marketplaces/thedotmack/plugin/scripts'
 
 ok() { printf "✅"; }; no() { printf "❌"; }; warn() { printf "🔶"; }

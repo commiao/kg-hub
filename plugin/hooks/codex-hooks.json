@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/workspace_claudeCode/kg-hub/tools/kg_push_hook.py --format codex",
+            "command": "/Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/work-ai/kg-hub/tools/kg_push_hook.py --format codex",
             "timeout": 10,
             "statusMessage": "Loading kg-hub canonical context"
           }

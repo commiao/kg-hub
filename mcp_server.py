@@ -15,14 +15,14 @@ Backend: FalkorDB (Docker container `kg-hub-falkordb`).
     underlying graph object — keeps us provider-agnostic for future migrations.
 
 Launch (stdio mode, for Claude Code / Cursor / Codex):
-    python /Users/mac/workspace_claudeCode/kg-hub/mcp_server.py
+    python /Users/mac/work-ai/kg-hub/mcp_server.py
 
 Settings.json snippet:
     {
       "mcpServers": {
         "kg-hub": {
-          "command": "/Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python",
-          "args": ["/Users/mac/workspace_claudeCode/kg-hub/mcp_server.py"]
+          "command": "/Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python",
+          "args": ["/Users/mac/work-ai/kg-hub/mcp_server.py"]
         }
       }
     }

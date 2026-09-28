@@ -19,7 +19,7 @@ Idempotency:
   IngestedKey node. Hit → 200 OK skip; miss → write + record.
 
 Launch:
-  /Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python kg_hub_server.py
+  /Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python kg_hub_server.py
   # → listens on 0.0.0.0:8080
 """
 
