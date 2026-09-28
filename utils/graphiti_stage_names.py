@@ -18,6 +18,7 @@ def graphiti_model_stage(prompt_name: str | None) -> str | None:
         "extract_edges.edge", "extract_edges.extract_timestamps",
         "extract_edges.extract_timestamps_batch",
         "extract_edges.extract_attributes", "dedupe_edges.resolve_edge",
+        "dedupe_edges.resolve_edge_batch",
     }:
         return "edge_phase"
     if prompt_name in {
