@@ -39,6 +39,27 @@ class TimestampBatchTests(unittest.TestCase):
             self.assertEqual(client.calls[0][1]["prompt_name"], "extract_edges.extract_timestamps_batch")
         asyncio.run(run())
 
+    def test_requests_are_bounded_and_keep_edge_assignment(self):
+        async def run():
+            original_calls = []
+            async def original(*args):
+                original_calls.append(args)
+            batch = _TimestampBatch(original, max_items=2, delay=0)
+            episode = SimpleNamespace(uuid="episode-1", valid_at=datetime(2026, 9, 28, tzinfo=timezone.utc))
+            edges = [SimpleNamespace(fact=f"fact {i}", valid_at=None, invalid_at=None) for i in range(5)]
+            client = FakeClient({"timestamps": [
+                {"index": 0, "valid_at": "2026-09-01T00:00:00Z"},
+                {"index": 1, "valid_at": "2026-09-02T00:00:00Z"},
+            ]})
+            await asyncio.gather(*(batch.extract(client, edge, episode) for edge in edges))
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(original_calls), 1)
+            self.assertEqual(batch.batch_requests, 2)
+            self.assertEqual(batch.batched_edges, 4)
+            self.assertEqual([edge.valid_at.day if edge.valid_at else None for edge in edges],
+                             [1, 2, 1, 2, None])
+        asyncio.run(run())
+
     def test_single_edge_uses_pinned_original(self):
         async def run():
             calls = []

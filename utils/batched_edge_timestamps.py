@@ -3,7 +3,7 @@
 The pinned Graphiti release already ships BatchEdgeTimestamps and its prompt,
 but resolve_extracted_edge still calls the single-fact prompt for every edge.
 Keep the upstream resolver (including duplicate/invalidation behavior) intact.
-Only coalesce timestamp requests which it actually makes.
+Only coalesce timestamp requests which it actually makes, in bounded groups.
 """
 from __future__ import annotations
 
@@ -42,8 +42,9 @@ def _parse_timestamp(value: str | None):
 
 
 class _TimestampBatch:
-    def __init__(self, original, *, delay: float = 0.015):
+    def __init__(self, original, *, max_items: int = 12, delay: float = 0.015):
         self.original = original
+        self.max_items = max(1, max_items)
         self.delay = delay
         self.pending = []
         self.flush_task = None
@@ -70,47 +71,55 @@ class _TimestampBatch:
             raise
         pending, self.pending = self.pending, []
         self.flush_task = None
-        try:
-            if len(pending) == 1:
-                client, edge, episode, _ = pending[0]
-                await self.original(client, edge, episode)
+        for start in range(0, len(pending), self.max_items):
+            chunk = pending[start:start + self.max_items]
+            try:
+                if len(chunk) == 1:
+                    client, edge, episode, _ = chunk[0]
+                    await self.original(client, edge, episode)
+                else:
+                    clients = {id(item[0]) for item in chunk}
+                    episodes = {item[2].uuid for item in chunk}
+                    if len(clients) != 1 or len(episodes) != 1:
+                        raise RuntimeError("timestamp batch mixed clients or episodes")
+                    facts = [
+                        {"index": index, "fact": edge.fact,
+                         "reference_time": episode.valid_at.isoformat()}
+                        for index, (_, edge, episode, _) in enumerate(chunk)
+                    ]
+                    response = await chunk[0][0].generate_response(
+                        prompt_library.extract_edges.extract_timestamps_batch({"facts": facts}),
+                        response_model=_TimestampResponse,
+                        model_size=ModelSize.small,
+                        prompt_name="extract_edges.extract_timestamps_batch",
+                    )
+                    values = _TimestampResponse(**response).timestamps
+                    if [value.index for value in values] != list(range(len(chunk))):
+                        raise RuntimeError("timestamp batch response identity mismatch")
+                    parsed = [(_parse_timestamp(value.valid_at),
+                               _parse_timestamp(value.invalid_at)) for value in values]
+                    # Validate the entire response before mutating any graph object.
+                    for (_, edge, _, _), (valid_at, invalid_at) in zip(chunk, parsed):
+                        if valid_at is not None:
+                            edge.valid_at = valid_at
+                        if invalid_at is not None:
+                            edge.invalid_at = invalid_at
+                    self.batch_requests += 1
+                    self.batched_edges += len(chunk)
+            except BaseException as exc:
+                for _, _, _, done in chunk:
+                    if not done.done():
+                        done.set_exception(exc)
+                for _, _, _, done in pending[start + len(chunk):]:
+                    if not done.done():
+                        done.set_exception(exc)
+                if not isinstance(exc, Exception):
+                    raise
+                return
             else:
-                clients = {id(item[0]) for item in pending}
-                episodes = {item[2].uuid for item in pending}
-                if len(clients) != 1 or len(episodes) != 1:
-                    raise RuntimeError("timestamp batch mixed clients or episodes")
-                facts = [
-                    {"index": index, "fact": edge.fact,
-                     "reference_time": episode.valid_at.isoformat()}
-                    for index, (_, edge, episode, _) in enumerate(pending)
-                ]
-                response = await pending[0][0].generate_response(
-                    prompt_library.extract_edges.extract_timestamps_batch({"facts": facts}),
-                    response_model=_TimestampResponse,
-                    model_size=ModelSize.small,
-                    prompt_name="extract_edges.extract_timestamps_batch",
-                )
-                values = _TimestampResponse(**response).timestamps
-                if [value.index for value in values] != list(range(len(pending))):
-                    raise RuntimeError("timestamp batch response identity mismatch")
-                parsed = [(_parse_timestamp(value.valid_at),
-                           _parse_timestamp(value.invalid_at)) for value in values]
-                self.batch_requests += 1
-                self.batched_edges += len(pending)
-                # Validate the entire response before mutating any graph object.
-                for (_, edge, _, _), (valid_at, invalid_at) in zip(pending, parsed):
-                    if valid_at is not None:
-                        edge.valid_at = valid_at
-                    if invalid_at is not None:
-                        edge.invalid_at = invalid_at
-        except BaseException as exc:
-            for _, _, _, done in pending:
-                if not done.done():
-                    done.set_exception(exc)
-        else:
-            for _, _, _, done in pending:
-                if not done.done():
-                    done.set_result(None)
+                for _, _, _, done in chunk:
+                    if not done.done():
+                        done.set_result(None)
 
 
 def install(sample_percent: int):
