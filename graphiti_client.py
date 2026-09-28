@@ -59,10 +59,12 @@ import copy as _copy  # noqa: E402
 import graphiti_core.utils.maintenance.edge_operations as _edge_ops  # noqa: E402
 import graphiti_core.graphiti as _graphiti_pipeline  # noqa: E402
 from utils.batched_node_attributes import extract_attributes_from_nodes as _batch_attributes  # noqa: E402
+from utils.batched_edge_timestamps import install_batched_edge_timestamp_resolver as _install_edge_timestamp_batch  # noqa: E402
 
 # Graphiti imports this helper into its pipeline module. Bind that actual call
 # site; rebinding node_operations alone leaves add_episode on the old helper.
 _graphiti_pipeline.extract_attributes_from_nodes = _batch_attributes
+_install_edge_timestamp_batch(_graphiti_pipeline, _edge_ops)
 # Durable stage recovery calls the maintenance entry point directly. Keep its
 # original and restored executions on the same batch implementation too.
 from graphiti_core.utils.maintenance import node_operations as _node_ops  # noqa: E402

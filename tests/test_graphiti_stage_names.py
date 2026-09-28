@@ -11,6 +11,7 @@ class GraphitiStageNameTests(unittest.TestCase):
             "extract_edges.edge": "edge_phase",
             "dedupe_edges.resolve_edge": "edge_phase",
             "extract_edges.extract_timestamps": "edge_phase",
+            "extract_edges.extract_timestamps_batch": "edge_phase",
             "extract_nodes.extract_attributes": "attribute_phase",
             "extract_nodes.extract_summaries_batch": "attribute_phase",
         }
