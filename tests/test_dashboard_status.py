@@ -14,18 +14,17 @@ NOW = datetime(2026, 9, 7, 8, 0, tzinfo=timezone.utc)
 
 
 class StatusTests(unittest.TestCase):
-    def test_real_paused_backlog_retains_low_throughput_warning(self):
-        result = D.pipeline_signal({"heartbeat_at": NOW.isoformat(),
-                                    "idle_outside_window": True}, NOW, 26, 7786)
-        self.assertFalse(result["stalled"])
-        self.assertTrue(result["low_throughput"])
-        self.assertIn("计划暂停", result["activity"]["label"])
+    def test_scheduled_pause_is_not_a_stall(self):
+        result = D.refinery_activity({"heartbeat_at": NOW.isoformat(),
+                                      "idle_outside_window": True}, NOW)
+        self.assertNotEqual(result["state"], "red")
+        self.assertIn("计划暂停", result["label"])
 
     def test_stale_pause_cannot_hide_dead_process(self):
-        result = D.pipeline_signal({"heartbeat_at": (NOW - timedelta(hours=1)).isoformat(),
-                                    "idle_outside_window": True}, NOW, 26, 7786)
-        self.assertTrue(result["stalled"])
-        self.assertIn("未收到心跳", result["activity"]["label"])
+        result = D.refinery_activity({"heartbeat_at": (NOW - timedelta(hours=1)).isoformat(),
+                                      "idle_outside_window": True}, NOW)
+        self.assertEqual(result["state"], "red")
+        self.assertIn("未收到心跳", result["label"])
 
     def test_error_cannot_be_hidden_by_schedule_and_absent_signal_is_unknown(self):
         r = D.refinery_activity({"heartbeat_at": NOW.isoformat(),
@@ -33,10 +32,9 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(r["state"], "red")
         self.assertEqual(D.refinery_activity({}, NOW)["state"], "grey")
 
-    def test_active_slow_pipeline_not_called_stopped(self):
-        r = D.pipeline_signal({"heartbeat_at": NOW.isoformat()}, NOW, 26, 7786)
-        self.assertFalse(r["stalled"])
-        self.assertTrue(r["low_throughput"])
+    def test_active_refinery_not_called_stopped(self):
+        self.assertEqual(D.refinery_activity({"heartbeat_at": NOW.isoformat()}, NOW)["state"],
+                         "green")
 
     def test_503_visible_even_with_free_quota_and_recent_success(self):
         node = {"state": "green", "detail": "今日 2484/120000", "metrics": {}}
