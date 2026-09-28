@@ -12,7 +12,7 @@
 - 图内 IngestedKey / Episodic：pending 年龄、错误分类、领取→终态耗时、按日入图量
 - 进程内 `utils.ingest_timing`：写锁排队与抽取耗时拆分
 
-观测条数与模型调用次数是两个单位，只在同一 UTC 日两边都有数时才相除。
+观测条数与模型调用次数是两个单位；调用倍数只拿两个持久计数（网关当日调用、图内当日新增）在同一 UTC 日相除。
 为什么单独成文件：同 topology.py，kg_hub_server.py 常有多方并行改动。
 """
 from __future__ import annotations
@@ -35,6 +35,8 @@ CALLS_PER_OBS_SLOW = 10
 DEFERRED_SHARE_SLOW = 0.2
 ERRORS_24H_SLOW = 10
 ETA_DAYS_SLOW = 30
+# 当日入图太少时比值只反映零点附近的噪声，不给数。
+CALLS_RATIO_MIN_EPISODES = 10
 
 STAGES = (
     ("tools", "工具", "Claude Code / Cursor / Codex 等 + hook 捕获动作"),
@@ -127,7 +129,13 @@ def probe_stages(snapshots: list[dict]) -> dict[str, dict]:
                     and isinstance(metrics.get("nas_max_obs_id"), int):
                 lag = metrics["local_max_obs_id"] - metrics["nas_max_obs_id"]
                 metrics["lag_rows"] = lag
-            sub = f"落差 {lag} 条" if lag is not None else ("异常" if bad else "正常")
+            if lag is None:
+                sub = "异常" if bad else "正常"
+            elif lag < 0:
+                # NAS 副本汇总多台设备的观测，编号可以领先任何一台本机。
+                sub = f"已同步 · NAS 汇总领先本机 {-lag} 条"
+            else:
+                sub = f"落差 {lag} 条"
         out[stage] = {"state": _worst(states), "sub": sub,
                       "detail": "\n".join(lines), "metrics": metrics}
     return out
@@ -281,21 +289,25 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         "backlog_ingested_per_day_7d": backlog_7d,
         "graph_eta_days": graph_eta_days,
         "result_counts": ((budget.get("lines") or {}).get("backlog") or {}).get("result_counts") or {},
-        "budget_day": budget.get("day"),
-        "terminal_today": budget.get("terminal_total"),
     }
 
 
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
-    """同一 UTC 日：网关 kg-hub 调用次数 ÷ refinery 终态观测条数。"""
-    if not gateway_node or digest.get("budget_day") != now.strftime("%Y-%m-%d"):
+    """同一 UTC 日：网关 kg-hub 调用次数 ÷ 图内当日新增 Episode。
+
+    两端都是持久计数。refinery 的当日终态数在它进程内存里，重启即归零，
+    拿它当分母会在每次重启后把倍数放大几百倍。被质量闸拒绝的观测不调模型，
+    失败的抽取调了模型却没入图，所以这个比值就是「每成功入图一条的调用成本」。"""
+    if not gateway_node:
         return None
     from topology import GATEWAY_PRIMARY_KEY
     keys = (gateway_node.get("metrics") or {}).get("keys") or {}
     calls = (keys.get(GATEWAY_PRIMARY_KEY) or {}).get("today")
-    terminal = digest.get("terminal_today")
-    if isinstance(calls, int) and isinstance(terminal, int) and terminal > 0:
-        return round(calls / terminal, 1)
+    today = now.strftime("%Y-%m-%d")
+    row = next((d for d in digest.get("daily") or [] if d.get("day") == today), None)
+    episodes = sum(v for k, v in row.items() if k != "day") if row else 0
+    if isinstance(calls, int) and episodes >= CALLS_RATIO_MIN_EPISODES:
+        return round(calls / episodes, 1)
     return None
 
 
@@ -403,7 +415,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
 
     if isinstance(calls_per_obs, (int, float)) and calls_per_obs >= CALLS_PER_OBS_SLOW:
         add("gateway", "slow", "每条观测模型调用次数高",
-            f"今日约 {calls_per_obs} 次调用 / 条终态观测",
+            f"今日约 {calls_per_obs} 次调用 / 条入图",
             "降低调用倍数：合批抽取、属性合批、减少重试")
     share = digest.get("deferred_share")
     if isinstance(share, (int, float)) and share >= DEFERRED_SHARE_SLOW:
@@ -861,7 +873,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 
 <h2>口径</h2>
 <div class=note>
-「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同，只在同一 UTC 日两边都有数时才相除。<br>
+「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关当日调用 ÷ 图内当日新增，两端都是持久计数、都按 UTC 日，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
@@ -902,7 +914,7 @@ const cards=[
  ['有产出小时',fmt(L.active_hours)+' / 24','每个有产出小时消化 '+fmt(B.rate_per_active_hour)+' 条'],
  ['入图率',B.accept_rate!=null?B.accept_rate+'%':'—','积压终态中进图的比例'],
  ['推迟/重试占比',pct(B.deferred_share),'近 24h 积压推迟 '+fmt(L.backlog_deferred)+' 条'],
- ['调用 / 条观测',fmt(E.calls_per_observation),'今日网关调用 ÷ 今日终态观测'],
+ ['调用 / 条入图',fmt(E.calls_per_observation),'今日网关调用 ÷ 今日图内新增（UTC 日）'],
  ['单条抽取耗时',E.extract_p50!=null?(E.extract_p50+'s'):(E.duration_p50!=null?(E.duration_p50+'s'):'—'),E.extract_p50!=null?('P90 '+fmt(E.extract_p90)+'s · 不含排队'):('领取→终态 P90 '+fmt(E.duration_p90)+'s · 含排队')],
  [(E.queue_label||'排队')+'占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
  ['实时线近 24h',fmt(L.live_ingested),'入图（拒绝 '+fmt(L.live_rejected)+'）'],
