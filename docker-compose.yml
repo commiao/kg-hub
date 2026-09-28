@@ -313,8 +313,8 @@ services:
       # 持续补位池的业务任务并发上限，与服务端并行抽取槽位一致。
       - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-4}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
-      # 工作窗口(北京时间 / Asia/Shanghai, UTC+8): 默认 22:00-08:00，
-      # 跨午夜；温度门控仍可独立暂停整轮处理。
+      # /state/refinery-window.json 是热加载的工作时间正本；文件缺失时
+      # 回退到这两个启动环境变量(默认北京时间 22:00-08:00)。
       - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-22}
       - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)

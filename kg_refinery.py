@@ -17,8 +17,8 @@ NAS(sync_claude_mem_to_nas.sh),此前无消费者(4555 条积压)。本进程:
 
 新旧数据分流:
   live    — id > boundary_id(首轮启动时的 db 最大 id):每轮全量处理,分钟级
-  backlog — id ≤ boundary_id 的历史积压:仅在夜间窗口(22:00-08:00 Asia/Shanghai)
-            每轮限量烧,不与白天真实使用抢 LLM 串行额度
+  backlog — id ≤ boundary_id 的历史积压:按持久工作时间配置处理，
+            与实时任务共用网关额度和温度保护
 
 状态外露:/state/status.json(server 挂同卷 ro,门户「精炼层」卡读它)。
 
@@ -48,6 +48,7 @@ import sqlite3
 import sys
 import threading
 import time
+import refinery_window
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
@@ -263,10 +264,10 @@ LIVE_DISPATCH_THRESHOLD = max(1, int(os.environ.get(
     "KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD", "10")))
 MAX_WAIT_SEC = max(0, int(os.environ.get("KG_HUB_REFINERY_MAX_WAIT_SEC", "900")))
 BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1", "true", "yes")
-# 夜间回填窗口(北京时间 / Asia/Shanghai, UTC+8;含头不含尾;跨午夜写成 start>end)。
-# 默认 22:00-08:00，由环境变量显式覆盖时以覆盖值为准。
+# 配置文件每次准入重读；缺失时按启动环境变量回退到 22:00-08:00。
 BACKLOG_START = int(os.environ.get("KG_HUB_REFINERY_WINDOW_START", "22"))
 BACKLOG_END = int(os.environ.get("KG_HUB_REFINERY_WINDOW_END", "8"))
+WINDOW_CONFIG = STATE_DIR / "refinery-window.json"
 # 旧直连线水印(526 ingested + 2471 rejected)。repo 的 data/ 被 .dockerignore 排除,
 # 容器里拿不到 → 部署时必须把该 json 预置到 refinery-state 卷(见 REFINERY-DESIGN
 # 部署步骤);这里两个位置都找:先 STATE 卷(生产),再 repo(Mac 本地调试)。
@@ -840,15 +841,9 @@ def refresh_envelope_repairs() -> None:
 
 
 def in_backlog_window() -> bool:
-    """工作窗口:refinery 的全部摄入(新 obs + 积压回填)只在此窗口内跑,窗口外
-    完全静默(白天不与真实使用抢 LLM/IO,也避开室温峰值)。默认北京时间 22:00-08:00,
-    可经 env 调(跨午夜按 start>end 处理)。"""
-    h = datetime.now(tz=CST).hour
-    if BACKLOG_START == BACKLOG_END:
-        return False
-    if BACKLOG_START < BACKLOG_END:          # 同日窗口,如 1-5
-        return BACKLOG_START <= h < BACKLOG_END
-    return h >= BACKLOG_START or h < BACKLOG_END   # 跨午夜,如 22-5
+    """Read the persistent schedule each time; old env hours are the fallback."""
+    return refinery_window.is_open(
+        datetime.now(tz=CST).hour, WINDOW_CONFIG, BACKLOG_START, BACKLOG_END)
 
 
 async def heartbeat_loop() -> None:

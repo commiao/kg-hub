@@ -61,7 +61,7 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 - **当前 Phase A 实现（队列策略已更新）**：继续复用 `utils/ingest_filter.py` 的硬门和评分闸；refinery 调用时不启用 Layer3 本地每日观测条数配额。按项目待处理数触发调度：历史积压未清空时阈值 200 条，清空后阈值 10 条；不足阈值的任务由最长等待 900 秒兜底。阈值只决定何时调度，每条观测仍逐条提交 `/api/ingest`；实际模型外呼次数由网关额度限制。
 - 规范化后 POST `/api/ingest`:`name=claude-mem-obs-<id>`(沿用现有命名)、`source_obs_id=content_hash`(表内天然幂等锚)、`sd` 携带 `type=/project=/platform=`(现有 origin 派生正则直接可用)
 - **水印迁移**:导入旧 `data/.ingested.claude_mem.json`(526 ingested + 2471 rejected)为初始状态,防止重复入图
-- **积压回填**(决策④):同一消费者、加 `--backlog` 节流模式(默认仅北京时间 22:00-08:00 跑,LLM 串行限速已有 SEMAPHORE=1+4s 间隔),预计 ~800 条入图,烧数个夜间;进度进日报
+- **积压回填**(决策④):同一消费者按工作窗口处理，当前批准配置为全天；温度、额度、人工断路器仍独立生效。运行配置位于 NAS `/volume2/4T/kg-hub-data/refinery-state/refinery-window.json`，仓库正本为 `config/refinery-window.json`。修改正本后执行 `python3 -m refinery_window apply config/refinery-window.json /volume2/4T/kg-hub-data/refinery-state/refinery-window.json`，原子替换后下一次准入判断即生效，无需重启。
 
 ### 3. Level-0 原始会话摄入(新工具 + OpenClaw)
 - **契约**(刻意最小,两个端点):
@@ -113,7 +113,7 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 
 ## 风险与协调
 1. **另一 kg-hub 会话地盘重叠最高**(ingest/治理②/compose 都是他们刚收拢的):实施前必须 git log+漂移检查+读最新 northstar,理想是把本方案文档 commit 进 `docs/REFINERY-DESIGN.md` 让两会话共识后再动工
-2. LLM 预算:回填+夜间治理都吃百炼额度,全部限速串行+夜间窗口+每日上限,进日报可见
+2. LLM 预算:回填与实时治理共用网关额度；工作时间从持久配置文件读取，网关每日上限与温度门控继续独立生效，进日报可见
 3. 质量闸误杀(historic 18% 接纳率):决策日志留全量,shadow 指标进精炼层看板,阈值 bind-mount 可调
 4. OpenClaw tailer 读 sessions.json/jsonl 含敏感内容:提炼后原文不出 VPS 之外只进 refinery 缓冲,缓冲文件 0600 + 提炼完成即清
 
