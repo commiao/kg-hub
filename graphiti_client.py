@@ -59,6 +59,9 @@ import copy as _copy  # noqa: E402
 import graphiti_core.utils.maintenance.edge_operations as _edge_ops  # noqa: E402
 import graphiti_core.graphiti as _graphiti_pipeline  # noqa: E402
 from utils.batched_node_attributes import extract_attributes_from_nodes as _batch_attributes  # noqa: E402
+from utils.batched_edge_timestamps import install as _install_timestamp_batch  # noqa: E402
+
+_install_timestamp_batch(int(os.environ.get("KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT", "0")))
 
 # Graphiti imports this helper into its pipeline module. Bind that actual call
 # site; rebinding node_operations alone leaves add_episode on the old helper.

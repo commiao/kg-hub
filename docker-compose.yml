@@ -128,6 +128,8 @@ services:
       - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-4}
       # 模型外呼并发保留线上已确认的 2，独立于 4 个业务任务槽位。
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
+      # 时间提取先覆盖稳定哈希命中的 25% episode；对照质量与冲突后再扩大。
+      - KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT=${KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT:-25}
       # 2.0 是线上实际在跑的值 —— 把模型调用速率相对 git 里的 4.0 翻了一倍。
       - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-2.0}
       # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
