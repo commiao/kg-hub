@@ -52,7 +52,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from graphiti_core.driver.falkordb_driver import FalkorDriver  # type: ignore
@@ -70,7 +70,6 @@ from topology import (  # noqa: E402
     breakers_set, breakers_state, dashboard_topology, topology_latest,
     topology_report,
 )
-from dashboard_status import pipeline_signal
 from flow_dashboard import dashboard_flow, dashboard_flow_json  # noqa: E402
 from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
 from utils import ingest_budget  # noqa: E402
@@ -3671,8 +3670,6 @@ PORTAL_REPORTS = [
      "url": "/dashboard/curate", "icon": "🗂", "ready": True},
     {"name": "精炼层", "desc": "统一摄入 refinery:claude-mem 复活线吞吐/积压烧进度 + fact 层质量指标",
      "url": "/dashboard/refinery", "icon": "⚗️", "ready": True},
-    {"name": "采集链路吞吐", "desc": "各环节月/日/时**已完成量**与待处理量;live 线与积压线分开,停滞一眼可见",
-     "url": "/dashboard/pipeline", "icon": "🚰", "ready": True},
     {"name": "积压消化链路", "desc": "工具→claude-mem→refinery→kg-hub→知识图谱:拓扑/用例/流程/架构/应用架构图 + 积压消化速度 + 卡点定位",
      "url": "/dashboard/flow", "icon": "🔀", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
@@ -5201,219 +5198,6 @@ var f=D.fq;document.getElementById('fq').innerHTML='<div class=mc><div class=l>f
 </script></body></html>"""
 
 
-_DASH_PIPELINE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=300>
-<title>kg-hub 采集链路吞吐</title>
-<style>:root{color-scheme:light dark}
-body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:940px;margin:1.5rem auto;padding:0 1rem;background:Canvas;color:CanvasText;line-height:1.6}
-a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
-table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px}
-th,td{border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent);padding:8px 10px;text-align:right}
-th:first-child,td:first-child{text-align:left}
-th{font-size:12px;color:GrayText;font-weight:500}
-td.n{font-family:ui-monospace,Menlo,monospace}
-tr.stall td{background:color-mix(in srgb,#D64545 12%,transparent)}
-.flag{font-size:11px;padding:2px 7px;border-radius:8px;background:#FDEDED;color:#8A1C1C;margin-left:6px}
-.flag.slow{background:#FFF3CD;color:#715500}.activity{font-size:12px;color:GrayText}
-.lbl{font-size:12px;color:GrayText;margin:1.4rem 0 .3rem}
-.row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid color-mix(in srgb,CanvasText 12%,transparent)}
-.nm{width:120px;font-family:ui-monospace,Menlo,monospace;font-size:12px;flex:none}
-.bar{width:170px;height:6px;border-radius:3px;overflow:hidden;background:color-mix(in srgb,CanvasText 10%,transparent);flex:none}
-.bar>i{display:block;height:100%;background:#5B8FF9}
-.ct{font-size:12px;width:56px;text-align:right;flex:none;font-family:ui-monospace,monospace}
-.ts{color:GrayText;font-size:12px}
-.warn{background:#FDEDED;color:#8A1C1C;border-radius:8px;padding:.5rem .8rem;font-size:13px;margin:.6rem 0}
-.note{font-size:12px;color:GrayText;margin:.4rem 0 0}</style></head><body>
-<a class=back href="/portal">← 报表门户</a><h1>采集链路吞吐</h1>
-<div id=warn></div>
-<div class=note id=note></div>
-<table><thead><tr><th>环节 / 当前状态</th><th>本月已完成</th><th>今日已完成</th><th>本小时（UTC）</th><th>待处理</th></tr></thead>
-<tbody id=stages></tbody></table>
-<div class=lbl>入图量 · 按日（最近 14 天，分线）</div><div id=daily></div>
-<div class=lbl>入图量 · 按小时（最近 48 小时，分线）</div><div id=hourly></div>
-<script>
-const D=__DATA__;
-if(D.error){const w=document.getElementById('warn');w.className='warn';w.textContent=D.error}
-document.getElementById('note').textContent=
- '「已完成」= 真正落入知识图的 Episode 数（按 created_at 分桶，UTC）。积压线与 live 线以 refinery 的 boundary_id='
- +(D.boundary_id??'—')+' 划分：obs id ≤ boundary 属积压。快照 '+(D.generated_at||'—')+'。';
-const tb=document.getElementById('stages');
-(D.stages||[]).forEach(s=>{
- const tr=document.createElement('tr');
- if(s.stalled)tr.className='stall';
- const name=document.createElement('td');
- name.textContent=s.name;
- if(s.activity){const a=document.createElement('div');a.className='activity';
-  a.textContent=s.activity.label;name.append(a)}
- if(s.low_throughput){const f=document.createElement('span');f.className='flag slow';
-  f.textContent=s.throughput_note;name.append(f)}
- if(s.pending_note){const p=document.createElement('div');p.className='activity';
-  p.textContent=s.pending_note;name.append(p)}
- tr.append(name);
- ['month','day','hour','pending'].forEach(k=>{
-  const td=document.createElement('td');td.className='n';
-  td.textContent=(s[k]===null||s[k]===undefined)?'—':s[k];tr.append(td)});
- tb.append(tr)});
-function bars(rows,labelKey,target,keep){
- const box=document.getElementById(target);
- const buckets=new Map();
- (rows||[]).forEach(r=>{const k=String(r[labelKey]);
-  if(!buckets.has(k))buckets.set(k,new Map());
-  buckets.get(k).set(String(r.lane),Number(r.count)||0)});
- let labels=[...buckets.keys()].sort().reverse();
- if(keep)labels=labels.slice(0,keep);
- if(!labels.length){const e=document.createElement('div');e.className='ts';
-  e.textContent='暂无数据';box.append(e);return}
- const peak=Math.max(...labels.map(l=>[...buckets.get(l).values()].reduce((a,b)=>a+b,0)),1);
- labels.forEach(l=>{const per=buckets.get(l);
-  const total=[...per.values()].reduce((a,b)=>a+b,0);
-  const row=document.createElement('div');row.className='row';
-  const nm=document.createElement('span');nm.className='nm';nm.textContent=l;
-  const bar=document.createElement('span');bar.className='bar';
-  const fill=document.createElement('i');fill.style.width=Math.max(2,Math.round(total*100/peak))+'%';
-  bar.append(fill);
-  const ct=document.createElement('span');ct.className='ct';ct.textContent=total;
-  const dt=document.createElement('span');dt.className='ts';dt.style.flex='1';
-  dt.textContent=[...per.entries()].sort().map(([k,v])=>k+' '+v).join(' · ');
-  row.append(nm,bar,ct,dt);box.append(row)})}
-bars(D.daily,'bucket','daily',14);
-bars(D.hourly,'bucket','hourly',48);
-</script></body></html>"""
-
-
-async def _latest_topology_metrics() -> dict:
-    """取最新拓扑快照里 Mac→NAS 同步节点的 metrics(两侧 MAX id 与落差)。
-
-    复用 topology._load_snapshots —— 面板与告警必须看同一份数据,自己再查一遍
-    会制造"两个真相"。读不到就返回空,由调用方显示 "—",不猜。
-    """
-    try:
-        from topology import _load_snapshots
-        snapshots = await _load_snapshots()
-    except Exception:  # noqa: BLE001
-        return {}
-
-    def find_sync(node: Any) -> dict | None:
-        if isinstance(node, dict):
-            if node.get("id") == "sync" and isinstance(node.get("metrics"), dict):
-                return node["metrics"]
-            for value in node.values():
-                found = find_sync(value)
-                if found is not None:
-                    return found
-        elif isinstance(node, list):
-            for value in node:
-                found = find_sync(value)
-                if found is not None:
-                    return found
-        return None
-
-    for snapshot in snapshots:
-        payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except (TypeError, ValueError):
-                continue
-        metrics = find_sync(payload if payload is not None else snapshot)
-        if metrics:
-            return metrics
-    return {}
-
-
-async def dashboard_pipeline(request: Request) -> HTMLResponse:
-    """采集链路吞吐:每个环节的月/日/时**已完成量**与**待处理量**。
-
-    为什么必须按环节分「已完成」而不是只看总量:2026-09-06 复盘发现积压
-    `backlog_remaining` 连续 3 天恒为 7919 却无人察觉 —— 因为总入图量在涨(live 线
-    正常)、模型调用量也在涨,任何汇总视图都显示"健康"。只有把 live 线与积压线的
-    **完成量分开**,才看得出「待处理 7919、本月完成 0」这种停滞。
-
-    分线依据:episode 名形如 `claude-mem-obs-<id>`,与 refinery 的 boundary_id 比较
-    即可判定该条属积压线还是 live 线。
-    """
-    driver = get_status_driver()
-    now = datetime.now(tz=timezone.utc)
-    data: dict = {"stages": [], "daily": [], "hourly": [], "error": None,
-                  "boundary_id": None,
-                  "generated_at": now.isoformat(timespec="seconds")}
-
-    status: dict = {}
-    try:
-        sp = Path(os.environ.get("KG_HUB_REFINERY_STATUS",
-                                 "/refinery-state/status.json"))
-        if sp.exists():
-            status = json.loads(sp.read_text())
-    except Exception:  # noqa: BLE001
-        pass
-    boundary = status.get("boundary_id")
-    data["boundary_id"] = boundary
-
-    async def buckets(length: int, floor: str) -> list[dict]:
-        """按 created_at 前缀分桶,并按 boundary 分 live / backlog / 其他源。"""
-        cypher = (
-            "MATCH (n:Episodic) WHERE n.created_at >= $floor "
-            f"WITH n, substring(n.created_at, 0, {length}) AS bucket "
-            "WITH bucket, CASE "
-            "  WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
-            "  WHEN toInteger(substring(n.name, 15)) <= $boundary THEN '积压线' "
-            "  ELSE 'live 线' END AS lane "
-            "RETURN bucket, lane, count(*) AS c ORDER BY bucket"
-        )
-        rows, _, _ = await driver.execute_query(
-            cypher, floor=floor, boundary=int(boundary or 0))
-        return [{"bucket": r.get("bucket"), "lane": r.get("lane"),
-                 "count": int(r.get("c") or 0)} for r in rows]
-
-    try:
-        if boundary is None:
-            raise RuntimeError("refinery status.json 缺 boundary_id")
-        data["hourly"] = await buckets(
-            13, (now - timedelta(hours=48)).strftime("%Y-%m-%dT%H"))
-        data["daily"] = await buckets(
-            10, (now - timedelta(days=14)).strftime("%Y-%m-%d"))
-        month_rows = await buckets(7, now.strftime("%Y-%m"))
-    except Exception as exc:  # noqa: BLE001
-        data["error"] = f"入图量读取失败:{type(exc).__name__}"
-        month_rows = []
-
-    def total(rows: list[dict], lane: str, prefix: str | None = None) -> int:
-        return sum(r["count"] for r in rows
-                   if r["lane"] == lane
-                   and (prefix is None or str(r["bucket"]).startswith(prefix)))
-
-    day_key = now.strftime("%Y-%m-%d")
-    hour_key = now.strftime("%Y-%m-%dT%H")
-    topology = await _latest_topology_metrics()
-    lag = topology.get("lag_rows")
-    nas_max = topology.get("nas_max_obs_id")
-    cursor = status.get("live_cursor")
-    live_pending = (int(nas_max) - int(cursor)
-                    if isinstance(nas_max, int) and isinstance(cursor, int)
-                    and nas_max >= cursor else None)
-
-    for name, lane, pending in (
-        ("Mac→NAS 同步", None, lag),
-        ("入图 · live 线", "live 线", live_pending),
-        ("入图 · 积压线", "积压线", status.get("backlog_remaining")),
-        ("入图 · 其他源", "其他源", None),
-    ):
-        month = total(month_rows, lane) if lane else None
-        day = total(data["daily"], lane, day_key) if lane else None
-        hour = total(data["hourly"], lane, hour_key) if lane else None
-        data["stages"].append({
-            "name": name, "month": month, "day": day, "hour": hour,
-            "pending": pending,
-            **(pipeline_signal(status, now, month, pending)
-               if lane in {"live 线", "积压线"} else {"stalled": False}),
-            "pending_note": ("待处理为 NAS 最大 ID 与扫描游标之差（估算，非精确队列条数）"
-                             if lane == "live 线" else None),
-        })
-
-    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    return HTMLResponse(_DASH_PIPELINE_HTML.replace("__DATA__", payload))
-
-
 _DASH_GATEWAY_USAGE_HTML = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=300>
 <title>kg-hub 模型用量与成本</title>
@@ -5752,7 +5536,9 @@ app = Starlette(
         Route("/dashboard/curate", dashboard_curate, methods=["GET"]),
         Route("/dashboard/refinery", dashboard_refinery, methods=["GET"]),
         Route("/api/gateway-usage", gateway_usage_snapshot, methods=["GET"]),
-        Route("/dashboard/pipeline", dashboard_pipeline, methods=["GET"]),
+        Route("/dashboard/pipeline",
+              lambda request: RedirectResponse("/dashboard/flow", status_code=301),
+              methods=["GET"]),
         Route("/dashboard/tag", dashboard_tag, methods=["POST"]),
         Route("/dashboard/capsule_requeue", capsule_requeue, methods=["POST"]),
         Route("/dashboard/archive_episode", archive_episode, methods=["POST"]),
