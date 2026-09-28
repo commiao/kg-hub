@@ -102,6 +102,34 @@ class StageArtifactStore:
                  hashlib.sha256(payload.encode()).hexdigest()))
             return json.loads(payload)
 
+    def save_batch_or_load(self, task_sd, task_sid, operation_id, input_digest, values):
+        """Atomically fsync immutable read records together, never weaken FULL durability."""
+        if not all((task_sd, task_sid, operation_id, input_digest)) or not values:
+            raise RuntimeError("graphiti batch identity is incomplete")
+        saved = {}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for stage, value in values.items():
+                if not stage:
+                    raise RuntimeError("graphiti batch stage is empty")
+                row = db.execute("SELECT input_digest,artifact_json,artifact_digest "
+                    "FROM graphiti_stage_artifacts WHERE task_sd=? AND task_sid=? "
+                    "AND operation_id=? AND stage=?",
+                    (task_sd, task_sid, operation_id, stage)).fetchone()
+                if row is not None:
+                    if row[0] != input_digest:
+                        raise RuntimeError("graphiti stage input drift")
+                    if hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
+                        raise RuntimeError("graphiti stage artifact corrupted")
+                    saved[stage] = json.loads(row[1])
+                else:
+                    payload = _encoded(value)
+                    db.execute("INSERT INTO graphiti_stage_artifacts VALUES (?,?,?,?,?,?,?)",
+                        (task_sd, task_sid, operation_id, input_digest, stage, payload,
+                         hashlib.sha256(payload.encode()).hexdigest()))
+                    saved[stage] = json.loads(payload)
+        return saved
+
     def locate(self, task_sd: str, task_sid: str, operation_id: str, stage: str):
         """Resolve a saved input digest without guessing a historical operation."""
         with self._connect() as db:
