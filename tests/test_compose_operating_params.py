@@ -30,6 +30,7 @@ COMPOSE = (ROOT / "docker-compose.yml").read_text("utf-8")
 DECIDED = {
     "KG_HUB_REFINERY_MAX_DISK_TEMP": ("59", "用户 2026-09-17 拍板上调；DSM 约 61°C 强制关机"),
     "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "模型外呼并发保持 2；业务任务并发独立设为 4"),
+    "KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT": ("25", "关系时间合批先做 25% 稳定样本对照"),
     "KG_HUB_LLM_MIN_INTERVAL_SEC":   ("2.0", "两次模型调用的最小间隔"),
     "KG_HUB_PREDIGEST":              ("1",  "预消化开关，线上开启"),
     "KG_HUB_REFINERY_DATA_DISK":     ("sata3", "承载数据卷那块盘；仅用于遥测单列一栏，判定仍取 max(全部盘)"),
