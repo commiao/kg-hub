@@ -13,6 +13,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -42,6 +43,20 @@ CLIENT_TIMEOUT_MARGIN_SEC = float(
     os.environ.get("KG_HUB_GATEWAY_CLIENT_TIMEOUT_MARGIN_SEC", "30"))
 MIN_CLIENT_TIMEOUT_SEC = GATEWAY_ROUTE_TIMEOUT_SEC + CLIENT_TIMEOUT_MARGIN_SEC
 _timeout_floor_noted = False
+
+# credvault 的本地准入(每业务并发 / 每分钟)在幂等登记之后、供应商调用之前拒绝,
+# 并当场撤销幂等与见证预占 —— 同一把 Idempotency-Key 重发不会拿到缓存的 429,
+# 也不计费。网关对这两种拒绝只给通用码 cost_limit_exceeded,只能靠原文区分;
+# 请求体/输入/输出超限、日上限用的也是这个码,但等多久都不会好,不能重试。
+# 总等待要远小于 KG_HUB_STUCK_THRESHOLD_MIN(30min):单条观测已能跑到约 25min,
+# 超过阈值的 pending 键会被改成 needs_reconciliation。
+ADMISSION_RETRY_MAX_WAIT_SEC = float(
+    os.environ.get("KG_HUB_GATEWAY_ADMISSION_RETRY_MAX_WAIT_SEC", "120"))
+_ADMISSION_REJECTION_MESSAGES = frozenset({
+    "该业务并发请求已达到本地上限",
+    "该业务每分钟请求数已达到本地上限",
+})
+_ADMISSION_RETRIES_TOTAL = [0]
 
 import breakers
 
@@ -229,6 +244,40 @@ _REPAIRS_TOTAL: dict[str, int] = {}
 # 不把它当成"这条观测有毛病":84 条观测提到 HANDOVER.md,只有其中一两条踩到,
 # 说明是采样噪声而非内容决定 —— 和 5xx 同类,该按 1h 释放而不是锁 24h。
 _OFFSCRIPT_TOTAL = [0]
+
+
+def is_local_admission_rejection(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) != 429:
+        return False
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    return (isinstance(error, dict)
+            and error.get("code") == "cost_limit_exceeded"
+            and error.get("message") in _ADMISSION_REJECTION_MESSAGES)
+
+
+def admission_retries_total() -> int:
+    return _ADMISSION_RETRIES_TOTAL[0]
+
+
+async def _create_with_admission_retry(create, args, kwargs, *,
+                                       max_wait: float | None = None):
+    budget = ADMISSION_RETRY_MAX_WAIT_SEC if max_wait is None else max_wait
+    deadline = time.monotonic() + budget
+    delay = 2.0
+    while True:
+        try:
+            return await create(*args, **kwargs)
+        except Exception as exc:
+            pause = delay * (0.5 + random.random())
+            if (not is_local_admission_rejection(exc)
+                    or time.monotonic() + pause > deadline):
+                raise
+            _ADMISSION_RETRIES_TOTAL[0] += 1
+            logging.getLogger("kg_hub.gateway").warning(
+                "[gateway_admission] %s; retry in %.1fs", exc.body["error"]["message"], pause)
+            await asyncio.sleep(pause)
+            delay = min(delay * 2, 30.0)
 
 
 def offscript_total() -> int:
@@ -605,7 +654,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             wire_token = (_wire_attempt.set((key, step_id))
                           if journal and task else None)
             try:
-                result = await original_create(*args, **kwargs)
+                result = await _create_with_admission_retry(original_create, args, kwargs)
             finally:
                 if wire_token is not None:
                     _wire_attempt.reset(wire_token)
