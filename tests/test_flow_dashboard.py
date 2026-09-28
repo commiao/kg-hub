@@ -288,6 +288,12 @@ class WiringTests(unittest.TestCase):
         portal = SERVER.split("PORTAL_REPORTS =", 1)[1].split("]\n", 1)[0]
         self.assertIn('"url": "/dashboard/flow"', portal)
 
+    def test_retired_pipeline_page_redirects_to_flow(self):
+        portal = SERVER.split("PORTAL_REPORTS =", 1)[1].split("]\n", 1)[0]
+        self.assertNotIn("/dashboard/pipeline", portal)
+        route = SERVER.split('Route("/dashboard/pipeline",', 1)[1].split("methods=", 1)[0]
+        self.assertIn('RedirectResponse("/dashboard/flow", status_code=301)', route)
+
     def test_every_extraction_exit_records_timing(self):
         body = SERVER.split("async def _do_extract_inner", 1)[1].split("\nasync def ", 1)[0]
         for call in ('_record_ingest_timing(started, lock_acquired, extract_finished, "ok")',

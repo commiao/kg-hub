@@ -238,11 +238,3 @@ def refinery_activity(status: dict, now: datetime) -> dict:
     if status.get("quota_paused"):
         return {"state": "red", "label": "配额耗尽，暂停提交"}
     return {"state": "green", "label": "工作窗口内；以入图完成量判断进展"}
-
-
-def pipeline_signal(status: dict, now: datetime, month: int, pending: int | None) -> dict:
-    activity = refinery_activity(status, now)
-    low = isinstance(pending, int) and pending > 0 and month * 100 < pending
-    return {"activity": activity, "stalled": activity["state"] == "red",
-            "low_throughput": low,
-            "throughput_note": "本月已完成量不足待处理量的 1%，消化速度偏低" if low else ""}
