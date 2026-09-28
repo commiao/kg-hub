@@ -645,10 +645,23 @@ async def inspect_graph_commit_materialization(driver, *, episode, nodes,
         raise RuntimeError("unsupported Graphiti version for commit readback")
     if not episode.uuid or not episode.group_id:
         raise RuntimeError("episode identity is incomplete")
-    expected_nodes = {node.uuid: node for node in nodes}
-    expected_edges = {edge.uuid: edge for edge in entity_edges}
-    if len(expected_nodes) != len(nodes) or len(expected_edges) != len(entity_edges):
-        raise RuntimeError("duplicate expected graph identities")
+    expected_nodes = {}
+    for node in nodes:
+        previous = expected_nodes.get(node.uuid)
+        if previous is not None and previous.group_id != node.group_id:
+            raise RuntimeError("conflicting expected graph identities")
+        expected_nodes[node.uuid] = node
+    expected_edges = {}
+    for edge in entity_edges:
+        previous = expected_edges.get(edge.uuid)
+        if previous is not None and (
+                previous.group_id != edge.group_id
+                or previous.source_node_uuid != edge.source_node_uuid
+                or previous.target_node_uuid != edge.target_node_uuid):
+            raise RuntimeError("conflicting expected graph identities")
+        # Graphiti can return one relation as both resolved and invalidated;
+        # expiration may differ, but the graph has only one UUID to read back.
+        expected_edges[edge.uuid] = edge
 
     episode_rows, _, _ = await driver.execute_query(
         "MATCH (e:Episodic {uuid: $uuid}) "

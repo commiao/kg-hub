@@ -78,6 +78,24 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
         driver.missing = "episode"
         self.assertEqual((await inspect())["phase"], "core_absent")
         self.assertTrue(all("RETURN" in query for query in driver.calls))
+        driver.missing = None
+        # Graphiti may emit the same resolved node twice, or emit a relation
+        # both as resolved and invalidated. The graph has one identity in each
+        # case, so the readback must check that identity once.
+        edge_expired = edge.model_copy(update={"expired_at": now})
+        self.assertEqual((await inspect_graph_commit_materialization(
+            driver, episode=episode, nodes=[node, node],
+            entity_edges=[edge, edge_expired]))["phase"], "core_materialized")
+        driver.missing = "edge"
+        self.assertEqual((await inspect_graph_commit_materialization(
+            driver, episode=episode, nodes=[node, node],
+            entity_edges=[edge, edge_expired]))["missing"]["entity_edges"], [edge.uuid])
+        driver.missing = None
+        conflicting = edge.model_copy(update={"target_node_uuid": "other"})
+        with self.assertRaisesRegex(RuntimeError, "conflicting expected graph identities"):
+            await inspect_graph_commit_materialization(
+                driver, episode=episode, nodes=[node],
+                entity_edges=[edge, conflicting])
         with tempfile.TemporaryDirectory() as temp:
             store = StageArtifactStore(Path(temp) / "stages.sqlite3")
             store.begin_graph_commit("source", "sid", "op", "input", expected={
