@@ -43,6 +43,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 线上以 `python kg_hub_server.py` 启动,模块名是 __main__。flow_dashboard / topology
+# 里延迟的 `from kg_hub_server import ...` 否则会再加载一份独立模块:在飞计数恒为 0、
+# 状态库驱动另起一份(2026-09-28 实测看板在飞 0,同时 /health 报 2)。
+if __name__ == "__main__":
+    sys.modules.setdefault("kg_hub_server", sys.modules[__name__])
 
 from kg_hub_env import load_kg_hub_env
 load_kg_hub_env(override=True)

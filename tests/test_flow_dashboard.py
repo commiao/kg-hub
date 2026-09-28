@@ -322,5 +322,32 @@ class TimingTests(unittest.TestCase):
         self.assertIsNone(ingest_timing.summary(window_s=60, now=1000)["wait_share"])
 
 
+class ServerModuleIdentityTests(unittest.TestCase):
+    """`python kg_hub_server.py` 下,看板读到的必须是正在跑的那份在飞计数。"""
+
+    ALIAS = 'if __name__ == "__main__":\n    sys.modules.setdefault("kg_hub_server", sys.modules[__name__])'
+
+    def test_main_module_registers_itself_before_any_definition(self):
+        self.assertIn(self.ALIAS, SERVER)
+        self.assertLess(SERVER.index(self.ALIAS), SERVER.index("\ndef "),
+                        "别名必须在模块顶部登记,延迟 import 才拿得到同一份")
+
+    def test_lazy_import_resolves_to_the_running_main_module(self):
+        import subprocess
+        probe = (
+            "import sys, types\n"
+            f"src = open({str(ROOT / 'kg_hub_server.py')!r}, encoding='utf-8').read()\n"
+            f"start = src.index({self.ALIAS!r})\n"
+            "block = src[start:src.index('\\n\\n', start)]\n"
+            "main = types.ModuleType('__main__'); main.active_extractions = lambda: 7\n"
+            "sys.modules['__main__'] = main\n"
+            "exec(block, {'__name__': '__main__', 'sys': sys})\n"
+            "from kg_hub_server import active_extractions\n"
+            "print(active_extractions())\n")
+        out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                             text=True, timeout=30, cwd="/")
+        self.assertEqual(out.stdout.strip(), "7", out.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
