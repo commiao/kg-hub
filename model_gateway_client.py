@@ -333,6 +333,7 @@ def model_operation(namespace: str, operation_id: str):
             or any(ord(ch) < 0x20 for ch in operation_id)):
         raise RuntimeError("invalid durable model operation identity")
     token = _operation.set((namespace, operation_id))
+    parent_tally = _repairs.get()
     tally: dict[str, int] = {}
     repairs_token = _repairs.set(tally)
     try:
@@ -340,6 +341,9 @@ def model_operation(namespace: str, operation_id: str):
     finally:
         _operation.reset(token)
         _repairs.reset(repairs_token)
+        if parent_tally is not None:
+            for shape, count in tally.items():
+                parent_tally[shape] = parent_tally.get(shape, 0) + count
 
 
 @contextmanager

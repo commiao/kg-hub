@@ -102,7 +102,7 @@ async def finish_optimistic_episode(
     from graphiti_core.graphiti import AddEpisodeResults
     from graphiti_core.nodes import EntityNode
     from graphiti_core.edges import EntityEdge
-    from model_gateway_client import model_operation
+    from model_gateway_client import model_operation, acknowledge_restored_steps
     from utils.graphiti_stage_adapter import (
         resolve_nodes_with_candidate_snapshot, extract_and_resolve_edges_with_snapshot,
         extract_attributes_with_snapshot, commit_episode_with_receipt,
@@ -110,10 +110,25 @@ async def finish_optimistic_episode(
     task_sd, task_sid, operation_id, input_digest = identity
     selected = store.save_or_load(*identity, "parallel_selected_round")
     first = selected["round"] if selected else 0
+    # Human recovery accounts for every completed paid step, including a
+    # proven-stale round. Restoring a prepared commit skips the stage helpers
+    # that normally acknowledge these receipts.
+    def acknowledge_round(round_identity):
+        complete = store.save_or_load(*round_identity, "prepared_commit")
+        if complete is None:
+            raise RuntimeError("completed parallel round receipt missing")
+        acknowledge_restored_steps(complete.get("model_step_ids", []))
+
+    for earlier in range(first):
+        old_identity = (task_sd, task_sid, operation_id + f":graph-round:{earlier}", input_digest)
+        if store.save_or_load(*old_identity, "graph_conflict") is None:
+            raise RuntimeError("selected parallel round lacks prior conflict proof")
+        acknowledge_round(old_identity)
     for round_number in range(first, MAX_ROUNDS):
         round_id = operation_id + f":graph-round:{round_number}"
         round_identity = (task_sd, task_sid, round_id, input_digest)
         if store.save_or_load(*round_identity, "graph_conflict") is not None:
+            acknowledge_round(round_identity)
             continue
         dependencies = ReadDependencies(graphiti.driver, store, round_identity)
         view = dependencies.graphiti_view(graphiti)
@@ -144,11 +159,18 @@ async def finish_optimistic_episode(
             for edge in resolved + invalidated:
                 if edge.fact_embedding is None:
                     await edge.generate_embedding(graphiti.embedder)
+            completed_steps = set()
+            for phase in ("resolved_nodes", "edge_phase", "attribute_phase"):
+                artifact = store.save_or_load(*round_identity, phase)
+                if artifact is not None:
+                    completed_steps.update(artifact.get("model_step_ids", []))
             prepared = store.save_or_load(*round_identity, "prepared_commit", {
                 "nodes": [n.model_dump(mode="json") for n in hydrated],
                 "edges": [e.model_dump(mode="json") for e in resolved + invalidated],
                 "reads": sorted(dependencies.records),
+                "model_step_ids": sorted(completed_steps),
             })
+        acknowledge_round(round_identity)
         if prepared["reads"] != sorted(dependencies.records):
             raise RuntimeError("parallel graph read footprint drift")
         hydrated = [EntityNode.model_validate(n) for n in prepared["nodes"]]
