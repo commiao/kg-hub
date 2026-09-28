@@ -1228,6 +1228,7 @@ async def main() -> int:
 
             # A completion immediately frees a shared consumer slot. The old
             # 70/30 knobs bound each metadata fetch, not an hours-long barrier.
+            # The pool also outlives the cycle: see checkpoint() below.
             from utils.refinery_scheduler import consume_fairly, ProgressLedger
             ledger = ProgressLedger()
             totals = ledger.totals
@@ -1272,28 +1273,53 @@ async def main() -> int:
                     quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
                 progress(stats)
 
+            def advance_cursor():
+                nonlocal cursor
+                terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
+                for oid in first_seen_at.keys() & terminal:
+                    first_seen_at.pop(oid, None)
+                # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
+                new_cursor = cursor
+                for i in fetch_ids(min_id_exclusive=cursor):
+                    if i in terminal:
+                        new_cursor = i
+                    else:
+                        break
+                if new_cursor != cursor:
+                    cursor = new_cursor
+                    wm["live_cursor"] = new_cursor
+                    save_watermark(wm)
+
+            def checkpoint():
+                # 池不再按轮排空,原本轮与轮之间做的事在这里按同一节奏做:
+                # 轮次推进是 409 退避"等 N 轮"的时钟,不推进被推迟的永远不重试。
+                nonlocal cycle, cfg, decision_day
+                cycle += 1
+                refresh_envelope_repairs()
+                if datetime.now(tz=CST).date() != decision_day:
+                    decided.clear()
+                    decision_day = datetime.now(tz=CST).date()
+                cfg = load_config()
+                advance_cursor()
+                snapshot(backlog_processed=totals["backlog"], live_processed=totals["live"],
+                         backlog_remaining=backlog_remaining)
+
+            def pool_can_submit():
+                # 盘温门控原来只在轮首查;池跨轮运行后必须在池内查,过热即排空交回轮首歇工。
+                if not can_submit() or quota_pause.get("reason"):
+                    return False
+                temps = disk_temps()
+                return not temps or max(temps.values()) < MAX_DISK_TEMP
+
             await consume_fairly(
                 refill, consume,
-                can_submit=lambda: can_submit() and not quota_pause.get("reason"),
+                can_submit=pool_can_submit,
                 concurrency=INGEST_CONCURRENCY,
                 backlog_weight=int(os.environ.get("KG_HUB_REFINERY_BACKLOG_WEIGHT", "4")),
                 live_weight=int(os.environ.get("KG_HUB_REFINERY_LIVE_WEIGHT", "1")),
-                active_seconds=900)
+                active_seconds=INTERVAL, checkpoint=checkpoint)
             s_back, s_live = totals["backlog"], totals["live"]
-            terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
-            for oid in first_seen_at.keys() & terminal:
-                first_seen_at.pop(oid, None)
-            # 游标只推进到"连续终态"的最高 id:deferred 挡住游标,下轮重取重试
-            terminal = wm["ingested"] | wm["rejected"] | wm["failed"] | wm["held"]
-            new_cursor = cursor
-            for i in fetch_ids(min_id_exclusive=cursor):
-                if i in terminal:
-                    new_cursor = i
-                else:
-                    break
-            if new_cursor != cursor:
-                wm["live_cursor"] = new_cursor
-                save_watermark(wm)
+            advance_cursor()
 
             # Per-item deltas were booked at completion time, including partial
             # progress, so do not count the pass a second time here.

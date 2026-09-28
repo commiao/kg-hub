@@ -6,9 +6,23 @@ from collections import deque
 import time
 
 
+_IDLE = object()
+
+
 async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                          backlog_weight=4, live_weight=1,
-                         active_seconds=900):
+                         active_seconds=900, checkpoint=None):
+    """Without ``checkpoint`` the pool stops taking work after ``active_seconds``
+    and drains. With it, every ``active_seconds`` the pool runs ``checkpoint()``
+    and keeps going: a deadline followed by a drain leaves slots idle behind the
+    slowest in-flight item (2026-09-28: ~21% of slot time, one item ran 1539s).
+
+    After a checkpoint, rows attempted earlier but no longer in flight may be
+    offered again by ``refill`` — deferred/backed-off rows need that to retry.
+    Idle workers wait for a completion or the next checkpoint instead of
+    exiting while others are still busy; the pool ends once nothing is in
+    flight and nothing is left to take, or ``can_submit()`` turns false.
+    """
     if min(concurrency, backlog_weight, live_weight) < 1 or active_seconds <= 0:
         raise ValueError("positive scheduler bounds required")
     # Spread live slots through the schedule, not one giant backlog phase.
@@ -21,14 +35,28 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
             schedule.append("live"); l += 1
     queues = {kind: deque() for kind in ("backlog", "live")}
     attempted = set()
+    inflight = set()
+    taken = 0
     turn = 0
     stop = False
     deadline = time.monotonic() + active_seconds
+    wake = asyncio.Event()
 
     def take():
-        nonlocal turn
-        if stop or time.monotonic() >= deadline or not can_submit():
+        nonlocal turn, taken, deadline
+        if stop or not can_submit():
             return None
+        if time.monotonic() >= deadline:
+            if checkpoint is None:
+                return None
+            checkpoint()
+            deadline = time.monotonic() + active_seconds
+            attempted.intersection_update(inflight)
+            for queue in queues.values():
+                queue.clear()
+            wake.set()
+            if stop or not can_submit():
+                return None
         preferred = schedule[turn % len(schedule)]
         turn += 1
         for kind in (preferred, "live" if preferred == "backlog" else "backlog"):
@@ -39,8 +67,9 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                 if row["id"] in attempted:
                     continue
                 attempted.add(row["id"])
+                taken += 1
                 return kind, row
-        return None
+        return _IDLE if checkpoint is not None and inflight else None
 
     async def worker():
         nonlocal stop
@@ -49,7 +78,21 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                 item = take()
                 if item is None:
                     return
-                await process(*item)
+                if item is _IDLE:
+                    wake.clear()
+                    try:
+                        await asyncio.wait_for(
+                            wake.wait(), max(0.0, deadline - time.monotonic()) + 0.01)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                kind, row = item
+                inflight.add(row["id"])
+                try:
+                    await process(kind, row)
+                finally:
+                    inflight.discard(row["id"])
+                    wake.set()
                 # Locally filtered rows must not monopolize the event loop.
                 await asyncio.sleep(0)
         except BaseException:
@@ -68,7 +111,7 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
     for result in results:
         if isinstance(result, BaseException):
             raise result
-    return len(attempted)
+    return taken
 
 
 class ProgressLedger:

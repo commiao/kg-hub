@@ -68,6 +68,18 @@ class CycleBudgetTests(unittest.TestCase):
         self.assertNotIn("s_back = await process_batch(", SOURCE)
         self.assertNotIn("s_live = await process_batch(", SOURCE)
 
+    def test_pool_outlives_the_cycle_without_losing_cycle_duties(self):
+        # 行为在 test_refinery_scheduler.RollingPoolTests;这里钉生产入口真的接上了,
+        # 且原来只在轮首做的事(退避时钟、盘温)没有随屏障一起丢掉。
+        self.assertIn("active_seconds=INTERVAL, checkpoint=checkpoint)", SOURCE)
+        self.assertNotIn("active_seconds=900)", SOURCE)
+        body = SOURCE.split("def checkpoint():", 1)[1].split("def pool_can_submit():", 1)[0]
+        for duty in ("cycle += 1", "decided.clear()", "cfg = load_config()", "advance_cursor()"):
+            self.assertIn(duty, body, f"checkpoint 漏了 {duty}")
+        gate = SOURCE.split("def pool_can_submit():", 1)[1].split("await consume_fairly(", 1)[0]
+        self.assertIn("MAX_DISK_TEMP", gate, "池内门控必须查盘温")
+        self.assertIn("can_submit=pool_can_submit", SOURCE)
+
     def test_backlog_is_never_given_less_than_live(self):
         """2026-09-20 用户拍板：维持网关日额度不提，窗口内积压优先于 live。
 
