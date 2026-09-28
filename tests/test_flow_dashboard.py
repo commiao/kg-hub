@@ -171,12 +171,26 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(digest["backlog_ingested_per_day_7d"], 70.0)
         self.assertEqual(digest["graph_eta_days"], 10.0)
 
-    def test_calls_per_observation_requires_the_same_utc_day(self):
+    def test_calls_ratio_uses_todays_graph_episodes_not_refinery_memory(self):
         node = {"metrics": {"keys": {"kg_hub.entity_extract": {"today": 2000}}}}
-        same = {"budget_day": "2026-09-28", "terminal_today": 100}
-        self.assertEqual(F.calls_per_observation(node, same, NOW), 20.0)
-        stale = {"budget_day": "2026-09-27", "terminal_today": 100}
-        self.assertIsNone(F.calls_per_observation(node, stale, NOW))
+        today = {"daily": [{"day": "2026-09-27", "积压线": 500},
+                           {"day": "2026-09-28", "积压线": 60, "live 线": 40}]}
+        self.assertEqual(F.calls_per_observation(node, today, NOW), 20.0)
+        yesterday_only = {"daily": [{"day": "2026-09-27", "积压线": 500}]}
+        self.assertIsNone(F.calls_per_observation(node, yesterday_only, NOW))
+
+    def test_calls_ratio_survives_a_refinery_restart(self):
+        node = {"metrics": {"keys": {"kg_hub.entity_extract": {"today": 3183}}}}
+        budget = {"day": NOW.strftime("%Y-%m-%d"), "terminal_total": 2, "hourly": {}}
+        rows = [{"bucket": NOW.strftime("%Y-%m-%d"), "lane": "live 线", "count": 152}]
+        flow = build(status=status(budget_today=budget), graph_daily=rows,
+                     gateway_node={"state": "green", **node})
+        self.assertEqual(flow["efficiency"]["calls_per_observation"], 20.9)
+
+    def test_calls_ratio_withheld_when_too_few_episodes_today(self):
+        node = {"metrics": {"keys": {"kg_hub.entity_extract": {"today": 90}}}}
+        few = {"daily": [{"day": "2026-09-28", "live 线": 3}]}
+        self.assertIsNone(F.calls_per_observation(node, few, NOW))
 
 
 class HourlyGapTests(unittest.TestCase):
@@ -203,6 +217,14 @@ class StageTests(unittest.TestCase):
         self.assertEqual(stages["sync"]["state"], "grey")
         self.assertEqual(stages["sync"]["metrics"]["lag_rows"], 20)
         self.assertEqual(stages["tools"]["sub"], "无探针快照")
+        self.assertEqual(stages["sync"]["sub"], "落差 20 条")
+
+    def test_nas_ahead_of_one_device_reads_as_synced(self):
+        snap = {"_host": "mac", "nodes": [{"id": "sync", "layer": "transport", "state": "green",
+                "metrics": {"local_max_obs_id": 31772, "nas_max_obs_id": 32593,
+                            "lag_rows": -821}}]}
+        stages = F.probe_stages([snap])
+        self.assertEqual(stages["sync"]["sub"], "已同步 · NAS 汇总领先本机 821 条")
 
     def test_worker_queue_depth_is_surfaced(self):
         snap = {"_host": "mac", "nodes": [{"id": "worker", "layer": "worker", "state": "green",
