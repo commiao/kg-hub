@@ -88,7 +88,7 @@ DOMAIN="gui/$(id -u)"
 LAUNCHD_LIB="${FLEET_OPS_LAUNCHD_LIB:-$HOME/.local/share/fleet-ops/current/platform/darwin/launchd.sh}"
 if [ ! -f "$LAUNCHD_LIB" ]; then
   echo "缺少 fleet-ops 的 launchd 库：$LAUNCHD_LIB" >&2
-  echo "  先装 fleet-ops： sh ~/workspace_claudeCode/fleet-ops/platform/darwin/install.sh" >&2
+  echo "  先装 fleet-ops： sh ~/work-ai/fleet-ops/platform/darwin/install.sh" >&2
   exit 1
 fi
 # shellcheck source=/dev/null
