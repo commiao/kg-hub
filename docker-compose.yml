@@ -130,6 +130,9 @@ services:
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
       # 时间提取先覆盖稳定哈希命中的 25% episode；对照质量与冲突后再扩大。
       - KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT=${KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT:-25}
+      # 关系去重/失效每条观测约 10.6 次外呼，合成一次请求；与时间合批共用哈希分桶，
+      # 先覆盖同一批 25% episode，对照质量后再扩大。
+      - KG_HUB_EDGE_DEDUPE_BATCH_PERCENT=${KG_HUB_EDGE_DEDUPE_BATCH_PERCENT:-25}
       # 2.0 是线上实际在跑的值 —— 把模型调用速率相对 git 里的 4.0 翻了一倍。
       - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-2.0}
       # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
