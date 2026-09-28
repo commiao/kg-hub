@@ -99,6 +99,53 @@ class DedupeBatchTests(unittest.TestCase):
             return client.calls[0][0][-1].content
         self.assertEqual(run(go(["f1", "f2", "f3"])), run(go(["f3", "f1", "f2"])))
 
+    def test_episode_boundary_stabilizes_batches_across_arrival_windows(self):
+        async def go(order):
+            facts = ("f1", "f2", "f3")
+            answers = {f: {"duplicate_facts": [], "contradicted_facts": []}
+                       for f in facts}
+            client = FakeClient(answers)
+            batch = _DedupeBatch(client, limit=2, max_items=12, delay=0)
+            batch.set_expected_edges(facts)
+
+            async def submit(fact, delay):
+                await asyncio.sleep(delay)
+                return await batch.resolve(
+                    resolve_messages(fact, ["x"]), {"prompt_name": RESOLVE_PROMPT},
+                    edge_id=fact)
+
+            results = await asyncio.gather(*(submit(fact, delay) for fact, delay in order))
+            self.assertEqual(results, [answers[fact] for fact, _ in order])
+            self.assertEqual(len(client.calls), 1)
+            return client.calls[0][0][-1].content
+
+        first = run(go([("f1", 0), ("f2", 0.02), ("f3", 0.04)]))
+        replay = run(go([("f3", 0), ("f1", 0.02), ("f2", 0.04)]))
+        self.assertEqual(first, replay)
+
+    def test_episode_boundary_waits_for_resolvers_without_dedupe_prompt(self):
+        async def go():
+            answers = {f: {"duplicate_facts": [], "contradicted_facts": []}
+                       for f in ("f1", "f2")}
+            client = FakeClient(answers)
+            batch = _DedupeBatch(client, limit=2, max_items=12, delay=0)
+            batch.set_expected_edges({"f1", "f2"})
+            async def resolve_requests():
+                return await asyncio.gather(*(batch.resolve(
+                    resolve_messages(f, ["x"]), {"prompt_name": RESOLVE_PROMPT},
+                    edge_id=f) for f in answers))
+
+            # The fast-path/no-candidate edge is outside the set of model calls;
+            # once the two eligible requests arrive, they form a stable batch.
+            pending = asyncio.create_task(resolve_requests())
+            await asyncio.sleep(0)
+            self.assertFalse(client.calls)
+            batch.edge_finished("no-candidates")
+            first, second = await pending
+            self.assertEqual((first, second), (answers["f1"], answers["f2"]))
+            self.assertEqual(len(client.calls), 1)
+        run(go())
+
     def test_single_edge_uses_upstream_prompt_unchanged(self):
         async def go():
             answer = {"duplicate_facts": [], "contradicted_facts": []}
@@ -258,8 +305,11 @@ class Client:
 
 async def fake_resolve(clients, extracted_edges, episode, *a, **k):
     old = EntityEdge(group_id="g", source_node_uuid="s", target_node_uuid="d", name="R", fact="old", created_at=NOW)
-    return await ops.semaphore_gather(*[ops.resolve_extracted_edge(clients.llm_client, e, [old], [], episode)
-                                        for e in extracted_edges])
+    return await ops.semaphore_gather(*[
+        ops.resolve_extracted_edge(clients.llm_client, e,
+                                   [old] if e.fact != "fact 5" else [], [], episode)
+        for e in extracted_edges
+    ])
 
 ops.resolve_extracted_edges = fake_resolve
 batched_edge_timestamps.install(100)

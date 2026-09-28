@@ -42,6 +42,8 @@ class _DedupeResponse(BaseModel):
 
 _batch: contextvars.ContextVar[_DedupeBatch | None] = contextvars.ContextVar(
     "edge_dedupe_batch", default=None)
+_current_edge: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "edge_dedupe_current_edge", default=None)
 log = logging.getLogger("kg_hub.edge_dedupe_batch")
 
 
@@ -77,22 +79,60 @@ class _DedupeBatch:
         self.flush_task = None
         self.batch_requests = 0
         self.batched_edges = 0
+        self.expected_edges = None
+        self.requested_edges = set()
+        self.completed_edges = set()
+        self.failure = None
         self.proxy = _DedupeClient(self)
 
     async def call(self, messages, **kwargs):
         async with self.limit:
             return await self.client.generate_response(messages, **kwargs)
 
-    async def resolve(self, messages, kwargs):
+    def set_expected_edges(self, edge_ids):
+        if self.expected_edges is not None:
+            raise RuntimeError("dedupe batch resolver boundary was set twice")
+        self.expected_edges = set(edge_ids)
+        self._maybe_flush()
+
+    def edge_finished(self, edge_id):
+        if (edge_id in (self.expected_edges or set()) and self.failure is None):
+            self.completed_edges.add(edge_id)
+            self._maybe_flush()
+
+    def abort(self, exc):
+        if self.failure is not None:
+            return
+        self.failure = exc
+        pending, self.pending = self.pending, []
+        for _, _, done in pending:
+            if not done.done():
+                done.set_exception(exc)
+
+    def _maybe_flush(self):
+        resolved = self.requested_edges | self.completed_edges
+        if (self.expected_edges is not None and self.expected_edges <= resolved
+                and self.flush_task is None and self.failure is None):
+            self.flush_task = asyncio.create_task(self._flush())
+
+    async def resolve(self, messages, kwargs, edge_id=None):
+        if self.failure is not None:
+            raise self.failure
         done = asyncio.get_running_loop().create_future()
         self.pending.append((messages, kwargs, done))
-        if self.flush_task is None:
-            self.flush_task = asyncio.create_task(self._flush())
+        if edge_id is not None:
+            self.requested_edges.add(edge_id)
+        if self.expected_edges is None:
+            if self.flush_task is None:
+                self.flush_task = asyncio.create_task(self._flush())
+        else:
+            self._maybe_flush()
         return await done
 
     async def _flush(self):
         try:
-            await asyncio.sleep(self.delay)
+            if self.expected_edges is None:
+                await asyncio.sleep(self.delay)
         except BaseException as exc:
             pending, self.pending = self.pending, []
             self.flush_task = None
@@ -111,6 +151,7 @@ class _DedupeBatch:
             failure = await self._request(chunk)
             if failure is not None:
                 # The episode fails as a whole; do not pay for the rest.
+                self.failure = failure
                 for rest in chunks[position + 1:]:
                     for _, _, done in rest:
                         if not done.done():
@@ -154,6 +195,7 @@ class _DedupeClient:
 
     def __init__(self, batch: _DedupeBatch):
         self._batch = batch
+        self._kg_model_call_limit_managed = True
 
     def __getattr__(self, name):
         return getattr(self._batch.client, name)
@@ -165,7 +207,7 @@ class _DedupeClient:
                   "model_size": model_size, "group_id": group_id,
                   "prompt_name": prompt_name}
         if prompt_name == RESOLVE_PROMPT:
-            return await self._batch.resolve(messages, kwargs)
+            return await self._batch.resolve(messages, kwargs, _current_edge.get())
         return await self._batch.call(messages, **kwargs)
 
 
@@ -196,12 +238,51 @@ def install(sample_percent: int, max_items: int = 12):
         batch = _batch.get()
         if batch is None:
             return await original_resolve_edge(llm_client, *args, **kwargs)
-        return await original_resolve_edge(batch.proxy, *args, **kwargs)
+        edge = kwargs.get("extracted_edge") or args[0]
+        edge_id = id(edge)
+        token = _current_edge.set(edge_id)
+        try:
+            result = await original_resolve_edge(batch.proxy, *args, **kwargs)
+        except BaseException as exc:
+            batch.abort(exc)
+            raise
+        else:
+            batch.edge_finished(edge_id)
+            return result
+        finally:
+            _current_edge.reset(token)
+
+    def pending_dedupe_edge_id(coroutine):
+        frame = getattr(coroutine, "cr_frame", None)
+        if frame is None:
+            return None
+        local = frame.f_locals
+        args = local.get("args", ())
+        kwargs = local.get("kwargs", {})
+        edge = kwargs.get("extracted_edge") or (args[0] if args else None)
+        related = kwargs.get("related_edges")
+        if related is None and len(args) > 1:
+            related = args[1]
+        existing = kwargs.get("existing_edges")
+        if existing is None and len(args) > 2:
+            existing = args[2]
+        if edge is None or not (related or existing):
+            return None
+        normalized_fact = ops._normalize_string_exact(edge.fact)
+        if any(candidate.source_node_uuid == edge.source_node_uuid
+               and candidate.target_node_uuid == edge.target_node_uuid
+               and ops._normalize_string_exact(candidate.fact) == normalized_fact
+               for candidate in (related or [])):
+            return None
+        return id(edge)
 
     async def edge_gather(*coroutines, max_coroutines=None):
-        if (_batch.get() is not None and coroutines and all(
-                getattr(c, "__name__", None) == batched_resolve_edge.__name__
-                for c in coroutines)):
+        batch = _batch.get()
+        is_edge_gather = bool(coroutines) and all(
+            getattr(c, "__name__", None) == batched_resolve_edge.__name__
+            for c in coroutines)
+        if batch is not None and is_edge_gather:
+            batch.set_expected_edges(filter(None, map(pending_dedupe_edge_id, coroutines)))
             max_coroutines = len(coroutines)
         return await original_gather(*coroutines, max_coroutines=max_coroutines)
 
