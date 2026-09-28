@@ -122,6 +122,38 @@ class ParallelCommitTests(unittest.IsolatedAsyncioTestCase):
             for sid in ('a','b'):
                 self.assertIsNotNone(store.save_or_load('source',sid,sid,'input','graph_commit_receipt'))
 
+    async def test_completed_conflict_receipts_are_acknowledged_before_recovery(self):
+        from graphiti_core.nodes import EpisodicNode, EpisodeType
+        import utils.graphiti_stage_adapter as stage
+        from model_gateway_client import _resume, model_operation
+        import model_gateway_client as gateway
+        with tempfile.TemporaryDirectory() as temp:
+            store=StageArtifactStore(Path(temp)/'stage.db');driver=Driver(Graph())
+            g=SimpleNamespace(driver=driver,clients=SimpleNamespace(driver=driver))
+            old=('s','i','o:graph-round:0','d')
+            store.save_or_load(*old,'graph_conflict',{'validated':False})
+            store.save_or_load(*old,'prepared_commit',{'model_step_ids':['old-paid']})
+            now=datetime.now(timezone.utc)
+            episode=EpisodicNode(name='a',group_id='kg_hub',source=EpisodeType.text,
+                                content='x',source_description='s',valid_at=now)
+            async def resume(*args,**kwargs):
+                self.assertEqual(_resume.get()['cached_pending'],set())
+                self.assertEqual(kwargs['operation_id'],'o:graph-round:1')
+                raise RuntimeError('stop before model')
+            token=_resume.set({'cached_pending':{'old-paid'}})
+            try:
+                with patch.object(stage,'resolve_nodes_with_candidate_snapshot',resume):
+                    with self.assertRaisesRegex(RuntimeError,'stop before model'):
+                        await finish_optimistic_episode(g,store=store,identity=('s','i','o','d'),
+                            episode=episode,previous_episodes=[],extracted_nodes=[],node_episode_index_map={},
+                            now=now,entity_types=None,edge_type_map={},group_id='kg_hub',edge_types=None,
+                            custom_extraction_instructions=None)
+            finally:_resume.reset(token)
+        with model_operation('ingest.episode','parent') as parent:
+            with model_operation('ingest.graph-round','child') as child:
+                child['fixed_envelope']=2
+            self.assertEqual(parent,{'fixed_envelope':2})
+
     async def test_failed_model_stage_never_auto_retries(self):
         from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
         import utils.graphiti_stage_adapter as stage
