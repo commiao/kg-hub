@@ -173,10 +173,10 @@ async def gateway_task_correlation_request_hook(request: Any) -> None:
     request.headers["X-Model-Gateway-Step-Id"] = wire_step_id
     local_attempt = _wire_attempt.get()
     if local_attempt:
-        journal = journal_from_backup_env()
+        journal = await asyncio.to_thread(journal_from_backup_env)
         if journal is None:
             raise RuntimeError("gateway wire step has no durable local journal")
-        journal.record_gateway_step(
+        await asyncio.to_thread(journal.record_gateway_step,
             *task, local_attempt[0], wire_step_id, body_digest,
             mailbox_step_id=mailbox_step_id)
 
@@ -525,7 +525,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             kwargs["extra_body"] = extra_body
         key = headers["Idempotency-Key"]
         task = _business_task.get()
-        journal = journal_from_backup_env() if task else None
+        journal = await asyncio.to_thread(journal_from_backup_env) if task else None
         request_digest = ""
         step_id = ""
         if journal and task:
@@ -580,7 +580,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                         await asyncio.sleep(wait)
                     last_call["at"] = time.monotonic()
             if journal and task and not reserved_by_grant:
-                cached_result = journal.prepare(
+                cached_result = await asyncio.to_thread(journal.prepare,
                     key=key, business_key=str(kwargs.get("model") or gateway_model()),
                     source_description=task[0], source_obs_id=task[1],
                     step_id=step_id, request_digest=request_digest,
@@ -601,7 +601,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 # A crash/timeout after this point is one failed business
                 # model attempt once the maximum timeout expires, even when
                 # gateway provider admission remains unknown.
-                journal.start_http(key)
+                await asyncio.to_thread(journal.start_http, key)
             wire_token = (_wire_attempt.set((key, step_id))
                           if journal and task else None)
             try:
@@ -613,7 +613,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             repair_structured_envelopes(result)
             note_offscript_if_missing_tool_use(kwargs, result)
             if journal and prepared:
-                journal.complete(key, result.model_dump_json())
+                await asyncio.to_thread(journal.complete, key, result.model_dump_json())
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
@@ -627,7 +627,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     )
                 except Exception:
                     status = {"phase": "unknown", "provider_call_started": None}
-                reconciliation = journal.update_gateway_status(key, status)
+                reconciliation = await asyncio.to_thread(journal.update_gateway_status, key, status)
                 if reconciliation.provider_call_started is not False:
                     exc = reconciliation
             if not future.done():

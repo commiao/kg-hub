@@ -7,7 +7,10 @@ new model identities apply only to a completed, proven-stale resolution round.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
+import hashlib
+import json
 import logging
 import time
 from types import MethodType
@@ -32,12 +35,19 @@ class ReadDependencies:
         if not callable(getattr(self.graph, "ro_query", None)):
             raise RuntimeError("optimistic extraction requires Falkor read-only queries")
         self.records = {}
+        self._pending = {}
+        self._flush_task = None
+        self._flush_error = None
         with store._connect() as db:
-            stages = [row[0] for row in db.execute(
-                "SELECT stage FROM graphiti_stage_artifacts WHERE task_sd=? AND task_sid=? "
-                "AND operation_id=? AND stage LIKE 'graph_read:%'", identity[:3])]
-        for stage in stages:
-            self.records[stage] = store.save_or_load(*identity, stage)
+            rows = db.execute(
+                "SELECT stage,input_digest,artifact_json,artifact_digest "
+                "FROM graphiti_stage_artifacts WHERE task_sd=? AND task_sid=? "
+                "AND operation_id=? AND stage LIKE 'graph_read:%'", identity[:3]).fetchall()
+        for stage, digest, payload, checksum in rows:
+            if digest != identity[3] or hashlib.sha256(payload.encode()).hexdigest() != checksum:
+                raise RuntimeError("graph read dependency identity/corruption")
+            self.records[stage] = json.loads(payload)
+        self._known_keys = set(self.records)
         if len(self.records) > MAX_READS:
             raise RuntimeError("graph read dependency limit exceeded")
 
@@ -53,18 +63,41 @@ class ReadDependencies:
     async def execute(self, cypher_query_, **kwargs):
         params = _stage_value(kwargs)
         key = "graph_read:" + _stage_digest([cypher_query_, params])
-        if key not in self.records and len(self.records) >= MAX_READS:
+        if key not in self._known_keys and len(self._known_keys) >= MAX_READS:
             raise RuntimeError("graph read dependency limit exceeded")
         result = await self.read(cypher_query_, params)
         record = {"query": cypher_query_, "params": params,
                   "result_digest": _stage_digest(result)}
-        saved = self.store.save_or_load(*self.identity, key, record)
-        if saved != record:
-            # A graph changed during a stage, possibly after a paid call.
-            # Do not silently create a new paid round from an incomplete stage.
+        if self._flush_error is not None:
+            raise self._flush_error
+        saved = self.records.get(key) or self._pending.get(key)
+        if saved is not None and saved != record:
             raise GraphReadConflict("graph changed within an unfinished resolution stage")
-        self.records[key] = saved
+        if key not in self.records:
+            self._known_keys.add(key)
+            self._pending[key] = record
+            if self._flush_task is None:
+                self._flush_task = asyncio.create_task(self._persist_pending())
+            # A read never reaches Graphiti or a paid model before its durable
+            # dependency. Concurrent reads share one FULL synchronous commit.
+            await asyncio.shield(self._flush_task)
         return result
+
+    async def _persist_pending(self):
+        try:
+            await asyncio.sleep(0.005)
+            while self._pending:
+                pending, self._pending = self._pending, {}
+                saved = await asyncio.to_thread(
+                    self.store.save_batch_or_load, *self.identity, pending)
+                if saved != pending:
+                    raise GraphReadConflict("graph changed within an unfinished resolution stage")
+                self.records.update(saved)
+        except BaseException as exc:
+            self._flush_error = exc
+            raise
+        finally:
+            self._flush_task = None
 
     async def validate(self):
         for record in self.records.values():
@@ -130,7 +163,8 @@ async def finish_optimistic_episode(
         if store.save_or_load(*round_identity, "graph_conflict") is not None:
             acknowledge_round(round_identity)
             continue
-        dependencies = ReadDependencies(graphiti.driver, store, round_identity)
+        dependencies = await asyncio.to_thread(
+            ReadDependencies, graphiti.driver, store, round_identity)
         view = dependencies.graphiti_view(graphiti)
         common = dict(store=store, task_sd=task_sd, task_sid=task_sid,
                       operation_id=round_id, input_digest=input_digest)

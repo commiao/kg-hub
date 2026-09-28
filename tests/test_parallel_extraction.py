@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, AsyncMock
@@ -44,6 +45,45 @@ class ReadSetTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await restored.validate())
             with self.assertRaises(GraphReadConflict):
                 await restored.execute('MATCH candidates RETURN version', query='fuzzy terms')
+
+    async def test_slow_disk_batches_reads_without_blocking_network_loop(self):
+        class SlowStore(StageArtifactStore):
+            batches=0
+            def save_batch_or_load(self,*args):
+                time.sleep(.08)
+                result=super().save_batch_or_load(*args)
+                self.batches+=1
+                return result
+        with tempfile.TemporaryDirectory() as temp:
+            store=SlowStore(Path(temp)/'stage.db')
+            reads=ReadDependencies(Driver(Graph()),store,('s','i','o','d'))
+            ticks=0;done=False
+            async def heartbeat():
+                nonlocal ticks
+                while not done:
+                    ticks+=1;await asyncio.sleep(.005)
+            async def query(i):
+                result=await reads.execute('MATCH candidates RETURN version', query=str(i))
+                self.assertGreater(store.batches,0,'read must not return before durable commit')
+                return result
+            task=asyncio.create_task(heartbeat())
+            try:
+                await asyncio.gather(*(query(i) for i in range(12)))
+            finally:
+                done=True;await task
+            self.assertEqual(store.batches,1,'concurrent reads share one fsync')
+            self.assertGreaterEqual(ticks,5,'slow disk must not block event-loop I/O')
+            restored=ReadDependencies(Driver(Graph()),store,('s','i','o','d'))
+            self.assertEqual(len(restored.records),12)
+            await restored.execute('MATCH candidates RETURN version',query='0')
+            self.assertEqual(store.batches,1,'replaying unchanged reads must not fsync again')
+
+    async def test_batch_failure_does_not_publish_partial_dependencies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store=StageArtifactStore(Path(temp)/'stage.db')
+            with self.assertRaises(TypeError):
+                store.save_batch_or_load('s','i','o','d',{'one':{'value':1},'two':object()})
+            self.assertIsNone(store.save_or_load('s','i','o','d','one'))
 
     async def test_readonly_enforced_and_original_driver_never_mutated(self):
         with tempfile.TemporaryDirectory() as temp:
