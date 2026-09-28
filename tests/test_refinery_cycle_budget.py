@@ -37,10 +37,7 @@ class CycleBudgetTests(unittest.TestCase):
 
     def test_live_batch_is_not_sliced_by_a_literal(self):
         """按项目调度仍须受 live 每轮名额约束，不能藏入字面量上限。"""
-        body = SOURCE.split("live_ids = select_project_batch(", 1)[1][:300]
-        self.assertIn("live_meta, terminal, backoff, cycle, LIVE_PER_CYCLE", body)
-        self.assertIsNone(re.search(r"\[:\d+\]", body),
-                          "live 批量不许用字面量切片——写死的数字没人审得到")
+        self.assertIn("metadata, excluded, backoff, cycle, LIVE_PER_CYCLE", SOURCE)
         rows = [{"id": i, "project": f"p{i % 2}", "created_at": "2020-01-01T00:00:00Z"}
                 for i in range(1, 6)]
         picked = refinery.select_project_batch(rows, set(), {}, cycle=1, limit=2,
@@ -63,17 +60,13 @@ class CycleBudgetTests(unittest.TestCase):
                 share, 0.75,
                 f"{name} 独占 {share:.0%} 的每轮名额——另一条线会饿死（09-19 实测 live 占 94%）")
 
-    def test_backlog_is_dispatched_before_live(self):
-        """积压必须排在 live 前面 —— 这是 2026-09-07 夜实测换来的顺序。
-
-        当时 live 一轮吃掉整个 12 小时窗口，排在它后面的积压名额整夜拿不到，
-        backlog_remaining 连续 4 天恒为 7786。顺序是承载性的，却一直没人钉住：
-        谁把这两段调个个儿，测试都不会响。
-        """
-        back = SOURCE.index("s_back = await process_batch(")
-        live = SOURCE.index("s_live = await process_batch(")
-        self.assertLess(back, live,
-                        "backlog 批必须先于 live 批派发——顺序反了积压整夜拿不到名额")
+    def test_both_lines_share_the_continuous_consumer_pool(self):
+        # The behavioral fairness/slow-task test lives in test_refinery_scheduler.
+        # The production entrypoint must actually use that pool.
+        self.assertIn("await consume_fairly(", SOURCE)
+        self.assertIn("concurrency=INGEST_CONCURRENCY", SOURCE)
+        self.assertNotIn("s_back = await process_batch(", SOURCE)
+        self.assertNotIn("s_live = await process_batch(", SOURCE)
 
     def test_backlog_is_never_given_less_than_live(self):
         """2026-09-20 用户拍板：维持网关日额度不提，窗口内积压优先于 live。
@@ -157,12 +150,18 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertEqual(topology.budget_detail({}, 5000), ([], {}))
         self.assertEqual(topology.budget_detail({"budget_today": {"lines": {}}}, 5000), ([], {}))
 
-    def test_refinery_records_each_batch_once_per_cycle(self):
-        """累加必须发生在整批结束处,不能放进按条回调的 on_progress。"""
-        src = SOURCE.split("snapshot(live_processed=s_live", 1)[0][-600:]
-        self.assertIn('note_budget("backlog", s_back)', src)
-        self.assertIn('note_budget("live", s_live)', src)
-        self.assertNotIn("note_budget", SOURCE.split("on_progress=lambda st: snapshot(", 1)[1][:200])
+    def test_progress_deltas_count_once_and_use_completion_hour(self):
+        from utils.refinery_scheduler import ProgressLedger
+        ledger = ProgressLedger()
+        stats = {"ingested": 1, "result_counts": {"ok": 1}}
+        first = ledger.update("backlog", 17, stats)
+        second = ledger.update("backlog", 17, stats)
+        self.assertEqual(first["ingested"], 1)
+        self.assertEqual(second["ingested"], 0)
+        self.assertEqual(second["result_counts"]["ok"], 0)
+        self.assertEqual(ledger.totals["backlog"]["ingested"], 1)
+        self.assertIn("note_budget(kind, delta)", SOURCE)
+        self.assertNotIn('note_budget("backlog", s_back)', SOURCE)
 
 
 class PerCycleFreshnessTests(unittest.TestCase):

@@ -928,6 +928,28 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
     return u
 
 
+_parallel_ingest_slots = asyncio.Semaphore(max(1, min(8, int(
+    os.environ.get("KG_HUB_PARALLEL_TASKS", "4")))))
+
+
+def _parallel_ingest_enabled():
+    from utils.ingest_workflow import current_workflow
+    return (os.environ.get("KG_HUB_PARALLEL_EXTRACTION", "0") == "1"
+            and current_workflow() is not None)
+
+
+@asynccontextmanager
+async def _ingest_execution_lock(*, owner, timeout_seconds):
+    if _parallel_ingest_enabled():
+        # The stage adapter validates its durable read footprint and takes the
+        # shared writer lock only for commit. Legacy continuations lock there.
+        async with _parallel_ingest_slots:
+            yield
+    else:
+        async with async_writer_lock(owner=owner, timeout_seconds=timeout_seconds):
+            yield
+
+
 async def _locked_add_episode(graphiti, name: str, episode_body: str,
                               sd: str, ref_time: datetime,
                               attempt_epoch: str | None = None,
@@ -938,7 +960,7 @@ async def _locked_add_episode(graphiti, name: str, episode_body: str,
     attempt = 0
     while True:
         try:
-            async with async_writer_lock(
+            async with _ingest_execution_lock(
                 owner=f"api_ingest_predigest({name})",
                 timeout_seconds=INGEST_LOCK_TIMEOUT_SEC,
             ):
@@ -976,7 +998,7 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
         return await add_episode_with_stage_checkpoint(
             graphiti, store=workflow["store"], task_sd=task_sd, task_sid=task_sid,
             operation_id=operation_id, relevant_schema_limit=RELEVANT_SCHEMA_LIMIT,
-            **kwargs)
+            parallel=_parallel_ingest_enabled(), **kwargs)
     if os.environ.get("KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT") != "1":
         return await graphiti.add_episode(**kwargs)
     journal = journal_from_backup_env()
@@ -1206,13 +1228,13 @@ async def _do_extract_inner(
         attempt = 0
         while True:
             try:
-                async with async_writer_lock(
+                async with _ingest_execution_lock(
                     owner=f"api_ingest({sd})", timeout_seconds=INGEST_LOCK_TIMEOUT_SEC
                 ):
                     lock_acquired = datetime.now(tz=timezone.utc)
                     logger.info(
-                        "[ingest:lock_acquired] sd=%s sid=%s waited=%.1fs attempt=%d",
-                        sd, sid, (lock_acquired - started).total_seconds(), attempt + 1,
+                        "[ingest:%s] sd=%s sid=%s waited=%.1fs attempt=%d",
+                        "dispatch" if _parallel_ingest_enabled() else "lock_acquired", sd, sid, (lock_acquired - started).total_seconds(), attempt + 1,
                     )
                     operation_id = stable_operation_id(
                         sd, sid, body.name, body.episode_body, epoch
