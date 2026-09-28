@@ -61,7 +61,14 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
 - **当前 Phase A 实现（队列策略已更新）**：继续复用 `utils/ingest_filter.py` 的硬门和评分闸；refinery 调用时不启用 Layer3 本地每日观测条数配额。按项目待处理数触发调度：历史积压未清空时阈值 200 条，清空后阈值 10 条；不足阈值的任务由最长等待 900 秒兜底。阈值只决定何时调度，每条观测仍逐条提交 `/api/ingest`；实际模型外呼次数由网关额度限制。
 - 规范化后 POST `/api/ingest`:`name=claude-mem-obs-<id>`(沿用现有命名)、`source_obs_id=content_hash`(表内天然幂等锚)、`sd` 携带 `type=/project=/platform=`(现有 origin 派生正则直接可用)
 - **水印迁移**:导入旧 `data/.ingested.claude_mem.json`(526 ingested + 2471 rejected)为初始状态,防止重复入图
-- **积压回填**(决策④):同一消费者按工作窗口处理，当前批准配置为全天；温度、额度、人工断路器仍独立生效。运行配置位于 NAS `/volume2/4T/kg-hub-data/refinery-state/refinery-window.json`，仓库正本为 `config/refinery-window.json`。修改正本后执行 `python3 -m refinery_window apply config/refinery-window.json /volume2/4T/kg-hub-data/refinery-state/refinery-window.json`，原子替换后下一次准入判断即生效，无需重启。
+- **积压回填**(决策④):同一消费者按工作窗口处理，当前批准配置为全天；温度、额度、人工断路器仍独立生效。运行配置位于 NAS `/volume2/4T/kg-hub-data/refinery-state/refinery-window.json`，仓库正本为 `config/refinery-window.json`。修改正本并合入主干后，把该固定提交的配置传到 NAS，再用已发布的校验器原子安装；下一次准入判断即生效，无需重启：
+
+  ```sh
+  approved_sha=<已合入主干的提交 SHA>
+  git show "$approved_sha:config/refinery-window.json" > /tmp/refinery-window-approved.json
+  ssh -o BatchMode=yes -o ProxyJump=none commiao@100.123.208.32 'umask 077; cat > /tmp/refinery-window-approved.json' < /tmp/refinery-window-approved.json
+  ssh -o BatchMode=yes -o ProxyJump=none commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && python3 -m refinery_window apply /tmp/refinery-window-approved.json /volume2/4T/kg-hub-data/refinery-state/refinery-window.json && rm /tmp/refinery-window-approved.json'
+  ```
 
 ### 3. Level-0 原始会话摄入(新工具 + OpenClaw)
 - **契约**(刻意最小,两个端点):
