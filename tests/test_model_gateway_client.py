@@ -554,5 +554,116 @@ class GatewayClientContractTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class _GatewayRejection(Exception):
+    """Shape of anthropic.RateLimitError as the gateway returns it."""
+
+    status_code = 429
+
+    def __init__(self, message, code="cost_limit_exceeded"):
+        super().__init__(message)
+        self.body = {"type": "error", "request_id": "req_x",
+                     "error": {"type": "rate_limit_error", "message": message, "code": code}}
+
+
+CONCURRENCY = "该业务并发请求已达到本地上限"
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class GatewayAdmissionRetryTests(unittest.TestCase):
+    def _run(self, coro, clock):
+        fake_time = types.SimpleNamespace(monotonic=clock.monotonic)
+        with mock.patch.object(mgc, "time", fake_time), \
+                mock.patch.object(mgc.asyncio, "sleep", clock.sleep):
+            return asyncio.run(coro)
+
+    def test_admission_rejection_is_retried_with_the_same_idempotency_key(self):
+        class AdmissionMessages:
+            def __init__(self):
+                self.keys = []
+
+            async def create(self, *args, **kwargs):
+                self.keys.append(kwargs["extra_headers"]["Idempotency-Key"])
+                if len(self.keys) < 3:
+                    raise _GatewayRejection(CONCURRENCY)
+                return {"id": "msg-ok"}
+
+        client = FakeClient()
+        client.messages = AdmissionMessages()
+        mgc.install_gateway_request_contract(client)
+        before = mgc.admission_retries_total()
+
+        async def call():
+            with mgc.model_operation("ingest.episode", "admission"):
+                return await client.messages.create(
+                    model="kg_hub.entity_extract",
+                    messages=[{"role": "user", "content": "x"}])
+
+        clock = _FakeClock()
+        self.assertEqual(self._run(call(), clock), {"id": "msg-ok"})
+        self.assertEqual(len(client.messages.keys), 3)
+        self.assertEqual(len(set(client.messages.keys)), 1)
+        self.assertEqual(mgc.admission_retries_total() - before, 2)
+        self.assertEqual(len(clock.sleeps), 2)
+        self.assertTrue(1.0 <= clock.sleeps[0] <= 3.0, clock.sleeps)
+        self.assertTrue(2.0 <= clock.sleeps[1] <= 6.0, clock.sleeps)
+
+    def test_limits_that_waiting_cannot_fix_are_not_retried(self):
+        for message, code in [
+            ("该业务每日请求数已达到本地上限", "cost_limit_exceeded"),
+            ("模型输入超过该业务的本地成本上限", "cost_limit_exceeded"),
+            ("共享套餐每日请求额度已用完", "package_quota_exhausted"),
+            (CONCURRENCY, "rate_limit_exceeded"),
+        ]:
+            calls = []
+
+            async def create(*args, **kwargs):
+                calls.append(1)
+                raise _GatewayRejection(message, code)
+
+            clock = _FakeClock()
+            with self.subTest(message=message, code=code), \
+                    self.assertRaises(_GatewayRejection):
+                self._run(mgc._create_with_admission_retry(create, (), {}, max_wait=600), clock)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(clock.sleeps, [])
+
+    def test_other_status_codes_with_the_same_message_are_not_retried(self):
+        rejection = _GatewayRejection(CONCURRENCY)
+        rejection.status_code = 503
+        self.assertFalse(mgc.is_local_admission_rejection(rejection))
+        self.assertFalse(mgc.is_local_admission_rejection(RuntimeError(CONCURRENCY)))
+        self.assertTrue(mgc.is_local_admission_rejection(
+            _GatewayRejection("该业务每分钟请求数已达到本地上限")))
+
+    def test_retry_gives_up_within_the_wait_budget(self):
+        calls = []
+
+        async def create(*args, **kwargs):
+            calls.append(1)
+            raise _GatewayRejection(CONCURRENCY)
+
+        clock = _FakeClock()
+        with self.assertRaises(_GatewayRejection):
+            self._run(mgc._create_with_admission_retry(create, (), {}, max_wait=60), clock)
+        self.assertGreater(len(calls), 2)
+        self.assertLessEqual(sum(clock.sleeps), 60)
+        self.assertLessEqual(max(clock.sleeps), 30.0 * 1.5)
+
+    def test_default_budget_stays_well_below_stuck_claim_threshold(self):
+        self.assertLess(mgc.ADMISSION_RETRY_MAX_WAIT_SEC, 30 * 60 / 4)
+
+
 if __name__ == "__main__":
     unittest.main()
