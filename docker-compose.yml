@@ -122,11 +122,11 @@ services:
       - HF_HUB_OFFLINE=1
       # Durable backup of every /api/ingest episode body (survives graph loss).
       - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
-      # 4 条业务任务可并行预抽取；图读集校验和最终提交共用短写锁。
-      # 模型外呼仍受独立的并发和间隔限制，不能用任务数替代模型调用数。
+      # 并行预抽取在写锁外执行，提交时仍校验图读集。
       - KG_HUB_PARALLEL_EXTRACTION=${KG_HUB_PARALLEL_EXTRACTION:-1}
-      - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-4}
-      # 模型外呼并发保留线上已确认的 2，独立于 4 个业务任务槽位。
+      # 业务任务从 4 小步提到 6：关系合批已在 25% 样本命中；按成功吞吐与冲突率验收。
+      - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-6}
+      # 模型外呼并发保持 2，不随业务任务槽位一起上调。
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
       # 时间提取先覆盖稳定哈希命中的 25% episode；对照质量与冲突后再扩大。
       - KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT=${KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT:-25}
@@ -316,7 +316,8 @@ services:
       - KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD=${KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD:-10}
       - KG_HUB_REFINERY_MAX_WAIT_SEC=${KG_HUB_REFINERY_MAX_WAIT_SEC:-900}
       # 持续补位池的业务任务并发上限，与服务端并行抽取槽位一致。
-      - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-4}
+      # 上游也开 6 条并发请求，确保服务端 6 个任务槽位能够补满。
+      - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-6}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
       # /state/refinery-window.json 是热加载的工作时间正本；文件缺失时
       # 回退到这两个启动环境变量(默认北京时间 22:00-08:00)。

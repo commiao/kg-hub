@@ -29,7 +29,9 @@ COMPOSE = (ROOT / "docker-compose.yml").read_text("utf-8")
 # 值 → 这个值是怎么定下来的。没有出处的数字迟早被人当成手滑改掉。
 DECIDED = {
     "KG_HUB_REFINERY_MAX_DISK_TEMP": ("59", "用户 2026-09-17 拍板上调；DSM 约 61°C 强制关机"),
-    "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "模型外呼并发保持 2；业务任务并发独立设为 4"),
+    "KG_HUB_PARALLEL_TASKS":        ("6",  "关系阶段合批后小步提高业务任务槽位，按吞吐与冲突率验收"),
+    "KG_HUB_REFINERY_INGEST_CONCURRENCY": ("6", "上游并发请求与服务端业务任务槽位匹配"),
+    "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "模型外呼并发保持 2；业务任务槽位独立设为 6"),
     "KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT": ("25", "关系时间合批先做 25% 稳定样本对照"),
     "KG_HUB_EDGE_DEDUPE_BATCH_PERCENT": ("25", "关系去重合批与时间合批同一批 25% 样本对照"),
     "KG_HUB_LLM_MIN_INTERVAL_SEC":   ("2.0", "两次模型调用的最小间隔"),
