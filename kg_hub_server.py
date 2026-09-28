@@ -71,8 +71,10 @@ from topology import (  # noqa: E402
     topology_report,
 )
 from dashboard_status import pipeline_signal
+from flow_dashboard import dashboard_flow, dashboard_flow_json  # noqa: E402
 from monitor_topology import dashboard_monitor, monitor_status  # noqa: E402
 from utils import ingest_budget  # noqa: E402
+from utils import ingest_timing  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
@@ -1166,6 +1168,19 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
     return True
 
 
+def _record_ingest_timing(started: datetime, lock_acquired: datetime | None,
+                          extract_finished: datetime | None, outcome: str) -> None:
+    now = datetime.now(tz=timezone.utc)
+    try:
+        ingest_timing.record(
+            waited_s=((lock_acquired or now) - started).total_seconds(),
+            extract_s=(((extract_finished or now) - lock_acquired).total_seconds()
+                       if lock_acquired is not None else None),
+            outcome=outcome, parallel=_parallel_ingest_enabled())
+    except Exception:  # noqa: BLE001 — 计时只供看板，绝不影响抽取结果
+        pass
+
+
 async def _do_extract_inner(
     graphiti,
     body: IngestBody,
@@ -1223,6 +1238,8 @@ async def _do_extract_inner(
     # add_episode 抛出去了,外层 except 仍拿得到这一份(准则 23:分类信息要跟着数据
     # 走到做判断的那一侧)。
     model_tally: dict[str, int] = {}
+    lock_acquired: datetime | None = None
+    extract_finished: datetime | None = None
     try:
         result = None
         attempt = 0
@@ -1245,6 +1262,7 @@ async def _do_extract_inner(
                             result = await _optional_checkpointed_add_episode(
                                 graphiti, body.name, body.episode_body, sd, ref_time,
                                 operation_id, sd, sid)
+                            extract_finished = datetime.now(tz=timezone.utc)
                 break  # lock acquired + extraction completed
             except WriterLockBusy:
                 attempt += 1
@@ -1266,6 +1284,7 @@ async def _do_extract_inner(
                         "reason=lock_timeout_exhausted attempts=%d",
                         sd, sid, elapsed, attempt,
                     )
+                    _record_ingest_timing(started, None, None, "lock_timeout")
                     return
                 backoff = INGEST_LOCK_BACKOFF_SEC * attempt  # linear backoff
                 logger.warning(
@@ -1303,12 +1322,14 @@ async def _do_extract_inner(
             graphiti, sd, sid, "ok",
             episode_uuid=episode_uuid, nodes=nodes, edges=edges,
         )
+        _record_ingest_timing(started, lock_acquired, extract_finished, "ok")
         elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
         logger.info(
             "[ingest:done] sd=%s sid=%s uuid=%s elapsed=%.1fs nodes=%d edges=%d",
             sd, sid, episode_uuid, elapsed, nodes, edges,
         )
     except Exception as exc:  # noqa: BLE001
+        _record_ingest_timing(started, lock_acquired, extract_finished, "error")
         try:
             await update_ingested_key_status(
                 graphiti, sd, sid,
@@ -3652,6 +3673,8 @@ PORTAL_REPORTS = [
      "url": "/dashboard/refinery", "icon": "⚗️", "ready": True},
     {"name": "采集链路吞吐", "desc": "各环节月/日/时**已完成量**与待处理量;live 线与积压线分开,停滞一眼可见",
      "url": "/dashboard/pipeline", "icon": "🚰", "ready": True},
+    {"name": "积压消化链路", "desc": "工具→claude-mem→refinery→kg-hub→知识图谱:拓扑/用例/流程/架构/应用架构图 + 积压消化速度 + 卡点定位",
+     "url": "/dashboard/flow", "icon": "🔀", "ready": True},
     {"name": "运营反馈", "desc": "录入文章阅读/点赞/涨粉,写回知识库(真实 outcome)",
      "url": "/dashboard/feedback", "icon": "📣", "ready": True},
     {"name": "反馈待办", "desc": "自动列出需你拍板的:待分层(AI已建议)+待补运营数据",
@@ -5743,6 +5766,8 @@ app = Starlette(
         Route("/dashboard/usage_feedback_resolve", usage_feedback_resolve, methods=["POST"]),
         Route("/dashboard/usage_feedback_undo", usage_feedback_undo, methods=["POST"]),
         Route("/dashboard/topology", dashboard_topology, methods=["GET"]),
+        Route("/dashboard/flow", dashboard_flow, methods=["GET"]),
+        Route("/dashboard/flow.json", dashboard_flow_json, methods=["GET"]),
         Route("/dashboard/breakers", breakers_state, methods=["GET"]),
         Route("/dashboard/breaker", breakers_set, methods=["POST"]),
         Route("/api/topology/report", topology_report, methods=["POST"]),
