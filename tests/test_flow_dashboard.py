@@ -73,6 +73,15 @@ class BottleneckTests(unittest.TestCase):
         self.assertEqual(flow["primary"]["title"], "写锁排队是主要耗时")
         self.assertNotIn("单条抽取耗时高", titles(flow))
 
+    def test_parallel_mode_queue_is_slot_wait_not_writer_lock(self):
+        flow = build(timing={"samples": 20, "wait_share": 0.7, "wait_p50": 300.0,
+                             "extract_p50": 90.0, "extract_p90": 200.0, "parallel": True})
+        self.assertEqual(flow["primary"]["title"], "并发槽位排队是主要耗时")
+        self.assertNotIn("写锁排队是主要耗时", titles(flow))
+        self.assertEqual(flow["efficiency"]["queue_label"], "槽位排队")
+        kghub = next(s for s in flow["stages"] if s["id"] == "kghub")
+        self.assertIn("槽位排队 P50", kghub["detail"])
+
     def test_among_slow_items_the_cause_outranks_error_count_and_eta(self):
         keys = {"by_status": {"ok": 10}, "pending": 0, "pending_oldest_s": None,
                 "errors_24h": {"upstream_error": 30}, "duration_p50": 30.0,

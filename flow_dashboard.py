@@ -41,14 +41,14 @@ STAGES = (
     ("claude_mem", "claude-mem", "worker 用 LLM 提炼 observation，写入 SQLite"),
     ("sync", "Mac→NAS 同步", "launchd 每 15 分钟把 db 同步到 NAS 副本"),
     ("refinery", "refinery", "质量过滤 + 积压/实时调度 + 逐条提交入图"),
-    ("kghub", "kg-hub", "幂等领取 → 写锁 → graphiti 多轮抽取实体/关系"),
+    ("kghub", "kg-hub", "幂等领取 → 并发槽位 → 锁外多轮抽取 → 短写锁提交"),
     ("gateway", "模型网关", "credvault 额度/限流/熔断 → 百炼"),
     ("graph", "知识图谱", "FalkorDB：Episode / 实体 / 关系"),
 )
 
 SEVERITY_RANK = {"stop": 0, "slow": 1}
 # 同为慢流时按对吞吐的影响排：原因在前，「清空要很久」是这些原因的结果，排最后。
-SLOW_IMPACT_ORDER = ("写锁排队是主要耗时", "单条抽取耗时高", "单条入图耗时高",
+SLOW_IMPACT_ORDER = ("写锁排队是主要耗时", "并发槽位排队是主要耗时", "单条抽取耗时高", "单条入图耗时高",
                      "每条观测模型调用次数高", "推迟/重试占比高", "每天真正干活的小时数少",
                      "近 24h 抽取失败偏多", "今日额度接近上限", "Mac→NAS 同步落后",
                      "按当前速度清空积压需要很久")
@@ -177,11 +177,11 @@ def kghub_stage(keys: dict | None, timing: dict, active: int | None) -> dict:
               f"领取→终态耗时 P50 {keys.get('duration_p50')}s · P90 {keys.get('duration_p90')}s"
               f"（近 24h {keys.get('duration_samples', 0)} 条成功）"]
     if timing.get("samples"):
-        detail.append(f"写锁排队 P50 {timing.get('wait_p50')}s / P90 {timing.get('wait_p90')}s；"
+        detail.append(f"{_queue_label(timing)} P50 {timing.get('wait_p50')}s / P90 {timing.get('wait_p90')}s；"
                       f"抽取 P50 {timing.get('extract_p50')}s / P90 {timing.get('extract_p90')}s；"
                       f"排队占比 {_share(timing.get('wait_share'))}（本进程 {timing['samples']} 条样本）")
     else:
-        detail.append("写锁/抽取耗时拆分：本进程启动后尚无样本")
+        detail.append("排队/抽取耗时拆分：本进程启动后尚无样本")
     return {"state": state, "sub": sub, "detail": "\n".join(detail),
             "metrics": {"keys": keys, "timing": timing, "active_extractions": active}}
 
@@ -379,10 +379,17 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
     if timing.get("samples", 0) >= 5:
         share = timing.get("wait_share")
         if isinstance(share, (int, float)) and share >= LOCK_WAIT_SHARE_SLOW:
-            add("kghub", "slow", "写锁排队是主要耗时",
-                f"排队占 {_share(share)}；排队 P50 {timing.get('wait_p50')}s，"
-                f"抽取 P50 {timing.get('extract_p50')}s",
-                "把模型抽取移出写锁（吞吐方案 P3）；在此之前加并发只会拉长锁队列")
+            if timing.get("parallel"):
+                add("kghub", "slow", "并发槽位排队是主要耗时",
+                    f"等槽位占 {_share(share)}；排队 P50 {timing.get('wait_p50')}s，"
+                    f"抽取+提交 P50 {timing.get('extract_p50')}s",
+                    "槽位一直满载，吞吐由单条耗时决定：先压单条调用次数与冲突重算；"
+                    "加槽位前确认网关并发上限")
+            else:
+                add("kghub", "slow", "写锁排队是主要耗时",
+                    f"排队占 {_share(share)}；排队 P50 {timing.get('wait_p50')}s，"
+                    f"抽取 P50 {timing.get('extract_p50')}s",
+                    "把模型抽取移出写锁（KG_HUB_PARALLEL_EXTRACTION）；在此之前加并发只会拉长锁队列")
         extract_p50 = timing.get("extract_p50")
         if isinstance(extract_p50, (int, float)) and extract_p50 >= EXTRACT_P50_SLOW_S:
             add("kghub", "slow", "单条抽取耗时高",
@@ -391,7 +398,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
     elif keys is not None and isinstance(keys.get("duration_p50"), (int, float)) \
             and keys["duration_p50"] >= EXTRACT_P50_SLOW_S:
         add("kghub", "slow", "单条入图耗时高",
-            f"领取→终态 P50 {keys['duration_p50']}s / P90 {keys.get('duration_p90')}s（含写锁排队）",
+            f"领取→终态 P50 {keys['duration_p50']}s / P90 {keys.get('duration_p90')}s（含排队）",
             "graphiti 每条观测多轮调用；合批联合抽取（吞吐方案 P2）")
 
     if isinstance(calls_per_obs, (int, float)) and calls_per_obs >= CALLS_PER_OBS_SLOW:
@@ -419,12 +426,17 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         elif isinstance(eta, (int, float)) and eta > ETA_DAYS_SLOW:
             add("kghub", "slow", "按当前速度清空积压需要很久",
                 f"剩余 {remaining} 条，预计约 {eta} 天",
-                "结构性瓶颈：单条调用倍数 × 写锁串行；需要合批抽取与锁外抽取")
+                "结构性瓶颈在单条耗时 × 并发数：先看上面的慢流项，合批抽取降低调用倍数")
 
     found.sort(key=lambda b: (SEVERITY_RANK[b["level"]], b["deliberate"],
                               SLOW_IMPACT_ORDER.index(b["title"])
                               if b["title"] in SLOW_IMPACT_ORDER else len(SLOW_IMPACT_ORDER)))
     return found
+
+
+def _queue_label(timing: dict) -> str:
+    """并行抽取下 _ingest_execution_lock 取的是并发槽位，写锁只在提交时短暂持有。"""
+    return "槽位排队" if timing.get("parallel") else "写锁排队"
 
 
 def _human(seconds: object) -> str:
@@ -542,10 +554,12 @@ FLOW_MERMAID = """flowchart TD
   P --> K{"IngestedKey"}
   K -->|已 ok| SKIP["skipped"]
   K -->|error 键| E409["409 → 指数退避"]
-  K -->|新领取| L["排队等写锁"]
-  L --> G["graphiti.add_episode：抽实体 / 去重 / 抽边 / 属性 / 摘要"]
+  K -->|新领取| L["排队等并发槽位（串行模式：写锁）"]
+  L --> G["锁外抽取：实体 / 去重 / 抽边 / 属性 / 摘要"]
   G --> GW["每步经模型网关调 LLM"]
-  GW -->|成功| OK["写入 FalkorDB · 键=ok · 水印 ingested"]
+  GW -->|成功| CM{"短写锁提交：读集冲突？"}
+  CM -->|冲突| G
+  CM -->|无冲突| OK["写入 FalkorDB · 键=ok · 水印 ingested"]
   GW -->|额度/限流/5xx| PAUSE["键=error · refinery 整体暂停"]
   GW -->|结果未知| REC["needs_reconciliation · 禁止自动重放"]
 """
@@ -561,7 +575,7 @@ ARCH_MERMAID = """flowchart TB
     R1["窗口 / 温度 / 断路 / 恢复门控"] --> R2["按项目调度 积压 : 实时"] --> R3["ingest_filter 质量闸"] --> R4["提交 + 轮询终态"]
   end
   subgraph L4["服务层 · kg_hub_server"]
-    K1["/api/ingest 幂等领取"] --> K2["写锁"] --> K3["graphiti 抽取"]
+    K1["/api/ingest 幂等领取"] --> K2["并发槽位"] --> K3["graphiti 锁外抽取"] --> K4["短写锁提交 · 冲突重算"]
   end
   subgraph L5["模型层 · credvault"]
     G1["模型网关：共享日额度 / RPM / 幂等 / 熔断"] --> G2["百炼 qwen"]
@@ -579,7 +593,7 @@ ARCH_MERMAID = """flowchart TB
   R4 --> K1
   K3 --> G1
   W -. 提炼 observation .-> G1
-  K3 --> F
+  K4 --> F
   F --> U1
   F --> U2
 """
@@ -659,6 +673,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
         "wait_p50": timing.get("wait_p50"),
         "wait_share": timing.get("wait_share"),
         "timing_samples": timing.get("samples", 0),
+        "queue_label": _queue_label(timing),
         "duration_p50": (keys or {}).get("duration_p50"),
         "duration_p90": (keys or {}).get("duration_p90"),
     }
@@ -847,7 +862,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <h2>口径</h2>
 <div class=note>
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同，只在同一 UTC 日两边都有数时才相除。<br>
-写锁排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
+排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
@@ -889,7 +904,7 @@ const cards=[
  ['推迟/重试占比',pct(B.deferred_share),'近 24h 积压推迟 '+fmt(L.backlog_deferred)+' 条'],
  ['调用 / 条观测',fmt(E.calls_per_observation),'今日网关调用 ÷ 今日终态观测'],
  ['单条抽取耗时',E.extract_p50!=null?(E.extract_p50+'s'):(E.duration_p50!=null?(E.duration_p50+'s'):'—'),E.extract_p50!=null?('P90 '+fmt(E.extract_p90)+'s · 不含排队'):('领取→终态 P90 '+fmt(E.duration_p90)+'s · 含排队')],
- ['写锁排队占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
+ [(E.queue_label||'排队')+'占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
  ['实时线近 24h',fmt(L.live_ingested),'入图（拒绝 '+fmt(L.live_rejected)+'）'],
 ];
 $('bcards').innerHTML=cards.map(c=>'<div class=mc><div class=l>'+c[0]+'</div><div class=v>'+c[1]+'</div><div class=s>'+esc(c[2])+'</div></div>').join('');
