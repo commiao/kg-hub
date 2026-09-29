@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
 import time
 
 
@@ -11,7 +11,7 @@ _IDLE = object()
 
 async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                          backlog_weight=4, live_weight=1,
-                         active_seconds=900, checkpoint=None):
+                         active_seconds=900, checkpoint=None, group_of=None):
     """Without ``checkpoint`` the pool stops taking work after ``active_seconds``
     and drains. With it, every ``active_seconds`` the pool runs ``checkpoint()``
     and keeps going: a deadline followed by a drain leaves slots idle behind the
@@ -22,6 +22,14 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
     Idle workers wait for a completion or the next checkpoint instead of
     exiting while others are still busy; the pool ends once nothing is in
     flight and nothing is left to take, or ``can_submit()`` turns false.
+
+    ``group_of(row)`` names rows that contend for the same graph entities
+    (``None`` opts a row out).
+    A row whose group already has work in flight is passed over while any
+    other queued row is available; only when every candidate shares a busy
+    group is one taken anyway, so exclusion never idles a slot
+    (2026-09-29: 68% of read-set conflicts had a same-project commit land
+    during their prepare).
     """
     if min(concurrency, backlog_weight, live_weight) < 1 or active_seconds <= 0:
         raise ValueError("positive scheduler bounds required")
@@ -36,6 +44,7 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
     queues = {kind: deque() for kind in ("backlog", "live")}
     attempted = set()
     inflight = set()
+    busy_groups = Counter()
     taken = 0
     turn = 0
     stop = False
@@ -59,16 +68,35 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                 return None
         preferred = schedule[turn % len(schedule)]
         turn += 1
-        for kind in (preferred, "live" if preferred == "backlog" else "backlog"):
+        order = (preferred, "live" if preferred == "backlog" else "backlog")
+        contended = None
+        for kind in order:
             if not queues[kind]:
                 queues[kind].extend(refill(kind, attempted))
+            passed_over = []
+            chosen = None
             while queues[kind]:
                 row = queues[kind].popleft()
                 if row["id"] in attempted:
                     continue
-                attempted.add(row["id"])
+                group = group_of(row) if group_of is not None else None
+                if group is not None and busy_groups[group]:
+                    passed_over.append(row)
+                    continue
+                chosen = row
+                break
+            queues[kind].extendleft(reversed(passed_over))
+            if chosen is not None:
+                attempted.add(chosen["id"])
                 taken += 1
-                return kind, row
+                return kind, chosen
+            if contended is None and passed_over:
+                contended = kind
+        if contended is not None:
+            row = queues[contended].popleft()
+            attempted.add(row["id"])
+            taken += 1
+            return contended, row
         return _IDLE if checkpoint is not None and inflight else None
 
     async def worker():
@@ -87,11 +115,16 @@ async def consume_fairly(refill, process, *, can_submit, concurrency=4,
                         pass
                     continue
                 kind, row = item
+                group = group_of(row) if group_of is not None else None
                 inflight.add(row["id"])
+                if group is not None:
+                    busy_groups[group] += 1
                 try:
                     await process(kind, row)
                 finally:
                     inflight.discard(row["id"])
+                    if group is not None:
+                        busy_groups[group] -= 1
                     wake.set()
                 # Locally filtered rows must not monopolize the event loop.
                 await asyncio.sleep(0)
