@@ -175,4 +175,53 @@ class RollingPoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):await task
 
 
+class ProjectExclusionTests(unittest.IsolatedAsyncioTestCase):
+    """Same-group rows contend for the same entities (2026-09-29: 68% of conflicts)."""
+
+    async def test_busy_group_is_passed_over_while_other_groups_wait(self):
+        # Queue order a1 a2 a3 b1 c1: without exclusion slots 2-3 go to a2 a3.
+        rows=[{'id':1,'g':'a'},{'id':2,'g':'a'},{'id':3,'g':'a'},{'id':4,'g':'b'},{'id':5,'g':'c'}]
+        release=asyncio.Event(); first=[]; active={}; peak={}; _failsafe(release)
+        def refill(kind,attempted):return [r for r in rows if r['id'] not in attempted] if kind=='backlog' else []
+        async def process(kind,row):
+            g=row['g']; active[g]=active.get(g,0)+1; peak[g]=max(peak.get(g,0),active[g])
+            first.append(row['id'])
+            if len(first)==3: release.set()
+            await release.wait(); active[g]-=1
+        await consume_fairly(refill,process,can_submit=lambda:True,concurrency=3,group_of=lambda r:r['g'])
+        self.assertEqual(first[:3],[1,4,5], "有其他组可派时不得同组并发")
+        self.assertEqual(sorted(first),[1,2,3,4,5])
+
+    async def test_all_candidates_in_a_busy_group_still_fill_the_slots(self):
+        release=asyncio.Event(); active=[0]; peak=[0]; _failsafe(release)
+        def refill(kind,attempted):return [{'id':i,'g':'a'} for i in (1,2,3) if i not in attempted] if kind=='backlog' else []
+        async def process(kind,row):
+            active[0]+=1; peak[0]=max(peak[0],active[0])
+            if active[0]==3: release.set()
+            await release.wait(); active[0]-=1
+        await consume_fairly(refill,process,can_submit=lambda:True,concurrency=3,group_of=lambda r:r['g'])
+        self.assertEqual(peak[0],3, "互斥不得让槽位空转")
+
+    async def test_group_frees_when_its_row_completes(self):
+        # After a1 finishes, a2 (ahead of c4) must be eligible again.
+        seen=[]; groups={1:'a',2:'a',3:'b',4:'c'}
+        def refill(kind,attempted):return [{'id':i,'g':groups[i]} for i in groups if i not in attempted] if kind=='backlog' else []
+        async def process(kind,row):
+            seen.append(row['id'])
+            await asyncio.sleep(.1 if row['id']==3 else .01)
+        await consume_fairly(refill,process,can_submit=lambda:True,concurrency=2,group_of=lambda r:r['g'])
+        self.assertEqual(seen,[1,3,2,4], "a 组完成后同组的下一条才派发")
+
+    async def test_none_group_opts_out_of_exclusion(self):
+        release=asyncio.Event(); started=[]; _failsafe(release)
+        rows=[{'id':1,'g':None},{'id':2,'g':None},{'id':3,'g':'b'}]
+        def refill(kind,attempted):return [r for r in rows if r['id'] not in attempted] if kind=='backlog' else []
+        async def process(kind,row):
+            started.append(row['id'])
+            if len(started)==2: release.set()
+            await release.wait()
+        await consume_fairly(refill,process,can_submit=lambda:True,concurrency=2,group_of=lambda r:r['g'])
+        self.assertEqual(started[:2],[1,2], "无组的行互不排斥")
+
+
 if __name__=='__main__':unittest.main()

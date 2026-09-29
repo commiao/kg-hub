@@ -1008,6 +1008,13 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     return stats
 
 
+def conflict_group(row: dict) -> str | None:
+    """Top-level project: worktrees of one repo (``sd-server/<wt>``) describe
+    the same entities, so their concurrent commits invalidate each other's reads."""
+    project = (row.get("project") or "").split("/", 1)[0].strip()
+    return project or None
+
+
 def select_project_batch(rows: list[dict], terminal: set[int],
                          backoff: dict[int, list[int]], cycle: int, limit: int,
                          threshold: int, max_wait_sec: int,
@@ -1317,7 +1324,8 @@ async def main() -> int:
                 concurrency=INGEST_CONCURRENCY,
                 backlog_weight=int(os.environ.get("KG_HUB_REFINERY_BACKLOG_WEIGHT", "4")),
                 live_weight=int(os.environ.get("KG_HUB_REFINERY_LIVE_WEIGHT", "1")),
-                active_seconds=INTERVAL, checkpoint=checkpoint)
+                active_seconds=INTERVAL, checkpoint=checkpoint,
+                group_of=conflict_group)
             s_back, s_live = totals["backlog"], totals["live"]
             advance_cursor()
 
