@@ -40,8 +40,9 @@ OPTIONS {dimension:384, similarityFunction:'cosine'}
 ```
 
 `KG_HUB_EDGE_VECTOR_INDEX_PERCENT` chooses a stable percentage by observation
-ID. The Compose default is 10 for the first release; 0 restores exact search
-without dropping the index. Index-related query failures fall back to exact;
+ID. The initial release used 10%; the next stage uses a 50% Compose default.
+Setting it to 0 restores exact search without dropping the index.
+Index-related query failures fall back to exact;
 read-set conflicts and unrelated graph errors retain their normal handling.
 The stored read dependency contains the query actually used, so a restored
 round validates with the same semantics it used before the release.
@@ -58,3 +59,28 @@ DROP VECTOR INDEX FOR ()-[e:RELATES_TO]->() ON (e.fact_embedding)
 The `Entity.name_embedding` index was proven to work on the isolated graph,
 but the prepare-time node query was much shorter, so this change leaves node
 search exact.
+
+## First production canary: 10%
+
+The first hour after release `6952785` (2026-09-29 19:10–20:10 UTC) logged
+34 distinct dispatched observations. One landed in the stable 10% bucket.
+It executed 75 indexed broad-edge searches with zero index fallbacks. Across
+prepare and validation, that observation's 95 broad-edge reads averaged
+0.687 seconds; the other observations' 1,071 reads averaged 7.092 seconds.
+These are concurrent workloads, not a controlled latency experiment.
+
+The sole canary observation failed after three optimistic read-set conflicts;
+two non-canary observations logged unrelated `InternalServerError`s. The
+failed round's 30 sampled indexed reads produced identical digests on three
+immediate repetitions. Five of 25 indexed edge dependencies in the latest
+round differed from their saved results after concurrent graph writes, while
+the node and filtered edge dependencies matched at the later audit. This
+supports graph change rather than nondeterministic index output, but does not
+prove the cause of every conflict. The 10% sample has no successful canary
+observation and cannot establish business success rate.
+
+The 50% stage is a controlled load test because 90% exact traffic still left
+FalkorDB doing most broad scans. Keep the previous image as rollback target.
+Do not move to 100% unless indexed observations complete successfully and
+conflict/error rates stay acceptable; return the setting to 0 if indexed
+query errors or a clear canary-specific failure pattern appears.
