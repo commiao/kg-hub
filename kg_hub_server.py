@@ -88,6 +88,7 @@ from utils.predigest import (  # noqa: E402
 from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
+from utils.batch_answer import batch_fallbacks_total  # noqa: E402
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
@@ -693,6 +694,8 @@ async def health(request: Request) -> JSONResponse:
                          "drain_seconds_left": int(left),
                          "drain_refused": drain_refused(),
                          "envelope_repairs": envelope_repairs_total(),
+                         # 合批答案不合格、退回逐条付费请求的次数(按阶段)。
+                         "batch_fallbacks": batch_fallbacks_total(),
                          "offscript_responses": offscript_total()})
 
 

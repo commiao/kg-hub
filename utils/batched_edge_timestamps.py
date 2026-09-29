@@ -19,6 +19,8 @@ from graphiti_core.prompts import prompt_library
 from graphiti_core.utils.datetime_utils import ensure_utc
 from pydantic import BaseModel, Field
 
+from utils.batch_answer import BatchAnswerMismatch, is_bad_batch_answer, note_fallback
+
 
 class _TimestampRow(BaseModel):
     index: int = Field(description="Zero-based index of the input fact")
@@ -127,34 +129,15 @@ class _TimestampBatch:
                     client, edge, episode, _ = chunk[0]
                     await self.original(client, edge, episode)
                 else:
-                    clients = {id(item[0]) for item in chunk}
-                    episodes = {item[2].uuid for item in chunk}
-                    if len(clients) != 1 or len(episodes) != 1:
-                        raise RuntimeError("timestamp batch mixed clients or episodes")
-                    facts = [
-                        {"index": index, "fact": edge.fact,
-                         "reference_time": episode.valid_at.isoformat()}
-                        for index, (_, edge, episode, _) in enumerate(chunk)
-                    ]
-                    response = await chunk[0][0].generate_response(
-                        prompt_library.extract_edges.extract_timestamps_batch({"facts": facts}),
-                        response_model=_TimestampResponse,
-                        model_size=ModelSize.small,
-                        prompt_name="extract_edges.extract_timestamps_batch",
-                    )
-                    values = _TimestampResponse(**response).timestamps
-                    if [value.index for value in values] != list(range(len(chunk))):
-                        raise RuntimeError("timestamp batch response identity mismatch")
-                    parsed = [(_parse_timestamp(value.valid_at),
-                               _parse_timestamp(value.invalid_at)) for value in values]
-                    # Validate the entire response before mutating any graph object.
-                    for (_, edge, _, _), (valid_at, invalid_at) in zip(chunk, parsed):
-                        if valid_at is not None:
-                            edge.valid_at = valid_at
-                        if invalid_at is not None:
-                            edge.invalid_at = invalid_at
-                    self.batch_requests += 1
-                    self.batched_edges += len(chunk)
+                    try:
+                        await self._batched(chunk)
+                    except Exception as exc:
+                        if not is_bad_batch_answer(exc):
+                            raise
+                        note_fallback("edge_timestamps", len(chunk), exc)
+                        await asyncio.gather(*(
+                            self.original(client, edge, episode)
+                            for client, edge, episode, _ in chunk))
             except BaseException as exc:
                 self.failure = exc
                 for _, _, _, done in chunk:
@@ -170,6 +153,36 @@ class _TimestampBatch:
                 for _, _, _, done in chunk:
                     if not done.done():
                         done.set_result(None)
+
+    async def _batched(self, chunk):
+        clients = {id(item[0]) for item in chunk}
+        episodes = {item[2].uuid for item in chunk}
+        if len(clients) != 1 or len(episodes) != 1:
+            raise RuntimeError("timestamp batch mixed clients or episodes")
+        facts = [
+            {"index": index, "fact": edge.fact,
+             "reference_time": episode.valid_at.isoformat()}
+            for index, (_, edge, episode, _) in enumerate(chunk)
+        ]
+        response = await chunk[0][0].generate_response(
+            prompt_library.extract_edges.extract_timestamps_batch({"facts": facts}),
+            response_model=_TimestampResponse,
+            model_size=ModelSize.small,
+            prompt_name="extract_edges.extract_timestamps_batch",
+        )
+        values = _TimestampResponse(**response).timestamps
+        if [value.index for value in values] != list(range(len(chunk))):
+            raise BatchAnswerMismatch("timestamp batch response identity mismatch")
+        # Validate the entire response before mutating any graph object.
+        parsed = [(_parse_timestamp(value.valid_at),
+                   _parse_timestamp(value.invalid_at)) for value in values]
+        for (_, edge, _, _), (valid_at, invalid_at) in zip(chunk, parsed):
+            if valid_at is not None:
+                edge.valid_at = valid_at
+            if invalid_at is not None:
+                edge.invalid_at = invalid_at
+        self.batch_requests += 1
+        self.batched_edges += len(chunk)
 
 
 class _TimestampLimitedClient:

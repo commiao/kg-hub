@@ -11,8 +11,9 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.prompts import prompt_library
 from graphiti_core.utils.maintenance import edge_operations as ops
 
+from utils.batch_answer import batch_fallbacks_total
 from utils.batched_edge_dedupe import (
-    BATCH_PROMPT, RESOLVE_PROMPT, _DedupeBatch, _task_digest,
+    BATCH_PROMPT, RESOLVE_PROMPT, _DedupeBatch, _DedupeResponse, _task_digest,
 )
 from utils.graphiti_stage_names import graphiti_model_stage
 
@@ -62,6 +63,33 @@ class FakeClient:
             return {}
         finally:
             self.active -= 1
+
+
+class BadBatchClient(FakeClient):
+    """The first ``bad_batches`` batch requests get ``batch_response``."""
+
+    def __init__(self, answers, batch_response, bad_batches=None):
+        super().__init__(answers)
+        self.batch_response = batch_response
+        self.bad_batches = bad_batches
+
+    async def generate_response(self, messages, **kwargs):
+        if kwargs.get("prompt_name") == BATCH_PROMPT and self.bad_batches != 0:
+            if self.bad_batches is not None:
+                self.bad_batches -= 1
+            self.calls.append((messages, kwargs))
+            return _DedupeResponse(**self.batch_response).model_dump()
+        return await super().generate_response(messages, **kwargs)
+
+
+class FailingClient(FakeClient):
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+
+    async def generate_response(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        raise self.exc
 
 
 def run(coro):
@@ -158,27 +186,47 @@ class DedupeBatchTests(unittest.TestCase):
             self.assertEqual(client.calls[0][1]["prompt_name"], RESOLVE_PROMPT)
         run(go())
 
-    def test_swapped_identity_fails_every_edge_without_individual_retry(self):
+    def test_swapped_identity_reasks_each_edge_with_its_own_prompt(self):
         async def go():
-            client = FakeClient(response={"results": [
+            answers = {"a": {"duplicate_facts": [0], "contradicted_facts": []},
+                       "b": {"duplicate_facts": [], "contradicted_facts": [0]}}
+            client = BadBatchClient(answers, {"results": [
                 {"index": 1, "duplicate_facts": [], "contradicted_facts": []},
                 {"index": 0, "duplicate_facts": [], "contradicted_facts": []}]})
             batch = _DedupeBatch(client, limit=2, max_items=12, delay=0)
             results = await asyncio.gather(*(batch.proxy.generate_response(
                 resolve_messages(f, ["x"]), prompt_name=RESOLVE_PROMPT)
-                for f in ("a", "b")), return_exceptions=True)
-            self.assertTrue(all(isinstance(r, RuntimeError) for r in results))
-            self.assertEqual(len(client.calls), 1)
+                for f in ("a", "b")))
+            self.assertEqual(results, [answers["a"], answers["b"]])
+            self.assertEqual([c[1]["prompt_name"] for c in client.calls],
+                             [BATCH_PROMPT, RESOLVE_PROMPT, RESOLVE_PROMPT])
+            self.assertEqual((batch.batch_requests, batch.batched_edges), (0, 0))
         run(go())
 
-    def test_failed_chunk_stops_paying_for_later_chunks(self):
+    def test_schema_invalid_batch_falls_back_only_for_that_chunk(self):
         async def go():
-            client = FakeClient(response={"results": []})
+            answers = {f: {"duplicate_facts": [], "contradicted_facts": []}
+                       for f in ("a", "b", "c", "d")}
+            client = BadBatchClient(answers, {"results": [{"index": 0}]}, bad_batches=1)
+            batch = _DedupeBatch(client, limit=2, max_items=2, delay=0)
+            before = batch_fallbacks_total().get("edge_dedupe", 0)
+            results = await asyncio.gather(*(batch.proxy.generate_response(
+                resolve_messages(f, ["x"]), prompt_name=RESOLVE_PROMPT)
+                for f in answers))
+            self.assertEqual(results, list(answers.values()))
+            self.assertEqual([c[1]["prompt_name"] for c in client.calls],
+                             [BATCH_PROMPT, RESOLVE_PROMPT, RESOLVE_PROMPT, BATCH_PROMPT])
+            self.assertEqual(batch_fallbacks_total().get("edge_dedupe", 0) - before, 1)
+        run(go())
+
+    def test_transport_failure_stops_paying_for_later_chunks(self):
+        async def go():
+            client = FailingClient(ConnectionError("gateway down"))
             batch = _DedupeBatch(client, limit=2, max_items=2, delay=0)
             results = await asyncio.gather(*(batch.proxy.generate_response(
                 resolve_messages(f, ["x"]), prompt_name=RESOLVE_PROMPT)
                 for f in ("a", "b", "c", "d", "e")), return_exceptions=True)
-            self.assertTrue(all(isinstance(r, RuntimeError) for r in results))
+            self.assertTrue(all(isinstance(r, ConnectionError) for r in results))
             self.assertEqual(len(client.calls), 1)
         run(go())
 

@@ -24,6 +24,8 @@ from graphiti_core.llm_client.client import ModelSize
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel, Field
 
+from utils.batch_answer import BatchAnswerMismatch, is_bad_batch_answer, note_fallback
+
 RESOLVE_PROMPT = "dedupe_edges.resolve_edge"
 BATCH_PROMPT = "dedupe_edges.resolve_edge_batch"
 
@@ -164,19 +166,14 @@ class _DedupeBatch:
                 messages, kwargs, _ = chunk[0]
                 results = [await self.call(messages, **kwargs)]
             else:
-                response = await self.call(
-                    batch_messages([messages for messages, _, _ in chunk]),
-                    response_model=_DedupeResponse,
-                    model_size=ModelSize.small,
-                    prompt_name=BATCH_PROMPT,
-                )
-                rows = _DedupeResponse(**response).results
-                if [row.index for row in rows] != list(range(len(chunk))):
-                    raise RuntimeError("edge dedupe batch response identity mismatch")
-                results = [{"duplicate_facts": row.duplicate_facts,
-                            "contradicted_facts": row.contradicted_facts} for row in rows]
-                self.batch_requests += 1
-                self.batched_edges += len(chunk)
+                try:
+                    results = await self._batched(chunk)
+                except Exception as exc:
+                    if not is_bad_batch_answer(exc):
+                        raise
+                    note_fallback("edge_dedupe", len(chunk), exc)
+                    results = await asyncio.gather(*(
+                        self.call(messages, **kwargs) for messages, kwargs, _ in chunk))
         except BaseException as exc:
             for _, _, done in chunk:
                 if not done.done():
@@ -188,6 +185,21 @@ class _DedupeBatch:
             if not done.done():
                 done.set_result(result)
         return None
+
+    async def _batched(self, chunk) -> list[dict]:
+        response = await self.call(
+            batch_messages([messages for messages, _, _ in chunk]),
+            response_model=_DedupeResponse,
+            model_size=ModelSize.small,
+            prompt_name=BATCH_PROMPT,
+        )
+        rows = _DedupeResponse(**response).results
+        if [row.index for row in rows] != list(range(len(chunk))):
+            raise BatchAnswerMismatch("edge dedupe batch response identity mismatch")
+        self.batch_requests += 1
+        self.batched_edges += len(chunk)
+        return [{"duplicate_facts": row.duplicate_facts,
+                 "contradicted_facts": row.contradicted_facts} for row in rows]
 
 
 class _DedupeClient:

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import graphiti_core.graphiti as pipeline
 from graphiti_core.utils.maintenance import edge_operations as ops
+from utils.batch_answer import batch_fallbacks_total
 from utils.batched_edge_timestamps import _TimestampBatch
 from utils.batched_edge_timestamps import install
 from utils.graphiti_stage_names import graphiti_model_stage
@@ -19,6 +20,20 @@ class FakeClient:
     async def generate_response(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         return self.response
+
+
+class ValidatingClient(FakeClient):
+    """Like the production client: the response model is enforced on return."""
+
+    async def generate_response(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return kwargs["response_model"](**self.response).model_dump()
+
+
+class RaisingClient(FakeClient):
+    async def generate_response(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        raise self.response
 
 
 class TimestampBatchTests(unittest.TestCase):
@@ -144,10 +159,11 @@ class TimestampBatchTests(unittest.TestCase):
     def test_prompt_is_part_of_replayable_edge_phase(self):
         self.assertEqual(graphiti_model_stage("extract_edges.extract_timestamps_batch"), "edge_phase")
 
-    def test_swapped_identity_does_not_assign_wrong_edge(self):
+    def test_swapped_identity_reasks_each_edge_without_assigning_batch_values(self):
         async def run():
-            async def original(*args):
-                raise AssertionError("no individual retry after a paid batch")
+            asked = []
+            async def original(client, edge, episode):
+                asked.append(edge.fact)
             batch = _TimestampBatch(original)
             batch.set_expected_edges(2)
             episode = SimpleNamespace(uuid="episode-1", valid_at=datetime.now(timezone.utc))
@@ -158,9 +174,45 @@ class TimestampBatchTests(unittest.TestCase):
                 {"index": 1, "valid_at": "2026-09-01T00:00:00Z"},
                 {"index": 0, "valid_at": "2026-09-02T00:00:00Z"},
             ]})
-            results = await asyncio.gather(*(batch.extract(client, edge, episode) for edge in edges), return_exceptions=True)
-            self.assertTrue(all(isinstance(item, RuntimeError) for item in results))
+            await asyncio.gather(*(batch.extract(client, edge, episode) for edge in edges))
+            self.assertEqual(sorted(asked), ["fact 0", "fact 1"])
             self.assertTrue(all(edge.valid_at is None for edge in edges))
+            self.assertEqual(batch.batch_requests, 0)
+        asyncio.run(run())
+
+    def test_schema_invalid_batch_reasks_each_edge(self):
+        async def run():
+            asked = []
+            async def original(client, edge, episode):
+                asked.append(edge.fact)
+            batch = _TimestampBatch(original)
+            batch.set_expected_edges(2)
+            episode = SimpleNamespace(uuid="episode-1", valid_at=datetime.now(timezone.utc))
+            edges = [SimpleNamespace(fact=f"fact {i}", source_node_uuid="s",
+                                     target_node_uuid="t", valid_at=None,
+                                     invalid_at=None) for i in range(2)]
+            client = ValidatingClient({"timestamps": "not a list"})
+            before = batch_fallbacks_total().get("edge_timestamps", 0)
+            await asyncio.gather(*(batch.extract(client, edge, episode) for edge in edges))
+            self.assertEqual(sorted(asked), ["fact 0", "fact 1"])
+            self.assertEqual(len(client.calls), 1)
+            self.assertEqual(batch_fallbacks_total().get("edge_timestamps", 0) - before, 1)
+        asyncio.run(run())
+
+    def test_transport_failure_is_not_reasked(self):
+        async def run():
+            async def original(*args):
+                raise AssertionError("a transport failure must not trigger per-edge calls")
+            batch = _TimestampBatch(original)
+            batch.set_expected_edges(2)
+            episode = SimpleNamespace(uuid="episode-1", valid_at=datetime.now(timezone.utc))
+            edges = [SimpleNamespace(fact=f"fact {i}", source_node_uuid="s",
+                                     target_node_uuid="t", valid_at=None,
+                                     invalid_at=None) for i in range(2)]
+            client = RaisingClient(ConnectionError("gateway down"))
+            results = await asyncio.gather(*(batch.extract(client, edge, episode) for edge in edges),
+                                           return_exceptions=True)
+            self.assertTrue(all(isinstance(item, ConnectionError) for item in results))
         asyncio.run(run())
 
     def test_installed_batch_waits_for_all_resolvers_before_chunking(self):
