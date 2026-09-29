@@ -61,12 +61,14 @@ import graphiti_core.graphiti as _graphiti_pipeline  # noqa: E402
 from utils.batched_node_attributes import extract_attributes_from_nodes as _batch_attributes  # noqa: E402
 from utils.batched_edge_timestamps import install as _install_timestamp_batch  # noqa: E402
 from utils.batched_edge_dedupe import install as _install_dedupe_batch  # noqa: E402
+from utils.indexed_edge_search import install as _install_indexed_edge_search  # noqa: E402
 
 _install_timestamp_batch(int(os.environ.get("KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT", "0")))
 # Installed second so its widened per-edge gather also lets the timestamp batch
 # see every edge of an episode; both use the same episode hash buckets.
 _install_dedupe_batch(int(os.environ.get("KG_HUB_EDGE_DEDUPE_BATCH_PERCENT", "0")),
                       int(os.environ.get("KG_HUB_EDGE_DEDUPE_BATCH_MAX", "12")))
+_install_indexed_edge_search()
 
 # Graphiti imports this helper into its pipeline module. Bind that actual call
 # site; rebinding node_operations alone leaves add_episode on the old helper.

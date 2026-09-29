@@ -184,6 +184,7 @@ class ReadDependencies:
         def blocked(*args, **kwargs):
             raise RuntimeError("untracked driver access during optimistic extraction")
         driver.execute_query = MethodType(execute, driver)
+        driver._kg_hub_indexed_ingest = True
         driver.session = blocked
         driver.clone = blocked
         driver._get_graph = blocked
