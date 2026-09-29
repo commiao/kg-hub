@@ -126,6 +126,8 @@ services:
       - KG_HUB_PARALLEL_EXTRACTION=${KG_HUB_PARALLEL_EXTRACTION:-1}
       # 业务任务槽位 6；关系去重与时间合批已有 3 个线上样本成功提交，继续按成功吞吐与冲突率验收。
       - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-6}
+      # Stable per-observation canary for indexed broad edge search; 0 retains exact search.
+      - KG_HUB_EDGE_VECTOR_INDEX_PERCENT=${KG_HUB_EDGE_VECTOR_INDEX_PERCENT:-10}
       # 模型外呼并发保持 2，不随业务任务槽位一起上调。
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
       # 时间抽取合批对所有 episode 启用，每次最多 12 条；3 个线上样本成功提交，持续观察入图质量和任务耗时。
