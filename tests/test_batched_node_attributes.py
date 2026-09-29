@@ -143,6 +143,30 @@ class BatchAttributesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([n.attributes["path"] for n in nodes],
                          ["/single/a.py", "/single/b.py"])
 
+    async def test_truncated_arguments_keep_the_entities_written_in_full(self):
+        """2026-09-29: batches cut at max_tokens had most entities complete."""
+        nodes = self.named_nodes("a.py", "b.py", "c.py")
+        generate = self.answering({"raw_arguments":
+            '{"entity_0": {"path": "/a"}, "entity_1": {"path": "/b"}, "entity_2": {"path": "/tr'})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual(generate.await_count, 2)
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/a", "/b", "/single/c.py"])
+
+    async def test_arguments_mended_by_envelope_repair_are_used_directly(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = self.answering({"raw_arguments": {"entity_0": {"path": "/a"},
+                                                     "entity_1": {"path": "/b"}}})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual(generate.await_count, 1)
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/a", "/b"])
+
+    async def test_raw_arguments_beside_real_keys_are_not_mined(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = self.answering({"entity_0": {"path": "/a"},
+                                   "raw_arguments": '{"entity_1": {"path": "/b"}}'})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/a", "/single/b.py"])
+
     async def test_failed_single_retry_leaves_every_node_unchanged(self):
         nodes = self.named_nodes("a.py", "b.py")
         generate = AsyncMock(side_effect=[{"entity_0": {"path": "/a"}},
