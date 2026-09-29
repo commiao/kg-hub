@@ -9,6 +9,7 @@ before HTTP; an uncertain graph commit requires readback before success.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from importlib.metadata import version
 import json
@@ -211,17 +212,17 @@ async def extract_nodes_with_snapshot(
     identity = (task_sd, task_sid, operation_id, input_digest)
     inputs = (episode, previous_episodes, entity_types,
               excluded_entity_types, custom_extraction_instructions)
-    saved, digest = _stage_record(
-        store, identity, "extraction", inputs,
+    saved, digest = await asyncio.to_thread(
+        _stage_record, store, identity, "extraction", inputs,
         allow_retry=_active_manual_stage() == "node_extraction")
     if saved is None:
-        store.begin_stage(*identity, "extraction", digest)
+        await asyncio.to_thread(store.begin_stage, *identity, "extraction", digest)
         from model_gateway_client import model_stage
         with model_stage("node_extraction"), collect_model_steps() as used_steps:
             nodes, attribution = await ops.extract_nodes(
                 clients, episode, previous_episodes, entity_types,
                 excluded_entity_types, custom_extraction_instructions)
-        saved = store.save_or_load(*identity, "extraction", {
+        saved = await asyncio.to_thread(store.save_or_load, *identity, "extraction", {
             "stage_input_digest": digest,
             "nodes": [node.model_dump(mode="json") for node in nodes],
             "attribution": attribution,
@@ -252,10 +253,10 @@ async def resolve_nodes_with_candidate_snapshot(
     identity = (task_sd, task_sid, operation_id, input_digest)
     from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     extracted = [node.model_dump(mode="json") for node in extracted_nodes]
-    saved = store.save_or_load(*identity, "extracted_nodes", extracted)
+    saved = await asyncio.to_thread(store.save_or_load, *identity, "extracted_nodes", extracted)
     if saved != extracted:
         raise RuntimeError("extracted node UUID/input drift")
-    resolved = store.save_or_load(*identity, "resolved_nodes")
+    resolved = await asyncio.to_thread(store.save_or_load, *identity, "resolved_nodes")
     if resolved is not None:
         acknowledge_restored_steps(resolved.get("model_step_ids", []))
         return (
@@ -264,11 +265,11 @@ async def resolve_nodes_with_candidate_snapshot(
             [(EntityNode.model_validate(left), EntityNode.model_validate(right))
              for left, right in resolved["duplicates"]],
         )
-    candidate_json = store.save_or_load(*identity, "node_candidates")
+    candidate_json = await asyncio.to_thread(store.save_or_load, *identity, "node_candidates")
     if candidate_json is None:
         candidates = await ops._collect_candidate_nodes(clients, extracted_nodes, None)
-        candidate_json = store.save_or_load(
-            *identity, "node_candidates",
+        candidate_json = await asyncio.to_thread(
+            store.save_or_load, *identity, "node_candidates",
             [[node.model_dump(mode="json") for node in group] for group in candidates])
     candidate_nodes_by_extracted = [
         [EntityNode.model_validate(node) for node in group] for group in candidate_json]
@@ -277,12 +278,12 @@ async def resolve_nodes_with_candidate_snapshot(
 
     resolution_inputs = (episode, previous_episodes, entity_types,
                          extracted_nodes, candidate_nodes_by_extracted)
-    resolution, resolution_digest = _stage_record(
-        store, identity, "node_resolution",
+    resolution, resolution_digest = await asyncio.to_thread(
+        _stage_record, store, identity, "node_resolution",
         resolution_inputs,
         allow_retry=_active_manual_stage() == "node_resolution")
     if resolution is not None:
-        resolved = store.save_or_load(*identity, "resolved_nodes")
+        resolved = await asyncio.to_thread(store.save_or_load, *identity, "resolved_nodes")
         if resolved is None:
             raise RuntimeError("node resolution receipt is missing")
         return (
@@ -312,7 +313,8 @@ async def resolve_nodes_with_candidate_snapshot(
         llm_candidates = ops._merge_candidate_nodes(
             [candidate for idx in state.unresolved_indices
              for candidate in candidate_nodes_by_extracted[idx]], None)
-        store.begin_stage(*identity, "node_resolution", resolution_digest)
+        await asyncio.to_thread(
+            store.begin_stage, *identity, "node_resolution", resolution_digest)
         from model_gateway_client import model_stage
         with model_stage("node_resolution"), collect_model_steps() as used_steps:
             await ops._resolve_with_llm(
@@ -332,11 +334,12 @@ async def resolve_nodes_with_candidate_snapshot(
         "duplicates": [[left.model_dump(mode="json"), right.model_dump(mode="json")]
                        for left, right in result[2]],
     }
-    saved_resolved = store.save_or_load(*identity, "resolved_nodes", resolved_json)
+    saved_resolved = await asyncio.to_thread(
+        store.save_or_load, *identity, "resolved_nodes", resolved_json)
     if saved_resolved != resolved_json:
         raise RuntimeError("concurrent resolved node artifact drift")
     if state.unresolved_indices:
-        store.save_or_load(*identity, "node_resolution", {
+        await asyncio.to_thread(store.save_or_load, *identity, "node_resolution", {
             "stage_input_digest": resolution_digest,
             "resolved_nodes_digest": _stage_digest(resolved_json),
         })
@@ -373,15 +376,15 @@ async def extract_and_resolve_edges_with_snapshot(
     inputs = (episode, extracted_nodes, previous_episodes, edge_type_map,
               group_id, edge_types, nodes, uuid_map,
               custom_extraction_instructions)
-    saved, digest = _stage_record(
-        store, identity, "edge_phase", inputs,
+    saved, digest = await asyncio.to_thread(
+        _stage_record, store, identity, "edge_phase", inputs,
         allow_retry=_active_manual_stage() == "edge_phase")
     if saved is None:
-        store.begin_stage(*identity, "edge_phase", digest)
+        await asyncio.to_thread(store.begin_stage, *identity, "edge_phase", digest)
         from model_gateway_client import model_stage
         with model_stage("edge_phase"), collect_model_steps() as used_steps:
             groups = await graphiti._extract_and_resolve_edges(*inputs)
-        saved = store.save_or_load(*identity, "edge_phase", {
+        saved = await asyncio.to_thread(store.save_or_load, *identity, "edge_phase", {
             "stage_input_digest": digest,
             "model_step_ids": sorted(used_steps),
             "groups": [[edge.model_dump(mode="json") for edge in group]
@@ -406,17 +409,17 @@ async def extract_attributes_with_snapshot(
     identity = (task_sd, task_sid, operation_id, input_digest)
     from model_gateway_client import collect_model_steps, acknowledge_restored_steps
     inputs = (nodes, episode, previous_episodes, entity_types, new_edges)
-    saved, digest = _stage_record(
-        store, identity, "attribute_phase", inputs,
+    saved, digest = await asyncio.to_thread(
+        _stage_record, store, identity, "attribute_phase", inputs,
         allow_retry=_active_manual_stage() == "attribute_phase")
     if saved is None:
-        store.begin_stage(*identity, "attribute_phase", digest)
+        await asyncio.to_thread(store.begin_stage, *identity, "attribute_phase", digest)
         from model_gateway_client import model_stage
         with model_stage("attribute_phase"), collect_model_steps() as used_steps:
             hydrated = await ops.extract_attributes_from_nodes(
                 graphiti.clients, nodes, episode, previous_episodes,
                 entity_types, edges=new_edges)
-        saved = store.save_or_load(*identity, "attribute_phase", {
+        saved = await asyncio.to_thread(store.save_or_load, *identity, "attribute_phase", {
             "stage_input_digest": digest,
             "model_step_ids": sorted(used_steps),
             "nodes": [node.model_dump(mode="json") for node in hydrated],
@@ -447,11 +450,12 @@ async def commit_episode_with_receipt(
     inputs = (episode, hydrated_nodes, entity_edges, now, group_id,
               saga, saga_previous_episode_uuid, node_episode_index_map)
     step = time.monotonic()
-    saved, digest = _stage_record(store, identity, "graph_commit_receipt", inputs)
+    saved, digest = await asyncio.to_thread(
+        _stage_record, store, identity, "graph_commit_receipt", inputs)
     timings["receipt_lookup"] = time.monotonic() - step
     if saved is None:
         step = time.monotonic()
-        store.begin_graph_commit(*identity, expected={
+        await asyncio.to_thread(store.begin_graph_commit, *identity, expected={
             "episode": episode.model_dump(mode="json"),
             "nodes": [node.model_dump(mode="json") for node in hydrated_nodes],
             "entity_edges": [edge.model_dump(mode="json") for edge in entity_edges],
@@ -462,7 +466,7 @@ async def commit_episode_with_receipt(
         episodic_edges, saved_episode = await graphiti._process_episode_data(*inputs)
         timings["write"] = time.monotonic() - step
         step = time.monotonic()
-        saved = store.save_or_load(*identity, "graph_commit_receipt", {
+        saved = await asyncio.to_thread(store.save_or_load, *identity, "graph_commit_receipt", {
             "stage_input_digest": digest,
             "episode": saved_episode.model_dump(mode="json"),
             "episodic_edges": [edge.model_dump(mode="json")
@@ -485,12 +489,13 @@ async def add_episode_with_stage_checkpoint(
 ):
     from utils.writer_lock import async_writer_lock
     mode_identity = (task_sd, task_sid, operation_id, "execution-mode-v1")
-    mode = store.save_or_load(*mode_identity, "execution_mode")
+    mode = await asyncio.to_thread(store.save_or_load, *mode_identity, "execution_mode")
     if parallel and mode is None:
         # Existing paid artifacts retain the original serial continuation path.
-        legacy = store.locate(task_sd, task_sid, operation_id, "operation_envelope")
-        mode = store.save_or_load(*mode_identity, "execution_mode",
-                                 {"parallel": legacy is None})
+        legacy = await asyncio.to_thread(
+            store.locate, task_sd, task_sid, operation_id, "operation_envelope")
+        mode = await asyncio.to_thread(store.save_or_load, *mode_identity, "execution_mode",
+                                       {"parallel": legacy is None})
     if not parallel and mode and mode["parallel"]:
         raise RuntimeError("parallel operation cannot resume through legacy executor")
     arguments = dict(store=store, task_sd=task_sd, task_sid=task_sid,
@@ -576,7 +581,7 @@ async def _run_stage_checkpoint(
     identity = (task_sd, task_sid, operation_id, input_digest)
     schema_version = ("graphiti-core-0.29.0-parallel-v1" if optimistic
                       else "graphiti-core-0.29.0")
-    envelope = store.save_or_load(*identity, "operation_envelope")
+    envelope = await asyncio.to_thread(store.save_or_load, *identity, "operation_envelope")
     if envelope is None:
         now = utc_now()
         previous_episodes = await graphiti.retrieve_episodes(
@@ -594,7 +599,8 @@ async def _run_stage_checkpoint(
             "previous_episodes": [item.model_dump(mode="json")
                                   for item in previous_episodes],
         }
-        envelope = store.save_or_load(*identity, "operation_envelope", envelope_value)
+        envelope = await asyncio.to_thread(
+            store.save_or_load, *identity, "operation_envelope", envelope_value)
     if (envelope.get("input_digest") != input_digest
             or envelope.get("schema_version") != schema_version):
         raise RuntimeError("stage operation envelope identity drift")
@@ -729,7 +735,7 @@ async def inspect_started_graph_commit(driver, store: StageArtifactStore, *,
     from graphiti_core.nodes import EntityNode, EpisodicNode
 
     identity = (task_sd, task_sid, operation_id, input_digest)
-    marker = store.save_or_load(*identity, "graph_commit_started")
+    marker = await asyncio.to_thread(store.save_or_load, *identity, "graph_commit_started")
     if marker is None:
         return {"phase": "not_started"}
     expected = marker.get("expected")
@@ -743,6 +749,6 @@ async def inspect_started_graph_commit(driver, store: StageArtifactStore, *,
                       for edge in expected["entity_edges"]],
     )
     proof["saga_expected"] = bool(expected.get("saga_expected"))
-    proof["receipt_saved"] = store.save_or_load(
-        *identity, "graph_commit_receipt") is not None
+    proof["receipt_saved"] = await asyncio.to_thread(
+        store.save_or_load, *identity, "graph_commit_receipt") is not None
     return proof

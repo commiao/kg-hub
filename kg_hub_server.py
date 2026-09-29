@@ -262,7 +262,7 @@ async def cleanup_stuck_jobs(graphiti) -> int:
     cleaned = 0
     from utils.model_attempt_journal import journal_from_backup_env
     try:
-        journal = journal_from_backup_env()
+        journal = await asyncio.to_thread(journal_from_backup_env)
     except Exception:
         logger.exception("[ingest:cleanup] model journal unavailable; preserving stale claims")
         journal = None
@@ -287,7 +287,7 @@ async def cleanup_stuck_jobs(graphiti) -> int:
             # Legacy claims lack the episode name, so this graph query cannot
             # prove absence for them. Preserve those claims for manual review.
             graph_exists = not name or bool(graph_rows and int(graph_rows[0].get("c") or 0))
-            attempts = journal.find_task(sd, sid) if journal else []
+            attempts = await asyncio.to_thread(journal.find_task, sd, sid) if journal else []
             model_evidence = bool(claim.get("stage")) or any(
                 a["provider_call_started"] != 0 for a in attempts)
         except Exception:
@@ -998,7 +998,8 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
         from utils.graphiti_stage_adapter import add_episode_with_stage_checkpoint
         from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT
         if workflow["plan"]["route"] == "episode":
-            workflow["store"].save_or_load(
+            await asyncio.to_thread(
+                workflow["store"].save_or_load,
                 task_sd, task_sid, "business-task", workflow["digest"],
                 "episode_operation", {"operation_id": operation_id})
         return await add_episode_with_stage_checkpoint(
@@ -1365,13 +1366,15 @@ async def _run_recorded_extract(*args, **kwargs):
     graphiti = args[0] if args else kwargs["graphiti"]
 
     async def original_worker():
-        from utils.ingest_workflow import workflow_context
+        from utils.ingest_workflow import bind_workflow, open_workflow
         ref_time = args[2] if len(args) > 2 else kwargs["ref_time"]
         epoch = args[3] if len(args) > 3 else kwargs.get("attempt_epoch")
         route = (predigest_route(body.name, body.episode_body)
                  if PREDIGEST_ENABLED else None) or "episode"
         with model_business_task(body.source_description, body.source_obs_id):
-            with workflow_context(body, ref_time, epoch, route, journal_from_backup_env):
+            workflow = await asyncio.to_thread(
+                open_workflow, body, ref_time, epoch, route, journal_from_backup_env)
+            with bind_workflow(workflow):
                 return await _do_extract_inner(*args, **kwargs)
 
     return await run_task_execution(
@@ -1517,7 +1520,7 @@ async def ingest(request: Request) -> JSONResponse:
     # impossible. Save it before creating the claim or starting model work.
     request_id = str(uuidlib.uuid4())
     try:
-        _backup_episode(body, ref_time, request_id)
+        await asyncio.to_thread(_backup_episode, body, ref_time, request_id)
     except Exception:
         return JSONResponse(
             {"status": "error", "code": "ingest_backup_unavailable"},
@@ -1726,7 +1729,7 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
     sid = request.query_params.get("source_obs_id", "").strip()
     driver = get_status_driver()
     try:
-        journal = journal_from_backup_env()
+        journal = await asyncio.to_thread(journal_from_backup_env)
     except Exception:
         return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
     projection = (
@@ -1748,7 +1751,8 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
             f"RETURN {projection} LIMIT 1", sd=sd, sid=sid)
         if not rows:
             return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
-        return JSONResponse({"status": "ok", "task": _reconciliation_task_view(rows[0], journal)})
+        return JSONResponse({"status": "ok", "task": await asyncio.to_thread(
+            _reconciliation_task_view, rows[0], journal)})
     if bool(sd) != bool(sid):
         return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
     try:
@@ -1764,8 +1768,9 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
     count_rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
         "WHERE k.status IN ['needs_reconciliation', 'error', 'failed'] RETURN count(k) AS c")
-    return JSONResponse({"status": "ok", "items": [
-        _reconciliation_task_view(row, journal) for row in rows],
+    items = await asyncio.to_thread(
+        lambda: [_reconciliation_task_view(row, journal) for row in rows])
+    return JSONResponse({"status": "ok", "items": items,
         "total": int(count_rows[0].get("c") or 0) if count_rows else 0,
         "limit": limit, "offset": offset})
 
@@ -1844,10 +1849,10 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "not_found"}, status_code=404)
     row = rows[0]
     try:
-        journal = journal_from_backup_env()
+        journal = await asyncio.to_thread(journal_from_backup_env)
         if journal is None:
             return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
-        attempts = journal.find_task(sd, sid)
+        attempts = await asyncio.to_thread(journal.find_task, sd, sid)
     except Exception:
         return JSONResponse({"status": "error", "code": "journal_unavailable"}, status_code=503)
     for attempt in attempts:
@@ -1861,7 +1866,8 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             evidence = await asyncio.to_thread(
                 query_gateway_attempt_status, gateway_base_url(), gateway_token(),
                 attempt["business_key"], attempt["idempotency_key"])
-            journal.update_gateway_status(attempt["idempotency_key"], evidence)
+            await asyncio.to_thread(
+                journal.update_gateway_status, attempt["idempotency_key"], evidence)
         except Exception:
             # The saved intent is still evidence; failed status reads cannot
             # turn an unknown model call into a safe retry.
@@ -1869,7 +1875,8 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     missing_receipt_step_id = None
     if wire_step_id:
         try:
-            mapping = journal.resolve_gateway_step(sd, sid, wire_step_id)
+            mapping = await asyncio.to_thread(
+                journal.resolve_gateway_step, sd, sid, wire_step_id)
             missing_receipt_step_id = mapping.get("local_step_id")
         except Exception:
             # Missing/ambiguous sidecar identity fails closed: this check may
@@ -1890,7 +1897,7 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             now=datetime.now(tz=timezone.utc).isoformat())
         if changed and changed[0].get("c") == 1:
             row["status"] = "ok"
-    refreshed = journal.find_task(sd, sid)
+    refreshed = await asyncio.to_thread(journal.find_task, sd, sid)
     summary = summarize_attempts(
         refreshed, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
         missing_receipt_step_id=missing_receipt_step_id)
@@ -1898,15 +1905,16 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     if execution_id:
         try:
             if complete:
-                journal.finish_task_execution(sd, sid, execution_id,
-                                              state="succeeded",
-                                              reason="business_result_persisted")
+                await asyncio.to_thread(journal.finish_task_execution, sd, sid, execution_id,
+                                        state="succeeded",
+                                        reason="business_result_persisted")
             elif (row.get("status") not in {"pending", "running"}
                   and row.get("worker_state") != "running"):
                 execution_state = ("uncertain" if summary["in_flight"]
                                    or summary["unknown_without_http_evidence"]
                                    else "failed")
-                journal.finish_task_execution(
+                await asyncio.to_thread(
+                    journal.finish_task_execution,
                     sd, sid, execution_id, state=execution_state,
                     reason=("model_call_outcome_unknown" if execution_state == "uncertain"
                             else "business_result_missing"))
@@ -1915,7 +1923,7 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             # still promote an uncertain record to succeeded.
             pass
     try:
-        execution_summary = journal.task_execution_summary(sd, sid)
+        execution_summary = await asyncio.to_thread(journal.task_execution_summary, sd, sid)
     except Exception:
         execution_summary = {"failed_attempts": 0}
     if not complete and execution_summary["failed_attempts"] >= 3:
@@ -1946,7 +1954,8 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
                           a.get("step_id"), a.get("request_digest"))) for a in refreshed):
             missing = "reconciliation_model_step_identity_missing"
         if not missing and not row.get("worker_state"):
-            execution_summary = journal.task_execution_summary(sd, sid)
+            execution_summary = await asyncio.to_thread(
+                journal.task_execution_summary, sd, sid)
             if execution_summary.get("execution_count") == 0:
                 missing = "task_execution_history_missing"
         if missing:

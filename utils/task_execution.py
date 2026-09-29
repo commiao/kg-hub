@@ -47,10 +47,11 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                 row.get("status") != "pending" or row.get("worker_state") != "queued"
                 or row.get("manual_resume_command_id") != manual_command_id):
             raise RuntimeError("manual task claim changed")
-        journal = journal_factory()
+        journal = await asyncio.to_thread(journal_factory)
         if journal is None:
             raise RuntimeError("task execution journal unavailable")
-        claim = journal.begin_task_execution(
+        claim = await asyncio.to_thread(
+            journal.begin_task_execution,
             sd, sid, execution_id, manual_command_id=manual_command_id)
         if not claim["created"]:
             if manual_command_id:
@@ -75,8 +76,9 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
         log.exception("[task_execution:start] could not record worker start")
         if manual_command_id:
             if claimed:
-                journal.finish_task_execution(sd, sid, execution_id,
-                                              state="uncertain", reason="worker_not_started")
+                await asyncio.to_thread(
+                    journal.finish_task_execution, sd, sid, execution_id,
+                    state="uncertain", reason="worker_not_started")
             raise
 
     returned = False
@@ -92,7 +94,8 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                                 and row.get("worker_execution_id") == execution_id)
                 complete = bool(owns_row and await business_result_persisted(driver, row))
                 attempts = summarize_attempts(
-                    journal.find_task(sd, sid), deadline_seconds=deadline_seconds)
+                    await asyncio.to_thread(journal.find_task, sd, sid),
+                    deadline_seconds=deadline_seconds)
                 state = "uncertain"
                 if complete:
                     state = "succeeded"
@@ -101,10 +104,13 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                       and not attempts["in_flight"]
                       and not attempts["unknown_without_http_evidence"]):
                     state = "failed"
-                journal.finish_task_execution(
+                await asyncio.to_thread(
+                    journal.finish_task_execution,
                     sd, sid, execution_id, state=state,
                     reason="business_result_persisted" if complete else "business_result_missing")
-                if state == "failed" and journal.task_execution_summary(sd, sid)["failed_attempts"] >= 3:
+                summary = (await asyncio.to_thread(journal.task_execution_summary, sd, sid)
+                           if state == "failed" else None)
+                if summary and summary["failed_attempts"] >= 3:
                     await driver.execute_query(
                         "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
                         "WHERE k.worker_execution_id = $execution_id "

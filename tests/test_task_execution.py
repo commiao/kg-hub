@@ -46,7 +46,7 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse(SERVER.read_text())
         funcs = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
                  and n.name in {"do_extract", "_run_recorded_extract"}]
-        self.ns = {"_extraction_started": self.started,
+        self.ns = {"asyncio": asyncio, "_extraction_started": self.started,
                    "_extraction_finished": self.finished,
                    "_do_extract_inner": self.worker,
                    "model_business_task": model_business_task,

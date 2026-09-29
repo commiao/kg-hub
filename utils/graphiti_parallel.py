@@ -194,27 +194,31 @@ async def finish_optimistic_episode(
         extract_attributes_with_snapshot, commit_episode_with_receipt,
     )
     task_sd, task_sid, operation_id, input_digest = identity
-    selected = store.save_or_load(*identity, "parallel_selected_round")
+    # SQLite commits fsync and can wait on the write lock; keep them off the loop.
+    def load(*args):
+        return asyncio.to_thread(store.save_or_load, *args)
+
+    selected = await load(*identity, "parallel_selected_round")
     first = selected["round"] if selected else 0
     # Human recovery accounts for every completed paid step, including a
     # proven-stale round. Restoring a prepared commit skips the stage helpers
     # that normally acknowledge these receipts.
-    def acknowledge_round(round_identity):
-        complete = store.save_or_load(*round_identity, "prepared_commit")
+    async def acknowledge_round(round_identity):
+        complete = await load(*round_identity, "prepared_commit")
         if complete is None:
             raise RuntimeError("completed parallel round receipt missing")
         acknowledge_restored_steps(complete.get("model_step_ids", []))
 
     for earlier in range(first):
         old_identity = (task_sd, task_sid, operation_id + f":graph-round:{earlier}", input_digest)
-        if store.save_or_load(*old_identity, "graph_conflict") is None:
+        if await load(*old_identity, "graph_conflict") is None:
             raise RuntimeError("selected parallel round lacks prior conflict proof")
-        acknowledge_round(old_identity)
+        await acknowledge_round(old_identity)
     for round_number in range(first, MAX_ROUNDS):
         round_id = operation_id + f":graph-round:{round_number}"
         round_identity = (task_sd, task_sid, round_id, input_digest)
-        if store.save_or_load(*round_identity, "graph_conflict") is not None:
-            acknowledge_round(round_identity)
+        if await load(*round_identity, "graph_conflict") is not None:
+            await acknowledge_round(round_identity)
             continue
         dependencies = await asyncio.to_thread(
             ReadDependencies, graphiti.driver, store, round_identity)
@@ -222,7 +226,7 @@ async def finish_optimistic_episode(
         common = dict(store=store, task_sd=task_sd, task_sid=task_sid,
                       operation_id=round_id, input_digest=input_digest)
         started = time.monotonic()
-        prepared = store.save_or_load(*round_identity, "prepared_commit")
+        prepared = await load(*round_identity, "prepared_commit")
         if prepared is None:
             if selected:
                 raise RuntimeError("selected parallel round has no complete artifact")
@@ -248,16 +252,16 @@ async def finish_optimistic_episode(
                     await edge.generate_embedding(graphiti.embedder)
             completed_steps = set()
             for phase in ("resolved_nodes", "edge_phase", "attribute_phase"):
-                artifact = store.save_or_load(*round_identity, phase)
+                artifact = await load(*round_identity, phase)
                 if artifact is not None:
                     completed_steps.update(artifact.get("model_step_ids", []))
-            prepared = store.save_or_load(*round_identity, "prepared_commit", {
+            prepared = await load(*round_identity, "prepared_commit", {
                 "nodes": [n.model_dump(mode="json") for n in hydrated],
                 "edges": [e.model_dump(mode="json") for e in resolved + invalidated],
                 "reads": sorted(dependencies.records),
                 "model_step_ids": sorted(completed_steps),
             })
-        acknowledge_round(round_identity)
+        await acknowledge_round(round_identity)
         if prepared["reads"] != sorted(dependencies.records):
             raise RuntimeError("parallel graph read footprint drift")
         hydrated = [EntityNode.model_validate(n) for n in prepared["nodes"]]
@@ -269,8 +273,8 @@ async def finish_optimistic_episode(
             steps = {}
             # A receipt can be replayed after later legitimate graph writes.
             # An uncertain prior write is fenced by the original commit helper.
-            receipt = store.save_or_load(*identity, "graph_commit_receipt")
-            commit_started = store.save_or_load(*identity, "graph_commit_started")
+            receipt = await load(*identity, "graph_commit_receipt")
+            commit_started = await load(*identity, "graph_commit_started")
             steps["fence"] = time.monotonic() - acquired
             if receipt is None and commit_started is None:
                 step = time.monotonic()
@@ -279,7 +283,7 @@ async def finish_optimistic_episode(
                 if not unchanged:
                     if selected:
                         raise GraphReadConflict("selected commit dependencies changed; freeze")
-                    store.save_or_load(*round_identity, "graph_conflict", {"validated": False})
+                    await load(*round_identity, "graph_conflict", {"validated": False})
                     log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
                              "lock_wait=%.3fs hold=%.3fs validate=%.3fs loop_lag=%.3fs "
                              "validate_concurrency=%d",
@@ -289,8 +293,8 @@ async def finish_optimistic_episode(
                              VALIDATE_CONCURRENCY)
                     continue
                 step = time.monotonic()
-                selected = store.save_or_load(*identity, "parallel_selected_round",
-                                             {"round": round_number})
+                selected = await load(*identity, "parallel_selected_round",
+                                      {"round": round_number})
                 steps["select"] = time.monotonic() - step
                 if selected["round"] != round_number:
                     raise RuntimeError("parallel commit selection drift")

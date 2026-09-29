@@ -63,7 +63,7 @@ class BackupTests(unittest.TestCase):
     def test_claim_occurs_after_backup(self):
         source = SOURCE.read_text()
         handler = source[source.index("async def ingest(request:"):source.index("async def ingest_status(")]
-        self.assertLess(handler.index("_backup_episode(body, ref_time, request_id)"),
+        self.assertLess(handler.index("to_thread(_backup_episode, body, ref_time, request_id)"),
                         handler.index("merge_or_get_ingested_key("))
 
 

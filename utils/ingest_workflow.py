@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
@@ -21,6 +22,22 @@ def current_workflow():
 
 @contextmanager
 def workflow_context(body, reference_time, epoch, route, journal_factory):
+    with bind_workflow(open_workflow(body, reference_time, epoch, route,
+                                     journal_factory)) as workflow:
+        yield workflow
+
+
+@contextmanager
+def bind_workflow(workflow):
+    token = _current.set(workflow)
+    try:
+        yield workflow
+    finally:
+        _current.reset(token)
+
+
+def open_workflow(body, reference_time, epoch, route, journal_factory):
+    """Durably record the task plan; blocking, so async callers use a thread."""
     workflow = None
     try:
         journal = journal_factory()
@@ -44,11 +61,7 @@ def workflow_context(body, reference_time, epoch, route, journal_factory):
         if manual_resume_stage() is not None:
             raise
         log.exception("[ingest:checkpoint_unavailable] original worker continues")
-    token = _current.set(workflow)
-    try:
-        yield workflow
-    finally:
-        _current.reset(token)
+    return workflow
 
 
 def split_observations(new_value=None, *, step_ids=()):
@@ -76,9 +89,9 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
     """
     if journal is None:
         return None
-    store = StageArtifactStore(journal.path)
+    store = await asyncio.to_thread(StageArtifactStore, journal.path)
     sd, sid = row.get("source_description"), row.get("source_obs_id")
-    located = store.locate(sd, sid, "business-task", "task_plan")
+    located = await asyncio.to_thread(store.locate, sd, sid, "business-task", "task_plan")
     if located is None:
         return None
     digest, plan = located
@@ -96,7 +109,8 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
             return False
         row["episode_uuid"] = parent
     if plan["route"] == "split":
-        observations = store.save_or_load(sd, sid, "business-task", digest, "split_observations")
+        observations = await asyncio.to_thread(
+            store.save_or_load, sd, sid, "business-task", digest, "split_observations")
         if not observations:
             return False
         for index, obs in enumerate(observations["observations"], 1):
@@ -106,14 +120,16 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
                 observation_body(obs, plan["name"]), plan["epoch"]))
     elif plan["route"] == "episode":
         # The exact operation ID is recorded before its first Graphiti call.
-        link = store.save_or_load(sd, sid, "business-task", digest, "episode_operation")
+        link = await asyncio.to_thread(
+            store.save_or_load, sd, sid, "business-task", digest, "episode_operation")
         if not link:
             return False
         operations.append(link["operation_id"])
     elif plan["route"] != "catalog":
         return False
     for operation_id in operations:
-        envelope = store.locate(sd, sid, operation_id, "operation_envelope")
+        envelope = await asyncio.to_thread(
+            store.locate, sd, sid, operation_id, "operation_envelope")
         if envelope is None:
             return False
         input_digest, value = envelope

@@ -1,6 +1,7 @@
 """The operator check reads evidence and never creates another model call."""
 
 import ast
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
@@ -95,7 +96,7 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
             "summarize_attempts": summarize_attempts,
             "MIN_CLIENT_TIMEOUT_SEC": 180,
             "datetime": datetime, "timezone": timezone,
-            "MAX_OBS": 20, "asyncio": Mock(),
+            "MAX_OBS": 20, "asyncio": asyncio,
             "obs_to_episode_body": obs_to_episode_body,
         }
         exec(compile(module, str(SOURCE), "exec"), namespace)

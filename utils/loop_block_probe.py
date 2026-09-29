@@ -22,6 +22,7 @@ THRESHOLD = float(os.environ.get("KG_HUB_LOOP_BLOCK_THRESHOLD_SEC", "0.2"))
 SAMPLE = 0.02
 REPORT_SECONDS = float(os.environ.get("KG_HUB_LOOP_BLOCK_REPORT_SEC", "300"))
 TOP = 12
+CALLERS = 3
 _LIBRARY_MARKERS = ("site-packages", "dist-packages", f"{os.sep}lib{os.sep}python")
 
 
@@ -31,16 +32,22 @@ def _site(frame) -> str:
 
 
 def stack_key(frame) -> str:
-    """Innermost frame plus the innermost frame in our own code."""
+    """Innermost frame plus the innermost frames in our own code.
+
+    A shared helper such as a SQLite ``_connect`` is useless on its own, so
+    up to ``CALLERS`` of our frames are kept, innermost first.
+    """
     leaf = _site(frame)
-    own = None
+    own = []
     f = frame
-    while f is not None:
+    while f is not None and len(own) < CALLERS:
         if not any(m in f.f_code.co_filename for m in _LIBRARY_MARKERS):
-            own = _site(f)
-            break
+            own.append(_site(f))
         f = f.f_back
-    return leaf if own is None or own == leaf else f"{own} -> {leaf}"
+    if not own:
+        return leaf
+    chain = " <- ".join(own)
+    return chain if own[0] == leaf else f"{chain} -> {leaf}"
 
 
 class LoopBlockProbe:

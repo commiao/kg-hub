@@ -161,9 +161,11 @@ def _task_report_data(journal, row: dict, *, deadline_seconds: float,
 
 def prepare_task_report(store: MailboxStore, journal, row: dict,
                         *, deadline_seconds: float,
+                        business_result_persisted: bool = False,
                         manual_resume_available: bool = False) -> dict:
     data = _task_report_data(
         journal, row, deadline_seconds=deadline_seconds,
+        business_result_persisted=business_result_persisted,
         manual_resume_available=manual_resume_available)
     return store.prepare_report(
         data["source_description"], data["source_obs_id"],
@@ -183,10 +185,10 @@ async def refresh_tracked_reports(*, store: MailboxStore, journal,
     """
     active_states = {"queued", "running", "reconciliation", "retry_waiting"}
     refreshed = []
-    for prior in store.all_reports():
+    for prior in await asyncio.to_thread(store.all_reports):
         if prior.get("state") not in active_states:
             continue
-        identity = store.lookup_task(prior["task_id"])
+        identity = await asyncio.to_thread(store.lookup_task, prior["task_id"])
         if identity is None:
             continue
         try:
@@ -200,15 +202,11 @@ async def refresh_tracked_reports(*, store: MailboxStore, journal,
                 or not isinstance(result.get("task"), dict)
                 or not isinstance(result.get("business_result_persisted"), bool)):
             continue
-        data = _task_report_data(
-            journal, result["task"], deadline_seconds=deadline_seconds,
+        refreshed.append(await asyncio.to_thread(
+            prepare_task_report, store, journal, result["task"],
+            deadline_seconds=deadline_seconds,
             business_result_persisted=result["business_result_persisted"],
-            manual_resume_available=manual_resume_available)
-        refreshed.append(store.prepare_report(
-            data["source_description"], data["source_obs_id"],
-            step_id=data["model_step_id"], state=data["state"],
-            failed_attempts=data["failed_attempts"],
-            retryable=data["retryable"], reason=data["reason"]))
+            manual_resume_available=manual_resume_available))
     return refreshed
 
 
@@ -284,14 +282,15 @@ async def run_mailbox_cycle(*, driver, store: MailboxStore, journal, check_task,
         "k.source_obs_id AS source_obs_id, k.status AS status, "
         "k.error_kind AS error_kind")
     for row in rows:
-        prepare_task_report(store, journal, row,
-                            deadline_seconds=deadline_seconds,
-                            manual_resume_available=enqueue_manual_resume is not None)
+        await asyncio.to_thread(
+            prepare_task_report, store, journal, row,
+            deadline_seconds=deadline_seconds,
+            manual_resume_available=enqueue_manual_resume is not None)
     await refresh_tracked_reports(
         store=store, journal=journal, check_task=check_task,
         deadline_seconds=deadline_seconds,
         manual_resume_available=enqueue_manual_resume is not None)
-    for report in store.all_reports():
+    for report in await asyncio.to_thread(store.all_reports):
         if sent_versions.get(report["task_id"]) == report["version"]:
             continue
         await asyncio.to_thread(mailbox_post, base_url, token, "report", report)
