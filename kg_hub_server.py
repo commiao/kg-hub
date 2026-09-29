@@ -1744,7 +1744,7 @@ async def ingest_reconciliation(request: Request) -> JSONResponse:
         "k.failed_children AS failed_children, k.worker_state AS worker_state, "
         "k.created_at AS created_at, k.execution_epoch AS execution_epoch, k.stage AS stage, "
         "k.updated_at AS updated_at, "
-        "k.name AS name, k.stage AS stage, "
+        "k.name AS name, "
         "k.manual_resume_command_id AS manual_resume_command_id, "
         "k.worker_execution_id AS worker_execution_id"
     )
