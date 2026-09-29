@@ -14,6 +14,7 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from enum import Enum
@@ -428,36 +429,46 @@ async def commit_episode_with_receipt(
     graphiti, episode, hydrated_nodes, entity_edges, now, group_id,
     saga, saga_previous_episode_uuid, node_episode_index_map,
     *, store: StageArtifactStore, task_sd: str, task_sid: str,
-    operation_id: str, input_digest: str,
+    operation_id: str, input_digest: str, timings: dict | None = None,
 ):
     """Return a durable receipt or freeze any uncertain graph write.
 
     This does not infer business success from a missing receipt. It deliberately
     requires external graph verification after a crash between write and receipt.
+    ``timings``, when given, receives the seconds spent in each step.
     """
     from graphiti_core.edges import EpisodicEdge
     from graphiti_core.nodes import EpisodicNode
 
     if version("graphiti-core") != "0.29.0":
         raise RuntimeError("unsupported Graphiti version for commit adapter")
+    timings = {} if timings is None else timings
     identity = (task_sd, task_sid, operation_id, input_digest)
     inputs = (episode, hydrated_nodes, entity_edges, now, group_id,
               saga, saga_previous_episode_uuid, node_episode_index_map)
+    step = time.monotonic()
     saved, digest = _stage_record(store, identity, "graph_commit_receipt", inputs)
+    timings["receipt_lookup"] = time.monotonic() - step
     if saved is None:
+        step = time.monotonic()
         store.begin_graph_commit(*identity, expected={
             "episode": episode.model_dump(mode="json"),
             "nodes": [node.model_dump(mode="json") for node in hydrated_nodes],
             "entity_edges": [edge.model_dump(mode="json") for edge in entity_edges],
             "saga_expected": saga is not None,
         })
+        timings["begin"] = time.monotonic() - step
+        step = time.monotonic()
         episodic_edges, saved_episode = await graphiti._process_episode_data(*inputs)
+        timings["write"] = time.monotonic() - step
+        step = time.monotonic()
         saved = store.save_or_load(*identity, "graph_commit_receipt", {
             "stage_input_digest": digest,
             "episode": saved_episode.model_dump(mode="json"),
             "episodic_edges": [edge.model_dump(mode="json")
                                for edge in episodic_edges],
         })
+        timings["receipt_save"] = time.monotonic() - step
     return ([EpisodicEdge.model_validate(edge) for edge in saved["episodic_edges"]],
             EpisodicNode.model_validate(saved["episode"]))
 
