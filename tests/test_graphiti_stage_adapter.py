@@ -151,7 +151,7 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
             identity = dict(store=store, task_sd="source", task_sid="sid",
                             operation_id="op", input_digest="input")
             with patch.object(ops, "extract_attributes_from_nodes", attributes):
-                for _ in range(2):
+                for replay in (False, True):
                     resolved, invalidated, new = await extract_and_resolve_edges_with_snapshot(
                         graphiti, episode, [node], [], {}, "kg_hub", None,
                         [node], {node.uuid: node.uuid}, None, **identity)
@@ -159,9 +159,13 @@ class CandidateSnapshotTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(invalidated, [])
                     hydrated = await extract_attributes_with_snapshot(
                         graphiti, [node], episode, [], None, new, **identity)
+                    timings = {}
                     receipt_edges, receipt_episode = await commit_episode_with_receipt(
                         graphiti, episode, hydrated, resolved, now, "kg_hub",
-                        None, None, {node.uuid: [0]}, **identity)
+                        None, None, {node.uuid: [0]}, **identity, timings=timings)
+                    self.assertEqual(set(timings), {"receipt_lookup"} if replay else
+                                     {"receipt_lookup", "begin", "write", "receipt_save"})
+                    self.assertTrue(all(v >= 0 for v in timings.values()))
                     self.assertEqual(receipt_edges[0].uuid, episode_edge.uuid)
                     self.assertEqual(receipt_episode.uuid, episode.uuid)
             self.assertEqual(calls, {"edge": 1, "attribute": 1, "commit": 1})

@@ -46,6 +46,49 @@ class ReadSetTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(GraphReadConflict):
                 await restored.execute('MATCH candidates RETURN version', query='fuzzy terms')
 
+    async def test_concurrent_validation_is_bounded_and_detects_any_change(self):
+        class Versions(Graph):
+            def __init__(self):
+                super().__init__(); self.values={}; self.active=0; self.peak=0
+            async def ro_query(self, query, params):
+                self.active+=1; self.peak=max(self.peak,self.active)
+                try:
+                    await asyncio.sleep(.01)
+                    value=self.values.get(params['query'],0)
+                    return SimpleNamespace(header=[[1,'version']],result_set=[[value]])
+                finally:
+                    self.active-=1
+        with tempfile.TemporaryDirectory() as temp:
+            graph=Versions()
+            reads=ReadDependencies(Driver(graph),StageArtifactStore(Path(temp)/'stage.db'),('s','i','o','d'))
+            for i in range(20):
+                await reads.execute('MATCH candidates RETURN version',query=str(i))
+            graph.peak=0
+            self.assertTrue(await reads.validate(4))
+            self.assertEqual(graph.peak,4,'re-reads must overlap, bounded by the concurrency')
+            graph.values['1']=1
+            self.assertFalse(await reads.validate(4),'a change in any read is a conflict')
+            self.assertEqual(graph.active,0,'no re-read may outlive validation')
+            self.assertFalse(await reads.validate(1),'serial mode must agree')
+
+    async def test_concurrent_validation_error_cancels_remaining_reads(self):
+        class Failing(Graph):
+            started=0
+            async def ro_query(self, query, params):
+                if params['query']=='boom' and self.value==1:
+                    raise RuntimeError('falkor down')
+                Failing.started+=1
+                await asyncio.sleep(.2 if self.value==1 else 0)
+                return SimpleNamespace(header=[[1,'version']],result_set=[[0]])
+        with tempfile.TemporaryDirectory() as temp:
+            graph=Failing(); graph.value=0
+            reads=ReadDependencies(Driver(graph),StageArtifactStore(Path(temp)/'stage.db'),('s','i','o','d'))
+            for q in ('a','boom','b','c'):
+                await reads.execute('MATCH candidates RETURN version',query=q)
+            graph.value=1
+            with self.assertRaisesRegex(RuntimeError,'falkor down'):
+                await asyncio.wait_for(reads.validate(4),1)
+
     async def test_slow_disk_batches_reads_without_blocking_network_loop(self):
         class SlowStore(StageArtifactStore):
             batches=0
@@ -153,8 +196,17 @@ class ParallelCommitTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(stage,'resolve_nodes_with_candidate_snapshot',resolve), \
                  patch.object(stage,'extract_and_resolve_edges_with_snapshot',edges), \
                  patch.object(stage,'extract_attributes_with_snapshot',attrs), \
-                 patch.object(stage,'commit_episode_with_receipt',commit):
+                 patch.object(stage,'commit_episode_with_receipt',commit), \
+                 self.assertLogs('kg_hub.parallel','INFO') as logs:
                 results=await asyncio.wait_for(asyncio.gather(run('a'),run('b')),5)
+            timing=[m for m in logs.output if '[ingest:parallel_timing]' in m]
+            conflict=[m for m in logs.output if '[ingest:parallel_conflict]' in m]
+            self.assertEqual((len(timing),len(conflict)),(2,1))
+            for field in ('lock_wait=','commit=','fence=','validate=','select=','begin=',
+                          'write=','receipt_save=','loop_lag=','validate_concurrency='):
+                self.assertTrue(all(field in m for m in timing),field)
+            for field in ('lock_wait=','hold=','validate=','loop_lag='):
+                self.assertIn(field,conflict[0])
             self.assertEqual(len(commits),2)
             self.assertEqual(len(set(commits)),2)
             self.assertEqual(len(model_rounds),3, 'one stale completed round must rebase')
