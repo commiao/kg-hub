@@ -105,8 +105,55 @@ def _rejected_payload(exc: ValidationError) -> dict:
     for error in exc.errors():
         if len(error.get("loc", ())) == 1 and error.get("type") == "missing":
             if isinstance(error.get("input"), dict):
-                return error["input"]
+                payload = error["input"]
+                raw = payload.get("raw_arguments")
+                if set(payload) == {"raw_arguments"}:
+                    # Envelope repair may already have mended it into an object.
+                    if isinstance(raw, dict):
+                        return raw
+                    if isinstance(raw, str):
+                        return _complete_entries(raw)
+                return payload
     return {}
+
+
+def _complete_entries(raw: str) -> dict:
+    """Entries the model fully wrote before its arguments stopped being JSON.
+
+    The provider hands back unparseable tool arguments as ``raw_arguments``.
+    On 2026-09-29 those were mostly batches cut at max_tokens=4096 after
+    several complete ``entity_i`` objects. Raising max_tokens is not the fix:
+    4096 tokens already took 65-93s against a 150s gateway route timeout, and
+    a timed-out paid call becomes unknown-outcome, not retryable. Only values
+    that decode completely are kept; the cut-off entry and the rest are re-asked.
+    """
+    decoder = json.JSONDecoder()
+    entries: dict = {}
+    text = raw.lstrip()
+    if text[:1] != "{":
+        return entries
+    pos = 1
+    while True:
+        pos = _skip_ws(text, pos)
+        try:
+            key, pos = decoder.raw_decode(text, pos)
+            pos = _skip_ws(text, pos)
+            if not isinstance(key, str) or text[pos:pos + 1] != ":":
+                return entries
+            value, pos = decoder.raw_decode(text, _skip_ws(text, pos + 1))
+        except ValueError:
+            return entries
+        entries[key] = value
+        pos = _skip_ws(text, pos)
+        if text[pos:pos + 1] != ",":
+            return entries
+        pos += 1
+
+
+def _skip_ws(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos] in " \t\r\n":
+        pos += 1
+    return pos
 
 
 async def _salvage(clients, batch, payload, episode, previous_episodes):

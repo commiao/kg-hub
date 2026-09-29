@@ -77,6 +77,25 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(out["timestamps"], [{"index": 0, "valid_at": None, "invalid_at": None}])
         self.assertEqual(gw.envelope_repairs_total(), {"prefixed_json_string": 1})
 
+    def test_paren_closing_a_list_becomes_a_bracket(self):
+        # 2026-09-29 线上 ExtractedEntities 原文（截短）
+        raw = ('\n[{"name": "Linkwatch", "entity_type_id": 4, "episode_indices": [0]}, '
+               '{"name": "linkwatch.jsonl", "entity_type_id": 3, "episode_indices": [0)}]\n')
+        out = self.repair({"extracted_entities": raw})
+        self.assertEqual(out["extracted_entities"][1],
+                         {"name": "linkwatch.jsonl", "entity_type_id": 3, "episode_indices": [0]})
+        self.assertEqual(gw.envelope_repairs_total(), {"paren_as_bracket": 1})
+
+    def test_one_extra_closing_brace_is_dropped(self):
+        # 2026-09-29 线上 SummarizedEntities 原文（截短）
+        raw = ('\n[{"name": "openclaw", "summary": "AI agent orchestrator.", '
+               '"entity_types": ["Entity", "Tool"], "attributes": {"version": null}}}]\n')
+        out = self.repair({"summaries": raw})
+        self.assertEqual(out["summaries"], [{
+            "name": "openclaw", "summary": "AI agent orchestrator.",
+            "entity_types": ["Entity", "Tool"], "attributes": {"version": None}}])
+        self.assertEqual(gw.envelope_repairs_total(), {"stray_closer": 1})
+
     def test_object_wrapped_under_an_unknown_key_is_unwrapped_by_schema(self):
         # 2026-09-29 线上 _DedupeResponse 原文
         rows = [{"index": 0, "duplicate_facts": [], "contradicted_facts": []}]
@@ -145,6 +164,18 @@ class DoNotTouchTests(unittest.TestCase):
     def test_only_a_leading_angle_bracket_is_accepted_as_prefix(self):
         for raw in ('>> [1]', 'json\n[1]', '> not json'):
             self.unchanged({"timestamps": raw})
+
+    def test_brackets_inside_strings_are_prose_not_structure(self):
+        """整串坏了也只动字符串外面；summary 里写的 "[1)" 与 "}" 是正文。"""
+        raw = '[{"summary": "见 [1) 与 }"}, {"summary": "缺右括号"'
+        self.unchanged({"summaries": raw})
+        mended, fixes = gw._mend_brackets('[{"summary": "见 [1) 与 }"}]}')
+        self.assertEqual((mended, fixes), ('[{"summary": "见 [1) 与 }"}]', ["stray_closer"]))
+
+    def test_a_missing_closer_is_not_invented(self):
+        """少写的括号修不出来：丢掉对不上的那个之后仍不是合法 JSON，就原样放过。"""
+        for raw in ('[{"episode_indices": [0}]', '[{"a": 1}, {"b": [2)'):
+            self.unchanged({"extracted_entities": raw})
 
     def test_wrapper_needs_the_tool_schema_to_prove_it(self):
         wrapped = {"result": {"results": []}}

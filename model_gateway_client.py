@@ -342,6 +342,11 @@ def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
         try:
             return json.loads(text), shape
         except ValueError:
+            pass
+        mended, fixes = _mend_brackets(text)
+        try:
+            return json.loads(mended), "+".join(fixes)
+        except ValueError:
             return value, None
     # B:外壳多包一层,且内层用的是同一个字段名 —— 同名是关键,它把「多包一层」
     #   和「一个正当的单元素列表」区分开。
@@ -350,6 +355,53 @@ def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
             and isinstance(value[0][key], list)):
         return value[0][key], "double_wrapped"
     return value, None
+
+
+_CLOSER_OF = {"[": "]", "{": "}"}
+
+
+def _mend_brackets(text: str) -> tuple[str, list[str]]:
+    """只修字符串**外面**的括号错,返回 (修后文本, 用到的规则)。
+
+    2026-09-29 线上原文,整串 json.loads 失败、其余全部完好:
+      ExtractedEntities   ..."episode_indices": [0)}, {"name": ...
+      SummarizedEntities  ..."attributes": {}}}]
+    字符串外的 `)` 在 JSON 里从来不合法,对着 `[` 时只能是 `]`;对不上栈顶的
+    闭合括号只能是多写的那一个。字符串里的括号一律不动 —— summary 里写着
+    "见 [1)" 是正文。修完仍须整串 json.loads 成功才算数,少写的括号修不出来。
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    fixes: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in _CLOSER_OF:
+            stack.append(ch)
+        elif ch == ")" and stack and stack[-1] == "[":
+            stack.pop()
+            out.append("]")
+            if "paren_as_bracket" not in fixes:
+                fixes.append("paren_as_bracket")
+            continue
+        elif ch in ("]", "}"):
+            if not stack or _CLOSER_OF[stack[-1]] != ch:
+                if "stray_closer" not in fixes:
+                    fixes.append("stray_closer")
+                continue
+            stack.pop()
+        out.append(ch)
+    return "".join(out), fixes
 
 
 def _tool_schemas(tools: Any) -> dict[str, dict]:
