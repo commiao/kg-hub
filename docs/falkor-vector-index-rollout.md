@@ -40,10 +40,11 @@ OPTIONS {dimension:384, similarityFunction:'cosine'}
 ```
 
 `KG_HUB_EDGE_VECTOR_INDEX_PERCENT` chooses a stable percentage by observation
-ID. The initial release used 10%; the next stage uses a 50% Compose default.
-Setting it to 0 restores exact search without dropping the index.
-Index-related query failures fall back to exact;
-read-set conflicts and unrelated graph errors retain their normal handling.
+ID. The initial release used 10%, then a 50% load test was stopped. The
+repaired release returns to a 10% Compose default. Setting it to 0 restores
+exact search without dropping the index. Index-related query failures fall
+back to exact; read-set conflicts and unrelated graph errors retain their
+normal handling.
 The stored read dependency contains the query actually used, so a restored
 round validates with the same semantics it used before the release.
 
@@ -73,16 +74,22 @@ The sole canary observation failed after three optimistic read-set conflicts;
 two non-canary observations logged unrelated `InternalServerError`s. The
 failed round's 30 sampled indexed reads produced identical digests on three
 immediate repetitions. Five of 25 indexed edge dependencies in the latest
-round differed from their saved results after concurrent graph writes, while
-the node and filtered edge dependencies matched at the later audit. This
-supports graph change rather than nondeterministic index output, but does not
-prove the cause of every conflict. The 10% sample has no successful canary
+round differed from their saved results at a later audit, while the node and
+filtered edge dependencies matched. That audit cannot separate intervening
+graph writes from index instability; the later static-graph test below found
+the latter under concurrent reads. The 10% sample has no successful canary
 observation and cannot establish business success rate.
 
-The 50% stage exposed a canary-specific failure pattern. On the unchanged
-isolated graph, six concurrent repetitions of each of 12 stored indexed
-queries produced different ordered result digests for 11 queries. This can
-cause false optimistic read-set conflicts even without graph changes. The
-Compose default is therefore 0 until indexed results are made deterministic
-and a concurrent repeatability test passes. Do not advance the canary before
-that repair is verified.
+The 50% stage exposed a canary-specific failure pattern: six indexed
+observations included three `GraphReadConflict` failures and one success,
+with 13 conflicts in total. On the unchanged isolated graph, the same
+asynchronous Falkor driver returned stable edge identity sets for all 12
+stored queries when serialized, but unstable sets for all 12 with three
+concurrent queries. Larger ANN candidate pools did not reliably fix this.
+Release `0decfee` returned production routing to 0%.
+
+The repair serializes only relationship vector-index reads across observations
+and validation phases in the server event loop. Other graph reads retain
+their existing concurrency. A unit test exercises both behaviors. The
+Compose default returns to 10% for a new canary; do not raise it until
+indexed observations complete and the read-set conflict rate is acceptable.

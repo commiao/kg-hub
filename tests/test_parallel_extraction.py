@@ -32,6 +32,35 @@ class Driver:
 
 
 class ReadSetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_indexed_reads_serialize_across_observations_but_other_reads_overlap(self):
+        class ConcurrentGraph:
+            active = 0
+            peak = 0
+            async def ro_query(self, query, params):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                try:
+                    await asyncio.sleep(.01)
+                    return SimpleNamespace(header=[[1, 'uuid']], result_set=[[self.active]])
+                finally:
+                    self.active -= 1
+        with tempfile.TemporaryDirectory() as temp:
+            graph = ConcurrentGraph()
+            store = StageArtifactStore(Path(temp) / 'stage.db')
+            reads = [ReadDependencies(Driver(graph), store, ('s', str(i), 'o', 'd'))
+                     for i in range(2)]
+            indexed = 'CALL db.idx.vector.queryRelationships() WITH vec.cosineDistance(e.fact_embedding, $v) AS score RETURN e.uuid'
+            with self.assertLogs('kg_hub.parallel', 'INFO'):
+                results = await asyncio.gather(*(
+                    reads[i % 2].read(indexed, {'v': [1.0]}, phase='prevalidate')
+                    for i in range(8)))
+            self.assertEqual(graph.peak, 1)
+            self.assertTrue(all(result[0] == [{'uuid': 1}] for result in results))
+            graph.peak = 0
+            await asyncio.gather(*(reads[i % 2].read('MATCH (n) RETURN n.uuid', {})
+                                   for i in range(8)))
+            self.assertGreater(graph.peak, 1)
+
     async def test_similarity_timing_labels_prepare_and_validation_without_query_data(self):
         class TimedGraph(Graph):
             async def ro_query(self, query, params):

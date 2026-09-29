@@ -64,6 +64,19 @@ class GraphReadConflict(RuntimeError):
     pass
 
 
+def _vector_read_lock():
+    # Falkor's relationship ANN query returned different top-result sets when
+    # multiple read-only calls ran concurrently on an unchanged graph. One
+    # lock per event loop covers prepare and every validation phase, across
+    # all observations; ordinary graph reads keep their existing concurrency.
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, "_kg_hub_vector_read_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        loop._kg_hub_vector_read_lock = lock
+    return lock
+
+
 class ReadDependencies:
     """Record exact ordered read results without retaining graph content twice."""
     def __init__(self, driver, store, identity):
@@ -98,7 +111,11 @@ class ReadDependencies:
             similarity = 'node'
         started = time.monotonic() if similarity else None
         try:
-            result = await self.graph.ro_query(query, params)
+            if 'db.idx.vector.queryRelationships' in query:
+                async with _vector_read_lock():
+                    result = await self.graph.ro_query(query, params)
+            else:
+                result = await self.graph.ro_query(query, params)
         finally:
             if similarity:
                 log.info('[ingest:similarity_query] sid=%s phase=%s kind=%s '
