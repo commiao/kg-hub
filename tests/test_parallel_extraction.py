@@ -32,6 +32,25 @@ class Driver:
 
 
 class ReadSetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_similarity_timing_labels_prepare_and_validation_without_query_data(self):
+        class TimedGraph(Graph):
+            async def ro_query(self, query, params):
+                return SimpleNamespace(header=[[1, 'uuid']], result_set=[])
+        with tempfile.TemporaryDirectory() as temp:
+            reads = ReadDependencies(Driver(TimedGraph()),
+                                     StageArtifactStore(Path(temp) / 'stage.db'),
+                                     ('source', 'sid', 'round', 'input'))
+            edge = 'WITH vec.cosineDistance(e.fact_embedding, $search_vector) AS score WHERE e.uuid IN $edge_uuids'
+            node = 'WITH vec.cosineDistance(n.name_embedding, $search_vector) AS score'
+            with self.assertLogs('kg_hub.parallel', 'INFO') as logs:
+                await reads.read(edge, {'search_vector': [0.1]}, phase='prepare')
+                await reads.read(node, {'search_vector': [0.2]}, phase='prevalidate')
+                await reads.read('MATCH (n) RETURN n', {}, phase='validate')
+            self.assertEqual(len(logs.output), 2)
+            self.assertIn('phase=prepare kind=edge scope=filtered seconds=', logs.output[0])
+            self.assertIn('phase=prevalidate kind=node scope=group seconds=', logs.output[1])
+            self.assertNotIn('search_vector', ''.join(logs.output))
+
     async def test_empty_or_changed_results_are_validated_after_restart(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StageArtifactStore(Path(temp)/'stage.db')
