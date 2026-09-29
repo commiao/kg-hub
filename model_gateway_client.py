@@ -325,6 +325,11 @@ def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
     #   字段(比如某个 summary)误当成 JSON。
     if isinstance(value, str):
         text = value.strip()
+        shape = "json_string"
+        # 2026-09-29 线上 _TimestampResponse / NodeResolutions 各一次:内容完整的
+        # JSON 列表前多了一个 `>` 和换行。只认这一个字符,不做通用的前缀剥离。
+        if text[:1] == ">":
+            text, shape = text[1:].lstrip(), "prefixed_json_string"
         # 首字符就是那道闸,别再在后面加一个 isinstance(parsed, (list, dict)) ——
         # 有了这一句,json.loads 要么抛,要么只能得出 list / dict,那个 isinstance
         # 永远为真。**写一个走不到的分支比不写更坏:它看起来像在处理一种情况**
@@ -335,7 +340,7 @@ def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
         if text[:1] not in ("[", "{"):
             return value, None
         try:
-            return json.loads(text), "json_string"
+            return json.loads(text), shape
         except ValueError:
             return value, None
     # B:外壳多包一层,且内层用的是同一个字段名 —— 同名是关键,它把「多包一层」
@@ -347,19 +352,52 @@ def _repair_field(key: str, value: Any) -> tuple[Any, str | None]:
     return value, None
 
 
-def repair_structured_envelopes(response: Any) -> None:
+def _tool_schemas(tools: Any) -> dict[str, dict]:
+    schemas = {}
+    for tool in tools or []:
+        if isinstance(tool, dict) and isinstance(tool.get("input_schema"), dict):
+            schemas[str(tool.get("name"))] = tool["input_schema"]
+    return schemas
+
+
+def _unwrap_object(payload: dict, schema: dict | None) -> dict | None:
+    """C:整个参数对象被多包一层 {"result": {...真正的参数...}}。
+
+    只有请求自带的工具 schema 能证明「外层那个键不属于参数、内层恰好是参数」:
+    外层唯一的键不在 properties 里,内层的键全在 properties 里且覆盖全部 required。
+    """
+    if not schema or len(payload) != 1:
+        return None
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    (outer, inner), = payload.items()
+    required = set(schema.get("required") or ())
+    if (outer in properties or not isinstance(inner, dict) or not inner
+            or not required <= set(inner) or not set(inner) <= set(properties)):
+        return None
+    return inner
+
+
+def repair_structured_envelopes(response: Any, tools: Any = None) -> None:
     """就地修正响应里 tool_use 块的 input。
 
     只改 dict 的内容,不给 SDK 模型对象赋属性(那些 pydantic 对象可能不可变)。
     任何异常都吞掉:修正是锦上添花,绝不能让它把一次已经付过费的调用弄失败。
     """
     try:
+        schemas = _tool_schemas(tools)
         for block in getattr(response, "content", None) or []:
             if getattr(block, "type", None) != "tool_use":
                 continue
             payload = getattr(block, "input", None)
             if not isinstance(payload, dict):
                 continue
+            inner = _unwrap_object(payload, schemas.get(str(getattr(block, "name", ""))))
+            if inner is not None:
+                payload.clear()
+                payload.update(inner)
+                _note_repair("wrapped_object")
             for key in list(payload):
                 fixed, shape = _repair_field(key, payload[key])
                 if shape is not None:
@@ -638,6 +676,9 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 if cached_result is not None:
                     from anthropic.types import Message
                     result = Message.model_validate_json(cached_result)
+                    # 账本存的是当时修正规则下的结果;重放时用现行规则再修一遍,
+                    # 否则一次外壳错会随同一请求的每次重试原样重现。
+                    repair_structured_envelopes(result, kwargs.get("tools"))
                     if resume is not None:
                         resume["cached_pending"].discard(step_id)
                     future.set_result(result)
@@ -659,7 +700,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 if wire_token is not None:
                     _wire_attempt.reset(wire_token)
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
-            repair_structured_envelopes(result)
+            repair_structured_envelopes(result, kwargs.get("tools"))
             note_offscript_if_missing_tool_use(kwargs, result)
             if journal and prepared:
                 await asyncio.to_thread(journal.complete, key, result.model_dump_json())

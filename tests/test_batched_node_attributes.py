@@ -1,4 +1,5 @@
 """Exercise the Graphiti entry point, including its unchanged summary tail."""
+import ast
 import json
 import tempfile
 import sys
@@ -95,12 +96,59 @@ class BatchAttributesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nodes[1].attributes["version"], "1.0")
         self.assertNotIn("path", nodes[1].attributes)
 
-    async def test_missing_entity_fails_without_mutation_or_paid_fallback(self):
-        nodes = self.nodes(2)
-        generate = AsyncMock(return_value={"entity_0": {"path": "/a"}})
-        with self.assertRaises(ValidationError):
-            await self.run_pipeline(nodes, generate)
+    @staticmethod
+    def answering(batch_answer):
+        """Batch prompt gets ``batch_answer``; the upstream single-entity prompt
+        answers with the entity's own name so a retried entity is identifiable."""
+        async def generate(messages, response_model, **kwargs):
+            if kwargs.get("prompt_name") == "extract_nodes.extract_attributes":
+                name = ast.literal_eval(messages[1].content.split("<ENTITY>")[1]
+                                        .split("</ENTITY>")[0].strip())["name"]
+                return response_model(path=f"/single/{name}").model_dump()
+            return response_model.model_validate(batch_answer).model_dump()
+        return AsyncMock(side_effect=generate)
+
+    def named_nodes(self, *names):
+        return [EntityNode(name=name, group_id="kg_hub", labels=["Entity", "File"],
+                           attributes={"old": "kept"}) for name in names]
+
+    async def test_missing_entity_keeps_valid_answers_and_reasks_only_the_gap(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = self.answering({"entity_0": {"path": "/a"}})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual(generate.await_count, 2)
+        self.assertEqual(generate.await_args_list[1].kwargs["prompt_name"],
+                         "extract_nodes.extract_attributes")
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/a", "/single/b.py"])
+
+    async def test_name_keyed_answer_maps_back_when_names_are_unique(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = self.answering({"a.py": {"path": "/a"}, "b.py": {"path": "/b"}})
+        await self.run_pipeline(nodes, generate)
         self.assertEqual(generate.await_count, 1)
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/a", "/b"])
+
+    async def test_name_keys_are_not_trusted_for_duplicate_names(self):
+        nodes = self.named_nodes("same.py", "same.py")
+        generate = self.answering({"same.py": {"path": "/which"}})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual(generate.await_count, 3)
+        self.assertEqual([n.attributes["path"] for n in nodes], ["/single/same.py"] * 2)
+
+    async def test_unparsed_arguments_reask_every_entity(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = self.answering({"raw_arguments": '{"entity_0": {"path": "/tru'})
+        await self.run_pipeline(nodes, generate)
+        self.assertEqual(generate.await_count, 3)
+        self.assertEqual([n.attributes["path"] for n in nodes],
+                         ["/single/a.py", "/single/b.py"])
+
+    async def test_failed_single_retry_leaves_every_node_unchanged(self):
+        nodes = self.named_nodes("a.py", "b.py")
+        generate = AsyncMock(side_effect=[{"entity_0": {"path": "/a"}},
+                                          ConnectionError("gateway down")])
+        with self.assertRaises(ConnectionError):
+            await self.run_pipeline(nodes, generate)
         self.assertEqual([n.attributes for n in nodes], [{"old": "kept"}] * 2)
 
     async def test_untyped_nodes_need_no_attribute_call(self):
@@ -114,10 +162,11 @@ class BatchAttributesTests(unittest.IsolatedAsyncioTestCase):
         nodes = self.nodes(9)
         generate = AsyncMock(side_effect=[
             {f"entity_{i}": {"path": "/a"} for i in range(8)}, {},
+            ValidationError.from_exception_data("FileAttrs", []),
         ])
         with self.assertRaises(ValidationError):
             await self.run_pipeline(nodes, generate)
-        self.assertEqual(generate.await_count, 2)
+        self.assertEqual(generate.await_count, 3)
         self.assertTrue(all(n.attributes == {"old": "kept"} for n in nodes))
 
 

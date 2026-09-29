@@ -38,10 +38,15 @@ REAL_JSON_STRING = '\n[{"name": "192.168.10.1", "entity_type_id": 0, "episode_in
 REAL_DOUBLE_WRAP = [{"edges": [{"source_entity_name": "a", "target_entity_name": "b"}]}]
 
 
+DEDUPE_TOOL = {"name": "_DedupeResponse", "input_schema": {
+    "type": "object", "properties": {"results": {"type": "array"}}, "required": ["results"]}}
+
+
 class _Block:
-    def __init__(self, type_: str, payload):
+    def __init__(self, type_: str, payload, name: str = "tool"):
         self.type = type_
         self.input = payload
+        self.name = name
 
 
 class _Response:
@@ -64,6 +69,21 @@ class RepairTests(unittest.TestCase):
                          [{"name": "192.168.10.1", "entity_type_id": 0,
                            "episode_indices": [0]}])
         self.assertEqual(gw.envelope_repairs_total(), {"json_string": 1})
+
+    def test_prefixed_json_string_from_production_is_parsed(self):
+        # 2026-09-29 线上 _TimestampResponse 原文
+        raw = '>\n[{"index": 0, "valid_at": null, "invalid_at": null}]\n'
+        out = self.repair({"timestamps": raw})
+        self.assertEqual(out["timestamps"], [{"index": 0, "valid_at": None, "invalid_at": None}])
+        self.assertEqual(gw.envelope_repairs_total(), {"prefixed_json_string": 1})
+
+    def test_object_wrapped_under_an_unknown_key_is_unwrapped_by_schema(self):
+        # 2026-09-29 线上 _DedupeResponse 原文
+        rows = [{"index": 0, "duplicate_facts": [], "contradicted_facts": []}]
+        r = _Response(_Block("tool_use", {"result": {"results": rows}}, "_DedupeResponse"))
+        gw.repair_structured_envelopes(r, [DEDUPE_TOOL])
+        self.assertEqual(r.content[0].input, {"results": rows})
+        self.assertEqual(gw.envelope_repairs_total(), {"wrapped_object": 1})
 
     def test_double_wrapped_list_loses_exactly_one_layer(self):
         out = self.repair({"edges": REAL_DOUBLE_WRAP})
@@ -121,6 +141,34 @@ class DoNotTouchTests(unittest.TestCase):
             gw.repair_structured_envelopes(r)
             self.assertEqual(r.content[0].input["count"], raw, f"{raw!r} 被改写了")
         self.assertEqual(gw.envelope_repairs_total(), {})
+
+    def test_only_a_leading_angle_bracket_is_accepted_as_prefix(self):
+        for raw in ('>> [1]', 'json\n[1]', '> not json'):
+            self.unchanged({"timestamps": raw})
+
+    def test_wrapper_needs_the_tool_schema_to_prove_it(self):
+        wrapped = {"result": {"results": []}}
+        self.unchanged(wrapped)
+        for payload in ({"results": {"results": []}},        # outer key is a real field
+                        {"result": {"other": []}},           # inner misses required
+                        {"result": {"results": [], "x": 1}},  # inner has unknown field
+                        {"result": {"results": []}, "y": 2}):  # not a single wrapper
+            r = _Response(_Block("tool_use", dict(payload), "_DedupeResponse"))
+            gw.repair_structured_envelopes(r, [DEDUPE_TOOL])
+            self.assertEqual(r.content[0].input, payload)
+        # inner holds only an optional field, so it is not the argument object
+        optional = {"name": "T", "input_schema": {
+            "properties": {"results": {}, "note": {}}, "required": ["results"]}}
+        r = _Response(_Block("tool_use", {"result": {"note": "x"}}, "T"))
+        gw.repair_structured_envelopes(r, [optional])
+        self.assertEqual(r.content[0].input, {"result": {"note": "x"}})
+        self.assertEqual(gw.envelope_repairs_total(), {})
+
+    def test_cached_replay_goes_through_the_current_repair_rules(self):
+        src = (ROOT / "model_gateway_client.py").read_text("utf-8")
+        replay = src[src.index("Message.model_validate_json(cached_result)"):]
+        replay = replay[:replay.index("return result")]
+        self.assertIn('repair_structured_envelopes(result, kwargs.get("tools"))', replay)
 
     def test_non_tool_use_blocks_are_never_rewritten(self):
         r = _Response(_Block("text", {"extracted_entities": REAL_JSON_STRING}))
