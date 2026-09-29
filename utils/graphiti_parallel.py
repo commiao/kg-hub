@@ -17,14 +17,17 @@ import time
 from types import MethodType
 
 from utils.graphiti_stage_adapter import _stage_value, _stage_digest
-from utils.writer_lock import async_writer_lock
+from utils.writer_lock import async_writer_lock, read_generation
 
 log = logging.getLogger("kg_hub.parallel")
 MAX_ROUNDS = 3
 MAX_READS = 1024
-# Re-reads run under the writer lock, where no other graph writer can interleave,
-# so their order does not matter. 1 restores the original one-by-one validation.
+# Re-reads that decide a commit either run under the writer lock or are proven
+# free of any interleaved holder, so their order does not matter. 1 restores
+# the original one-by-one validation.
 VALIDATE_CONCURRENCY = max(1, int(os.environ.get("KG_HUB_COMMIT_VALIDATE_CONCURRENCY", "8")))
+# 0 restores validating only under the lock.
+PREVALIDATE = os.environ.get("KG_HUB_COMMIT_PREVALIDATE", "1") != "0"
 
 
 class _LoopLag:
@@ -266,11 +269,32 @@ async def finish_optimistic_episode(
             raise RuntimeError("parallel graph read footprint drift")
         hydrated = [EntityNode.model_validate(n) for n in prepared["nodes"]]
         edges = [EntityEdge.model_validate(e) for e in prepared["edges"]]
+        # Validate before queueing for the lock. A conflict found here skips
+        # the lock entirely; a clean result stays valid under the lock only
+        # while no other holder has taken it since (see read_generation).
+        prevalidated_at = None
+        step = time.monotonic()
+        if (PREVALIDATE and not selected
+                and await load(*identity, "graph_commit_receipt") is None
+                and await load(*identity, "graph_commit_started") is None):
+            generation = read_generation()
+            if not await dependencies.validate(VALIDATE_CONCURRENCY):
+                await load(*round_identity, "graph_conflict", {"validated": False})
+                log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
+                         "lock_wait=0.000s hold=0.000s validate=%.3fs loop_lag=0.000s "
+                         "validate_concurrency=%d prevalidated=1",
+                         task_sid, round_number, len(dependencies.records),
+                         time.monotonic() - step, VALIDATE_CONCURRENCY)
+                continue
+            if generation % 2 == 0:
+                prevalidated_at = generation
+        prevalidate = time.monotonic() - step
         wait_started = time.monotonic()
         async with async_writer_lock(owner="optimistic-graph-commit", timeout_seconds=180):
             acquired = time.monotonic()
             lag_at_acquire = _loop_lag.reading()
-            steps = {}
+            steps = {"prevalidate": prevalidate}
+            skipped = prevalidated_at is not None and read_generation() == prevalidated_at + 1
             # A receipt can be replayed after later legitimate graph writes.
             # An uncertain prior write is fenced by the original commit helper.
             receipt = await load(*identity, "graph_commit_receipt")
@@ -278,7 +302,7 @@ async def finish_optimistic_episode(
             steps["fence"] = time.monotonic() - acquired
             if receipt is None and commit_started is None:
                 step = time.monotonic()
-                unchanged = await dependencies.validate(VALIDATE_CONCURRENCY)
+                unchanged = skipped or await dependencies.validate(VALIDATE_CONCURRENCY)
                 steps["validate"] = time.monotonic() - step
                 if not unchanged:
                     if selected:
@@ -309,12 +333,13 @@ async def finish_optimistic_episode(
                  "lock_wait=%.3fs commit=%.3fs reads=%d "
                  "fence=%.3fs validate=%.3fs select=%.3fs receipt_lookup=%.3fs "
                  "begin=%.3fs write=%.3fs receipt_save=%.3fs loop_lag=%.3fs "
-                 "validate_concurrency=%d", task_sid, round_number,
+                 "validate_concurrency=%d prevalidate=%.3fs validate_skipped=%d",
+                 task_sid, round_number,
                  wait_started-started, acquired-wait_started, finished-acquired,
                  len(dependencies.records),
                  *(steps.get(k, 0.0) for k in ("fence", "validate", "select", "receipt_lookup",
                                                 "begin", "write", "receipt_save")),
-                 loop_lag, VALIDATE_CONCURRENCY)
+                 loop_lag, VALIDATE_CONCURRENCY, steps["prevalidate"], int(skipped))
         return AddEpisodeResults(episode=saved_episode, episodic_edges=episodic_edges,
                                  nodes=hydrated, edges=edges, communities=[], community_edges=[])
     raise GraphReadConflict("graph remained contended after bounded completed rounds")

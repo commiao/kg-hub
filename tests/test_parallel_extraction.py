@@ -317,4 +317,86 @@ class ExecutionModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result,'legacy')
 
 
+class PrevalidatedCommitTests(unittest.IsolatedAsyncioTestCase):
+    """Reads validated before the lock count only if no other holder came between."""
+    def setUp(self):
+        import utils.writer_lock as wl
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        self.dir=Path(temp.name)
+        patcher=patch.multiple(wl,LOCK_DIR=self.dir/'locks',LOCK_FILE=self.dir/'locks'/'writer.lock')
+        patcher.start();self.addCleanup(patcher.stop)
+
+    async def _run(self,graph,*,after_prepare_read=None,during_prevalidate=None):
+        from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+        import utils.graphiti_stage_adapter as stage
+        store=StageArtifactStore(self.dir/'stage.db');driver=Driver(graph)
+        graphiti=SimpleNamespace(driver=driver,clients=SimpleNamespace(driver=driver))
+        rounds=[];commits=[]
+        async def resolve(clients,nodes,*args,**kwargs):
+            await clients.driver.execute_query('MATCH candidates RETURN version')
+            rounds.append(kwargs['operation_id'])
+            if after_prepare_read and len(rounds)==1: after_prepare_read()
+            return nodes,{n.uuid:n.uuid for n in nodes},[]
+        async def edges(*args,**kwargs): return [],[],[]
+        async def attrs(g,nodes,*args,**kwargs): return nodes
+        async def commit(g,episode,*args,**kwargs):
+            commits.append(kwargs['operation_id']);graph.value+=1
+            return [],episode
+        original=graph.ro_query
+        async def ro_query(query,params):
+            result=await original(query,params)
+            graph.reads+=1
+            if during_prevalidate and graph.reads==2: during_prevalidate()
+            return result
+        graph.reads=0;graph.ro_query=ro_query
+        now=datetime.now(timezone.utc)
+        episode=EpisodicNode(name='a',group_id='kg_hub',source=EpisodeType.text,
+                             content='x',source_description='s',valid_at=now)
+        with patch.object(stage,'resolve_nodes_with_candidate_snapshot',resolve), \
+             patch.object(stage,'extract_and_resolve_edges_with_snapshot',edges), \
+             patch.object(stage,'extract_attributes_with_snapshot',attrs), \
+             patch.object(stage,'commit_episode_with_receipt',commit), \
+             self.assertLogs('kg_hub.parallel','INFO') as logs:
+            await finish_optimistic_episode(
+                graphiti,store=store,identity=('s','a','o','d'),episode=episode,
+                previous_episodes=[],extracted_nodes=[EntityNode(name='n',group_id='kg_hub',name_embedding=[1.0])],
+                node_episode_index_map={},now=now,entity_types=None,edge_type_map={},
+                group_id='kg_hub',edge_types=None,custom_extraction_instructions=None)
+        return rounds,commits,logs.output
+
+    async def test_no_intervening_holder_skips_validation_under_the_lock(self):
+        graph=Graph()
+        rounds,commits,logs=await self._run(graph)
+        self.assertEqual(len(commits),1)
+        self.assertEqual(graph.reads,2,'one prepare read and one pre-lock re-read only')
+        self.assertIn('validate_skipped=1',[m for m in logs if 'parallel_timing' in m][0])
+
+    async def test_holder_after_prevalidation_forces_validation_under_the_lock(self):
+        import utils.writer_lock as wl
+        graph=Graph()
+        def other_writer():
+            with wl.writer_lock(owner='other'):
+                graph.value+=1
+        rounds,commits,logs=await self._run(graph,during_prevalidate=other_writer)
+        conflicts=[m for m in logs if 'parallel_conflict' in m]
+        self.assertEqual(len(conflicts),1)
+        self.assertNotIn('prevalidated=1',conflicts[0],'the change is only visible under the lock')
+        self.assertEqual(rounds,['o:graph-round:0','o:graph-round:1'],
+                         'the stale round must be rebuilt, never committed')
+        self.assertEqual(commits,['o'])
+
+    async def test_conflict_found_before_the_lock_never_takes_it(self):
+        import utils.writer_lock as wl
+        graph=Graph()
+        def other_writer():
+            graph.value+=1
+        rounds,commits,logs=await self._run(graph,after_prepare_read=other_writer)
+        conflicts=[m for m in logs if 'parallel_conflict' in m]
+        self.assertEqual(len(conflicts),1)
+        self.assertIn('prevalidated=1',conflicts[0])
+        self.assertEqual(rounds,['o:graph-round:0','o:graph-round:1'])
+        self.assertEqual(commits,['o'])
+        self.assertEqual(wl.read_generation(),2,'only the final commit took the lock')
+
+
 if __name__=='__main__':unittest.main()
