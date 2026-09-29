@@ -157,7 +157,8 @@ def _journal_path(value: str | None) -> Path:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--apply", action="store_true", help="delete; default only counts")
-    parser.add_argument("--retention-days", type=float, default=7)
+    parser.add_argument("--retention-days", type=float, default=1,
+                        help="'ok' is terminal; the window only keeps recent evidence for humans")
     parser.add_argument("--batch", type=int, default=25)
     parser.add_argument("--pause", type=float, default=0.2)
     parser.add_argument("--max-seconds", type=float, default=600)
