@@ -41,8 +41,9 @@ OPTIONS {dimension:384, similarityFunction:'cosine'}
 
 `KG_HUB_EDGE_VECTOR_INDEX_PERCENT` chooses a stable percentage by observation
 ID. The initial release used 10%, then a 50% load test was stopped. The
-repaired release returns to a 10% Compose default. Setting it to 0 restores
-exact search without dropping the index. Index-related query failures fall
+repaired release passed a new 10% canary; this stage uses a 50% Compose
+default. Setting it to 0 restores exact search without dropping the index.
+Index-related query failures fall
 back to exact; read-set conflicts and unrelated graph errors retain their
 normal handling.
 The stored read dependency contains the query actually used, so a restored
@@ -91,5 +92,21 @@ Release `0decfee` returned production routing to 0%.
 The repair serializes only relationship vector-index reads across observations
 and validation phases in the server event loop. Other graph reads retain
 their existing concurrency. A unit test exercises both behaviors. The
-Compose default returns to 10% for a new canary; do not raise it until
-indexed observations complete and the read-set conflict rate is acceptable.
+Compose default returned to 10% for a new canary.
+
+## Repaired 10% canary
+
+During the full hour after release `6945fc8` (2026-09-29 21:10–22:10 UTC),
+48 distinct dispatched observations included two in the stable 10% bucket.
+Both completed successfully. The window logged 36 indexed queries, no index
+fallbacks, one canary read-set conflict and ten non-canary conflicts. The
+canary's 78 broad-edge reads across prepare and validation averaged 1.173
+seconds (median 0.492, maximum 17.301 including serial wait); 1,031 other
+broad-edge reads averaged 6.765 seconds (median 5.722). Four non-canary
+errors were logged: three `InternalServerError` and one `ValidationError`.
+The service stayed healthy.
+
+Two successful canary observations establish that the repaired path can
+complete business writes, but do not estimate its failure rate precisely.
+The next 50% stage is a separate load and correctness gate; return to 0% if
+indexed errors or excess read-set conflicts reappear.
