@@ -18,8 +18,12 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import os
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
@@ -77,6 +81,113 @@ def _percentile(values: list[float], q: float) -> float | None:
 
 def _pct(numerator: float, denominator: float) -> float | None:
     return round(100 * numerator / denominator, 1) if denominator else None
+
+
+def _hour_key(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def _model_attempt_rows(since: datetime) -> list[tuple]:
+    """Read the existing journal without its schema setup or write transaction."""
+    backup = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
+    if not backup:
+        raise FileNotFoundError("KG_HUB_INGEST_BACKUP_PATH 未配置")
+    path = Path(backup).with_name("model-attempts.sqlite3")
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2) as db:
+        return db.execute(
+            "SELECT http_started_at, updated_at, phase FROM model_attempts "
+            "WHERE http_started_at >= ?", (since.isoformat(),)).fetchall()
+
+
+def key_metric_trends(*, now: datetime, commits: list[dict],
+                      attempts: list[tuple] | None,
+                      outcomes: list[dict] | None) -> list[dict]:
+    """Hourly UTC buckets. None means unavailable; zero means observed zero."""
+    start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+    buckets = []
+    for i in range(24):
+        hour = start + timedelta(hours=i)
+        buckets.append({"hour": _hour_key(hour), "ingested": None, "errors": None,
+                        "lock_wait_avg": None, "lock_wait_p90": None,
+                        "commit_avg": None, "commit_p50": None,
+                        "validate_skipped": None, "commit_attempts": None,
+                        "conflicts": None, "prevalidated_conflicts": None,
+                        "conflict_rate": None, "model_calls": None,
+                        "call_duration_avg": None, "model_inflight_avg": None,
+                        "calls_per_ingested": None})
+    by_hour = {b["hour"]: b for b in buckets}
+    if outcomes is not None:
+        for b in buckets:
+            b["ingested"] = b["errors"] = 0
+        for row in outcomes:
+            b = by_hour.get(str(row.get("hour")))
+            if b and row.get("status") == "ok":
+                b["ingested"] += int(row.get("count") or 0)
+            elif b and row.get("status") in ("error", "failed", "needs_reconciliation"):
+                b["errors"] += int(row.get("count") or 0)
+    grouped: dict[str, list[dict]] = {}
+    for row in commits:
+        key = _hour_key(datetime.fromtimestamp(row["at"], tz=timezone.utc))
+        if key in by_hour:
+            grouped.setdefault(key, []).append(row)
+    for key, rows in grouped.items():
+        b = by_hour[key]
+        successes = [r for r in rows if not r["conflict"]]
+        waits = [r["lock_wait_s"] for r in successes]
+        durations = [r["commit_s"] for r in successes if r["commit_s"] is not None]
+        b["commit_attempts"] = len(rows)
+        b["conflicts"] = len(rows) - len(successes)
+        b["prevalidated_conflicts"] = sum(r["prevalidated_conflict"] for r in rows)
+        b["conflict_rate"] = _pct(b["conflicts"], len(rows))
+        b["validate_skipped"] = sum(r["validate_skipped"] for r in successes)
+        if waits:
+            b["lock_wait_avg"] = round(sum(waits) / len(waits), 1)
+            b["lock_wait_p90"] = _percentile(waits, .9)
+        if durations:
+            b["commit_avg"] = round(sum(durations) / len(durations), 1)
+            b["commit_p50"] = _percentile(durations, .5)
+    if attempts is not None:
+        for b in buckets:
+            b["model_calls"] = 0
+        duration_by_hour: dict[str, list[float]] = {}
+        for started_raw, ended_raw, phase in attempts:
+            started = _parse_ts(started_raw)
+            ended = _parse_ts(ended_raw) if phase != "http_started" else None
+            if not started or started > now:
+                continue
+            b = by_hour.get(_hour_key(started))
+            if b:
+                b["model_calls"] += 1
+                if phase == "completed" and ended and ended >= started:
+                    duration_by_hour.setdefault(b["hour"], []).append(
+                        (ended-started).total_seconds())
+            # Integrate call-seconds over each hour, including calls spanning boundaries.
+            # An interrupted, unresolved call has no known end. Cap its
+            # interval so a stale journal row cannot look in flight for days.
+            if phase != "completed":
+                ended = min(ended or now, started + timedelta(minutes=15))
+            end = min(ended or now, now)
+            if end < started:
+                continue
+            cursor = max(started, start)
+            while cursor < end:
+                hour_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                segment_end = min(end, hour_end)
+                cell = by_hour.get(_hour_key(cursor))
+                if cell:
+                    cell["model_inflight_avg"] = (cell["model_inflight_avg"] or 0) + (segment_end-cursor).total_seconds()
+                cursor = segment_end
+        for b in buckets:
+            values = duration_by_hour.get(b["hour"], [])
+            if values:
+                b["call_duration_avg"] = round(sum(values) / len(values), 1)
+            elapsed = min(3600, max(0, (now - _parse_ts(b["hour"] + ":00:00+00:00")).total_seconds()))
+            b["model_inflight_avg"] = round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None
+            if b["ingested"] and b["model_calls"] is not None:
+                b["calls_per_ingested"] = round(b["model_calls"] / b["ingested"], 1)
+    return buckets
 
 
 # ---------- 各段状态 ----------
@@ -648,7 +759,8 @@ APP_ARCH_MERMAID = """flowchart LR
 def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None,
                keys: dict | None, timing: dict, active: int | None,
                graph_daily: list[dict] | None, now: datetime,
-               source_errors: list[str] | None = None) -> dict:
+               source_errors: list[str] | None = None,
+               key_trends: list[dict] | None = None) -> dict:
     status = status if isinstance(status, dict) else {}
     probed = probe_stages(snapshots)
     per_stage = {
@@ -694,6 +806,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
         "stages": stages,
         "backlog": digest,
         "efficiency": efficiency,
+        "key_trends": key_trends or [],
         "bottlenecks": bottlenecks,
         "primary": primary,
         "diagrams": {
@@ -753,12 +866,23 @@ async def _graph_daily(driver, boundary: object, now: datetime) -> list[dict]:
             for r in rows]
 
 
+async def _hourly_outcomes(driver, now: datetime) -> list[dict]:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (k:IngestedKey) WHERE k.updated_at >= $since "
+        "AND k.status IN ['ok','error','failed','needs_reconciliation'] "
+        "RETURN substring(k.updated_at,0,13) AS hour, k.status AS status, "
+        "count(k) AS c ORDER BY hour",
+        since=(now - timedelta(hours=24)).isoformat())
+    return [{"hour": r.get("hour"), "status": r.get("status"),
+             "count": int(r.get("c") or 0)} for r in rows]
+
+
 async def collect_flow() -> dict:
     from dashboard_status import apply_gateway_health, gateway_health
     from kg_hub_server import active_extractions, get_status_driver
     from topology import (GATEWAY_USAGE_PATH, REFINERY_STATUS_PATH, _load_snapshots,
                           _read_json, gateway_quota_node)
-    from utils import ingest_timing
+    from utils import ingest_timing, flow_metrics
 
     now = datetime.now(tz=timezone.utc)
     errors: list[str] = []
@@ -788,10 +912,23 @@ async def collect_flow() -> dict:
             graph_daily = await _graph_daily(driver, status["boundary_id"], now)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"入图量查询失败：{type(exc).__name__}")
+    outcomes = None
+    try:
+        outcomes = await _hourly_outcomes(driver, now)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"小时入图状态不可读：{type(exc).__name__}")
+    attempts = None
+    try:
+        attempts = await asyncio.to_thread(_model_attempt_rows, now - timedelta(hours=24))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"模型调用账本不可读：{type(exc).__name__}")
+    trends = key_metric_trends(now=now, commits=flow_metrics.recent(
+        since=(now - timedelta(hours=24)).timestamp()), attempts=attempts,
+        outcomes=outcomes)
     return build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
                       keys=keys, timing=ingest_timing.summary(now=time.time()),
                       active=active_extractions(), graph_daily=graph_daily, now=now,
-                      source_errors=errors)
+                      source_errors=errors, key_trends=trends)
 
 
 async def dashboard_flow(request: Request) -> HTMLResponse:
@@ -844,6 +981,12 @@ th{font-size:12px;color:GrayText;font-weight:500}
 .dg{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:10px;padding:.8rem;overflow:auto;min-height:200px;background:#fff}
 .dg svg{max-width:100%;height:auto}
 .warn{background:#FDEDED;color:#8A1C1C;border-radius:8px;padding:.5rem .8rem;font-size:13px;margin:.6rem 0}
+.trend-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.trend{border:1px solid color-mix(in srgb,CanvasText 14%,transparent);border-radius:10px;padding:10px;min-width:0}
+.trend h3{font-size:14px;margin:0 0 3px}.trend svg{display:block;width:100%;height:145px}
+.trend .legend{font-size:11px;color:GrayText;display:flex;gap:12px;flex-wrap:wrap}
+.trend .legend i{display:inline-block;width:13px;height:3px;vertical-align:3px;margin-right:4px}
+@media(max-width:700px){.trend-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.chain{grid-template-columns:repeat(2,1fr)}.st::after{display:none}}
 </style></head><body>
 <a class=back href="/portal">← 报表门户</a>
@@ -863,6 +1006,10 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=lg>近 14 天每日入图 Episode（图内实数，UTC）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
+<h2>关键指标趋势</h2>
+<div class=note>最近 24 小时 · UTC 整点分桶 · 每 2 分钟刷新；曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
+<div class=trend-grid id=keytrends></div>
+
 <h2>卡点清单（按影响排序：停流 → 慢流）</h2>
 <table><thead><tr><th style="width:90px">位置</th><th style="width:60px">类型</th><th>现象</th><th>证据</th><th>建议</th></tr></thead><tbody id=bn></tbody></table>
 
@@ -876,6 +1023,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关当日调用 ÷ 图内当日新增，两端都是持久计数、都按 UTC 日，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
+关键指标按 UTC 小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取本服务进程内采样，重启后历史为空；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
 
@@ -932,6 +1080,33 @@ stack('hourly',(B.hourly||[]).slice().reverse(),r=>r.hour.slice(5).replace('T','
  ['实时入图',r=>r.live.ingested,'#5B8FF9'],['推迟',r=>r.backlog.deferred+r.live.deferred,'#E8A33D']]);
 stack('daily',(B.daily||[]).slice().reverse(),r=>r.day,[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
+
+const trends=D.key_trends||[];
+const trendSpecs=[
+ ['入图结果（条）',[['成功','ingested','#1D9E75'],['报错','errors','#D64545']]],
+ ['锁等待（秒）',[['均值','lock_wait_avg','#378ADD'],['P90','lock_wait_p90','#E8A33D']]],
+ ['提交耗时（秒）',[['均值','commit_avg','#8250C4'],['P50','commit_p50','#1D9E75']]],
+ ['提交尝试（次）',[['尝试','commit_attempts','#378ADD'],['冲突','conflicts','#D64545'],['锁外冲突','prevalidated_conflicts','#E8A33D'],['跳过复查','validate_skipped','#1D9E75']]],
+ ['冲突率（%）',[['冲突率','conflict_rate','#D64545']]],
+ ['模型调用（次）',[['调用','model_calls','#378ADD']]],
+ ['模型耗时（秒）',[['已完成均值','call_duration_avg','#8250C4']]],
+ ['平均在飞模型调用',[['在飞','model_inflight_avg','#1D9E75']]],
+ ['调用 / 成功入图',[['同小时比值','calls_per_ingested','#E8A33D']]],
+];
+function trendChart(title,series){
+ const vals=trends.flatMap(r=>series.map(s=>r[s[1]]).filter(v=>Number.isFinite(v)));
+ const peak=Math.max(1,...vals)*1.1,W=440,H=125,L=34,R=8,T=9,B=24;
+ const x=i=>L+i*(W-L-R)/Math.max(1,trends.length-1), y=v=>T+(H-T-B)*(1-v/peak);
+ const curves=series.map(s=>{let pieces=[],part=[];
+  trends.forEach((r,i)=>{const v=r[s[1]];if(Number.isFinite(v))part.push(x(i).toFixed(1)+','+y(v).toFixed(1));
+   else if(part.length){pieces.push(part);part=[]}});if(part.length)pieces.push(part);
+  return pieces.map(p=>'<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('')
+   +trends.map((r,i)=>Number.isFinite(r[s[1]])?'<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[s[1]]).toFixed(1)+'" r="2.5" fill="'+s[2]+'"><title>'+esc(r.hour)+' UTC · '+esc(s[0])+' '+r[s[1]]+'</title></circle>':'').join('')}).join('');
+ const ticks=[0,peak/2,peak].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+(+v.toFixed(1))+'</text>').join('');
+ const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[0].hour.slice(5).replace('T',' '))+'</text><text x="'+(W-49)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[trends.length-1].hour.slice(5).replace('T',' '))+'</text>':'';
+ return '<div class=trend><h3>'+title+'</h3><svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' 最近24小时趋势"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'</svg><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
+}
+$('keytrends').innerHTML=trends.length?trendSpecs.map(s=>trendChart(s[0],s[1])).join(''):'<div class=note>暂无趋势数据</div>';
 
 const names=Object.fromEntries(D.stages.map(s=>[s.id,s.label]));
 $('bn').innerHTML=D.bottlenecks.length?D.bottlenecks.map(b=>'<tr><td>'+esc(names[b.stage]||b.stage)+'</td><td><span class="lv '+(b.deliberate?'plan':b.level)+'">'+(b.deliberate?'计划内':(b.level==='stop'?'停流':'慢流'))+'</span></td><td>'+esc(b.title)+'</td><td>'+esc(b.evidence)+'</td><td>'+esc(b.action)+'</td></tr>').join(''):'<tr><td colspan=5 class=note>无</td></tr>';

@@ -17,6 +17,7 @@ import time
 from types import MethodType
 
 from utils.graphiti_stage_adapter import _stage_value, _stage_digest
+from utils import flow_metrics
 from utils.writer_lock import async_writer_lock, read_generation
 
 log = logging.getLogger("kg_hub.parallel")
@@ -316,6 +317,7 @@ async def finish_optimistic_episode(
                          "validate_concurrency=%d prevalidated=1",
                          task_sid, round_number, len(dependencies.records),
                          time.monotonic() - step, VALIDATE_CONCURRENCY)
+                flow_metrics.record(conflict=True, prevalidated_conflict=True)
                 continue
             if generation % 2 == 0:
                 prevalidated_at = generation
@@ -346,6 +348,7 @@ async def finish_optimistic_episode(
                              acquired-wait_started, time.monotonic()-acquired,
                              steps["validate"], _loop_lag.reading()-lag_at_acquire,
                              VALIDATE_CONCURRENCY)
+                    flow_metrics.record(conflict=True, lock_wait_s=acquired-wait_started)
                     continue
                 step = time.monotonic()
                 selected = await load(*identity, "parallel_selected_round",
@@ -371,6 +374,8 @@ async def finish_optimistic_episode(
                  *(steps.get(k, 0.0) for k in ("fence", "validate", "select", "receipt_lookup",
                                                 "begin", "write", "receipt_save")),
                  loop_lag, VALIDATE_CONCURRENCY, steps["prevalidate"], int(skipped))
+        flow_metrics.record(conflict=False, lock_wait_s=acquired-wait_started,
+                            commit_s=finished-acquired, validate_skipped=skipped)
         return AddEpisodeResults(episode=saved_episode, episodic_edges=episodic_edges,
                                  nodes=hydrated, edges=edges, communities=[], community_edges=[])
     raise GraphReadConflict("graph remained contended after bounded completed rounds")

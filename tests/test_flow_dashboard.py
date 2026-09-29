@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 import flow_dashboard as F  # noqa: E402
 from utils import ingest_timing  # noqa: E402
+from utils import flow_metrics  # noqa: E402
 
 NOW = datetime(2026, 9, 28, 4, 30, tzinfo=timezone.utc)
 SERVER = (ROOT / "kg_hub_server.py").read_text("utf-8")
@@ -320,6 +321,57 @@ class TimingTests(unittest.TestCase):
         ingest_timing.record(waited_s=5, extract_s=5, outcome="ok", at=0)
         self.assertEqual(ingest_timing.summary(window_s=60, now=1000)["samples"], 0)
         self.assertIsNone(ingest_timing.summary(window_s=60, now=1000)["wait_share"])
+
+
+class KeyTrendTests(unittest.TestCase):
+    def test_hourly_metrics_keep_sample_gaps_and_count_prevalidation(self):
+        at = NOW.timestamp()
+        commits = [
+            {"at": at, "conflict": True, "lock_wait_s": 0,
+             "commit_s": None, "validate_skipped": False,
+             "prevalidated_conflict": True},
+            {"at": at, "conflict": False, "lock_wait_s": 4,
+             "commit_s": 10, "validate_skipped": True,
+             "prevalidated_conflict": False},
+        ]
+        attempts = [
+            ("2026-09-28T04:10:00+00:00", "2026-09-28T04:11:00+00:00", "completed"),
+            ("2026-09-28T04:20:00+00:00", "2026-09-28T04:22:00+00:00", "completed"),
+        ]
+        rows = F.key_metric_trends(now=NOW, commits=commits, attempts=attempts,
+                                   outcomes=[{"hour": "2026-09-28T04", "status": "ok", "count": 1},
+                                             {"hour": "2026-09-28T04", "status": "error", "count": 2}])
+        current = rows[-1]
+        self.assertEqual((current["ingested"], current["errors"]), (1, 2))
+        self.assertEqual((current["commit_attempts"], current["conflicts"],
+                          current["prevalidated_conflicts"], current["validate_skipped"]),
+                         (2, 1, 1, 1))
+        self.assertEqual((current["lock_wait_avg"], current["commit_avg"],
+                          current["call_duration_avg"], current["calls_per_ingested"]),
+                         (4.0, 10.0, 90.0, 2.0))
+        self.assertAlmostEqual(current["model_inflight_avg"], .1, places=2)
+        self.assertIsNone(rows[-2]["commit_attempts"])
+        self.assertEqual(rows[-2]["ingested"], 0)
+
+    def test_missing_sources_are_unknown_not_zero(self):
+        rows = F.key_metric_trends(now=NOW, commits=[], attempts=None, outcomes=None)
+        self.assertIsNone(rows[-1]["ingested"])
+        self.assertIsNone(rows[-1]["model_calls"])
+        self.assertIsNone(rows[-1]["commit_attempts"])
+
+    def test_late_reconciliation_does_not_count_as_hours_in_flight(self):
+        rows = F.key_metric_trends(
+            now=NOW, commits=[], outcomes=[],
+            attempts=[("2026-09-28T03:10:00+00:00",
+                       "2026-09-28T04:20:00+00:00", "unknown")])
+        self.assertEqual(rows[-2]["model_inflight_avg"], .25)
+        self.assertEqual(rows[-1]["model_inflight_avg"], 0)
+
+    def test_commit_sample_retains_only_numbers_and_flags(self):
+        flow_metrics.record(conflict=True, prevalidated_conflict=True, at=NOW.timestamp())
+        sample = flow_metrics.recent(since=NOW.timestamp())[0]
+        self.assertEqual(sample["prevalidated_conflict"], True)
+        self.assertNotIn("sid", sample)
 
 
 class ServerModuleIdentityTests(unittest.TestCase):
