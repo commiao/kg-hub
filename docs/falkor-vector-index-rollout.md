@@ -79,8 +79,10 @@ supports graph change rather than nondeterministic index output, but does not
 prove the cause of every conflict. The 10% sample has no successful canary
 observation and cannot establish business success rate.
 
-The 50% stage is a controlled load test because 90% exact traffic still left
-FalkorDB doing most broad scans. Keep the previous image as rollback target.
-Do not move to 100% unless indexed observations complete successfully and
-conflict/error rates stay acceptable; return the setting to 0 if indexed
-query errors or a clear canary-specific failure pattern appears.
+The 50% stage exposed a canary-specific failure pattern. On the unchanged
+isolated graph, six concurrent repetitions of each of 12 stored indexed
+queries produced different ordered result digests for 11 queries. This can
+cause false optimistic read-set conflicts even without graph changes. The
+Compose default is therefore 0 until indexed results are made deterministic
+and a concurrent repeatability test passes. Do not advance the canary before
+that repair is verified.
