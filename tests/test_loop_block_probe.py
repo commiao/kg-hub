@@ -46,7 +46,16 @@ class LoopBlockProbeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         site = probe.snapshot()[2][0][0]
         self.assertTrue(site.startswith("test_loop_block_probe.py:"), site)
-        self.assertIn("_library_blocking_helper -> ", site)
+        self.assertIn("_library_blocking_helper <- ", site)
+        self.assertIn(" -> ", site)
+
+    async def test_shared_helper_is_charged_with_its_callers(self):
+        probe = await self._probe()
+        _blocking_helper()
+        await asyncio.sleep(0.1)
+        site = probe.snapshot()[2][0][0]
+        self.assertIn("_blocking_helper <- ", site)
+        self.assertIn("test_shared_helper_is_charged_with_its_callers", site)
 
     async def test_report_logs_and_resets_the_window(self):
         probe = await self._probe()

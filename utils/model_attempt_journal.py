@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sqlite3
 import hashlib
+import threading
 import uuid
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -603,11 +604,21 @@ def query_gateway_attempt_status(base_url: str, token: str, business_key: str,
     return value
 
 
+_journals: dict[Path, ModelAttemptJournal] = {}
+_journals_lock = threading.Lock()
+
+
 def journal_from_backup_env() -> ModelAttemptJournal | None:
+    """One journal per path: its schema setup takes the SQLite write lock."""
     path = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
     if not path:
         return None
-    return ModelAttemptJournal(Path(path).with_name("model-attempts.sqlite3"))
+    journal_path = Path(path).with_name("model-attempts.sqlite3")
+    with _journals_lock:
+        journal = _journals.get(journal_path)
+        if journal is None or not journal_path.exists():
+            journal = _journals[journal_path] = ModelAttemptJournal(journal_path)
+    return journal
 
 
 def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
