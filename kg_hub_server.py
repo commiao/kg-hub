@@ -5519,11 +5519,14 @@ async def dashboard_translate(request: Request) -> JSONResponse:
 
 @asynccontextmanager
 async def _application_lifespan(app):
+    from utils.loop_block_probe import start_probe, stop_probe
+    start_probe()
     await _start_reconciliation_mailbox()
     try:
         yield
     finally:
         await _stop_reconciliation_mailbox()
+        await stop_probe()
 
 
 app = Starlette(
