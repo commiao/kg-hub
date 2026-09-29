@@ -44,6 +44,42 @@ class WriterLockBusy(Exception):
     """Another writer holds the lock; caller should skip this round."""
 
 
+def _generation_file() -> Path:
+    return LOCK_DIR / "writer.gen"
+
+
+def read_generation() -> int:
+    """Holder generation: odd while the lock is held, even while it is free.
+
+    Every holder advances it on acquire and on release, so a reader that saw
+    an even value ``g`` and later holds the lock at ``g + 1`` knows no other
+    holder, and therefore no graph write, came in between.
+    """
+    try:
+        return int(_generation_file().read_text() or 0)
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def _advance_generation(*, held: bool) -> None:
+    generation = read_generation() + 1
+    if generation % 2 != int(held):
+        # A holder that died without releasing left the value odd.
+        generation += 1
+    target = _generation_file()
+    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(str(generation))
+    os.replace(temporary, target)
+
+
+def _release_generation() -> None:
+    try:
+        _advance_generation(held=False)
+    except OSError:
+        # Left odd, readers fall back to validating under the lock.
+        pass
+
+
 @contextmanager
 def writer_lock(owner: str = "?", timeout_seconds: float = 0.0):
     """
@@ -74,6 +110,7 @@ def writer_lock(owner: str = "?", timeout_seconds: float = 0.0):
                     )
                 time.sleep(0.5)
 
+        _advance_generation(held=True)
         # Stamp owner + pid + acquire time for `cat writer.lock` debugging.
         fd.seek(0)
         fd.truncate()
@@ -85,6 +122,7 @@ def writer_lock(owner: str = "?", timeout_seconds: float = 0.0):
         yield fd
     finally:
         if acquired:
+            _release_generation()
             fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
         fd.close()
 
@@ -119,6 +157,7 @@ async def async_writer_lock(owner: str = "?", timeout_seconds: float = 0.0):
                     )
                 await asyncio.sleep(0.5)  # async-friendly: yields to event loop
 
+        _advance_generation(held=True)
         fd.seek(0)
         fd.truncate()
         fd.write(
@@ -129,5 +168,6 @@ async def async_writer_lock(owner: str = "?", timeout_seconds: float = 0.0):
         yield fd
     finally:
         if acquired:
+            _release_generation()
             fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
         fd.close()
