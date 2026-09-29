@@ -41,8 +41,8 @@ OPTIONS {dimension:384, similarityFunction:'cosine'}
 
 `KG_HUB_EDGE_VECTOR_INDEX_PERCENT` chooses a stable percentage by observation
 ID. The initial release used 10%, then a 50% load test was stopped. The
-repaired release passed a new 10% canary; this stage uses a 50% Compose
-default. Setting it to 0 restores exact search without dropping the index.
+repaired release passed new 10% and 50% canaries; the next stage uses a 100%
+Compose default. Setting it to 0 restores exact search without dropping the index.
 Index-related query failures fall
 back to exact; read-set conflicts and unrelated graph errors retain their
 normal handling.
@@ -110,3 +110,22 @@ Two successful canary observations establish that the repaired path can
 complete business writes, but do not estimate its failure rate precisely.
 The next 50% stage is a separate load and correctness gate; return to 0% if
 indexed errors or excess read-set conflicts reappear.
+
+## Repaired 50% canary
+
+During the first full hour after release `74bbe20` (2026-09-29 22:18–23:18
+UTC), 52 distinct observations were dispatched. Twenty-four were in the stable
+50% bucket; 21 completed, none failed, and three were still in flight at the
+window end. There were 263 indexed queries, no index fallbacks, three canary
+read-set conflicts and 12 non-canary conflicts. Two non-canary observations
+failed, one with `ValidationError` and one with `GraphReadConflict`. The
+service remained healthy.
+
+The canary's 563 broad-edge reads across prepare and validation averaged
+1.331 seconds (median 0.487, maximum 33.251 including serial wait), versus
+5.832 seconds (median 4.826) for 678 non-canary reads. These are different
+observations under shared load, not a paired benchmark. The long indexed tail
+shows that serial queueing remains relevant as routing rises. The 100% stage
+therefore needs a separate full-hour gate on successful completions, errors,
+conflicts, index fallbacks, and read latency before the rollout is considered
+complete.
