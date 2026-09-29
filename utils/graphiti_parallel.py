@@ -88,10 +88,23 @@ class ReadDependencies:
         if len(self.records) > MAX_READS:
             raise RuntimeError("graph read dependency limit exceeded")
 
-    async def read(self, query, params):
+    async def read(self, query, params, *, phase="prepare"):
         # Falkor enforces read-only behavior, including procedures. Never fall
         # back to query(), even for a seemingly harmless unsupported statement.
-        result = await self.graph.ro_query(query, params)
+        similarity = None
+        if 'e.fact_embedding' in query and 'cosineDistance' in query:
+            similarity = 'edge'
+        elif 'n.name_embedding' in query and 'cosineDistance' in query:
+            similarity = 'node'
+        started = time.monotonic() if similarity else None
+        try:
+            result = await self.graph.ro_query(query, params)
+        finally:
+            if similarity:
+                log.info('[ingest:similarity_query] sid=%s phase=%s kind=%s '
+                         'scope=%s seconds=%.3f', self.identity[1], phase,
+                         similarity, 'filtered' if 'edge_uuids' in query else 'group',
+                         time.monotonic() - started)
         header = [h[1] for h in result.header]
         rows = [{field: row[i] if i < len(row) else None
                  for i, field in enumerate(header)} for row in result.result_set]
@@ -136,11 +149,11 @@ class ReadDependencies:
         finally:
             self._flush_task = None
 
-    async def validate(self, concurrency: int = 1):
+    async def validate(self, concurrency: int = 1, *, phase="validate"):
         records = list(self.records.values())
         if concurrency <= 1:
             for record in records:
-                current = await self.read(record["query"], record["params"])
+                current = await self.read(record["query"], record["params"], phase=phase)
                 if _stage_digest(current) != record["result_digest"]:
                     return False
             return True
@@ -148,7 +161,7 @@ class ReadDependencies:
 
         async def unchanged(record):
             async with slots:
-                current = await self.read(record["query"], record["params"])
+                current = await self.read(record["query"], record["params"], phase=phase)
             return _stage_digest(current) == record["result_digest"]
 
         checks = [asyncio.ensure_future(unchanged(record)) for record in records]
@@ -278,7 +291,7 @@ async def finish_optimistic_episode(
                 and await load(*identity, "graph_commit_receipt") is None
                 and await load(*identity, "graph_commit_started") is None):
             generation = read_generation()
-            if not await dependencies.validate(VALIDATE_CONCURRENCY):
+            if not await dependencies.validate(VALIDATE_CONCURRENCY, phase="prevalidate"):
                 await load(*round_identity, "graph_conflict", {"validated": False})
                 log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
                          "lock_wait=0.000s hold=0.000s validate=%.3fs loop_lag=0.000s "
