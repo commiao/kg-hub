@@ -986,6 +986,9 @@ th{font-size:12px;color:GrayText;font-weight:500}
 .trend h3{font-size:14px;margin:0 0 3px}.trend svg{display:block;width:100%;height:145px}
 .trend .legend{font-size:11px;color:GrayText;display:flex;gap:12px;flex-wrap:wrap}
 .trend .legend i{display:inline-block;width:13px;height:3px;vertical-align:3px;margin-right:4px}
+.trend-readout{font-size:12px;min-height:38px;padding:4px 0;color:CanvasText}
+.trend-readout b{display:block;font-weight:600}.trend-readout span{margin-right:10px;white-space:nowrap}
+.trend svg{cursor:crosshair}.trend svg:focus-visible{outline:2px solid #378ADD;outline-offset:2px}
 @media(max-width:700px){.trend-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.chain{grid-template-columns:repeat(2,1fr)}.st::after{display:none}}
 </style></head><body>
@@ -1007,7 +1010,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div id=daily></div>
 
 <h2>关键指标趋势</h2>
-<div class=note>最近 24 小时 · UTC 整点分桶 · 每 2 分钟刷新；曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
+<div class=note>最近 24 小时 · UTC 整点分桶 · 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
 <div class=trend-grid id=keytrends></div>
 
 <h2>卡点清单（按影响排序：停流 → 慢流）</h2>
@@ -1083,17 +1086,17 @@ stack('daily',(B.daily||[]).slice().reverse(),r=>r.day,[
 
 const trends=D.key_trends||[];
 const trendSpecs=[
- ['入图结果（条）',[['成功','ingested','#1D9E75'],['报错','errors','#D64545']]],
- ['锁等待（秒）',[['均值','lock_wait_avg','#378ADD'],['P90','lock_wait_p90','#E8A33D']]],
- ['提交耗时（秒）',[['均值','commit_avg','#8250C4'],['P50','commit_p50','#1D9E75']]],
- ['提交尝试（次）',[['尝试','commit_attempts','#378ADD'],['冲突','conflicts','#D64545'],['锁外冲突','prevalidated_conflicts','#E8A33D'],['跳过复查','validate_skipped','#1D9E75']]],
- ['冲突率（%）',[['冲突率','conflict_rate','#D64545']]],
- ['模型调用（次）',[['调用','model_calls','#378ADD']]],
- ['模型耗时（秒）',[['已完成均值','call_duration_avg','#8250C4']]],
- ['平均在飞模型调用',[['在飞','model_inflight_avg','#1D9E75']]],
- ['调用 / 成功入图',[['同小时比值','calls_per_ingested','#E8A33D']]],
+ ['入图结果（条）',[['成功','ingested','#1D9E75'],['报错','errors','#D64545']],' 条'],
+ ['锁等待（秒）',[['均值','lock_wait_avg','#378ADD'],['P90','lock_wait_p90','#E8A33D']],' 秒'],
+ ['提交耗时（秒）',[['均值','commit_avg','#8250C4'],['P50','commit_p50','#1D9E75']],' 秒'],
+ ['提交尝试（次）',[['尝试','commit_attempts','#378ADD'],['冲突','conflicts','#D64545'],['锁外冲突','prevalidated_conflicts','#E8A33D'],['跳过复查','validate_skipped','#1D9E75']],' 次'],
+ ['冲突率（%）',[['冲突率','conflict_rate','#D64545']],'%'],
+ ['模型调用（次）',[['调用','model_calls','#378ADD']],' 次'],
+ ['模型耗时（秒）',[['已完成均值','call_duration_avg','#8250C4']],' 秒'],
+ ['平均在飞模型调用',[['在飞','model_inflight_avg','#1D9E75']],' 次'],
+ ['调用 / 成功入图',[['同小时比值','calls_per_ingested','#E8A33D']],' 次/条'],
 ];
-function trendChart(title,series){
+function trendChart(title,series,unit,index){
  const vals=trends.flatMap(r=>series.map(s=>r[s[1]]).filter(v=>Number.isFinite(v)));
  const peak=Math.max(1,...vals)*1.1,W=440,H=125,L=34,R=8,T=9,B=24;
  const x=i=>L+i*(W-L-R)/Math.max(1,trends.length-1), y=v=>T+(H-T-B)*(1-v/peak);
@@ -1101,12 +1104,47 @@ function trendChart(title,series){
   trends.forEach((r,i)=>{const v=r[s[1]];if(Number.isFinite(v))part.push(x(i).toFixed(1)+','+y(v).toFixed(1));
    else if(part.length){pieces.push(part);part=[]}});if(part.length)pieces.push(part);
   return pieces.map(p=>'<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('')
-   +trends.map((r,i)=>Number.isFinite(r[s[1]])?'<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[s[1]]).toFixed(1)+'" r="2.5" fill="'+s[2]+'"><title>'+esc(r.hour)+' UTC · '+esc(s[0])+' '+r[s[1]]+'</title></circle>':'').join('')}).join('');
+   +trends.map((r,i)=>Number.isFinite(r[s[1]])?'<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[s[1]]).toFixed(1)+'" r="2.5" fill="'+s[2]+'"/>':'').join('')}).join('');
  const ticks=[0,peak/2,peak].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+(+v.toFixed(1))+'</text>').join('');
  const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[0].hour.slice(5).replace('T',' '))+'</text><text x="'+(W-49)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[trends.length-1].hour.slice(5).replace('T',' '))+'</text>':'';
- return '<div class=trend><h3>'+title+'</h3><svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' 最近24小时趋势"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'</svg><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
+ return '<div class=trend><h3>'+title+'</h3><svg data-trend="'+index+'" tabindex="0" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' 最近24小时趋势，用左右方向键查看每小时数值"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'<line data-hover-line x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg><div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
-$('keytrends').innerHTML=trends.length?trendSpecs.map(s=>trendChart(s[0],s[1])).join(''):'<div class=note>暂无趋势数据</div>';
+$('keytrends').innerHTML=trends.length?trendSpecs.map((s,i)=>trendChart(s[0],s[1],s[2],i)).join(''):'<div class=note>暂无趋势数据</div>';
+function showTrendHour(svg,index){
+ const row=trends[index], spec=trendSpecs[Number(svg.dataset.trend)], readout=svg.parentElement.querySelector('[data-trend-readout]');
+ if(!row||!spec)return;
+ const parts=spec[1].map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+esc(s[0])+' '+(Number.isFinite(row[s[1]])?row[s[1]]+spec[2]:'无数据')+'</span>');
+ readout.innerHTML='<b>'+esc(row.hour.replace('T',' '))+':00 UTC</b>'+parts.join('');
+ const line=svg.querySelector('[data-hover-line]'),x=34+index*(440-34-8)/Math.max(1,trends.length-1);
+ line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';svg.dataset.hourIndex=index;
+}
+function clearTrendHour(svg){
+ svg.querySelector('[data-hover-line]').style.display='none';
+ svg.parentElement.querySelector('[data-trend-readout]').textContent='移动光标到图上查看数值';
+ delete svg.dataset.hourIndex;
+}
+$('keytrends').addEventListener('pointermove',e=>{
+ const svg=e.target.closest('svg[data-trend]');if(!svg)return;
+ const point=svg.createSVGPoint();point.x=e.clientX;point.y=e.clientY;
+ const local=point.matrixTransform(svg.getScreenCTM().inverse());
+ const index=Math.max(0,Math.min(trends.length-1,Math.round((local.x-34)/(440-34-8)*(trends.length-1))));
+ if(svg.dataset.hourIndex!==String(index))showTrendHour(svg,index);
+});
+$('keytrends').addEventListener('pointerout',e=>{
+ const svg=e.target.closest('svg[data-trend]');
+ if(svg&&!svg.contains(e.relatedTarget))clearTrendHour(svg);
+});
+$('keytrends').addEventListener('focusin',e=>{
+ const svg=e.target.closest('svg[data-trend]');if(svg)showTrendHour(svg,trends.length-1);
+});
+$('keytrends').addEventListener('focusout',e=>{
+ const svg=e.target.closest('svg[data-trend]');if(svg)clearTrendHour(svg);
+});
+$('keytrends').addEventListener('keydown',e=>{
+ const svg=e.target.closest('svg[data-trend]');if(!svg||!['ArrowLeft','ArrowRight'].includes(e.key))return;
+ e.preventDefault();const step=e.key==='ArrowLeft'?-1:1;
+ showTrendHour(svg,Math.max(0,Math.min(trends.length-1,Number(svg.dataset.hourIndex??trends.length-1)+step)));
+});
 
 const names=Object.fromEntries(D.stages.map(s=>[s.id,s.label]));
 $('bn').innerHTML=D.bottlenecks.length?D.bottlenecks.map(b=>'<tr><td>'+esc(names[b.stage]||b.stage)+'</td><td><span class="lv '+(b.deliberate?'plan':b.level)+'">'+(b.deliberate?'计划内':(b.level==='stop'?'停流':'慢流'))+'</span></td><td>'+esc(b.title)+'</td><td>'+esc(b.evidence)+'</td><td>'+esc(b.action)+'</td></tr>').join(''):'<tr><td colspan=5 class=note>无</td></tr>';
