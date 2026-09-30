@@ -317,12 +317,14 @@ async def finish_optimistic_episode(
                          "validate_concurrency=%d prevalidated=1",
                          task_sid, round_number, len(dependencies.records),
                          time.monotonic() - step, VALIDATE_CONCURRENCY)
-                flow_metrics.record(conflict=True, prevalidated_conflict=True)
+                await asyncio.to_thread(flow_metrics.record, conflict=True,
+                                        prevalidated_conflict=True)
                 continue
             if generation % 2 == 0:
                 prevalidated_at = generation
         prevalidate = time.monotonic() - step
         wait_started = time.monotonic()
+        conflict_inside_lock = False
         async with async_writer_lock(owner="optimistic-graph-commit", timeout_seconds=180):
             acquired = time.monotonic()
             lag_at_acquire = _loop_lag.reading()
@@ -348,21 +350,26 @@ async def finish_optimistic_episode(
                              acquired-wait_started, time.monotonic()-acquired,
                              steps["validate"], _loop_lag.reading()-lag_at_acquire,
                              VALIDATE_CONCURRENCY)
-                    flow_metrics.record(conflict=True, lock_wait_s=acquired-wait_started)
-                    continue
-                step = time.monotonic()
-                selected = await load(*identity, "parallel_selected_round",
-                                      {"round": round_number})
-                steps["select"] = time.monotonic() - step
-                if selected["round"] != round_number:
-                    raise RuntimeError("parallel commit selection drift")
-            episodic_edges, saved_episode = await commit_episode_with_receipt(
-                graphiti, episode, hydrated, edges, now, group_id,
-                None, None, node_episode_index_map,
-                store=store, task_sd=task_sd, task_sid=task_sid,
-                operation_id=operation_id, input_digest=input_digest, timings=steps)
-            finished = time.monotonic()
-            loop_lag = _loop_lag.reading() - lag_at_acquire
+                    conflict_inside_lock = True
+                else:
+                    step = time.monotonic()
+                    selected = await load(*identity, "parallel_selected_round",
+                                          {"round": round_number})
+                    steps["select"] = time.monotonic() - step
+                    if selected["round"] != round_number:
+                        raise RuntimeError("parallel commit selection drift")
+            if not conflict_inside_lock:
+                episodic_edges, saved_episode = await commit_episode_with_receipt(
+                    graphiti, episode, hydrated, edges, now, group_id,
+                    None, None, node_episode_index_map,
+                    store=store, task_sd=task_sd, task_sid=task_sid,
+                    operation_id=operation_id, input_digest=input_digest, timings=steps)
+                finished = time.monotonic()
+                loop_lag = _loop_lag.reading() - lag_at_acquire
+        if conflict_inside_lock:
+            await asyncio.to_thread(flow_metrics.record, conflict=True,
+                                    lock_wait_s=acquired-wait_started)
+            continue
         log.info("[ingest:parallel_timing] sid=%s round=%d prepare=%.3fs "
                  "lock_wait=%.3fs commit=%.3fs reads=%d "
                  "fence=%.3fs validate=%.3fs select=%.3fs receipt_lookup=%.3fs "
@@ -374,8 +381,9 @@ async def finish_optimistic_episode(
                  *(steps.get(k, 0.0) for k in ("fence", "validate", "select", "receipt_lookup",
                                                 "begin", "write", "receipt_save")),
                  loop_lag, VALIDATE_CONCURRENCY, steps["prevalidate"], int(skipped))
-        flow_metrics.record(conflict=False, lock_wait_s=acquired-wait_started,
-                            commit_s=finished-acquired, validate_skipped=skipped)
+        await asyncio.to_thread(flow_metrics.record, conflict=False,
+                                lock_wait_s=acquired-wait_started,
+                                commit_s=finished-acquired, validate_skipped=skipped)
         return AddEpisodeResults(episode=saved_episode, episodic_edges=episodic_edges,
                                  nodes=hydrated, edges=edges, communities=[], community_edges=[])
     raise GraphReadConflict("graph remained contended after bounded completed rounds")
