@@ -317,8 +317,7 @@ async def finish_optimistic_episode(
                          "validate_concurrency=%d prevalidated=1",
                          task_sid, round_number, len(dependencies.records),
                          time.monotonic() - step, VALIDATE_CONCURRENCY)
-                await asyncio.to_thread(flow_metrics.record, conflict=True,
-                                        prevalidated_conflict=True)
+                flow_metrics.record(conflict=True, prevalidated_conflict=True)
                 continue
             if generation % 2 == 0:
                 prevalidated_at = generation
@@ -367,8 +366,7 @@ async def finish_optimistic_episode(
                 finished = time.monotonic()
                 loop_lag = _loop_lag.reading() - lag_at_acquire
         if conflict_inside_lock:
-            await asyncio.to_thread(flow_metrics.record, conflict=True,
-                                    lock_wait_s=acquired-wait_started)
+            flow_metrics.record(conflict=True, lock_wait_s=acquired-wait_started)
             continue
         log.info("[ingest:parallel_timing] sid=%s round=%d prepare=%.3fs "
                  "lock_wait=%.3fs commit=%.3fs reads=%d "
@@ -381,9 +379,10 @@ async def finish_optimistic_episode(
                  *(steps.get(k, 0.0) for k in ("fence", "validate", "select", "receipt_lookup",
                                                 "begin", "write", "receipt_save")),
                  loop_lag, VALIDATE_CONCURRENCY, steps["prevalidate"], int(skipped))
-        await asyncio.to_thread(flow_metrics.record, conflict=False,
-                                lock_wait_s=acquired-wait_started,
-                                commit_s=finished-acquired, validate_skipped=skipped)
+        # No new cancellation point after the graph commit: a cancelled caller
+        # must never observe a failed request for a successfully written graph.
+        flow_metrics.record(conflict=False, lock_wait_s=acquired-wait_started,
+                            commit_s=finished-acquired, validate_skipped=skipped)
         return AddEpisodeResults(episode=saved_episode, episodic_edges=episodic_edges,
                                  nodes=hydrated, edges=edges, communities=[], community_edges=[])
     raise GraphReadConflict("graph remained contended after bounded completed rounds")
