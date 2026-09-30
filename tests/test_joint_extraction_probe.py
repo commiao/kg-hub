@@ -79,6 +79,15 @@ class JointExtractionProbeTests(unittest.TestCase):
         self.assertEqual((measured["key_fact_quoted"], measured["key_fact_total"]),
                          (1, 2))
 
+    def test_rejects_entity_without_summary(self) -> None:
+        result = {"items": [
+            {"source_obs_id": "source-1", "entities": [
+                {"name": "A", "summary": ""}], "facts": []},
+            {"source_obs_id": "source-2", "entities": [], "facts": []},
+        ]}
+        with self.assertRaisesRegex(ValueError, "entity"):
+            validate_result(result, self.rows)
+
 
 if __name__ == "__main__":
     unittest.main()

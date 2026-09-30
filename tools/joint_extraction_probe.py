@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -196,7 +197,7 @@ def _tool_schema() -> dict:
                 "items": {"type": "array", "items": item}}, "required": ["items"]}}
 
 
-def run_once(rows: list[dict]) -> dict:
+def run_once(rows: list[dict], *, save_dir: Path | None = None) -> dict:
     from anthropic import Anthropic
     token = os.environ["KG_HUB_MODEL_GATEWAY_TOKEN"]
     model = os.environ["ANTHROPIC_MODEL"]
@@ -211,7 +212,7 @@ def run_once(rows: list[dict]) -> dict:
     # that a slow paid result is not orphaned by a premature client timeout.
     client = Anthropic(api_key=token, base_url=base_url, max_retries=0, timeout=240)
     response = client.messages.create(
-        model=model, max_tokens=4096,
+        model=model, max_tokens=4096, temperature=0,
         system=("Extract all supported entities and factual relationships from each "
                 "source separately. Every fact must carry a verbatim evidence substring "
                 "from that source; quote from Key facts bullets when present. "
@@ -226,6 +227,17 @@ def run_once(rows: list[dict]) -> dict:
     blocks = [block.input for block in response.content
               if getattr(block, "type", None) == "tool_use"
               and getattr(block, "name", None) == "submit_joint_extraction"]
+    if save_dir is not None and len(blocks) == 1:
+        save_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination = save_dir / f"joint-probe-{digest[:16]}.json"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=save_dir, prefix=".joint-probe-",
+                                         delete=False) as stream:
+            json.dump(blocks[0], stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary = Path(stream.name)
+        os.replace(temporary, destination)
     measured = {"stop_reason": response.stop_reason,
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens}
@@ -245,6 +257,8 @@ def main() -> None:
     parser.add_argument("--journal", type=Path, default=JOURNAL)
     parser.add_argument("--before", help="ISO backup timestamp ceiling for a stable pair")
     parser.add_argument("--execute", action="store_true", help="Make exactly one paid gateway call")
+    parser.add_argument("--save-dir", type=Path,
+                        help="Keep the structured result in a private container directory")
     args = parser.parse_args()
     rows = select_pair(args.backup, args.journal, before=args.before)
     print(json.dumps({"mode": "execute" if args.execute else "dry_run",
@@ -252,7 +266,8 @@ def main() -> None:
                       "baseline": _baseline(rows, args.journal)}, ensure_ascii=False))
     if args.execute:
         try:
-            print(json.dumps({"pilot": run_once(rows)}, ensure_ascii=False))
+            print(json.dumps({"pilot": run_once(rows, save_dir=args.save_dir)},
+                             ensure_ascii=False))
         except Exception as exc:
             print(json.dumps({"pilot_error": type(exc).__name__}, ensure_ascii=False))
             raise SystemExit(1) from None
