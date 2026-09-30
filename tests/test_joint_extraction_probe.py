@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.joint_extraction_probe import select_pair, validate_result
+from tools.joint_extraction_probe import _tool_schema, select_pair, validate_result
 
 
 class JointExtractionProbeTests(unittest.TestCase):
@@ -87,6 +87,32 @@ class JointExtractionProbeTests(unittest.TestCase):
         ]}
         with self.assertRaisesRegex(ValueError, "entity"):
             validate_result(result, self.rows)
+
+    def test_extraction_only_keeps_source_evidence_check_without_summary(self) -> None:
+        result = {"items": [
+            {"source_obs_id": "source-1", "entities": [{"name": "A"}, {"name": "B"}],
+             "facts": [{"subject": "A", "relation": "supports", "object": "B",
+                        "evidence": "Source 1 says A supports B."}]},
+            {"source_obs_id": "source-2", "entities": [{"name": "A"}, {"name": "B"}],
+             "facts": [{"subject": "A", "relation": "supports", "object": "B",
+                        "evidence": "Source 1 says A supports B."}]},
+        ]}
+        measured = validate_result(result, self.rows, extraction_only=True)
+        self.assertEqual((measured["entities"], measured["summary_chars"],
+                          measured["evidence_miss"]), (4, 0, 1))
+        item_schema = _tool_schema(extraction_only=True)["input_schema"]["properties"]["items"]["items"]
+        entity_schema = item_schema["properties"]["entities"]["items"]
+        self.assertEqual(entity_schema["required"], ["name"])
+
+    def test_extraction_only_rejects_fact_with_missing_endpoint(self) -> None:
+        result = {"items": [
+            {"source_obs_id": "source-1", "entities": [{"name": "A"}],
+             "facts": [{"subject": "A", "relation": "supports", "object": "B",
+                        "evidence": "Source 1 says A supports B."}]},
+            {"source_obs_id": "source-2", "entities": [], "facts": []},
+        ]}
+        with self.assertRaisesRegex(ValueError, "endpoint"):
+            validate_result(result, self.rows, extraction_only=True)
 
 
 if __name__ == "__main__":
