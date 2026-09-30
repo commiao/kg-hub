@@ -212,7 +212,7 @@ def run_once(rows: list[dict], *, save_dir: Path | None = None) -> dict:
     # that a slow paid result is not orphaned by a premature client timeout.
     client = Anthropic(api_key=token, base_url=base_url, max_retries=0, timeout=240)
     response = client.messages.create(
-        model=model, max_tokens=4096, temperature=0,
+        model=model, max_tokens=8192, temperature=0,
         system=("Extract all supported entities and factual relationships from each "
                 "source separately. Every fact must carry a verbatim evidence substring "
                 "from that source; quote from Key facts bullets when present. "
@@ -222,6 +222,7 @@ def run_once(rows: list[dict], *, save_dir: Path | None = None) -> dict:
         messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
         tools=[_tool_schema()],
         tool_choice={"type": "tool", "name": "submit_joint_extraction"},
+        extra_body={"thinking": {"type": "disabled"}},
         extra_headers={"Idempotency-Key": key},
     )
     blocks = [block.input for block in response.content
