@@ -281,6 +281,32 @@ class RenderTests(unittest.TestCase):
             response = asyncio.run(F.dashboard_flow_json(None))
         self.assertEqual(json.loads(response.body)["generated_at"], flow["generated_at"])
 
+    def test_beijing_labels_keep_utc_source_buckets_and_cross_midnight(self):
+        at = datetime(2026, 9, 28, 17, 15, tzinfo=timezone.utc)
+        hour = "2026-09-28T17"
+        flow = build(now=at,
+                     status=status(heartbeat_at=at.isoformat(), ts=at.isoformat(),
+                                   budget_today={"hourly": {hour: {"backlog": {"ingested": 2}}}}),
+                     graph_daily=[{"bucket": "2026-09-28", "lane": "积压线", "count": 2}],
+                     key_trends=[{"hour": hour, "ingested": 2}])
+        self.assertEqual(flow["generated_at_beijing"], "2026-09-29 01:15:00 北京时间")
+        self.assertEqual(flow["key_trends"][0]["hour"], hour)
+        self.assertEqual(flow["key_trends"][0]["hour_beijing"], "2026-09-29 01:00")
+        self.assertEqual(flow["backlog"]["hourly"][0]["hour_beijing"], "2026-09-29 01:00")
+        self.assertEqual(flow["backlog"]["daily"][0]["day_beijing_start"], "2026-09-28 08:00")
+        refinery = next(s for s in flow["stages"] if s["id"] == "refinery")
+        self.assertIn("2026-09-29 01:15:00 北京时间", refinery["detail"])
+        graph = next(s for s in flow["stages"] if s["id"] == "graph")
+        self.assertIn("2026-09-28 08:00 至次日 08:00", graph["detail"])
+        self.assertEqual(F._beijing_hour("2026-12-31T17"), "2027-01-01 01:00")
+
+    def test_page_uses_beijing_labels_for_charts_and_hover(self):
+        html = F._HTML
+        self.assertIn("row.hour_beijing", html)
+        self.assertIn("r.hour_beijing.slice(5)", html)
+        self.assertIn("r.day_beijing_start.slice(5)", html)
+        self.assertIn("D.generated_at_beijing", html)
+
 
 class WiringTests(unittest.TestCase):
     def test_routes_and_portal_entry_are_registered(self):

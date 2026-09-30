@@ -29,6 +29,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 STATE_RANK = {"green": 0, "grey": 1, "amber": 2, "red": 3}
+BEIJING = timezone(timedelta(hours=8))
 
 # 服务端 pending 键的最长合法寿命：写锁等待上限 + 单次抽取上限（utils/ingest_budget）。
 # 超过它还在 pending，就不是「在排队」而是卡死了。
@@ -56,7 +57,7 @@ SEVERITY_RANK = {"stop": 0, "slow": 1}
 # 同为慢流时按对吞吐的影响排：原因在前，「清空要很久」是这些原因的结果，排最后。
 SLOW_IMPACT_ORDER = ("写锁排队是主要耗时", "并发槽位排队是主要耗时", "单条抽取耗时高", "单条入图耗时高",
                      "每条观测模型调用次数高", "推迟/重试占比高", "每天真正干活的小时数少",
-                     "近 24h 抽取失败偏多", "今日额度接近上限", "Mac→NAS 同步落后",
+                     "近 24h 抽取失败偏多", "本额度日接近上限", "Mac→NAS 同步落后",
                      "按当前速度清空积压需要很久")
 
 
@@ -70,6 +71,22 @@ def _parse_ts(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _beijing_time(value: object) -> str:
+    """Format a source timestamp for people; keep source timestamps unchanged in JSON."""
+    parsed = _parse_ts(value)
+    return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S 北京时间") if parsed else "—"
+
+
+def _beijing_hour(value: str) -> str:
+    parsed = _parse_ts(value + ":00:00+00:00")
+    return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:00") if parsed else "—"
+
+
+def _beijing_day_start(value: str) -> str:
+    parsed = _parse_ts(value + "T00:00:00+00:00")
+    return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:00") if parsed else "—"
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -265,14 +282,15 @@ def refinery_stage(status: dict, now: datetime) -> dict:
     if isinstance(remaining, int):
         sub = f"积压 {remaining} · {sub}"
     detail = [activity["label"],
-              f"心跳 {status.get('heartbeat_at')} · 最近处理 {status.get('ts')}",
+              f"心跳 {_beijing_time(status.get('heartbeat_at'))} · 最近处理 {_beijing_time(status.get('ts'))}",
               f"工作窗口 {'开' if status.get('backlog_window_open') else '关'}"
               f" · 每轮名额 积压 {status.get('per_cycle')} / 实时 {status.get('live_per_cycle')}"]
     if status.get("recovery_reason"):
-        detail.append(f"恢复暂停：{status.get('recovery_reason')}，下次探测 {status.get('recovery_retry_at')}")
+        detail.append(f"恢复暂停：{status.get('recovery_reason')}，下次探测 {_beijing_time(status.get('recovery_retry_at'))}")
     thermal = status.get("thermal") if isinstance(status.get("thermal"), dict) else {}
     if thermal:
-        detail.append(f"今日温度歇工 {thermal.get('holds', 0)} 次 / {thermal.get('minutes', 0)} 分钟")
+        detail.append(f"本统计日温度歇工 {thermal.get('holds', 0)} 次 / {thermal.get('minutes', 0)} 分钟"
+                      "（北京时间 08:00 切日）")
     return {"state": activity["state"], "sub": sub, "detail": "\n".join(detail),
             "metrics": metrics}
 
@@ -314,8 +332,8 @@ def graph_stage(graph_daily: list[dict] | None, now: datetime) -> dict:
         if row.get("bucket") == today:
             per_lane[row["lane"]] = per_lane.get(row["lane"], 0) + int(row.get("count") or 0)
     total = sum(per_lane.values())
-    return {"state": "green", "sub": f"今日入图 {total}",
-            "detail": "今日（UTC）入图 Episode：" + (
+    return {"state": "green", "sub": f"本统计日入图 {total}",
+            "detail": f"本统计日（北京时间 {_beijing_day_start(today)} 至次日 08:00）入图 Episode：" + (
                 "、".join(f"{k} {v}" for k, v in sorted(per_lane.items())) or "0"),
             "metrics": {"today": per_lane}}
 
@@ -336,7 +354,8 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         if start is None or now - start > timedelta(hours=48):
             continue
         bucket = hourly_raw[key] if isinstance(hourly_raw[key], dict) else {}
-        hours.append({"hour": key, "backlog": _line(bucket, "backlog"),
+        hours.append({"hour": key, "hour_beijing": _beijing_hour(key),
+                      "backlog": _line(bucket, "backlog"),
                       "live": _line(bucket, "live")})
     # 空闲小时补零行：看板要让人看见「哪些小时没干活」；最早记录之前是未知，不补。
     if hours:
@@ -346,7 +365,8 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         while cursor <= now:
             key = cursor.strftime("%Y-%m-%dT%H")
             if key not in seen:
-                hours.append({"hour": key, "backlog": dict(zero), "live": dict(zero)})
+                hours.append({"hour": key, "hour_beijing": _beijing_hour(key),
+                              "backlog": dict(zero), "live": dict(zero)})
             cursor += timedelta(hours=1)
         hours.sort(key=lambda h: h["hour"])
 
@@ -377,7 +397,8 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         for row in graph_daily:
             by_day.setdefault(row["bucket"], {})
             by_day[row["bucket"]][row["lane"]] = int(row.get("count") or 0)
-        daily = [{"day": d, **v} for d, v in sorted(by_day.items())]
+        daily = [{"day": d, "day_beijing_start": _beijing_day_start(d), **v}
+                 for d, v in sorted(by_day.items())]
         week = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
         backlog_7d = round(sum(by_day.get(d, {}).get("积压线", 0) for d in week) / 7, 1)
         if isinstance(remaining, int) and backlog_7d:
@@ -416,7 +437,7 @@ def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime
     calls = (keys.get(GATEWAY_PRIMARY_KEY) or {}).get("today")
     today = now.strftime("%Y-%m-%d")
     row = next((d for d in digest.get("daily") or [] if d.get("day") == today), None)
-    episodes = sum(v for k, v in row.items() if k != "day") if row else 0
+    episodes = sum(v for k, v in row.items() if k not in ("day", "day_beijing_start")) if row else 0
     if isinstance(calls, int) and episodes >= CALLS_RATIO_MIN_EPISODES:
         return round(calls / episodes, 1)
     return None
@@ -438,7 +459,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
     heartbeat = _parse_ts(status.get("heartbeat_at"))
     if heartbeat is None or (now - heartbeat).total_seconds() > 900:
         add("refinery", "stop", "refinery 无心跳",
-            f"最后心跳 {status.get('heartbeat_at') or '无'}",
+            f"最后心跳 {_beijing_time(status.get('heartbeat_at'))}",
             "检查 kg-refinery 容器是否存活、refinery-state 卷是否挂载")
     if status.get("last_error"):
         add("refinery", "stop", "refinery 本轮异常", str(status["last_error"])[:200],
@@ -463,9 +484,9 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         label = reason or ("配额耗尽" if status.get("quota_paused") else
                            "限流" if status.get("rate_limited") else "上游 5xx")
         add("gateway", "stop", f"网关/供应商暂停：{label}",
-            f"下次探测 {status.get('recovery_retry_at') or '—'}；停工闸门 "
+            f"下次探测 {_beijing_time(status.get('recovery_retry_at'))}；停工闸门 "
             + ("、".join(halt["gates"]) or "—"),
-            "等待自动恢复；日额度耗尽需等 UTC 日切或调整共享额度")
+            "等待自动恢复；日额度于北京时间 08:00 重置，或调整共享额度")
     if gateway_node:
         if gateway_node.get("state") == "red" and not reason:
             add("gateway", "stop", "网关不可用或额度打满",
@@ -474,7 +495,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         ratio = ((gateway_node.get("metrics") or {}).get("keys") or {}) \
             .get("kg_hub.entity_extract", {}).get("ratio")
         if isinstance(ratio, (int, float)) and 0.8 <= ratio < 1:
-            add("gateway", "slow", "今日额度接近上限", f"已用 {ratio * 100:.0f}%",
+            add("gateway", "slow", "本额度日接近上限", f"已用 {ratio * 100:.0f}%",
                 "关注窗口尾部；额度不是消化速度的上限，调用倍数才是")
     for stage in ("tools", "claude_mem", "sync"):
         info = stages.get(stage) or {}
@@ -526,7 +547,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
 
     if isinstance(calls_per_obs, (int, float)) and calls_per_obs >= CALLS_PER_OBS_SLOW:
         add("gateway", "slow", "每条观测模型调用次数高",
-            f"今日约 {calls_per_obs} 次调用 / 条入图",
+            f"本统计日约 {calls_per_obs} 次调用 / 条入图",
             "降低调用倍数：合批抽取、属性合批、减少重试")
     share = digest.get("deferred_share")
     if isinstance(share, (int, float)) and share >= DEFERRED_SHARE_SLOW:
@@ -803,10 +824,12 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
     }
     return {
         "generated_at": now.isoformat(timespec="seconds"),
+        "generated_at_beijing": _beijing_time(now),
         "stages": stages,
         "backlog": digest,
         "efficiency": efficiency,
-        "key_trends": key_trends or [],
+        "key_trends": [{**row, "hour_beijing": _beijing_hour(row["hour"])}
+                       for row in (key_trends or [])],
         "bottlenecks": bottlenecks,
         "primary": primary,
         "diagrams": {
@@ -1004,13 +1027,13 @@ th{font-size:12px;color:GrayText;font-weight:500}
 
 <h2>积压消化情况</h2>
 <div class=cards id=bcards></div>
-<div class=lg>近 48 小时每小时去向（单位：观测条数，UTC）：<i style="background:#1D9E75"></i>积压入图<i style="background:#A8B5B0"></i>积压过滤拒绝<i style="background:#5B8FF9"></i>实时入图<i style="background:#E8A33D"></i>推迟/重试</div>
+<div class=lg>近 48 小时每小时去向（北京时间，单位：观测条数）：<i style="background:#1D9E75"></i>积压入图<i style="background:#A8B5B0"></i>积压过滤拒绝<i style="background:#5B8FF9"></i>实时入图<i style="background:#E8A33D"></i>推迟/重试</div>
 <div id=hourly></div>
-<div class=lg>近 14 天每日入图 Episode（图内实数，UTC）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
+<div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
 <h2>关键指标趋势</h2>
-<div class=note>最近 24 小时 · UTC 整点分桶 · 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
+<div class=note>最近 24 小时 · 北京时间整点分桶（UTC+8）· 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
 <div class=trend-grid id=keytrends></div>
 
 <h2>卡点清单（按影响排序：停流 → 慢流）</h2>
@@ -1023,10 +1046,10 @@ th{font-size:12px;color:GrayText;font-weight:500}
 
 <h2>口径</h2>
 <div class=note>
-「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关当日调用 ÷ 图内当日新增，两端都是持久计数、都按 UTC 日，当日新增不足 10 条时不给数。<br>
+「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
-关键指标按 UTC 小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取本服务进程内采样，重启后历史为空；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
+关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取本服务进程内采样，重启后历史为空；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
 
@@ -1037,7 +1060,7 @@ const $=id=>document.getElementById(id);
 const fmt=v=>(v===null||v===undefined)?'—':v;
 const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-$('gen').textContent='快照 '+D.generated_at+' UTC · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
+$('gen').textContent='快照 '+D.generated_at_beijing+' · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
 if(D.source_errors.length){$('errs').innerHTML='<div class=warn>部分数据源不可读：'+D.source_errors.map(esc).join('；')+'</div>'}
 
 const P=D.primary;const vd=$('verdict');
@@ -1065,7 +1088,7 @@ const cards=[
  ['有产出小时',fmt(L.active_hours)+' / 24','每个有产出小时消化 '+fmt(B.rate_per_active_hour)+' 条'],
  ['入图率',B.accept_rate!=null?B.accept_rate+'%':'—','积压终态中进图的比例'],
  ['推迟/重试占比',pct(B.deferred_share),'近 24h 积压推迟 '+fmt(L.backlog_deferred)+' 条'],
- ['调用 / 条入图',fmt(E.calls_per_observation),'今日网关调用 ÷ 今日图内新增（UTC 日）'],
+ ['调用 / 条入图',fmt(E.calls_per_observation),'本统计日网关调用 ÷ 图内新增（北京时间 08:00 切日）'],
  ['单条抽取耗时',E.extract_p50!=null?(E.extract_p50+'s'):(E.duration_p50!=null?(E.duration_p50+'s'):'—'),E.extract_p50!=null?('P90 '+fmt(E.extract_p90)+'s · 不含排队'):('领取→终态 P90 '+fmt(E.duration_p90)+'s · 含排队')],
  [(E.queue_label||'排队')+'占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
  ['实时线近 24h',fmt(L.live_ingested),'入图（拒绝 '+fmt(L.live_rejected)+'）'],
@@ -1078,10 +1101,10 @@ function stack(target,rows,label,parts){const box=$(target);
  box.innerHTML=rows.map(r=>{const t=tot(r);return '<div class=row><span class=k>'+esc(label(r))+'</span><span class=bar>'
   +parts.map(p=>{const v=p[1](r)||0;return v?'<i title="'+p[0]+' '+v+'" style="width:'+(v*100/peak)+'%;background:'+p[2]+'"></i>':''}).join('')
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
-stack('hourly',(B.hourly||[]).slice().reverse(),r=>r.hour.slice(5).replace('T',' ')+'h',[
+stack('hourly',(B.hourly||[]).slice().reverse(),r=>r.hour_beijing.slice(5),[
  ['积压入图',r=>r.backlog.ingested,'#1D9E75'],['积压拒绝',r=>r.backlog.rejected,'#A8B5B0'],
  ['实时入图',r=>r.live.ingested,'#5B8FF9'],['推迟',r=>r.backlog.deferred+r.live.deferred,'#E8A33D']]);
-stack('daily',(B.daily||[]).slice().reverse(),r=>r.day,[
+stack('daily',(B.daily||[]).slice().reverse(),r=>r.day_beijing_start.slice(5),[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
 
 const trends=D.key_trends||[];
@@ -1106,7 +1129,7 @@ function trendChart(title,series,unit,index){
   return pieces.map(p=>'<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('')
    +trends.map((r,i)=>Number.isFinite(r[s[1]])?'<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[s[1]]).toFixed(1)+'" r="2.5" fill="'+s[2]+'"/>':'').join('')}).join('');
  const ticks=[0,peak/2,peak].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+(+v.toFixed(1))+'</text>').join('');
- const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[0].hour.slice(5).replace('T',' '))+'</text><text x="'+(W-49)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[trends.length-1].hour.slice(5).replace('T',' '))+'</text>':'';
+ const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[0].hour_beijing.slice(5))+'</text><text x="'+(W-69)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[trends.length-1].hour_beijing.slice(5))+'</text>':'';
  return '<div class=trend><h3>'+title+'</h3><svg data-trend="'+index+'" tabindex="0" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' 最近24小时趋势，用左右方向键查看每小时数值"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'<line data-hover-line x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg><div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
 $('keytrends').innerHTML=trends.length?trendSpecs.map((s,i)=>trendChart(s[0],s[1],s[2],i)).join(''):'<div class=note>暂无趋势数据</div>';
@@ -1114,7 +1137,7 @@ function showTrendHour(svg,index){
  const row=trends[index], spec=trendSpecs[Number(svg.dataset.trend)], readout=svg.parentElement.querySelector('[data-trend-readout]');
  if(!row||!spec)return;
  const parts=spec[1].map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+esc(s[0])+' '+(Number.isFinite(row[s[1]])?row[s[1]]+spec[2]:'无数据')+'</span>');
- readout.innerHTML='<b>'+esc(row.hour.replace('T',' '))+':00 UTC</b>'+parts.join('');
+ readout.innerHTML='<b>'+esc(row.hour_beijing)+' 北京时间</b>'+parts.join('');
  const line=svg.querySelector('[data-hover-line]'),x=34+index*(440-34-8)/Math.max(1,trends.length-1);
  line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';svg.dataset.hourIndex=index;
 }
