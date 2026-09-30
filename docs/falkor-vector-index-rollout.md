@@ -129,3 +129,44 @@ shows that serial queueing remains relevant as routing rises. The 100% stage
 therefore needs a separate full-hour gate on successful completions, errors,
 conflicts, index fallbacks, and read latency before the rollout is considered
 complete.
+
+## 100% production observation
+
+Release `936ee48` enabled the 100% default at 2026-09-29 23:30:50 UTC. Its
+first six indexed observations completed successfully with no conflict or
+fallback before an independent dashboard release replaced the container at
+23:43:58 UTC. That release (`6b177e4`) added flow metrics without changing the
+vector route.
+
+Between 23:43:58 and the last pre-replacement sample at 00:38:36 UTC, the
+`6b177e4` container dispatched 39 distinct observations: 37 completed, one
+failed after all three `GraphReadConflict` prevalidation rounds, and one was
+still in flight. There were 15 conflict events across the cohort, 524 vector
+queries and no index fallbacks. Its 1,002 broad-edge reads averaged 0.341
+seconds (median 0.172, maximum 2.270). A separate `ValidationError` in that
+container belonged to a resumed task with no broad-edge similarity read; it
+is included in the overall error count but not the 39-dispatch cohort.
+
+At 00:39:39 UTC another dashboard-only release (`fc5bfd3`) replaced the
+container. The effective vector percentage remained 100 and the service was
+healthy. By 00:44:31 UTC, its four dispatched observations were still in
+flight; 37 vector queries and 48 broad-edge reads had completed with no
+fallback or error. These reads averaged 0.193 seconds (median 0.118, maximum
+0.747). Container replacement leaves approximately one minute between the
+last old-container sample and the new-container start without retained task
+logs, so the two segments must not be presented as one uninterrupted log
+series. The vector implementation was unchanged across both dashboard releases.
+
+This evidence supports keeping 100% routing: index reads remain fast, there
+are no index fallbacks, and the one conflict failure has not formed a repeat
+pattern. It does not prove that indexing alone increased completed ingests per
+hour; writer-lock wait and workload mix also affect throughput. Continue
+watching conflict failures and long-tail index waits, and return routing to
+0% if a canary-specific failure pattern recurs.
+
+The same deployment included the reconciliation projection fix from PR #49.
+The protected read-only endpoint now answers successfully. At the final check,
+eight recent `GraphReadConflict` error keys remained: each had one failed
+execution, no persisted episode UUID, no in-flight work, and no unknown model
+outcome. This check did not clear or replay those keys; their recovery remains
+under the existing refinery policy.
