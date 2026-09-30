@@ -153,6 +153,22 @@ class BottleneckTests(unittest.TestCase):
 
 
 class DigestTests(unittest.TestCase):
+    def test_remaining_history_records_real_samples_and_skips_stale_status(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                "os.environ", {"KG_HUB_INGEST_BACKUP_PATH": str(Path(tmp) / "ingest-backup.jsonl")}):
+            first = F.backlog_remaining_history(status(backlog_remaining=5000), NOW)
+            self.assertEqual([r["remaining"] for r in first], [5000])
+            self.assertEqual(first[0]["at_beijing"], "2026-09-28 12:30:00 北京时间")
+            same_bucket = F.backlog_remaining_history(
+                status(backlog_remaining=4998), NOW + timedelta(seconds=30))
+            self.assertEqual([r["remaining"] for r in same_bucket], [4998])
+            later = F.backlog_remaining_history(
+                status(backlog_remaining=4995), NOW + timedelta(minutes=2))
+            self.assertEqual([r["remaining"] for r in later], [4998, 4995])
+            stale = F.backlog_remaining_history(
+                status(backlog_remaining=4000), NOW + timedelta(minutes=20))
+            self.assertEqual([r["remaining"] for r in stale], [4998, 4995])
+
     def test_eta_uses_a_full_day_of_terminal_observations(self):
         st = status(backlog_remaining=4800,
                     budget_today={"day": "2026-09-28", "hourly": hourly(24, 8, 2)})
@@ -306,9 +322,10 @@ class RenderTests(unittest.TestCase):
     def test_page_uses_beijing_labels_for_charts_and_hover(self):
         html = F._HTML
         self.assertIn("row.hour_beijing", html)
-        self.assertIn("r.hour_beijing.slice(5)", html)
+        self.assertIn("r.hour_beijing+' 北京时间'", html)
         self.assertIn("r.day_beijing_start.slice(5)", html)
         self.assertIn("D.generated_at_beijing", html)
+        self.assertIn("data-backlog-chart", html)
 
 
 class WiringTests(unittest.TestCase):
