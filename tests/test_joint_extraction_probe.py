@@ -55,7 +55,22 @@ class JointExtractionProbeTests(unittest.TestCase):
         ]}
         measured = validate_result(result, self.rows)
         self.assertEqual(measured, {"sources": 2, "entities": 4,
-                                    "facts": 2, "evidence_miss": 1})
+                                    "facts": 2, "evidence_miss": 1,
+                                    "key_fact_total": 0, "key_fact_quoted": 0})
+
+    def test_reports_literal_key_fact_quote_coverage(self) -> None:
+        rows = [{**self.rows[0], "episode_body": (
+            "Key facts:\n- Alpha supports beta in the new release.\n"
+            "- Gamma was removed on Tuesday.\n\nProject: alpha")}, self.rows[1]]
+        result = {"items": [
+            {"source_obs_id": "source-1", "entities": ["Alpha", "beta"],
+             "facts": [{"subject": "Alpha", "relation": "supports", "object": "beta",
+                        "evidence": "Alpha supports beta"}]},
+            {"source_obs_id": "source-2", "entities": [], "facts": []},
+        ]}
+        measured = validate_result(result, rows)
+        self.assertEqual((measured["key_fact_quoted"], measured["key_fact_total"]),
+                         (1, 2))
 
 
 if __name__ == "__main__":
