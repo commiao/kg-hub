@@ -29,8 +29,8 @@ COMPOSE = (ROOT / "docker-compose.yml").read_text("utf-8")
 # 值 → 这个值是怎么定下来的。没有出处的数字迟早被人当成手滑改掉。
 DECIDED = {
     "KG_HUB_REFINERY_MAX_DISK_TEMP": ("59", "用户 2026-09-17 拍板上调；DSM 约 61°C 强制关机"),
-    "KG_HUB_PARALLEL_TASKS":        ("8",  "6→8 槽吞吐对照；按成功入图、模型延迟、冲突率和错误验收"),
-    "KG_HUB_REFINERY_INGEST_CONCURRENCY": ("8", "上游并发请求与服务端 8 个业务任务槽位匹配"),
+    "KG_HUB_PARALLEL_TASKS":        ("6",  "8 槽对照未增产并触发阶段账本 SQLite 锁错误，恢复 6 槽"),
+    "KG_HUB_REFINERY_INGEST_CONCURRENCY": ("6", "上游并发与恢复后的服务端 6 槽匹配"),
     "KG_HUB_SEMAPHORE_LIMIT":        ("2",  "保持环境变量不变；Graphiti max_coroutines=1 使单条观测内调用串行"),
     "KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT": ("100", "3 个线上批量样本成功提交后全量启用；持续按成功吞吐与入图质量验收"),
     "KG_HUB_EDGE_DEDUPE_BATCH_PERCENT": ("100", "3 个线上批量样本成功提交后全量启用；持续按成功吞吐与入图质量验收"),
