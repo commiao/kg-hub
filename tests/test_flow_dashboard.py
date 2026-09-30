@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tempfile
 import unittest
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -350,6 +353,66 @@ class TimingTests(unittest.TestCase):
 
 
 class KeyTrendTests(unittest.TestCase):
+    def test_commit_samples_survive_process_memory_reset(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                "os.environ", {"KG_HUB_INGEST_BACKUP_PATH": str(Path(tmp) / "ingest-backup.jsonl")}), \
+                patch.object(flow_metrics, "_samples", deque(maxlen=4000)):
+            at = NOW.timestamp()
+            flow_metrics.record(conflict=False, lock_wait_s=4.5, commit_s=7.2,
+                                validate_skipped=True, at=at)
+            flow_metrics.record(conflict=True, prevalidated_conflict=True, at=at + 1)
+            flow_metrics._samples.clear()  # model a server restart
+            rows = flow_metrics.recent(since=at - 1)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["commit_s"], 7.2)
+            self.assertTrue(rows[0]["validate_skipped"])
+            self.assertTrue(rows[1]["prevalidated_conflict"])
+            self.assertEqual(len(flow_metrics.recent(since=at + 1)), 1)
+
+    def test_parallel_commit_samples_remain_unique_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                "os.environ", {"KG_HUB_INGEST_BACKUP_PATH": str(Path(tmp) / "ingest-backup.jsonl")}), \
+                patch.object(flow_metrics, "_samples", deque(maxlen=4000)):
+            at = NOW.timestamp()
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                list(pool.map(lambda i: flow_metrics.record(conflict=bool(i % 2), at=at + i),
+                              range(36)))
+            self.assertEqual(len(flow_metrics.recent(since=at)), 36)
+            flow_metrics._samples.clear()
+            self.assertEqual(len(flow_metrics.recent(since=at)), 36)
+            self.assertIsNone(flow_metrics.storage_error())
+
+    def test_archived_hourly_commit_values_fill_only_missing_hours(self):
+        now = NOW
+        archived = [{"hour": "2026-09-28T03", "lock_wait_avg": 12.0,
+                     "commit_avg": 8.0, "commit_attempts": 5, "conflicts": 1,
+                     "conflict_rate": 20.0}]
+        rows = F.key_metric_trends(now=now, commits=[], attempts=None, outcomes=None,
+                                   archived_commits=archived)
+        self.assertEqual(rows[-2]["commit_attempts"], 5)
+        self.assertEqual(rows[-2]["lock_wait_avg"], 12.0)
+        self.assertIsNone(rows[-3]["commit_attempts"])
+        live = [{"at": (now - timedelta(hours=1)).timestamp(), "conflict": False,
+                 "lock_wait_s": 3, "commit_s": 4, "validate_skipped": False,
+                 "prevalidated_conflict": False}]
+        rows = F.key_metric_trends(now=now, commits=live, attempts=None, outcomes=None,
+                                   archived_commits=archived)
+        self.assertEqual(rows[-2]["commit_attempts"], 1)
+        self.assertEqual(rows[-2]["lock_wait_avg"], 3.0)
+
+    def test_archived_snapshot_reader_ignores_old_and_empty_hours(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                "os.environ", {"KG_HUB_INGEST_BACKUP_PATH": str(Path(tmp) / "ingest-backup.jsonl")}):
+            seed = Path(tmp) / "flow-commit-hourly-seed.json"
+            seed.write_text(json.dumps([
+                {"hour": "2026-09-28T03", "commit_attempts": 3, "commit_avg": 5.0},
+                {"hour": "2026-09-27T00", "commit_attempts": 2},
+                {"hour": "2026-09-28T02", "commit_attempts": None},
+            ]), encoding="utf-8")
+            rows = flow_metrics.archived_hourly(since=(NOW - timedelta(hours=2)).timestamp())
+            self.assertEqual(rows, [{"hour": "2026-09-28T03", "commit_attempts": 3,
+                                     "commit_avg": 5.0}])
+
     def test_hourly_metrics_keep_sample_gaps_and_count_prevalidation(self):
         at = NOW.timestamp()
         commits = [

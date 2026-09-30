@@ -120,7 +120,8 @@ def _model_attempt_rows(since: datetime) -> list[tuple]:
 
 def key_metric_trends(*, now: datetime, commits: list[dict],
                       attempts: list[tuple] | None,
-                      outcomes: list[dict] | None) -> list[dict]:
+                      outcomes: list[dict] | None,
+                      archived_commits: list[dict] | None = None) -> list[dict]:
     """Hourly UTC buckets. None means unavailable; zero means observed zero."""
     start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
     buckets = []
@@ -133,7 +134,7 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                         "conflicts": None, "prevalidated_conflicts": None,
                         "conflict_rate": None, "model_calls": None,
                         "call_duration_avg": None, "model_inflight_avg": None,
-                        "calls_per_ingested": None})
+                        "calls_per_ingested": None, "commit_source": None})
     by_hour = {b["hour"]: b for b in buckets}
     if outcomes is not None:
         for b in buckets:
@@ -151,6 +152,7 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
             grouped.setdefault(key, []).append(row)
     for key, rows in grouped.items():
         b = by_hour[key]
+        b["commit_source"] = "durable"
         successes = [r for r in rows if not r["conflict"]]
         waits = [r["lock_wait_s"] for r in successes]
         durations = [r["commit_s"] for r in successes if r["commit_s"] is not None]
@@ -165,6 +167,17 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
         if durations:
             b["commit_avg"] = round(sum(durations) / len(durations), 1)
             b["commit_p50"] = _percentile(durations, .5)
+    # One-time pre-migration snapshots only fill complete hours with no raw
+    # samples. Never mix precomputed percentiles with new samples in an hour.
+    commit_fields = ("lock_wait_avg", "lock_wait_p90", "commit_avg", "commit_p50",
+                     "commit_attempts", "conflicts", "prevalidated_conflicts",
+                     "validate_skipped", "conflict_rate")
+    for archived in archived_commits or []:
+        b = by_hour.get(archived.get("hour"))
+        if b and b["commit_attempts"] is None:
+            for field in commit_fields:
+                b[field] = archived.get(field)
+            b["commit_source"] = "archived_hourly"
     if attempts is not None:
         for b in buckets:
             b["model_calls"] = 0
@@ -945,9 +958,17 @@ async def collect_flow() -> dict:
         attempts = await asyncio.to_thread(_model_attempt_rows, now - timedelta(hours=24))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"模型调用账本不可读：{type(exc).__name__}")
-    trends = key_metric_trends(now=now, commits=flow_metrics.recent(
-        since=(now - timedelta(hours=24)).timestamp()), attempts=attempts,
-        outcomes=outcomes)
+    since = (now - timedelta(hours=24)).timestamp()
+    commits = await asyncio.to_thread(flow_metrics.recent, since=since)
+    if flow_metrics.storage_error():
+        errors.append("提交遥测持久库不可用：" + flow_metrics.storage_error())
+    try:
+        archived_commits = await asyncio.to_thread(flow_metrics.archived_hourly, since=since)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        archived_commits = []
+        errors.append(f"提交遥测历史快照不可读：{type(exc).__name__}")
+    trends = key_metric_trends(now=now, commits=commits, attempts=attempts,
+                               outcomes=outcomes, archived_commits=archived_commits)
     return build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
                       keys=keys, timing=ingest_timing.summary(now=time.time()),
                       active=active_extractions(), graph_daily=graph_daily, now=now,
@@ -1049,7 +1070,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
-关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取本服务进程内采样，重启后历史为空；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
+关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
 
@@ -1137,7 +1158,7 @@ function showTrendHour(svg,index){
  const row=trends[index], spec=trendSpecs[Number(svg.dataset.trend)], readout=svg.parentElement.querySelector('[data-trend-readout]');
  if(!row||!spec)return;
  const parts=spec[1].map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+esc(s[0])+' '+(Number.isFinite(row[s[1]])?row[s[1]]+spec[2]:'无数据')+'</span>');
- readout.innerHTML='<b>'+esc(row.hour_beijing)+' 北京时间</b>'+parts.join('');
+ readout.innerHTML='<b>'+esc(row.hour_beijing)+' 北京时间'+(row.commit_source==='archived_hourly'&&Number(svg.dataset.trend)>=1&&Number(svg.dataset.trend)<=4?' · 发布前小时汇总':'')+'</b>'+parts.join('');
  const line=svg.querySelector('[data-hover-line]'),x=34+index*(440-34-8)/Math.max(1,trends.length-1);
  line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';svg.dataset.hourIndex=index;
 }
