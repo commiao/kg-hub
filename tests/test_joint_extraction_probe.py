@@ -114,6 +114,31 @@ class JointExtractionProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "endpoint"):
             validate_result(result, self.rows, extraction_only=True)
 
+    def test_indexed_graph_requires_typed_entities_and_valid_endpoints(self) -> None:
+        result = {"items": [
+            {"source_obs_id": "source-1", "entities": [
+                {"name": "A", "entity_type": "Project"},
+                {"name": "B", "entity_type": "Tool"}],
+             "facts": [{"source_entity_index": 0, "target_entity_index": 1,
+                        "relation_type": "DEPENDS_ON", "fact": "A supports B",
+                        "evidence": "Source 1 says A supports B."}]},
+            {"source_obs_id": "source-2", "entities": [], "facts": []},
+        ]}
+        measured = validate_result(result, self.rows, indexed_graph=True)
+        self.assertEqual((measured["entities"], measured["facts"],
+                          measured["evidence_miss"]), (2, 1, 0))
+        item_schema = _tool_schema(indexed_graph=True)["input_schema"]["properties"]["items"]["items"]
+        self.assertIn("entity_type", item_schema["properties"]["entities"]["items"]["required"])
+        fact_schema = item_schema["properties"]["facts"]["items"]
+        self.assertIn("source_entity_index", fact_schema["required"])
+        result["items"][0]["facts"][0]["target_entity_index"] = 2
+        with self.assertRaisesRegex(ValueError, "indexed graph fact"):
+            validate_result(result, self.rows, indexed_graph=True)
+        result["items"][0]["facts"][0]["target_entity_index"] = 1
+        result["items"][0]["entities"][1]["entity_type"] = "Scalar"
+        with self.assertRaisesRegex(ValueError, "entity"):
+            validate_result(result, self.rows, indexed_graph=True)
+
 
 if __name__ == "__main__":
     unittest.main()
