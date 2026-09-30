@@ -51,6 +51,19 @@ class AttributePromptProbeTests(unittest.TestCase):
         self.assertEqual(result["equal_fields"], 0)
         self.assertTrue(result["differences"][1]["missing"])
 
+    def test_raw_omission_is_distinct_from_explicit_null_before_defaults(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        payload = {f"entity_{i}": {"path": f"/{i}.py", "project_id": None}
+                   for i in range(9)}
+        del payload["entity_0"]["project_id"]
+        omitted = probe.missing_fields(request, payload)
+        self.assertEqual(omitted, [{"uuid": request["uuids"][0], "field": "project_id"}])
+        normalized = probe.flatten(request, payload)
+        # Both normalize to null; comparing only normalized results loses evidence.
+        self.assertIsNone(normalized[request["uuids"][0]]["project_id"])
+        self.assertIsNone(normalized[request["uuids"][1]]["project_id"])
+        self.assertNotIn("project_id", payload["entity_0"])
+
     def test_equal_bad_results_do_not_hide_existing_value_loss(self):
         sample = self.sample()
         uuid = sample["nodes"][0]["uuid"]

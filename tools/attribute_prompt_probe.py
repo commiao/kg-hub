@@ -44,6 +44,43 @@ relevant new facts considered, existing supported information retained, no inven
 values and no cross-entity transfer. Return only the required structured response.
 """.strip()
 
+UPDATE_RECORDS_PROMPT = """
+Update the supplied existing entity records using the supplied source messages.
+Return the COMPLETE updated record for EVERY entity key using its own schema.
+The existing attributes are the starting state, not examples to discard.
+
+For each entity, work field by field in this order:
+1. Start with that entity's existing field value. Copy it unchanged when the
+   messages give no relevant update. An absent mention is NOT a deletion.
+2. Read the current episode, including its narrative, facts, Files read and
+   Project metadata, for explicit facts about this entity. Apply relevant facts.
+3. Use previous episodes for additional explicit facts only when they do not
+   conflict with the current episode. Current explicit corrections take priority.
+4. Return null only if no value exists and no supplied source establishes one,
+   or if explicit source evidence invalidates the old value without a replacement.
+
+Keep the identity and evidence for each entity separate. Never copy a value from
+another entity merely because their names are similar. Use only supplied values;
+do not invent repository URLs, absolute paths, versions or project identifiers.
+For files, inspect explicitly listed file paths and explicitly associated project
+metadata. A source may establish a field outside the narrative paragraph.
+For descriptions, retain still-valid existing facts and incorporate relevant new
+facts and corrections. Preserve conditions, exceptions and negation. Replace
+contradicted claims rather than retaining both. Avoid losing facts by shortening.
+
+Examples of the update rule (unrelated to the actual records):
+- Existing version is "2.4"; no message mentions version: return "2.4".
+- Existing path is null; the source lists that file at "lib/alpha.py": return
+  "lib/alpha.py" for that file's path.
+- Existing status is "open"; current source explicitly says it is resolved:
+  return "resolved".
+
+Before submitting, check EVERY field of EVERY record against its starting value
+and the source. Any removed nonempty value needs explicit invalidating evidence.
+Check that explicit new facts are covered and that no entity borrowed another's
+attributes. Return only the required structured response, with all entity keys.
+""".strip()
+
 
 def typed_nodes(nodes):
     result = []
@@ -133,6 +170,25 @@ def flatten(request, payload):
     validated = request["model"].model_validate(payload)
     return {uuid: getattr(validated, f"entity_{i}").model_dump()
             for i, uuid in enumerate(request["uuids"])}
+
+
+def missing_fields(request, payload):
+    """Audit raw omission before nullable schema defaults hide it as null.
+
+    This does not fill fields or accept an incomplete answer as quality-passing.
+    Invalid payloads still fail the original validation in flatten().
+    """
+    missing = []
+    for i, uuid in enumerate(request["uuids"]):
+        key = f"entity_{i}"
+        fields = request["model"].model_fields[key].annotation.model_fields
+        record = payload.get(key, {})
+        if not isinstance(record, dict):
+            continue
+        for field in fields:
+            if field not in record:
+                missing.append({"uuid": uuid, "field": field})
+    return missing
 
 
 def compare(baseline, merged):
@@ -243,8 +299,11 @@ def main():
     parser.add_argument("--sample", type=int, choices=range(6), default=0)
     parser.add_argument("--resume-rejected-digest", help="Exact SHA256; requires manual no-provider audit across all three gateway ledgers")
     parser.add_argument("--strengthened", action="store_true", help="Add per-entity coverage and preservation instructions only to merged prompt")
+    parser.add_argument("--update-records", action="store_true", help="Replace merged system prompt with full-record update instructions")
     parser.add_argument("--save-dir", type=Path, default=Path("/tmp/kg-attribute-probe"))
     args = parser.parse_args()
+    if args.strengthened and args.update_records:
+        parser.error("choose only one prompt variant")
     samples = select(args.journal, args.before)
     print(json.dumps({"samples": [{"index": i, "sid": s["sid"], "typed": s["typed_count"]}
                                    for i, s in enumerate(samples)]}), flush=True)
@@ -253,26 +312,33 @@ def main():
     sample = samples[args.sample]
     outputs = {}
     metrics = {}
+    omissions = {}
     for label, size in (("baseline", 8), ("merged", 16)):
         requests = asyncio.run(capture(sample, size))
         if label == "merged" and args.strengthened:
             requests[0]["messages"][0]["content"] += "\n\n" + CONSOLIDATION_RULES
+        if label == "merged" and args.update_records:
+            requests[0]["messages"][0]["content"] = UPDATE_RECORDS_PROMPT
         assert len(requests) == (2 if size == 8 else 1)
         outputs[label] = {}
+        omissions[label] = []
         metrics[label] = {"calls": 0, "elapsed": 0, "input_tokens": 0, "output_tokens": 0}
         for request in requests:
             saved = call(request, args.save_dir, args.resume_rejected_digest)
             outputs[label].update(flatten(request, saved["payload"]))
+            omissions[label].extend(missing_fields(request, saved["payload"]))
             metrics[label]["calls"] += 1
             metrics[label]["elapsed"] += saved["elapsed"]
             for key in ("input_tokens", "output_tokens"):
                 metrics[label][key] += saved["usage"].get(key, 0)
             print(json.dumps({"sample": args.sample, "stage": label, "completed": metrics[label]["calls"]}), flush=True)
-    result = {"sid": sample["sid"], "strengthened": args.strengthened, "metrics": metrics,
+    result = {"sid": sample["sid"], "strengthened": args.strengthened, "update_records": args.update_records, "metrics": metrics,
+              "omitted_fields": omissions,
               "existing_value_losses": {label: lost_existing_values(sample, output)
                                         for label, output in outputs.items()},
               "comparison": compare(outputs["baseline"], outputs["merged"])}
-    output = args.save_dir / (sample["sid"] + ("-strengthened" if args.strengthened else "") + "-comparison.json")
+    suffix = "-update-records" if args.update_records else "-strengthened" if args.strengthened else ""
+    output = args.save_dir / (sample["sid"] + suffix + "-comparison.json")
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as stream:
         json.dump({**result, "sample": sample, "outputs": outputs}, stream, ensure_ascii=False)
