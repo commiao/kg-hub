@@ -8,12 +8,29 @@ from unittest.mock import patch
 from types import SimpleNamespace
 import httpx
 from anthropic import InternalServerError
+from pydantic import ValidationError
 
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
 from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_complete_contract_rejects_missing_but_accepts_explicit_null(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        original = request["model"]
+        user_content = request["messages"][1]["content"]
+        probe.require_complete_fields(request)
+        payload = {f"entity_{i}": {"path": f"/{i}.py", "project_id": None}
+                   for i in range(9)}
+        self.assertEqual(len(probe.flatten(request, payload)), 9)
+        del payload["entity_0"]["project_id"]
+        with self.assertRaises(ValidationError):
+            probe.flatten(request, payload)
+        self.assertIsNone(original.model_validate(payload).entity_0.project_id)
+        self.assertEqual(user_content, request["messages"][1]["content"])
+        schema = request["model"].model_json_schema()
+        self.assertEqual(set(schema["$defs"]["File"]["required"]), {"path", "project_id"})
+
     def sample(self):
         now = datetime.now(timezone.utc)
         nodes = [EntityNode(name="same name", group_id="test", labels=["Entity", "File"],
@@ -83,6 +100,15 @@ class AttributePromptProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unknown prior outcome"):
                     probe.call(request, Path(folder))
                 client.assert_not_called()
+
+    def test_replay_only_missing_receipt_never_calls_provider(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"ANTHROPIC_MODEL": "probe"}):
+            with patch("anthropic.Anthropic") as client:
+                with self.assertRaisesRegex(RuntimeError, "replay-only"):
+                    probe.call(request, Path(folder), replay_only=True)
+                client.assert_not_called()
+                self.assertEqual(list(Path(folder).iterdir()), [])
 
     def test_completed_receipt_reuses_result_without_model_call(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]

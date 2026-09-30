@@ -215,3 +215,37 @@ None，15 项本地测试通过。生产代码和 schema 尚未修改。
 失败门槛，不能继续用默认 None 掩盖不完整答案。三版 SP 均未通过，单纯再
 叠加“仔细检查”指令没有证据支持；应先确认是否同时收紧输出 schema，再做
 受控实验，并保留 SP-only 与契约修改的归因边界。
+
+### 2026-10-01：SP＋完整字段约束试验
+
+用户确认继续推荐方案。新增 `--complete-fields`：保留原字段类型，但每个
+实体的全部字段键必须返回；SP 定义 File.path/project_id、Project.path/repo，
+禁止将项目/会话标识自行拆成目录和仓库。这同时改了 SP 和 required schema，
+不能把结果归因于单一改动。生产提示词和 pipeline 均未修改。
+
+固定开发样本 `4f07a2a43ec36385` 从既有私有快照读取；两次基线命中缓存，
+仅新增一次模型调用。回执摘要：
+`8dd0c5bd1e27d7321fc340d833df32acb6f08e6e121d0d7d7d995a75837492ec`。
+耗时 74.614s、输入 17,198、输出 2,691 token、stop_reason=end_turn。
+相对缓存基线 109.373s 减少约 31.8%，单样本不同时刻对照不能视为稳定收益。
+
+改善：三个 Java 文件都返回源文完整路径和项目标识；已有 repo/category
+保留；不再将项目名拆成 path/repo；核心限速条件与更正事实得到覆盖。
+失败：遗漏 5 个必需字段——isFreeTask.version、getBusinessTagByBenefitTag.version、
+recordRequest.category/version、sd-server.version；recordRequest 还多出不属于
+Tool schema 的 description。完整字段校验产生 ValidationError，未自动补值，
+未重试，也没有进入“开发样本通过后”的留出样本实验。即使大部分遗漏对应
+原本未知的 version，recordRequest.category 的漏抽和错用字段仍是实质问题。
+
+只读核对生产 model-gateway 的 `_apply_anthropic_thinking_policy` 和
+`_upstream_body`：前者深拷贝请求并调整 thinking/effort，后者改写 model 和
+max_tokens，保留 tools/schema；这些转换函数没有删除 required 声明。
+这不是对上游严格结构化输出能力的认证，只能说明当前请求链路返回的答案
+仍可违反 schema，客户端失败门槛不能省略。
+
+探针增加私有 validation-failure artifact、额外字段诊断、固定快照/样本
+ID 核验以及 `--replay-only`。已用 replay-only 重放同一完成回执，保存完整
+失败证据，没有新增模型调用。新增测试保证无回执时 replay-only 不实例化
+模型客户端；本地 17 项测试通过。下一步聚焦实体与字段的对应关系：将每个
+实体允许字段及完整输出模板明确列入任务输入，保持相同模型与样本检验。
+这仍需真实质量复测；当前版本未达到上线标准。
