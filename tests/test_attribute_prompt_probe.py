@@ -15,6 +15,28 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_template_keeps_schema_and_source_and_duplicate_name_slots_separate(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        control = asyncio.run(probe.capture(self.sample(), 16))[0]
+        probe.require_complete_fields(control)
+        user = request["messages"][1]["content"]
+        probe.add_output_template(request)
+        self.assertEqual(request["model"].model_json_schema(), control["model"].model_json_schema())
+        self.assertEqual(request["messages"][1]["content"], user)
+        sp = request["messages"][0]["content"]
+        for i in range(9):
+            self.assertIn(f'"entity_{i}": {{"path": null, "project_id": null}}', sp)
+        self.assertNotIn("/0.py", sp)
+
+    def test_seeded_template_uses_existing_values_without_changing_source(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        user = request["messages"][1]["content"]
+        probe.add_output_template(request, seeded=True)
+        self.assertEqual(request["messages"][1]["content"], user)
+        sp = request["messages"][0]["content"]
+        for i in range(9):
+            self.assertIn(f'"entity_{i}": {{"path": "/{i}.py", "project_id": null}}', sp)
+
     def test_complete_contract_rejects_missing_but_accepts_explicit_null(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         original = request["model"]
