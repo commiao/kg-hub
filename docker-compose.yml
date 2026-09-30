@@ -124,11 +124,11 @@ services:
       - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
       # 并行预抽取在写锁外执行，提交时仍校验图读集。
       - KG_HUB_PARALLEL_EXTRACTION=${KG_HUB_PARALLEL_EXTRACTION:-1}
-      # 业务任务槽位 6；关系去重与时间合批已有 3 个线上样本成功提交，继续按成功吞吐与冲突率验收。
-      - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-6}
+      # 积压吞吐对照：任务槽位 6→8；单条观测内仍由 Graphiti max_coroutines=1 串行调用模型。
+      - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-8}
       # Stable per-observation canary for indexed broad edge search; 0 retains exact search.
       - KG_HUB_EDGE_VECTOR_INDEX_PERCENT=${KG_HUB_EDGE_VECTOR_INDEX_PERCENT:-100}
-      # 模型外呼并发保持 2，不随业务任务槽位一起上调。
+      # 保持原值；Graphiti 的 max_coroutines=1 仍决定每条观测内的调用并发。
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
       # 时间抽取合批对所有 episode 启用，每次最多 12 条；3 个线上样本成功提交，持续观察入图质量和任务耗时。
       - KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT=${KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT:-100}
@@ -317,8 +317,8 @@ services:
       - KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD=${KG_HUB_REFINERY_LIVE_DISPATCH_THRESHOLD:-10}
       - KG_HUB_REFINERY_MAX_WAIT_SEC=${KG_HUB_REFINERY_MAX_WAIT_SEC:-900}
       # 持续补位池的业务任务并发上限，与服务端并行抽取槽位一致。
-      # 上游也开 6 条并发请求，确保服务端 6 个任务槽位能够补满。
-      - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-6}
+      # 上游同期开 8 条任务，才能持续补满服务端 8 个槽位。
+      - KG_HUB_REFINERY_INGEST_CONCURRENCY=${KG_HUB_REFINERY_INGEST_CONCURRENCY:-8}
       - KG_HUB_REFINERY_BACKLOG=${KG_HUB_REFINERY_BACKLOG:-1}
       # /state/refinery-window.json 是热加载的工作时间正本；文件缺失时
       # 回退到这两个启动环境变量(默认北京时间 22:00-08:00)。
