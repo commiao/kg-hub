@@ -15,6 +15,18 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_compact_and_history_ablation_keep_current_source_and_entity_values(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        body = json.loads(request["messages"][1]["content"])
+        body["previous_episodes"] = ["Unrelated previous record"]
+        request["messages"][1]["content"] = json.dumps(body)
+        probe.add_output_template(request, seeded=True, compact=True)
+        self.assertEqual(json.loads(request["messages"][1]["content"]), body)
+        probe.omit_history(request)
+        changed = json.loads(request["messages"][1]["content"])
+        self.assertEqual(changed, {**body, "previous_episodes": []})
+        self.assertEqual(body["previous_episodes"], ["Unrelated previous record"])
+
     def test_template_keeps_schema_and_source_and_duplicate_name_slots_separate(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         control = asyncio.run(probe.capture(self.sample(), 16))[0]
