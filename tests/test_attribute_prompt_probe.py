@@ -15,6 +15,49 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_grounded_review_keeps_fields_and_source_but_rejects_extra_keys(self):
+        sample = self.sample()
+        sample["nodes"] = [EntityNode(name="src/alpha.py", group_id="test", labels=["Entity", "File"],
+                                      attributes={"path": "src/alpha.py", "project_id": "old"}).model_dump()]
+        sample["episode"]["content"] = "Files read: /srv/repo/src/alpha.py, /other/src/alpha.py\nProject: context\nUnrelated: no match"
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        probe.add_output_template(request, seeded=True, compact=True)
+        field_types = {key: field.annotation for key, field in request["model"].model_fields["entity_0"].annotation.model_fields.items()}
+        original_user = request["messages"][1]["content"]
+        probe.add_grounded_review(request, "2026-01-02T00:00:00Z")
+        self.assertEqual({key: field.annotation for key, field in request["model"].model_fields["entity_0"].annotation.model_fields.items()}, field_types)
+        self.assertEqual(request["messages"][1]["content"], original_user)
+        self.assertEqual(request["scalar_source_evidence"]["entity_0"]["candidate_source_lines"],
+                         ["Files read: /srv/repo/src/alpha.py, /other/src/alpha.py", "Project: context"])
+        self.assertEqual(sample["nodes"][0]["attributes"], {"path": "src/alpha.py", "project_id": "old"})
+        self.assertIn("2026-01-02T00:00:00Z", request["messages"][0]["content"])
+        with self.assertRaises(ValidationError):
+            probe.flatten(request, {"entity_0": {"path": "/srv/repo/src/alpha.py", "project_id": "context", "content_hash": None}})
+
+    def test_paired_screen_alternates_arms_and_preserves_raw_omissions(self):
+        sample = {**self.sample(), "sid": "fixture"}
+        sample["nodes"] = [EntityNode.model_validate(n).model_dump(mode="json") for n in sample["nodes"]]
+        sample["episode"] = EpisodicNode.model_validate(sample["episode"]).model_dump(mode="json")
+        def saved(request, *args, **kwargs):
+            merged = len(request["uuids"]) == 9
+            return {"body_digest": "fixture", "elapsed": 1, "usage": {}, "stop_reason": "end_turn",
+                    "payload": {f"entity_{i}": ({"path": "/file", "project_id": None} if merged else {"path": "/file"})
+                                for i in range(len(request["uuids"]))}}
+        with tempfile.TemporaryDirectory() as folder, patch.object(probe, "call", side_effect=saved) as call, patch("builtins.print"):
+            probe.paired_screen(sample, Path(folder), reverse=True)
+            result = json.loads((Path(folder) / "fixture-thinking-off-paired-screen.json").read_text())
+            self.assertEqual(result["arm_order"], ["merged", "baseline"])
+            self.assertEqual(call.call_count, 3)
+            self.assertEqual(len(result["arms"]["merged"]["output"]), 9)
+            self.assertEqual(len(result["arms"]["baseline"]["calls"][0]["omitted_fields"]), 8)
+
+    def test_paired_screen_does_not_continue_after_unknown_outcome(self):
+        sample = {**self.sample(), "sid": "fixture"}
+        with tempfile.TemporaryDirectory() as folder, patch.object(probe, "call", side_effect=RuntimeError("unknown")) as call:
+            with self.assertRaisesRegex(RuntimeError, "unknown"):
+                probe.paired_screen(sample, Path(folder))
+            self.assertEqual(call.call_count, 1)
+
     def delta_fixture(self):
         sample = self.sample()
         sample["nodes"] = [EntityNode(name="quota", group_id="test", labels=["Entity", "Concept"],

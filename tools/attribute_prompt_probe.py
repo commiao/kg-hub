@@ -246,6 +246,70 @@ def missing_source_quotes(request, output):
             for quote in quotes if quote not in (output.get(uuid_by_key[key], {}).get("description") or "")]
 
 
+def add_grounded_review(request, reference_time=None):
+    """Expose scalar source evidence without assigning values or rewriting answers."""
+    meanings = {
+        ("File", "path"): "Explicit filesystem path of this file, including its supplied full prefix. Never append behavioral descriptions or HTTP routes.",
+        ("File", "project_id"): "Project identity for this file. Explicit file ownership takes precedence over the message's general Project context.",
+        ("Config", "path"): "Explicit path of the configuration artifact; never a description, default value, SQL clause or class annotation.",
+        ("Config", "content_hash"): "Explicitly supplied content digest/hash only. Do not calculate or invent one. Never put configuration values, durations or descriptive prose here.",
+        ("Tool", "category"): "Explicit software/service/function category. Behavior and formulas do not belong here.",
+        ("Tool", "version"): "Explicit software release version only. Do not put behavior or formulas here.",
+        ("Project", "path"): "Explicit project directory. Do not derive it by splitting the entity name.",
+        ("Project", "repo"): "Explicitly evidenced repository identity. Do not infer by splitting a project/session identifier.",
+        ("Fix", "applied_at"): "Explicit application time of this fix, not automatically the observation or ingestion timestamp.",
+    }
+    strict_fields = {}
+    for key, outer in request["model"].model_fields.items():
+        schema = outer.annotation
+        described = {}
+        for name, field in schema.model_fields.items():
+            info = copy.deepcopy(field)
+            if (schema.__name__, name) in meanings:
+                info.description = meanings[(schema.__name__, name)]
+            described[name] = (field.annotation, info)
+        strict = create_model(schema.__name__, __base__=schema,
+                              __config__={**schema.model_config, "extra": "forbid"}, **described)
+        strict_fields[key] = (strict, copy.deepcopy(outer))
+    request["model"] = create_model(request["model"].__name__,
+                                    __config__=request["model"].model_config, **strict_fields)
+    context = json.loads(request["messages"][1]["content"])
+    lines = [line for line in context["episode_content"].splitlines() if line.strip()]
+    evidence = {}
+    for key, outer in request["model"].model_fields.items():
+        if "description" in outer.annotation.model_fields:
+            continue
+        entity = context["entities"][key]
+        is_file = "File" in entity["entity_types"]
+        needle = entity["name"].replace("\\", "/").rsplit("/", 1)[-1] if is_file else entity["name"]
+        matched = [line for line in lines if needle and needle.casefold() in line.casefold()]
+        if is_file:
+            matched += [line for line in lines if line.startswith("Project:") and line not in matched]
+        if matched:
+            evidence[key] = {"name": entity["name"], "candidate_source_lines": matched}
+    request["scalar_source_evidence"] = evidence
+    request["messages"][0]["content"] += """
+
+最后按字段复核，不要只关注 description 而复制未检查的普通字段：
+- 下方是从当前原文按名称检出的候选证据，不是预填答案；同名/同段不自动证明归属。
+- File.path：原文明确列出此文件的完整路径时，保留完整前缀，不能让起始记录中的相对路径遮蔽更新。
+- File.project_id：原文明示该文件属于另一项目/仓库时，该具体归属优先于消息末尾 Project 的会话上下文。
+- Tool.category：原文明确称某软件为“缓存服务”或“解析函数”可以作为类别证据；行为公式不是版本号。
+- 普通字段没有新证据则保留原值；源文明确提供了值就必须填入，不能机械复制 null。
+- Config.content_hash 只接受原文明示的内容摘要/哈希，不是配置内容、默认值、TTL 或说明。不得把行为追加进 File.path。
+- 只更新当前 schema 能表达的属性。没有对应属性字段的行为事实交给关系/摘要阶段，不得塞进 path、version、content_hash。
+- description：当前原文解决了旧疑问时，移除已解决的“待核实/尚不确定”表述，保留句内其他有效背景。
+  示例：旧“额度来自配置。是否生效待查。”，新证据“额度已经生效。”，更新为“额度来自配置。额度已经生效。”
+  不得只追加新结论并同时保留旧待查状态；也不得删除无关旧事实。全部条件/例外/否定仍必须完整。
+普通字段候选原文：
+""" + json.dumps(evidence, ensure_ascii=False)
+    if reference_time is not None:
+        request["messages"][0]["content"] += (
+            "\n当前观测参考时间（valid_at）：" + str(reference_time)
+            + "。仅用于解析原文明示的相对时间；不等于所有事实发生时间或修复实施时间。"
+            "不得把入库日期、前序观测日期或运行当天日期填给未明示日期的事件。")
+
+
 def delta_request(request):
     """Version 3: per-field edits with verbatim evidence; still experimental."""
     require_complete_fields(request)
@@ -590,7 +654,7 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
     return saved
 
 
-def stability(sample, directory, replay_only=False, temperature=None, trials=5, source_quotes=False):
+def stability(sample, directory, replay_only=False, temperature=None, trials=5, source_quotes=False, grounded_review=False):
     """Five predeclared independent trials of the frozen latest candidate."""
     request = asyncio.run(capture(sample, 16))[0]
     add_output_template(request, seeded=True, compact=True)
@@ -599,11 +663,15 @@ def stability(sample, directory, replay_only=False, temperature=None, trials=5, 
     request["messages"][0]["content"] += "\n\n" + NO_IMPLEMENTATION_INFERENCE
     if source_quotes:
         add_source_quotes(request)
+    if grounded_review:
+        add_grounded_review(request, sample["episode"].get("valid_at"))
     if temperature is not None:
         request["temperature"] = temperature
     experiment = "sp-stability-20261001" if temperature is None else f"sp-stability-temp{temperature:g}-20261001"
     if source_quotes:
         experiment += "-quotes"
+    if grounded_review:
+        experiment += "-grounded-review"
     results = []
     target = directory / (sample["sid"] + "-" + experiment.removeprefix("sp-") + ".json")
     for i in range(1, trials + 1):
@@ -631,6 +699,47 @@ def stability(sample, directory, replay_only=False, temperature=None, trials=5, 
         print(json.dumps({k: v for k, v in result.items() if k not in ("output", "payload")}, ensure_ascii=False), flush=True)
 
 
+def paired_screen(sample, directory, replay_only=False, reverse=False):
+    """Compare two complete thinking-disabled recipes; not a temperature-only A/B."""
+    original = asyncio.run(capture(sample, 8))
+    merged = asyncio.run(capture(sample, 16))[0]
+    add_output_template(merged, seeded=True, compact=True)
+    omit_history(merged)
+    merged["messages"][0]["content"] += "\n\n" + RELATIONAL_CONDITIONS
+    merged["messages"][0]["content"] += "\n\n" + NO_IMPLEMENTATION_INFERENCE
+    add_source_quotes(merged)
+    merged["temperature"] = 0
+    arms = [("baseline", original), ("merged", [merged])]
+    if reverse:
+        arms.reverse()
+    target = directory / (sample["sid"] + "-thinking-off-paired-screen.json")
+    result = {"sample": sample, "arm_order": [label for label, _ in arms], "arms": {}}
+    for label, requests in arms:
+        records, output = [], {}
+        for request in requests:
+            # Transport/unknown failures escape and stop the run; no new-key retry.
+            saved = call(request, directory, replay_only=replay_only)
+            record = {key: saved[key] for key in ("body_digest", "elapsed", "usage", "stop_reason", "payload")}
+            try:
+                values = flatten(request, saved["payload"])
+                output.update(values)
+                record.update({"schema_valid": True,
+                    "omitted_fields": missing_fields(request, saved["payload"]),
+                    "unexpected_fields": unexpected_fields(request, saved["payload"]),
+                    "existing_value_losses": lost_existing_values(sample, values),
+                    "missing_source_quotes": missing_source_quotes(request, values)})
+            except ValidationError as exc:
+                record.update({"schema_valid": False, "errors": exc.errors(include_input=False, include_url=False)})
+            records.append(record)
+            result["arms"][label] = {"calls": records, "output": output,
+                "elapsed": sum(r["elapsed"] for r in records)}
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                json.dump(result, stream, ensure_ascii=False)
+            print(json.dumps({"sid": sample["sid"], "arm": label, "call": len(records),
+                **{k: v for k, v in record.items() if k != "payload"}}, ensure_ascii=False), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--journal", default="/backup/model-attempts.sqlite3")
@@ -638,6 +747,8 @@ def main():
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--candidate-only", action="store_true", help="Evaluate merged candidate without additional baseline provider calls")
     parser.add_argument("--delta", action="store_true", help="Experimental explicit edits; --stability selects independent repetitions")
+    parser.add_argument("--paired-screen", action="store_true", help="Thinking-off original 8+8 versus frozen source-quote merged recipe")
+    parser.add_argument("--reverse-arms", action="store_true", help="Run merged first in paired screening to alternate ordering")
     parser.add_argument("--profile", action="store_true", help="Report context lengths and prompt variants without model calls")
     parser.add_argument("--export-samples", action="store_true", help="Freeze selected snapshots privately without model calls")
     parser.add_argument("--stability", action="store_true", help="Five independent trials of frozen latest candidate; requires completed control")
@@ -656,6 +767,7 @@ def main():
     parser.add_argument("--relational-conditions", action="store_true", help="Preserve complete multi-entity rules in the related concepts' descriptions")
     parser.add_argument("--no-implementation-inference", action="store_true", help="Disallow deriving concrete return values from business outcomes")
     parser.add_argument("--source-quotes", action="store_true", help="Include source-derived complete clauses in description instructions")
+    parser.add_argument("--grounded-review", action="store_true", help="Expose scalar source lines and review stale uncertainty; no answer repair")
     parser.add_argument("--snapshot", type=Path, help="Reuse the sample from a private comparison artifact")
     parser.add_argument("--expected-sid", help="Abort before any calls if sample identity changed")
     parser.add_argument("--save-dir", type=Path, default=Path("/tmp/kg-attribute-probe"))
@@ -668,6 +780,8 @@ def main():
         parser.error("implementation inference guard requires relational conditions")
     if args.source_quotes and not (args.stability or args.no_implementation_inference):
         parser.error("source quotes requires the explicit-evidence candidate")
+    if args.grounded_review and not args.source_quotes:
+        parser.error("grounded review requires --source-quotes")
     if sum((args.strengthened, args.update_records, args.complete_fields, args.output_template, args.seeded_template, args.compact_contract)) > 1:
         parser.error("choose only one prompt variant")
     samples = [json.loads(args.snapshot.read_text())["sample"]] if args.snapshot else select(args.journal, args.before)
@@ -690,11 +804,14 @@ def main():
     sample = samples[0 if args.snapshot else args.sample]
     if args.expected_sid and sample["sid"] != args.expected_sid:
         raise RuntimeError("sample identity changed; refusing model calls")
+    if args.paired_screen:
+        paired_screen(sample, args.save_dir, args.replay_only, args.reverse_arms)
+        return
     if args.delta:
         delta_experiment(sample, args.save_dir, args.replay_only, args.trials if args.stability else 0)
         return
     if args.stability:
-        stability(sample, args.save_dir, args.replay_only, args.temperature, args.trials, args.source_quotes)
+        stability(sample, args.save_dir, args.replay_only, args.temperature, args.trials, args.source_quotes, args.grounded_review)
         return
     if args.profile:
         profile = {}
@@ -736,6 +853,8 @@ def main():
                 requests[0]["messages"][0]["content"] += "\n\n" + NO_IMPLEMENTATION_INFERENCE
             if args.source_quotes:
                 add_source_quotes(requests[0])
+            if args.grounded_review:
+                add_grounded_review(requests[0], sample["episode"].get("valid_at"))
         if label == "merged" and args.temperature is not None:
             requests[0]["temperature"] = args.temperature
         assert len(requests) == (2 if size == 8 else 1)
@@ -752,13 +871,15 @@ def main():
                 normalized = flatten(request, saved["payload"])
             except ValidationError as exc:
                 failure = {"sid": sample["sid"], "stage": label,
+                           "body_digest": saved["body_digest"], "temperature": args.temperature,
+                           "source_quotes": args.source_quotes, "grounded_review": args.grounded_review,
                            "complete_fields": args.complete_fields, "output_template": args.output_template, "seeded_template": args.seeded_template,
                            "elapsed": saved["elapsed"], "usage": saved["usage"],
                            "omitted_fields": missing_fields(request, saved["payload"]),
                            "unexpected_fields": unexpected_fields(request, saved["payload"]),
                            "errors": exc.errors(include_input=False, include_url=False)}
                 variant = "explicit-evidence" if args.no_implementation_inference else "relational-conditions" if args.relational_conditions else "compact-current" if args.omit_history_for_probe else "compact-contract" if args.compact_contract else "seeded-template" if args.seeded_template else "output-template" if args.output_template else "complete-fields" if args.complete_fields else "other"
-                target = args.save_dir / (sample["sid"] + "-" + variant + "-validation-failure.json")
+                target = args.save_dir / (sample["sid"] + "-" + variant + "-" + saved["body_digest"] + "-validation-failure.json")
                 fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as stream:
                     json.dump({**failure, "sample": sample, "payload": saved["payload"]}, stream, ensure_ascii=False)
@@ -786,11 +907,14 @@ def main():
     result["no_implementation_inference"] = args.no_implementation_inference
     result["temperature"] = args.temperature
     result["source_quotes"] = args.source_quotes
+    result["grounded_review"] = args.grounded_review
     suffix = "-explicit-evidence" if args.no_implementation_inference else "-relational-conditions" if args.relational_conditions else "-compact-current" if args.omit_history_for_probe else "-compact-contract" if args.compact_contract else "-seeded-template" if args.seeded_template else "-output-template" if args.output_template else "-complete-fields" if args.complete_fields else "-update-records" if args.update_records else "-strengthened" if args.strengthened else ""
     if args.temperature is not None:
         suffix += f"-temp{args.temperature:g}"
     if args.source_quotes:
         suffix += "-quotes"
+    if args.grounded_review:
+        suffix += "-grounded-review"
     if args.candidate_only:
         suffix += "-candidate-only"
     output = args.save_dir / (sample["sid"] + suffix + "-comparison.json")
