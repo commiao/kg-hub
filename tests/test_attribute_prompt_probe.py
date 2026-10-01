@@ -379,6 +379,32 @@ class AttributePromptProbeTests(unittest.TestCase):
                                  {"thinking": {"type": "enabled", "budget_tokens": 2048}})
                 self.assertEqual(client.return_value.messages.create.call_count, 3)
 
+    def test_structured_output_keeps_invalid_response_and_never_repairs_it(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        probe.add_unified_contract(request, revision=3)
+        response = SimpleNamespace(content=[SimpleNamespace(type="text", text='{"entity_0":{}}')],
+                                   usage=SimpleNamespace(model_dump=lambda: {}), stop_reason="end_turn")
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
+                "ANTHROPIC_MODEL": "probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake",
+                "ANTHROPIC_BASE_URL": "http://model-gateway:39000"}), patch("anthropic.Anthropic") as client:
+            with self.assertRaisesRegex(RuntimeError, "isolated"):
+                probe.call(request, Path(folder), structured_output=True)
+            client.assert_not_called()
+            client.return_value.messages.create.return_value = response
+            with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://kg-attribute-accuracy-probe:39000"}):
+                saved = probe.call(request, Path(folder), structured_output=True)
+                self.assertEqual(saved["payload"], {"entity_0": {}})
+                with self.assertRaises(ValidationError):
+                    probe.flatten(request, saved["payload"])
+                body = saved["request_body"]
+                self.assertNotIn("tools", body)
+                schema = body["extra_body"]["output_config"]["format"]["schema"]
+                self.assertFalse(schema["additionalProperties"])
+                self.assertTrue(all(x.get("additionalProperties") is False for x in schema["$defs"].values()))
+                self.assertEqual(body["extra_body"]["thinking"], {"type": "disabled"})
+                probe.call(request, Path(folder), structured_output=True, replay_only=True)
+                self.assertEqual(client.return_value.messages.create.call_count, 1)
+
     def test_replay_only_missing_receipt_never_calls_provider(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"ANTHROPIC_MODEL": "probe"}):

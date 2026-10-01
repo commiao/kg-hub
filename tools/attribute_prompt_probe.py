@@ -645,7 +645,7 @@ def lost_existing_values(sample, output):
 
 
 def call(request, directory, resume_rejected_digest=None, replay_only=False, trial_id=None,
-         thinking_arm=None):
+         thinking_arm=None, structured_output=False):
     from anthropic import Anthropic, APIStatusError
     model = os.environ["ANTHROPIC_MODEL"]
     schema = request["model"].model_json_schema()
@@ -668,6 +668,26 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
             body["extra_body"]["thinking"]["budget_tokens"] = 2048
         if thinking_arm == "enabled":
             body["extra_body"]["output_config"] = {"effort": "medium"}
+    if structured_output:
+        if thinking_arm is not None:
+            raise ValueError("structured output cannot combine experiment arms")
+        if os.environ.get("ANTHROPIC_BASE_URL") != "http://kg-attribute-accuracy-probe:39000":
+            raise RuntimeError("structured comparison requires the isolated experiment gateway")
+        schema = copy.deepcopy(schema)
+        def close_objects(value):
+            if isinstance(value, dict):
+                if value.get("type") == "object":
+                    value["additionalProperties"] = False
+                for child in value.values():
+                    close_objects(child)
+            elif isinstance(value, list):
+                for child in value:
+                    close_objects(child)
+        close_objects(schema)
+        body.pop("tools")
+        body.pop("tool_choice")
+        body["max_tokens"] = 8192
+        body["extra_body"]["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
     digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     body_digest = digest
@@ -733,6 +753,14 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
              "text_blocks": [x.text for x in response.content if x.type == "text"],
              "usage": response.usage.model_dump(), "stop_reason": response.stop_reason,
              "payload": blocks[0] if len(blocks) == 1 else None}
+    if structured_output:
+        # Parse the single JSON document without repairing or filling its fields.
+        # Persist invalid output as a completed receipt; never silently retry it.
+        try:
+            saved["payload"] = json.loads("".join(saved["text_blocks"]))
+        except (ValueError, TypeError) as exc:
+            saved["payload"] = None
+            saved["parse_error"] = type(exc).__name__
     # Keep prepared receipt if interrupted before atomic replacement.
     temp = receipt.with_suffix(".tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
