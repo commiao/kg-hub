@@ -22,6 +22,7 @@ import asyncio
 import os
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -437,6 +438,33 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
     }
 
 
+def backlog_remaining_history(status: dict, now: datetime) -> list[dict]:
+    """Record real refinery snapshots on the existing backup volume."""
+    backup = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
+    if not backup:
+        return []
+    path = Path(backup).with_name("flow-backlog-remaining.sqlite3")
+    remaining = status.get("backlog_remaining")
+    heartbeat = _parse_ts(status.get("heartbeat_at"))
+    cutoff = now.timestamp() - 48 * 3600
+    with closing(sqlite3.connect(path, timeout=2)) as db, db:
+        db.execute("CREATE TABLE IF NOT EXISTS remaining_samples ("
+                   "bucket INTEGER PRIMARY KEY, remaining INTEGER NOT NULL, "
+                   "boundary TEXT, sampled_at REAL NOT NULL)")
+        if (isinstance(remaining, int) and not isinstance(remaining, bool) and remaining >= 0
+                and heartbeat and -60 <= (now - heartbeat).total_seconds() <= 900):
+            bucket = int(now.timestamp()) // 120 * 120
+            db.execute("INSERT OR REPLACE INTO remaining_samples VALUES (?,?,?,?)",
+                       (bucket, remaining, str(status.get("boundary_id") or ""), now.timestamp()))
+        db.execute("DELETE FROM remaining_samples WHERE sampled_at < ?", (cutoff,))
+        rows = db.execute("SELECT sampled_at, remaining, boundary FROM remaining_samples "
+                          "WHERE sampled_at >= ? ORDER BY sampled_at", (cutoff,)).fetchall()
+    return [{"at": datetime.fromtimestamp(at, tz=timezone.utc).isoformat(timespec="seconds"),
+             "at_beijing": _beijing_time(datetime.fromtimestamp(at, tz=timezone.utc)),
+             "remaining": value, "boundary_id": boundary}
+            for at, value, boundary in rows]
+
+
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
     """同一 UTC 日：网关 kg-hub 调用次数 ÷ 图内当日新增 Episode。
 
@@ -794,7 +822,8 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
                keys: dict | None, timing: dict, active: int | None,
                graph_daily: list[dict] | None, now: datetime,
                source_errors: list[str] | None = None,
-               key_trends: list[dict] | None = None) -> dict:
+               key_trends: list[dict] | None = None,
+               remaining_history: list[dict] | None = None) -> dict:
     status = status if isinstance(status, dict) else {}
     probed = probe_stages(snapshots)
     per_stage = {
@@ -840,6 +869,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
         "generated_at_beijing": _beijing_time(now),
         "stages": stages,
         "backlog": digest,
+        "backlog_remaining_history": remaining_history or [],
         "efficiency": efficiency,
         "key_trends": [{**row, "hour_beijing": _beijing_hour(row["hour"])}
                        for row in (key_trends or [])],
@@ -969,10 +999,16 @@ async def collect_flow() -> dict:
         errors.append(f"提交遥测历史快照不可读：{type(exc).__name__}")
     trends = key_metric_trends(now=now, commits=commits, attempts=attempts,
                                outcomes=outcomes, archived_commits=archived_commits)
+    try:
+        remaining_history = await asyncio.to_thread(backlog_remaining_history, status, now)
+    except (OSError, sqlite3.Error) as exc:
+        remaining_history = []
+        errors.append(f"积压剩余历史不可用：{type(exc).__name__}")
     return build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
                       keys=keys, timing=ingest_timing.summary(now=time.time()),
                       active=active_extractions(), graph_daily=graph_daily, now=now,
-                      source_errors=errors, key_trends=trends)
+                      source_errors=errors, key_trends=trends,
+                      remaining_history=remaining_history)
 
 
 async def dashboard_flow(request: Request) -> HTMLResponse:
@@ -1048,12 +1084,13 @@ th{font-size:12px;color:GrayText;font-weight:500}
 
 <h2>积压消化情况</h2>
 <div class=cards id=bcards></div>
-<div class=lg>近 48 小时每小时去向（北京时间，单位：观测条数）：<i style="background:#1D9E75"></i>积压入图<i style="background:#A8B5B0"></i>积压过滤拒绝<i style="background:#5B8FF9"></i>实时入图<i style="background:#E8A33D"></i>推迟/重试</div>
-<div id=hourly></div>
+<div class=note>最近 48 小时 · 北京时间；将光标移到图上查看该时刻的数值。积压剩余只记录真实快照，看板或数据接口被请求时采样；历史从首次采样开始，服务重启后仍保留。</div>
+<div class=trend-grid id=backlogtrends></div>
 <div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
 <h2>关键指标趋势</h2>
+<div class=cards id=ecards></div>
 <div class=note>最近 24 小时 · 北京时间整点分桶（UTC+8）· 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
 <div class=trend-grid id=keytrends></div>
 
@@ -1070,6 +1107,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
+积压剩余曲线来自 refinery 新鲜状态的实际快照，按两分钟采样到 kg-hub 的备份卷，保留最近 48 小时；首次启用前及无人请求看板期间没有历史点，工作边界变化或采样中断时曲线断开。<br>
 关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
@@ -1106,15 +1144,16 @@ const cards=[
  ['积压剩余',fmt(B.remaining),'工作窗口'+(B.window_open?'开':'关')+' · boundary '+fmt(B.boundary_id)],
  ['近 24h 积压消化',fmt(L.backlog_terminal),'入图 '+fmt(L.backlog_ingested)+' · 拒绝 '+fmt(L.backlog_rejected)+' · 样本 '+fmt(L.coverage_h)+'h'],
  ['预计清空',eta,etaNote],
- ['有产出小时',fmt(L.active_hours)+' / 24','每个有产出小时消化 '+fmt(B.rate_per_active_hour)+' 条'],
  ['入图率',B.accept_rate!=null?B.accept_rate+'%':'—','积压终态中进图的比例'],
- ['推迟/重试占比',pct(B.deferred_share),'近 24h 积压推迟 '+fmt(L.backlog_deferred)+' 条'],
+];
+const efficiencyCards=[
  ['调用 / 条入图',fmt(E.calls_per_observation),'本统计日网关调用 ÷ 图内新增（北京时间 08:00 切日）'],
  ['单条抽取耗时',E.extract_p50!=null?(E.extract_p50+'s'):(E.duration_p50!=null?(E.duration_p50+'s'):'—'),E.extract_p50!=null?('P90 '+fmt(E.extract_p90)+'s · 不含排队'):('领取→终态 P90 '+fmt(E.duration_p90)+'s · 含排队')],
  [(E.queue_label||'排队')+'占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
- ['实时线近 24h',fmt(L.live_ingested),'入图（拒绝 '+fmt(L.live_rejected)+'）'],
 ];
-$('bcards').innerHTML=cards.map(c=>'<div class=mc><div class=l>'+c[0]+'</div><div class=v>'+c[1]+'</div><div class=s>'+esc(c[2])+'</div></div>').join('');
+const renderCards=rows=>rows.map(c=>'<div class=mc><div class=l>'+c[0]+'</div><div class=v>'+c[1]+'</div><div class=s>'+esc(c[2])+'</div></div>').join('');
+$('bcards').innerHTML=renderCards(cards);
+$('ecards').innerHTML=renderCards(efficiencyCards);
 
 function stack(target,rows,label,parts){const box=$(target);
  if(!rows.length){box.innerHTML='<div class=note>暂无数据</div>';return}
@@ -1122,11 +1161,93 @@ function stack(target,rows,label,parts){const box=$(target);
  box.innerHTML=rows.map(r=>{const t=tot(r);return '<div class=row><span class=k>'+esc(label(r))+'</span><span class=bar>'
   +parts.map(p=>{const v=p[1](r)||0;return v?'<i title="'+p[0]+' '+v+'" style="width:'+(v*100/peak)+'%;background:'+p[2]+'"></i>':''}).join('')
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
-stack('hourly',(B.hourly||[]).slice().reverse(),r=>r.hour_beijing.slice(5),[
- ['积压入图',r=>r.backlog.ingested,'#1D9E75'],['积压拒绝',r=>r.backlog.rejected,'#A8B5B0'],
- ['实时入图',r=>r.live.ingested,'#5B8FF9'],['推迟',r=>r.backlog.deferred+r.live.deferred,'#E8A33D']]);
 stack('daily',(B.daily||[]).slice().reverse(),r=>r.day_beijing_start.slice(5),[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
+
+const backlogData=[
+ {title:'积压消化趋势（每小时）',unit:' 条',rows:(B.hourly||[]).map(r=>({
+   at:r.hour+':00:00Z',label:r.hour_beijing+' 北京时间',
+   consumed:r.backlog.ingested+r.backlog.rejected,ingested:r.backlog.ingested,
+   rejected:r.backlog.rejected,deferred:r.backlog.deferred})),
+  series:[['消化','consumed','#378ADD'],['入图','ingested','#1D9E75'],
+          ['拒绝','rejected','#A8B5B0'],['推迟/重试','deferred','#E8A33D']]},
+ {title:'积压剩余趋势（真实快照）',unit:' 条',rows:(D.backlog_remaining_history||[]).map(r=>({
+   at:r.at,label:r.at_beijing,remaining:r.remaining,boundary:r.boundary_id})),
+  series:[['剩余','remaining','#8250C4']]},
+];
+const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
+const backlogX=(spec,at)=>{
+ const first=Date.parse(spec.rows[0].at);
+ const start=Math.max(chartStart,Math.min(first-30*60000,chartEnd-2*3600000));
+ return 34+Math.max(0,Math.min(1,(Date.parse(at)-start)/(chartEnd-start)))*398;
+};
+function backlogChart(spec,index){
+ const rows=spec.rows;
+ if(!rows.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无可用样本；积压剩余从首次采样后开始显示。</div></div>';
+ const values=rows.flatMap(r=>spec.series.map(s=>r[s[1]]).filter(Number.isFinite));
+ const low=spec.series.length===1?Math.min(...values):0;
+ const high=Math.max(low+1,...values),top=high+(high-low)*.1;
+ const y=v=>9+(125-9-24)*(1-(v-low)/(top-low));
+ const curves=spec.series.map(s=>{
+   const pieces=[];let part=[];
+   rows.forEach((r,i)=>{
+     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(index===1?10:90)*60000
+       ||(index===1&&r.boundary!==previous.boundary));
+     if(gap&&part.length){pieces.push(part);part=[]}
+     if(Number.isFinite(r[s[1]]))part.push(backlogX(spec,r.at).toFixed(1)+','+y(r[s[1]]).toFixed(1));
+   });
+   if(part.length)pieces.push(part);
+   return pieces.map(p=>p.length===1?'<circle cx="'+p[0].split(',')[0]+'" cy="'+p[0].split(',')[1]+'" r="3" fill="'+s[2]+'"/>':
+     '<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('');
+ }).join('');
+ const ticks=[low,(low+top)/2,top].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
+ const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(rows[0].label.slice(5,16))+'</text>'+
+  '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(rows[rows.length-1].label.slice(5,16))+'</text>';
+ return '<div class=trend><h3>'+spec.title+'</h3><svg data-backlog-chart="'+index+'" tabindex="0" viewBox="0 0 440 125" role="img" aria-label="'+spec.title+'，用左右方向键查看数值">'+
+  '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+
+  '<line data-hover-line x1="0" x2="0" y1="9" y2="101" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg>'+
+  '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
+  spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
+}
+$('backlogtrends').innerHTML=backlogData.map(backlogChart).join('');
+function showBacklogPoint(svg,index){
+ const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
+ svg.dataset.pointIndex=index;
+ const parts=spec.series.map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+s[0]+' '+r[s[1]]+spec.unit+'</span>');
+ if(r.boundary!==undefined)parts.push('<span>boundary '+esc(r.boundary)+'</span>');
+ svg.parentElement.querySelector('[data-trend-readout]').innerHTML='<b>'+esc(r.label)+'</b>'+parts.join('');
+ const line=svg.querySelector('[data-hover-line]'),x=backlogX(spec,r.at);
+ line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';
+}
+function clearBacklogPoint(svg){
+ svg.querySelector('[data-hover-line]').style.display='none';
+ svg.parentElement.querySelector('[data-trend-readout]').textContent='移动光标到图上查看数值';
+ delete svg.dataset.pointIndex;
+}
+$('backlogtrends').addEventListener('pointermove',e=>{
+ const svg=e.target.closest('svg[data-backlog-chart]');if(!svg)return;
+ const point=svg.createSVGPoint();point.x=e.clientX;point.y=e.clientY;
+ const local=point.matrixTransform(svg.getScreenCTM().inverse());
+ const rows=backlogData[Number(svg.dataset.backlogChart)].rows;
+ const spec=backlogData[Number(svg.dataset.backlogChart)];
+ let nearest=0;for(let i=1;i<rows.length;i++)if(Math.abs(backlogX(spec,rows[i].at)-local.x)<Math.abs(backlogX(spec,rows[nearest].at)-local.x))nearest=i;
+ if(svg.dataset.pointIndex!==String(nearest))showBacklogPoint(svg,nearest);
+});
+$('backlogtrends').addEventListener('pointerout',e=>{
+ const svg=e.target.closest('svg[data-backlog-chart]');
+ if(svg&&!svg.contains(e.relatedTarget))clearBacklogPoint(svg);
+});
+$('backlogtrends').addEventListener('focusin',e=>{
+ const svg=e.target.closest('svg[data-backlog-chart]');if(svg)showBacklogPoint(svg,backlogData[Number(svg.dataset.backlogChart)].rows.length-1);
+});
+$('backlogtrends').addEventListener('focusout',e=>{
+ const svg=e.target.closest('svg[data-backlog-chart]');if(svg)clearBacklogPoint(svg);
+});
+$('backlogtrends').addEventListener('keydown',e=>{
+ const svg=e.target.closest('svg[data-backlog-chart]');if(!svg||!['ArrowLeft','ArrowRight'].includes(e.key))return;
+ e.preventDefault();const length=backlogData[Number(svg.dataset.backlogChart)].rows.length;
+ showBacklogPoint(svg,Math.max(0,Math.min(length-1,Number(svg.dataset.pointIndex??length-1)+(e.key==='ArrowLeft'?-1:1))));
+});
 
 const trends=D.key_trends||[];
 const trendSpecs=[
