@@ -1208,6 +1208,11 @@ def collect() -> dict:
     order = [n["id"].split(":", 1)[1] for n in tool_nodes]
     hook_nodes.sort(key=lambda h: (order.index(h["id"].split(":", 1)[1])
                                    if h["id"].split(":", 1)[1] in order else 99))
+    from claude_mem_queue import collect as collect_queue
+    try:
+        queue_telemetry = collect_queue(HOME, http_json, time.time())
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        queue_telemetry = {"current": [], "history": [], "error": type(exc).__name__}
     worker = probe_worker()
     sqlite_node, local_max = probe_sqlite()
     sync_node = probe_sync(local_max, nas_host)
@@ -1252,6 +1257,7 @@ def collect() -> dict:
         "nodes": nodes,
         "edges": edges,
         "hook_inventory": hook_inventory,
+        "claude_mem_queue": queue_telemetry,
     }
 
 
