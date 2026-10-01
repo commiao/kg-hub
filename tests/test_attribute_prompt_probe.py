@@ -15,6 +15,45 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_stability_stops_on_unknown_outcome_instead_of_advancing_trial(self):
+        sample = {**self.sample(), "sid": "fixture"}
+        sample["nodes"] = [EntityNode.model_validate(n).model_dump(mode="json") for n in sample["nodes"]]
+        sample["episode"] = EpisodicNode.model_validate(sample["episode"]).model_dump(mode="json")
+        saved = {"body_digest": "fixed-body", "elapsed": 1, "usage": {}, "stop_reason": "end_turn",
+                 "payload": {f"entity_{i}": {"path": f"/{i}.py", "project_id": None} for i in range(9)}}
+        with tempfile.TemporaryDirectory() as folder, patch.object(probe, "call",
+                side_effect=[saved, RuntimeError("unknown outcome")]) as call, patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "unknown outcome"):
+                probe.stability(sample, Path(folder))
+            self.assertEqual(call.call_count, 2)
+            recorded = json.loads((Path(folder) / "fixture-stability-20261001.json").read_text())
+            self.assertEqual([r["trial"] for r in recorded["trials"]], [1])
+
+    def test_independent_trials_same_body_distinct_stable_keys_and_completed_control(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        response = SimpleNamespace(content=[SimpleNamespace(type="tool_use", name="EntityAttributeBatch", input={})],
+                                   usage=SimpleNamespace(model_dump=lambda: {}), stop_reason="end_turn")
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
+                "ANTHROPIC_MODEL": "probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake"}):
+            with patch("anthropic.Anthropic") as client:
+                create = client.return_value.messages.create
+                create.return_value = response
+                with self.assertRaisesRegex(RuntimeError, "completed identical control"):
+                    probe.call(request, Path(folder), trial_id="r1")
+                create.assert_not_called()
+                base = probe.call(request, Path(folder))
+                one = probe.call(request, Path(folder), trial_id="r1")
+                two = probe.call(request, Path(folder), trial_id="r2")
+                self.assertEqual(one, probe.call(request, Path(folder), trial_id="r1"))
+                self.assertEqual(create.call_count, 3)
+                self.assertEqual(base["body_digest"], one["body_digest"])
+                self.assertEqual(one["body_digest"], two["body_digest"])
+                bodies = [dict(c.kwargs) for c in create.call_args_list]
+                headers = [body.pop("extra_headers") for body in bodies]
+                self.assertEqual(bodies[0], bodies[1])
+                self.assertEqual(bodies[1], bodies[2])
+                self.assertEqual(len({h["Idempotency-Key"] for h in headers}), 3)
+
     def test_compact_and_history_ablation_keep_current_source_and_entity_values(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         body = json.loads(request["messages"][1]["content"])

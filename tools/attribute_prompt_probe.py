@@ -342,7 +342,7 @@ def lost_existing_values(sample, output):
     return losses
 
 
-def call(request, directory, resume_rejected_digest=None, replay_only=False):
+def call(request, directory, resume_rejected_digest=None, replay_only=False, trial_id=None):
     from anthropic import Anthropic, APIStatusError
     model = os.environ["ANTHROPIC_MODEL"]
     schema = request["model"].model_json_schema()
@@ -355,6 +355,16 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False):
                 extra_body={"thinking": {"type": "disabled"}})
     digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    body_digest = digest
+    if trial_id is not None:
+        # User-authorized independent repetitions, NEVER recovery of an unknown
+        # request. Keep each trial identity stable across interrupted runs.
+        if resume_rejected_digest:
+            raise RuntimeError("independent trials cannot recover rejected requests")
+        control = directory / (body_digest + ".json")
+        if not control.exists() or json.loads(control.read_text()).get("phase") != "completed":
+            raise RuntimeError("independent trials require a completed identical control")
+        digest = hashlib.sha256((body_digest + "\0" + trial_id).encode()).hexdigest()
     receipt = directory / (digest + ".json")
     prior_error = None
     if receipt.exists():
@@ -374,7 +384,8 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False):
         raise RuntimeError("no completed receipt; replay-only forbids provider calls")
     fd = os.open(receipt, os.O_WRONLY | (os.O_TRUNC if prior_error else os.O_CREAT | os.O_EXCL), 0o600)
     with os.fdopen(fd, "w") as stream:
-        json.dump({"phase": "prepared", "digest": digest, "prior_error": prior_error}, stream)
+        json.dump({"phase": "prepared", "digest": digest, "body_digest": body_digest,
+                   "trial_id": trial_id, "prior_error": prior_error}, stream)
         stream.flush()
         os.fsync(stream.fileno())
     client = Anthropic(auth_token=os.environ["KG_HUB_MODEL_GATEWAY_TOKEN"],
@@ -390,6 +401,7 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False):
         # it and refuse automatic resubmission, just like an unknown outcome.
         with receipt.open("w") as stream:
             json.dump({"phase": "http_error", "digest": digest,
+                       "body_digest": body_digest, "trial_id": trial_id,
                        "status": exc.status_code, "request_id": (exc.body or {}).get("request_id") or exc.request_id,
                        "error_code": (exc.body or {}).get("error", {}).get("code"),
                        "prior_error": prior_error}, stream)
@@ -398,6 +410,7 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False):
         raise
     blocks = [x.input for x in response.content if x.type == "tool_use" and x.name == name]
     saved = {"phase": "completed", "elapsed": time.monotonic() - start, "prior_error": prior_error,
+             "body_digest": body_digest, "trial_id": trial_id,
              "usage": response.usage.model_dump(), "stop_reason": response.stop_reason,
              "payload": blocks[0] if len(blocks) == 1 else None}
     # Keep prepared receipt if interrupted before atomic replacement.
@@ -411,12 +424,46 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False):
     return saved
 
 
+def stability(sample, directory, replay_only=False):
+    """Five predeclared independent trials of the frozen latest candidate."""
+    request = asyncio.run(capture(sample, 16))[0]
+    add_output_template(request, seeded=True, compact=True)
+    omit_history(request)
+    request["messages"][0]["content"] += "\n\n" + RELATIONAL_CONDITIONS
+    request["messages"][0]["content"] += "\n\n" + NO_IMPLEMENTATION_INFERENCE
+    results = []
+    target = directory / (sample["sid"] + "-stability-20261001.json")
+    for i in range(1, 6):
+        trial_id = f"sp-stability-20261001-r{i}"
+        # Any transport/unknown error stops the experiment, not a new identity retry.
+        saved = call(request, directory, replay_only=replay_only, trial_id=trial_id)
+        result = {"trial": i, "trial_id": trial_id, "body_digest": saved["body_digest"],
+                  "elapsed": saved["elapsed"], "usage": saved["usage"],
+                  "stop_reason": saved["stop_reason"]}
+        try:
+            output = flatten(request, saved["payload"])
+            result.update({"schema_valid": True,
+                           "omitted_fields": missing_fields(request, saved["payload"]),
+                           "unexpected_fields": unexpected_fields(request, saved["payload"]),
+                           "existing_value_losses": lost_existing_values(sample, output),
+                           "output": output})
+        except ValidationError as exc:
+            result.update({"schema_valid": False, "errors": exc.errors(include_input=False, include_url=False),
+                           "payload": saved["payload"]})
+        results.append(result)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"sample": sample, "trials": results}, stream, ensure_ascii=False)
+        print(json.dumps({k: v for k, v in result.items() if k not in ("output", "payload")}, ensure_ascii=False), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--journal", default="/backup/model-attempts.sqlite3")
     parser.add_argument("--before", default="2026-09-30T09:00:00+00:00")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--profile", action="store_true", help="Report context lengths and prompt variants without model calls")
+    parser.add_argument("--stability", action="store_true", help="Five independent trials of frozen latest candidate; requires completed control")
     parser.add_argument("--replay-only", action="store_true", help="Require completed receipts; never send provider requests")
     parser.add_argument("--sample", type=int, choices=range(6), default=0)
     parser.add_argument("--resume-rejected-digest", help="Exact SHA256; requires manual no-provider audit across all three gateway ledgers")
@@ -449,6 +496,9 @@ def main():
     sample = samples[0 if args.snapshot else args.sample]
     if args.expected_sid and sample["sid"] != args.expected_sid:
         raise RuntimeError("sample identity changed; refusing model calls")
+    if args.stability:
+        stability(sample, args.save_dir, args.replay_only)
+        return
     if args.profile:
         profile = {}
         for variant in ("original", "seeded", "compact"):
