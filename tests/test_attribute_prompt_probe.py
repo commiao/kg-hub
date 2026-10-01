@@ -25,24 +25,43 @@ class AttributePromptProbeTests(unittest.TestCase):
         request = self.delta_fixture()
         uuid = request["uuids"][0]
         old = request["starting_records"]["entity_0"]["description"]
-        self.assertEqual(probe.apply_delta(request, {"entity_0": []})[uuid]["description"], old)
-        output = probe.apply_delta(request, {"entity_0": [
-            {"field": "description", "op": "replace", "old": "Old hypothesis.", "value": "Corrected fact."},
-            {"field": "description", "op": "append", "old": None, "value": "Full condition AND exception."}]})
+        self.assertEqual(probe.apply_delta(request, {"entity_0": {"description": []}})[uuid]["description"], old)
+        output = probe.apply_delta(request, {"entity_0": {"description": [
+            {"old": "Old hypothesis.", "evidence": "Nine files.", "value": "Corrected fact."},
+            {"old": None, "evidence": "Nine files.", "value": "Full condition AND exception."}]}})
         self.assertEqual(output[uuid]["description"], "Corrected fact. Unrelated valid fact.\n\nFull condition AND exception.")
         self.assertEqual(request["starting_records"]["entity_0"]["description"], old)
 
     def test_delta_rejects_missing_entities_wrong_fields_and_unsafe_replacement(self):
         request = self.delta_fixture()
-        cases = [{}, {"entity_0": [{"field": "path", "op": "set", "old": None, "value": "invented"}]},
-                 {"entity_0": [{"field": "description", "op": "set", "old": None, "value": "lose old"}]},
-                 {"entity_0": [{"field": "description", "op": "replace", "old": "not present", "value": "new"}]}]
+        cases = [{}, {"entity_0": {"path": [{"evidence": "Nine files.", "value": "invented"}]}},
+                 {"entity_0": {"description": [{"evidence": "Nine files.", "value": "lose old"}]}},
+                 {"entity_0": {"description": [{"old": "not present", "evidence": "Nine files.", "value": "new"}]}}]
         for payload in cases:
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 probe.apply_delta(request, payload)
         request["starting_records"]["entity_0"]["description"] = "repeat repeat"
         with self.assertRaisesRegex(ValueError, "exactly one"):
-            probe.apply_delta(request, {"entity_0": [{"field": "description", "op": "replace", "old": "repeat", "value": "new"}]})
+            probe.apply_delta(request, {"entity_0": {"description": [{"old": "repeat", "evidence": "Nine files.", "value": "new"}]}})
+
+    def test_delta_scalar_updates_keep_null_and_reject_description_operations(self):
+        request = probe.delta_request(asyncio.run(probe.capture(self.sample(), 16))[0])
+        payload = {key: {field: [] for field in value} for key, value in request["starting_records"].items()}
+        payload["entity_0"]["path"] = [{"evidence": "Nine files.", "value": "/new.py"}]
+        output = probe.apply_delta(request, payload)
+        self.assertEqual(output[request["uuids"][0]], {"path": "/new.py", "project_id": None})
+        payload["entity_0"]["path"] = [{"old": "/0.py", "evidence": "Nine files.", "value": "/new.py"}]
+        with self.assertRaises(ValidationError):
+            probe.apply_delta(request, payload)
+        payload["entity_0"]["path"] = [{"evidence": "Nine files.", "value": "one"}, {"evidence": "Nine files.", "value": "two"}]
+        with self.assertRaisesRegex(ValueError, "at most one"):
+            probe.apply_delta(request, payload)
+
+    def test_delta_rejects_fabricated_evidence(self):
+        request = self.delta_fixture()
+        with self.assertRaisesRegex(ValueError, "verbatim current-source"):
+            probe.apply_delta(request, {"entity_0": {"description": [
+                {"old": None, "value": "new fact", "evidence": "not in source"}]}})
 
     def test_candidate_only_does_not_send_baseline_requests(self):
         sample = {**self.sample(), "sid": "fixture", "typed_count": 9}
