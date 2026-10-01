@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
 from tools import attribute_prompt_probe as probe
+from tools import attribute_accuracy_probe as accuracy
 
 
 class AttributePromptProbeTests(unittest.TestCase):
@@ -32,6 +33,44 @@ class AttributePromptProbeTests(unittest.TestCase):
                         {"entity_0": {"path": None, "project_id": None, "content_hash": None}}):
             with self.assertRaises(ValidationError):
                 probe.flatten(request, payload)
+
+    def test_evidence_first_checks_quotes_without_repairing_values(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        probe.add_evidence_first_contract(request)
+        context = json.loads(request["messages"][1]["content"])
+        payload = {key: {"source_evidence": [], "superseded_old_claims": [],
+                         "attributes": entity["attributes"]} for key, entity in context["entities"].items()}
+        payload["entity_0"]["source_evidence"] = ["invented source"]
+        payload["entity_0"]["superseded_old_claims"] = ["invented old claim"]
+        output, errors = probe.evidence_first_output(request, payload)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(output[request["uuids"][0]], payload["entity_0"]["attributes"])
+        payload["entity_0"]["attributes"]["invented_field"] = "bad"
+        with self.assertRaises(ValidationError):
+            probe.evidence_first_output(request, payload)
+
+    def test_accuracy_dry_run_freezes_plan_without_calling_model(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(accuracy, "prepare", return_value=[]), \
+                patch.object(probe, "call") as call, patch("builtins.print"):
+            accuracy.screen(Path(folder), revision=4)
+            call.assert_not_called()
+            path = Path(folder) / "accuracy-structured-v4-20261001" / "plan.json"
+            self.assertEqual(json.loads(path.read_text())["max_new_calls"], 3)
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                accuracy.freeze(path, {"different": True})
+
+    def test_unified_v4_keeps_old_attributes_out_of_answer_template(self):
+        sample = self.sample()
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        before = json.loads(request["messages"][1]["content"])
+        probe.add_unified_contract(request, revision=4)
+        after = json.loads(request["messages"][1]["content"])
+        for key, entity in before["entities"].items():
+            for field, value in entity["attributes"].items():
+                self.assertEqual(after["entities"][key]["attributes"][field], value)
+        self.assertEqual(before["episode_content"], after["episode_content"])
+        self.assertNotIn("完整字段模板", request["messages"][0]["content"])
+        self.assertIn("每条完整原文", request["messages"][0]["content"])
 
     def test_unified_v2_seeds_scalar_values_without_duplicating_old_description(self):
         sample = self.sample()

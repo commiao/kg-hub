@@ -31,7 +31,7 @@ def freeze(path, value):
         os.fsync(stream.fileno())
 
 
-def prepare(directory):
+def prepare(directory, revision=3):
     prepared = []
     for sid in SIDS:
         sample = json.loads((directory / (
@@ -41,7 +41,10 @@ def prepare(directory):
             raise RuntimeError("snapshot identity mismatch")
         request = asyncio.run(probe.capture(sample, 16))[0]
         probe.omit_history(request)
-        probe.add_unified_contract(request, sample["episode"].get("valid_at"), revision=3)
+        if revision == 5:
+            probe.add_evidence_first_contract(request, sample["episode"].get("valid_at"))
+        else:
+            probe.add_unified_contract(request, sample["episode"].get("valid_at"), revision=revision)
         request["temperature"] = 0.0
         frozen = {"messages": request["messages"], "schema": request["model"].model_json_schema(),
                   "uuids": request["uuids"], "temperature": request["temperature"]}
@@ -50,12 +53,13 @@ def prepare(directory):
     return prepared
 
 
-def screen(directory, execute=False):
+def screen(directory, execute=False, revision=3):
     directory = Path(directory)
-    output = directory / CAMPAIGN
+    campaign = CAMPAIGN.replace("v3", "v" + str(revision))
+    output = directory / campaign
     output.mkdir(mode=0o700, exist_ok=True)
-    prepared = prepare(directory)
-    plan = {"campaign": CAMPAIGN, "stage": "development-screen", "max_new_calls": 3,
+    prepared = prepare(directory, revision)
+    plan = {"campaign": campaign, "stage": "development-screen", "max_new_calls": 3,
             "thinking": "disabled", "output_format": "json_schema", "max_tokens": 8192,
             "temperature_requested": 0.0,
             "steps": [{"sid": sid, "input_sha256": digest} for sid, _, _, digest in prepared]}
@@ -71,7 +75,10 @@ def screen(directory, execute=False):
                   **{key: saved.get(key) for key in ("body_digest", "elapsed", "usage",
                       "stop_reason", "parse_error", "response_block_types")}}
         try:
-            result["output"] = probe.flatten(request, saved["payload"])
+            if revision == 5:
+                result["output"], result["evidence_errors"] = probe.evidence_first_output(request, saved["payload"])
+            else:
+                result["output"] = probe.flatten(request, saved["payload"])
             result["schema_valid"] = True
             result["existing_value_losses"] = probe.lost_existing_values(sample, result["output"])
         except ValidationError as exc:
@@ -84,5 +91,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("/tmp/kg-attribute-probe"))
     parser.add_argument("--execute", action="store_true", help="Send up to three isolated model requests")
+    parser.add_argument("--revision", type=int, choices=(3, 4, 5), default=3)
     args = parser.parse_args()
-    screen(args.directory, execute=args.execute)
+    screen(args.directory, execute=args.execute, revision=args.revision)
