@@ -348,6 +348,37 @@ class AttributePromptProbeTests(unittest.TestCase):
                     probe.call(request, Path(folder))
                 client.assert_not_called()
 
+    def test_thinking_comparison_requires_isolation_and_only_changes_thinking_settings(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        response = SimpleNamespace(content=[SimpleNamespace(type="thinking", thinking="private"),
+                                           SimpleNamespace(type="tool_use", name="EntityAttributeBatch", input={})],
+                                   usage=SimpleNamespace(model_dump=lambda: {}), stop_reason="tool_use")
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
+                "ANTHROPIC_MODEL": "probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake",
+                "ANTHROPIC_BASE_URL": "http://model-gateway:39000"}), patch("anthropic.Anthropic") as client:
+            with self.assertRaisesRegex(RuntimeError, "isolated"):
+                probe.call(request, Path(folder), thinking_arm="enabled")
+            client.assert_not_called()
+            self.assertEqual(list(Path(folder).iterdir()), [])
+            client.return_value.messages.create.return_value = response
+            with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://kg-attribute-thinking-probe:39000"}):
+                off = probe.call(request, Path(folder), thinking_arm="disabled")
+                on = probe.call(request, Path(folder), thinking_arm="enabled")
+                self.assertNotEqual(off["body_digest"], on["body_digest"])
+                self.assertEqual(on["thinking_chars"], 7)
+                self.assertEqual({k: v for k, v in off["request_body"].items() if k != "extra_body"},
+                                 {k: v for k, v in on["request_body"].items() if k != "extra_body"})
+                self.assertEqual(on["request_body"]["tool_choice"], {"type": "auto"})
+                self.assertEqual(on["request_body"]["max_tokens"], 8192)
+                self.assertEqual(on["request_body"]["extra_body"],
+                                 {"thinking": {"type": "enabled", "budget_tokens": 2048}, "output_config": {"effort": "medium"}})
+                probe.call(request, Path(folder), thinking_arm="enabled")
+                self.assertEqual(client.return_value.messages.create.call_count, 2)
+                default = probe.call(request, Path(folder), thinking_arm="enabled-default")
+                self.assertEqual(default["request_body"]["extra_body"],
+                                 {"thinking": {"type": "enabled", "budget_tokens": 2048}})
+                self.assertEqual(client.return_value.messages.create.call_count, 3)
+
     def test_replay_only_missing_receipt_never_calls_provider(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {"ANTHROPIC_MODEL": "probe"}):

@@ -644,7 +644,8 @@ def lost_existing_values(sample, output):
     return losses
 
 
-def call(request, directory, resume_rejected_digest=None, replay_only=False, trial_id=None):
+def call(request, directory, resume_rejected_digest=None, replay_only=False, trial_id=None,
+         thinking_arm=None):
     from anthropic import Anthropic, APIStatusError
     model = os.environ["ANTHROPIC_MODEL"]
     schema = request["model"].model_json_schema()
@@ -655,6 +656,18 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
                 tools=[{"name": name, "description": schema.get("description", f"Extract {name} information"),
                         "input_schema": schema}], tool_choice={"type": "tool", "name": name},
                 extra_body={"thinking": {"type": "disabled"}})
+    if thinking_arm is not None:
+        if thinking_arm not in ("disabled", "enabled", "enabled-default"):
+            raise ValueError("invalid thinking experiment arm")
+        if os.environ.get("ANTHROPIC_BASE_URL") != "http://kg-attribute-thinking-probe:39000":
+            raise RuntimeError("thinking comparison requires the isolated experiment gateway")
+        body["max_tokens"] = 8192
+        body["tool_choice"] = {"type": "auto"}
+        body["extra_body"] = {"thinking": {"type": "disabled" if thinking_arm == "disabled" else "enabled"}}
+        if thinking_arm != "disabled":
+            body["extra_body"]["thinking"]["budget_tokens"] = 2048
+        if thinking_arm == "enabled":
+            body["extra_body"]["output_config"] = {"effort": "medium"}
     digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     body_digest = digest
@@ -714,6 +727,10 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
     saved = {"phase": "completed", "elapsed": time.monotonic() - start, "prior_error": prior_error,
              "body_digest": body_digest, "trial_id": trial_id,
              "request_body": body, "response_model": getattr(response, "model", None),
+             "response_block_types": [x.type for x in response.content],
+             "thinking_chars": sum(len(getattr(x, "thinking", "") or "") for x in response.content
+                                   if x.type == "thinking"),
+             "text_blocks": [x.text for x in response.content if x.type == "text"],
              "usage": response.usage.model_dump(), "stop_reason": response.stop_reason,
              "payload": blocks[0] if len(blocks) == 1 else None}
     # Keep prepared receipt if interrupted before atomic replacement.
