@@ -15,6 +15,54 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def test_unified_contract_retains_evidence_once_and_requires_complete_records(self):
+        sample = self.sample()
+        sample["nodes"] = [EntityNode(name="alpha.py", group_id="test", labels=["Entity", "File"],
+                                      attributes={"path": "legacy prose; not a path", "project_id": "old"}).model_dump()]
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        original = json.loads(request["messages"][1]["content"])
+        probe.add_unified_contract(request, "2026-01-02T00:00:00Z")
+        context = json.loads(request["messages"][1]["content"])
+        self.assertEqual({k: context[k] for k in original}, original)
+        self.assertNotIn("legacy prose", request["messages"][0]["content"])
+        self.assertEqual(context["reference_time"], "2026-01-02T00:00:00Z")
+        self.assertEqual(probe.flatten(request, {"entity_0": original["entities"]["entity_0"]["attributes"]}),
+                         {request["uuids"][0]: {"path": "legacy prose; not a path", "project_id": "old"}})
+        for payload in ({"entity_0": {"path": None}},
+                        {"entity_0": {"path": None, "project_id": None, "content_hash": None}}):
+            with self.assertRaises(ValidationError):
+                probe.flatten(request, payload)
+
+    def test_unified_v2_seeds_scalar_values_without_duplicating_old_description(self):
+        sample = self.sample()
+        sample["nodes"] = [
+            EntityNode(name="alpha.py", group_id="test", labels=["Entity", "File"],
+                       attributes={"path": "legacy prose"}).model_dump(),
+            EntityNode(name="quota", group_id="test", labels=["Entity", "Concept"],
+                       attributes={"description": "Old hypothesis requires inspection."}).model_dump()]
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        original = json.loads(request["messages"][1]["content"])
+        probe.add_unified_contract(request, revision=2)
+        self.assertIn('"path": "legacy prose", "project_id": null', request["messages"][0]["content"])
+        self.assertNotIn("Old hypothesis requires inspection.", request["messages"][0]["content"])
+        context = json.loads(request["messages"][1]["content"])
+        self.assertEqual({k: context[k] for k in original}, original)
+
+    def test_unified_v3_only_fills_absent_input_fields_and_never_repairs_output(self):
+        sample = self.sample()
+        sample["nodes"] = [EntityNode(name="alpha.py", group_id="test", labels=["Entity", "File"],
+                                      attributes={"path": "legacy prose"}).model_dump()]
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        original = json.loads(request["messages"][1]["content"])
+        probe.add_unified_contract(request, revision=3)
+        context = json.loads(request["messages"][1]["content"])
+        self.assertEqual(context["entities"]["entity_0"]["attributes"],
+                         {"path": "legacy prose", "project_id": None})
+        self.assertEqual(context["episode_content"], original["episode_content"])
+        self.assertEqual(sample["nodes"][0]["attributes"], {"path": "legacy prose"})
+        with self.assertRaises(ValidationError):
+            probe.flatten(request, {"entity_0": {"path": "legacy prose"}})
+
     def test_grounded_review_keeps_fields_and_source_but_rejects_extra_keys(self):
         sample = self.sample()
         sample["nodes"] = [EntityNode(name="src/alpha.py", group_id="test", labels=["Entity", "File"],
