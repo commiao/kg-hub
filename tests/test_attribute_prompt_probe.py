@@ -15,6 +15,70 @@ from tools import attribute_prompt_probe as probe
 
 
 class AttributePromptProbeTests(unittest.TestCase):
+    def delta_fixture(self):
+        sample = self.sample()
+        sample["nodes"] = [EntityNode(name="quota", group_id="test", labels=["Entity", "Concept"],
+                                      attributes={"description": "Old hypothesis. Unrelated valid fact."}).model_dump()]
+        return probe.delta_request(asyncio.run(probe.capture(sample, 16))[0])
+
+    def test_delta_preserves_unchanged_and_applies_explicit_edits_atomically(self):
+        request = self.delta_fixture()
+        uuid = request["uuids"][0]
+        old = request["starting_records"]["entity_0"]["description"]
+        self.assertEqual(probe.apply_delta(request, {"entity_0": []})[uuid]["description"], old)
+        output = probe.apply_delta(request, {"entity_0": [
+            {"field": "description", "op": "replace", "old": "Old hypothesis.", "value": "Corrected fact."},
+            {"field": "description", "op": "append", "old": None, "value": "Full condition AND exception."}]})
+        self.assertEqual(output[uuid]["description"], "Corrected fact. Unrelated valid fact.\n\nFull condition AND exception.")
+        self.assertEqual(request["starting_records"]["entity_0"]["description"], old)
+
+    def test_delta_rejects_missing_entities_wrong_fields_and_unsafe_replacement(self):
+        request = self.delta_fixture()
+        cases = [{}, {"entity_0": [{"field": "path", "op": "set", "old": None, "value": "invented"}]},
+                 {"entity_0": [{"field": "description", "op": "set", "old": None, "value": "lose old"}]},
+                 {"entity_0": [{"field": "description", "op": "replace", "old": "not present", "value": "new"}]}]
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                probe.apply_delta(request, payload)
+        request["starting_records"]["entity_0"]["description"] = "repeat repeat"
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            probe.apply_delta(request, {"entity_0": [{"field": "description", "op": "replace", "old": "repeat", "value": "new"}]})
+
+    def test_candidate_only_does_not_send_baseline_requests(self):
+        sample = {**self.sample(), "sid": "fixture", "typed_count": 9}
+        sample["nodes"] = [EntityNode.model_validate(n).model_dump(mode="json") for n in sample["nodes"]]
+        sample["episode"] = EpisodicNode.model_validate(sample["episode"]).model_dump(mode="json")
+        saved = {"elapsed": 1, "usage": {}, "stop_reason": "end_turn",
+                 "payload": {f"entity_{i}": {"path": f"/{i}.py", "project_id": None} for i in range(9)}}
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot = Path(folder) / "snapshot.json"
+            snapshot.write_text(json.dumps({"sample": sample}))
+            with patch("sys.argv", ["probe", "--execute", "--candidate-only", "--snapshot", str(snapshot),
+                                    "--save-dir", folder]), patch.object(probe, "call", return_value=saved) as call, patch("builtins.print"):
+                probe.main()
+            self.assertEqual(call.call_count, 1)
+            result = json.loads((Path(folder) / "fixture-candidate-only-comparison.json").read_text())
+            self.assertEqual(result["comparison"], {"not_run": "candidate-only"})
+            self.assertEqual(set(result["outputs"]), {"merged"})
+
+    def test_source_quotes_keep_whole_joint_conditions_and_ignore_metadata(self):
+        sample = self.sample()
+        sample["nodes"] = [EntityNode(name=name, group_id="test", labels=["Entity", "Concept"],
+                                      attributes={"description": "existing fact"}).model_dump()
+                           for name in ("quota_mode", "userCost")]
+        joint = "quotaMode==null AND userCost==0 -> allow; otherwise deny"
+        sample["episode"]["content"] = "Key facts:\n- " + joint + "\n- quotaMode==1 -> allow\n\nProject: unrelated"
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        probe.require_complete_fields(request)
+        source = request["messages"][1]["content"]
+        probe.add_source_quotes(request)
+        self.assertEqual(request["required_source_quotes"]["entity_0"], [joint, "quotaMode==1 -> allow"])
+        self.assertEqual(request["required_source_quotes"]["entity_1"], [joint])
+        self.assertEqual(source, request["messages"][1]["content"])
+        output = {u: {"description": joint} for u in request["uuids"]}
+        self.assertEqual(probe.missing_source_quotes(request, output),
+                         [{"uuid": request["uuids"][0], "quote": "quotaMode==1 -> allow"}])
+
     def test_stability_stops_on_unknown_outcome_instead_of_advancing_trial(self):
         sample = {**self.sample(), "sid": "fixture"}
         sample["nodes"] = [EntityNode.model_validate(n).model_dump(mode="json") for n in sample["nodes"]]
