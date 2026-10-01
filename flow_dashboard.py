@@ -465,6 +465,54 @@ def backlog_remaining_history(status: dict, now: datetime) -> list[dict]:
             for at, value, boundary in rows]
 
 
+def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
+    """Keep worker queues distinct from refinery observations and missing from zero."""
+    result = []
+    for snap in snapshots:
+        telemetry = snap.get("claude_mem_queue")
+        if not isinstance(telemetry, dict):
+            continue
+        grouped = {}
+        previous = {}
+        for point in sorted(telemetry.get("history") or [], key=lambda p: p.get("at", 0)):
+            at, worker, depth = point.get("at"), point.get("worker"), point.get("depth")
+            if worker not in ("current", "legacy") or not isinstance(at, (int, float)):
+                continue
+            if not now.timestamp()-7*86400 <= at <= now.timestamp()+60:
+                continue
+            if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
+                depth = None
+            bucket = int(at)//3600
+            row = grouped.setdefault(bucket, {"at": at, "current": None, "legacy": None,
+                                              "current_rate": None, "legacy_rate": None,
+                                              "total": None})
+            row[worker] = depth
+            row[worker+"_at"] = at
+            row["at"] = max(row["at"], at)
+            prev = previous.get(worker)
+            # A restart or missing sample must not look like successful digestion.
+            if (prev and depth is not None and prev.get("depth") is not None
+                    and point.get("source") == prev.get("source") == "live"
+                    and point.get("pid") and point.get("pid") == prev.get("pid")
+                    and 0 < at-prev["at"] <= 5400):
+                row[worker+"_rate"] = round((prev["depth"]-depth)*3600/(at-prev["at"]),1)
+            previous[worker] = {**point, "depth": depth}
+        rows=[]
+        for row in sorted(grouped.values(), key=lambda p:p["at"]):
+            if (row["current"] is not None and row["legacy"] is not None
+                    and abs(row["current_at"]-row["legacy_at"])<=1200):
+                row["total"]=row["current"]+row["legacy"]
+            stamp=datetime.fromtimestamp(row["at"],timezone.utc)
+            row.update(at=stamp.isoformat(), label=_beijing_time(stamp))
+            rows.append(row)
+        result.append({"host":snap.get("_host") or snap.get("host") or "unknown",
+                       "stale":bool(snap.get("_snapshot_stale") or snap.get("_disconnected")
+                                    or now.timestamp()-telemetry.get("sampled_at",0)>1200),
+                       "error":telemetry.get("error"),
+                       "current":telemetry.get("current") or [], "rows":rows})
+    return result
+
+
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
     """同一 UTC 日：网关 kg-hub 调用次数 ÷ 图内当日新增 Episode。
 
@@ -870,6 +918,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
         "stages": stages,
         "backlog": digest,
         "backlog_remaining_history": remaining_history or [],
+        "claude_mem_trends": claude_mem_trends(snapshots, now),
         "efficiency": efficiency,
         "key_trends": [{**row, "hour_beijing": _beijing_hour(row["hour"])}
                        for row in (key_trends or [])],
@@ -1082,14 +1131,20 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=chain id=chain></div>
 <pre class=dt id=stdetail hidden></pre>
 
-<h2>积压消化情况</h2>
+<section id=queue-trends>
+<h2>claude-mem · 压缩队列积压</h2>
+<div class=cards id=cmcards></div>
+<div class=note>最近 7 天 · 北京时间 · 探针每 10 分钟采样，保留每小时最后样本。新 worker 与旧 worker 分线；合计仅在两端均有同期数据时显示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
+<div class=trend-grid id=cmtrends></div>
+<h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=note>最近 48 小时 · 北京时间；将光标移到图上查看该时刻的数值。积压剩余只记录真实快照，看板或数据接口被请求时采样；历史从首次采样开始，服务重启后仍保留。</div>
 <div class=trend-grid id=backlogtrends></div>
 <div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
-<h2>关键指标趋势</h2>
+</section>
+<h2>kg-hub · 入图关键指标趋势</h2>
 <div class=cards id=ecards></div>
 <div class=note>最近 24 小时 · 北京时间整点分桶（UTC+8）· 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
 <div class=trend-grid id=keytrends></div>
@@ -1175,26 +1230,37 @@ const backlogData=[
    at:r.at,label:r.at_beijing,remaining:r.remaining,boundary:r.boundary_id})),
   series:[['剩余','remaining','#8250C4']]},
 ];
+const cmHosts=D.claude_mem_trends||[];
+$('cmcards').innerHTML=cmHosts.length?cmHosts.map(h=>'<div class=card><b>'+esc(h.host)+(h.stale?' · 数据过期':'')+'</b><div>'+h.current.map(w=>esc(w.worker==='current'?'新 worker':'旧 worker')+'：'+(Number.isFinite(w.depth)?w.depth+' 条':'不可用')).join(' · ')+'</div>'+(h.error?'<small>采样失败：'+esc(h.error)+'</small>':'')+'</div>').join(''):'<div class=note>等待 claude-mem 探针上报队列历史</div>';
+const cmOffset=backlogData.length;
+cmHosts.forEach(h=>{
+ backlogData.push({title:esc(h.host)+' · claude-mem 队列剩余',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows,
+ series:[['新 worker','current','#D97706'],['旧 worker','legacy','#9333EA'],['同期合计','total','#0F766E']]});
+ backlogData.push({title:esc(h.host)+' · claude-mem 净消化速度',unit:' 条/小时',windowHours:168,gapMinutes:90,rows:h.rows,
+ series:[['新 worker','current_rate','#D97706'],['旧 worker','legacy_rate','#9333EA']]});
+});
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
 const backlogX=(spec,at)=>{
  const first=Date.parse(spec.rows[0].at);
- const start=Math.max(chartStart,Math.min(first-30*60000,chartEnd-2*3600000));
+ const start=Math.max(chartEnd-(spec.windowHours||48)*3600000,Math.min(first-30*60000,chartEnd-2*3600000));
  return 34+Math.max(0,Math.min(1,(Date.parse(at)-start)/(chartEnd-start)))*398;
 };
 function backlogChart(spec,index){
  const rows=spec.rows;
  if(!rows.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无可用样本；积压剩余从首次采样后开始显示。</div></div>';
  const values=rows.flatMap(r=>spec.series.map(s=>r[s[1]]).filter(Number.isFinite));
- const low=spec.series.length===1?Math.min(...values):0;
+ if(!values.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无连续有效样本；净消化速度等待相邻小时同一进程的实时采样，不从日志队列下降推定压缩成功。</div></div>';
+ const low=spec.series.length===1&&values.length?Math.min(...values):Math.min(0,...values);
  const high=Math.max(low+1,...values),top=high+(high-low)*.1;
  const y=v=>9+(125-9-24)*(1-(v-low)/(top-low));
  const curves=spec.series.map(s=>{
    const pieces=[];let part=[];
    rows.forEach((r,i)=>{
-     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(index===1?10:90)*60000
+     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(spec.gapMinutes||(index===1?10:90))*60000
        ||(index===1&&r.boundary!==previous.boundary));
      if(gap&&part.length){pieces.push(part);part=[]}
      if(Number.isFinite(r[s[1]]))part.push(backlogX(spec,r.at).toFixed(1)+','+y(r[s[1]]).toFixed(1));
+     else if(part.length){pieces.push(part);part=[]}
    });
    if(part.length)pieces.push(part);
    return pieces.map(p=>p.length===1?'<circle cx="'+p[0].split(',')[0]+'" cy="'+p[0].split(',')[1]+'" r="3" fill="'+s[2]+'"/>':
@@ -1209,11 +1275,12 @@ function backlogChart(spec,index){
   '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
   spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
-$('backlogtrends').innerHTML=backlogData.map(backlogChart).join('');
+$('backlogtrends').innerHTML=backlogData.slice(0,cmOffset).map(backlogChart).join('');
+$('cmtrends').innerHTML=backlogData.slice(cmOffset).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
 function showBacklogPoint(svg,index){
  const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
  svg.dataset.pointIndex=index;
- const parts=spec.series.map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+s[0]+' '+r[s[1]]+spec.unit+'</span>');
+ const parts=spec.series.map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+s[0]+' '+(Number.isFinite(r[s[1]])?r[s[1]]+spec.unit:'无样本')+'</span>');
  if(r.boundary!==undefined)parts.push('<span>boundary '+esc(r.boundary)+'</span>');
  svg.parentElement.querySelector('[data-trend-readout]').innerHTML='<b>'+esc(r.label)+'</b>'+parts.join('');
  const line=svg.querySelector('[data-hover-line]'),x=backlogX(spec,r.at);
@@ -1224,7 +1291,7 @@ function clearBacklogPoint(svg){
  svg.parentElement.querySelector('[data-trend-readout]').textContent='移动光标到图上查看数值';
  delete svg.dataset.pointIndex;
 }
-$('backlogtrends').addEventListener('pointermove',e=>{
+$('queue-trends').addEventListener('pointermove',e=>{
  const svg=e.target.closest('svg[data-backlog-chart]');if(!svg)return;
  const point=svg.createSVGPoint();point.x=e.clientX;point.y=e.clientY;
  const local=point.matrixTransform(svg.getScreenCTM().inverse());
@@ -1233,17 +1300,17 @@ $('backlogtrends').addEventListener('pointermove',e=>{
  let nearest=0;for(let i=1;i<rows.length;i++)if(Math.abs(backlogX(spec,rows[i].at)-local.x)<Math.abs(backlogX(spec,rows[nearest].at)-local.x))nearest=i;
  if(svg.dataset.pointIndex!==String(nearest))showBacklogPoint(svg,nearest);
 });
-$('backlogtrends').addEventListener('pointerout',e=>{
+$('queue-trends').addEventListener('pointerout',e=>{
  const svg=e.target.closest('svg[data-backlog-chart]');
  if(svg&&!svg.contains(e.relatedTarget))clearBacklogPoint(svg);
 });
-$('backlogtrends').addEventListener('focusin',e=>{
+$('queue-trends').addEventListener('focusin',e=>{
  const svg=e.target.closest('svg[data-backlog-chart]');if(svg)showBacklogPoint(svg,backlogData[Number(svg.dataset.backlogChart)].rows.length-1);
 });
-$('backlogtrends').addEventListener('focusout',e=>{
+$('queue-trends').addEventListener('focusout',e=>{
  const svg=e.target.closest('svg[data-backlog-chart]');if(svg)clearBacklogPoint(svg);
 });
-$('backlogtrends').addEventListener('keydown',e=>{
+$('queue-trends').addEventListener('keydown',e=>{
  const svg=e.target.closest('svg[data-backlog-chart]');if(!svg||!['ArrowLeft','ArrowRight'].includes(e.key))return;
  e.preventDefault();const length=backlogData[Number(svg.dataset.backlogChart)].rows.length;
  showBacklogPoint(svg,Math.max(0,Math.min(length-1,Number(svg.dataset.pointIndex??length-1)+(e.key==='ArrowLeft'?-1:1))));

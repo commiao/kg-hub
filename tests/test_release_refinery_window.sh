@@ -56,6 +56,16 @@ configure_fake_docker() {
 #!/usr/bin/env bash
 set -eu
 case "$1" in
+  compose)
+    # release.sh validates resolved Compose values, including defaults. The
+    # fixture must model that output instead of returning an empty success.
+    if [ "${!#}" = config ]; then
+      . ./.env
+      printf '  ANTHROPIC_BASE_URL: %s\n  ANTHROPIC_MODEL: %s\n' \
+        "${ANTHROPIC_BASE_URL:-http://model-gateway:39000}" \
+        "${ANTHROPIC_MODEL:-kg_hub.entity_extract}"
+    fi
+    ;;
   inspect)
     if [ "${!#}" = model-gateway ]; then
       printf '%s\n' 'model-gateway-private'
