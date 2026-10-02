@@ -311,8 +311,16 @@ async def finish_optimistic_episode(
                 # Most stale rounds can be identified before the attribute model
                 # calls. A false result only aborts this round; the final commit
                 # fence still validates every read under the writer lock.
-                if PREVALIDATE and await dependencies.validate(
-                        VALIDATE_CONCURRENCY, phase="prevalidate") is False:
+                early_stale = False
+                if PREVALIDATE:
+                    early_started = time.monotonic()
+                    early_stale = not await dependencies.validate(
+                        VALIDATE_CONCURRENCY, phase="prevalidate")
+                    log.info("[ingest:parallel_early_validation] sid=%s round=%d "
+                             "reads=%d seconds=%.3f stale=%d", task_sid,
+                             round_number, len(dependencies.records),
+                             time.monotonic() - early_started, int(early_stale))
+                if early_stale:
                     completed_steps = set()
                     for phase in ("resolved_nodes", "edge_phase"):
                         artifact = await load(*round_identity, phase)

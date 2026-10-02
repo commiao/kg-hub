@@ -269,6 +269,8 @@ class ParallelCommitTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(conflict['early'])
             self.assertTrue(any('early=1 phase=before_attributes' in line
                                 for line in logs.output))
+            self.assertTrue(any('parallel_early_validation' in line and 'stale=1' in line
+                                for line in logs.output))
 
     async def test_two_overlapping_models_rebase_conflict_and_keep_original_receipts(self):
         from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
