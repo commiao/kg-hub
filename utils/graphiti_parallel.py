@@ -266,7 +266,10 @@ async def finish_optimistic_episode(
     async def acknowledge_round(round_identity):
         complete = await load(*round_identity, "prepared_commit")
         if complete is None:
-            raise RuntimeError("completed parallel round receipt missing")
+            conflict = await load(*round_identity, "graph_conflict")
+            if not conflict or not conflict.get("early"):
+                raise RuntimeError("completed parallel round receipt missing")
+            complete = conflict
         acknowledge_restored_steps(complete.get("model_step_ids", []))
 
     for earlier in range(first):
@@ -305,6 +308,34 @@ async def finish_optimistic_episode(
                     view, episode, fresh, previous_episodes, edge_type_map, group_id,
                     edge_types, nodes, uuid_map, custom_extraction_instructions, **common)
                 phase_seconds["edges"] = time.monotonic() - phase_started
+                # Most stale rounds can be identified before the attribute model
+                # calls. A false result only aborts this round; the final commit
+                # fence still validates every read under the writer lock.
+                early_stale = False
+                if PREVALIDATE:
+                    early_started = time.monotonic()
+                    early_stale = not await dependencies.validate(
+                        VALIDATE_CONCURRENCY, phase="prevalidate")
+                    log.info("[ingest:parallel_early_validation] sid=%s round=%d "
+                             "reads=%d seconds=%.3f stale=%d", task_sid,
+                             round_number, len(dependencies.records),
+                             time.monotonic() - early_started, int(early_stale))
+                if early_stale:
+                    completed_steps = set()
+                    for phase in ("resolved_nodes", "edge_phase"):
+                        artifact = await load(*round_identity, phase)
+                        if artifact is not None:
+                            completed_steps.update(artifact.get("model_step_ids", []))
+                    await load(*round_identity, "graph_conflict", {
+                        "validated": False, "early": True,
+                        "model_step_ids": sorted(completed_steps),
+                    })
+                    acknowledge_restored_steps(completed_steps)
+                    log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
+                             "early=1 phase=before_attributes", task_sid,
+                             round_number, len(dependencies.records))
+                    flow_metrics.record(conflict=True, prevalidated_conflict=True)
+                    continue
                 phase_started = time.monotonic()
                 hydrated = await extract_attributes_with_snapshot(
                     view, nodes, episode, previous_episodes, entity_types, new, **common)
