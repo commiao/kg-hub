@@ -474,6 +474,8 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
             continue
         grouped = {}
         previous = {}
+        unchanged_since = {}
+        unchanged_hours = {}
         for point in sorted(telemetry.get("history") or [], key=lambda p: p.get("at", 0)):
             at, worker, depth = point.get("at"), point.get("worker"), point.get("depth")
             if worker not in ("current", "legacy") or not isinstance(at, (int, float)):
@@ -496,6 +498,13 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
                     and point.get("pid") and point.get("pid") == prev.get("pid")
                     and 0 < at-prev["at"] <= 5400):
                 row[worker+"_rate"] = round((prev["depth"]-depth)*3600/(at-prev["at"]),1)
+                if depth > 0 and depth == prev["depth"]:
+                    unchanged_since.setdefault(worker, prev["at"])
+                else:
+                    unchanged_since.pop(worker, None)
+            else:
+                unchanged_since.pop(worker, None)
+            unchanged_hours[worker] = round((at-unchanged_since.get(worker, at))/3600, 1)
             previous[worker] = {**point, "depth": depth}
         rows=[]
         for row in sorted(grouped.values(), key=lambda p:p["at"]):
@@ -505,11 +514,18 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
             stamp=datetime.fromtimestamp(row["at"],timezone.utc)
             row.update(at=stamp.isoformat(), label=_beijing_time(stamp))
             rows.append(row)
+        # Rate history starts only when a real rate exists, not at the start
+        # of imported queue logs. Keep internal nulls so outages remain gaps.
+        rate_rows = [r for r in rows if _parse_ts(r["at"]).timestamp() >= now.timestamp()-86400]
+        first_rate = next((i for i,r in enumerate(rate_rows)
+                           if r["current_rate"] is not None or r["legacy_rate"] is not None),len(rate_rows))
+        rate_rows = rate_rows[first_rate:]
         result.append({"host":snap.get("_host") or snap.get("host") or "unknown",
                        "stale":bool(snap.get("_snapshot_stale") or snap.get("_disconnected")
                                     or now.timestamp()-telemetry.get("sampled_at",0)>1200),
                        "error":telemetry.get("error"),
-                       "current":telemetry.get("current") or [], "rows":rows})
+                       "current":telemetry.get("current") or [], "rows":rows,
+                       "rate_rows":rate_rows, "unchanged_hours":unchanged_hours})
     return result
 
 
@@ -1134,7 +1150,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列积压</h2>
 <div class=cards id=cmcards></div>
-<div class=note>最近 7 天 · 北京时间 · 探针每 10 分钟采样，保留每小时最后样本。新 worker 与旧 worker 分线；合计仅在两端均有同期数据时显示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
+<div class=note>队列剩余：最近 7 天；净消化速度：最近 24 小时内的有效实时区间。北京时间 · 探针每 10 分钟采样，保留每小时最后样本。新 worker 与旧 worker 分线；合计仅在两端均有同期数据时显示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
 <div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
@@ -1231,12 +1247,12 @@ const backlogData=[
   series:[['剩余','remaining','#8250C4']]},
 ];
 const cmHosts=D.claude_mem_trends||[];
-$('cmcards').innerHTML=cmHosts.length?cmHosts.map(h=>'<div class=card><b>'+esc(h.host)+(h.stale?' · 数据过期':'')+'</b><div>'+h.current.map(w=>esc(w.worker==='current'?'新 worker':'旧 worker')+'：'+(Number.isFinite(w.depth)?w.depth+' 条':'不可用')).join(' · ')+'</div>'+(h.error?'<small>采样失败：'+esc(h.error)+'</small>':'')+'</div>').join(''):'<div class=note>等待 claude-mem 探针上报队列历史</div>';
+$('cmcards').innerHTML=cmHosts.length?cmHosts.map(h=>'<div class=card><b>'+esc(h.host)+(h.stale?' · 数据过期':'')+'</b><div>'+h.current.map(w=>esc(w.worker==='current'?'新 worker':'旧 worker')+'：'+(Number.isFinite(w.depth)?w.depth+' 条':'不可用')).join(' · ')+'</div>'+Object.entries(h.unchanged_hours||{}).filter(([w,hours])=>hours>=2).map(([w,hours])=>'<div class=note style="color:#D97706">'+(w==='current'?'新 worker':'旧 worker')+'：截至采样，连续约 '+hours+' 小时队列未变化（按小时样本）</div>').join('')+(h.error?'<small>采样失败：'+esc(h.error)+'</small>':'')+'</div>').join(''):'<div class=note>等待 claude-mem 探针上报队列历史</div>';
 const cmOffset=backlogData.length;
 cmHosts.forEach(h=>{
  backlogData.push({title:esc(h.host)+' · claude-mem 队列剩余',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows,
  series:[['新 worker','current','#D97706'],['旧 worker','legacy','#9333EA'],['同期合计','total','#0F766E']]});
- backlogData.push({title:esc(h.host)+' · claude-mem 净消化速度',unit:' 条/小时',windowHours:168,gapMinutes:90,rows:h.rows,
+ backlogData.push({title:esc(h.host)+' · claude-mem 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:90,rows:h.rate_rows||[],
  series:[['新 worker','current_rate','#D97706'],['旧 worker','legacy_rate','#9333EA']]});
 });
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
