@@ -601,7 +601,8 @@ def gateway_token() -> str:
 
 
 def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
-                                     thinking_disabled: bool = True) -> Any:
+                                     thinking_disabled: bool = True,
+                                     max_inflight: int = 8) -> Any:
     """Inject a durable operation-derived key and optional local throttle.
 
     The SDK client is always constructed with ``max_retries=0``.  Therefore the
@@ -610,6 +611,9 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
     the random UUID fallback exists only for explicitly non-production tools.
     """
     original_create = client.messages.create
+    if not 1 <= max_inflight <= 8:
+        raise ValueError("max_inflight must be between 1 and the gateway's 8-call ceiling")
+    model_slots = asyncio.Semaphore(max_inflight)
     throttle_lock = asyncio.Lock()
     last_call = {"at": 0.0}
     # 同一操作内字节相同的并发请求算出同一把 Idempotency-Key。graphiti 对 fact 文本
@@ -711,7 +715,12 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         inflight[key] = future
         prepared = False
+        admitted = False
         try:
+            # Reserve local capacity before creating a durable paid intent. A
+            # cancelled waiter must not leave an ambiguous prepared attempt.
+            await model_slots.acquire()
+            admitted = True
             if min_interval > 0:
                 async with throttle_lock:
                     wait = min_interval - (time.monotonic() - last_call["at"])
@@ -751,6 +760,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             finally:
                 if wire_token is not None:
                     _wire_attempt.reset(wire_token)
+                model_slots.release()
+                admitted = False
             # 付过费的答案已经拿到了,外壳错不该让它作废。就地修正 + 计数。
             repair_structured_envelopes(result, kwargs.get("tools"))
             note_offscript_if_missing_tool_use(kwargs, result)
@@ -781,6 +792,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 future.set_result(result)
             return result
         finally:
+            if admitted:
+                model_slots.release()
             inflight.pop(key, None)
 
     client.messages.create = create_with_gateway_contract
