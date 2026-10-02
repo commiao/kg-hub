@@ -489,6 +489,7 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
                                               "current_rate": None, "legacy_rate": None,
                                               "total": None})
             row[worker] = depth
+            row[worker+"_rate"] = None
             row[worker+"_at"] = at
             row["at"] = max(row["at"], at)
             prev = previous.get(worker)
@@ -527,6 +528,17 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
                        "current":telemetry.get("current") or [], "rows":rows,
                        "rate_rows":rate_rows, "unchanged_hours":unchanged_hours})
     return result
+
+
+def refinery_queue_trends(path: Path, now: datetime) -> dict:
+    from utils import refinery_queues
+    rows = refinery_queues.read(path, now.timestamp())
+    for row in rows:
+        stamp = datetime.fromtimestamp(row["at"], timezone.utc)
+        row.update(at=stamp.isoformat(), label=_beijing_time(stamp))
+    latest = rows[-1] if rows else None
+    return {"rows": rows, "latest": latest,
+            "stale": latest is None or (now - _parse_ts(latest["at"])).total_seconds() > 600}
 
 
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
@@ -887,7 +899,8 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
                graph_daily: list[dict] | None, now: datetime,
                source_errors: list[str] | None = None,
                key_trends: list[dict] | None = None,
-               remaining_history: list[dict] | None = None) -> dict:
+               remaining_history: list[dict] | None = None,
+               queue_trends: dict | None = None) -> dict:
     status = status if isinstance(status, dict) else {}
     probed = probe_stages(snapshots)
     per_stage = {
@@ -934,6 +947,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
         "stages": stages,
         "backlog": digest,
         "backlog_remaining_history": remaining_history or [],
+        "refinery_queue_trends": queue_trends or {"rows": [], "latest": None, "stale": True},
         "claude_mem_trends": claude_mem_trends(snapshots, now),
         "efficiency": efficiency,
         "key_trends": [{**row, "hour_beijing": _beijing_hour(row["hour"])}
@@ -1069,11 +1083,17 @@ async def collect_flow() -> dict:
     except (OSError, sqlite3.Error) as exc:
         remaining_history = []
         errors.append(f"积压剩余历史不可用：{type(exc).__name__}")
+    queue_trends = None
+    try:
+        queue_trends = await asyncio.to_thread(
+            refinery_queue_trends, REFINERY_STATUS_PATH.with_name("queue-remaining.sqlite3"), now)
+    except (OSError, sqlite3.Error) as exc:
+        errors.append(f"live/backlog 队列历史不可用：{type(exc).__name__}")
     return build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
                       keys=keys, timing=ingest_timing.summary(now=time.time()),
                       active=active_extractions(), graph_daily=graph_daily, now=now,
                       source_errors=errors, key_trends=trends,
-                      remaining_history=remaining_history)
+                      remaining_history=remaining_history, queue_trends=queue_trends)
 
 
 async def dashboard_flow(request: Request) -> HTMLResponse:
@@ -1150,11 +1170,12 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列积压</h2>
 <div class=cards id=cmcards></div>
-<div class=note>队列剩余：最近 7 天；净消化速度：最近 24 小时内的有效实时区间。北京时间 · 探针每 10 分钟采样，保留每小时最后样本。新 worker 与旧 worker 分线；合计仅在两端均有同期数据时显示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
+<div class=note>队列剩余：最近 7 天；净消化速度：最近 24 小时内的有效实时区间。北京时间 · 探针每 10 分钟采样，保留每小时最后样本。压缩新 worker、压缩旧 worker 分别展示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，0 表示队列持平，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
 <div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
-<div class=note>最近 48 小时 · 北京时间；将光标移到图上查看该时刻的数值。积压剩余只记录真实快照，看板或数据接口被请求时采样；历史从首次采样开始，服务重启后仍保留。</div>
+<div class=cards id=kgqueuecards></div>
+<div class=note>剩余趋势：最近 7 天；净速度：最近 24 小时，单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核对单列，不算入图成功。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
 <div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
@@ -1178,7 +1199,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
-积压剩余曲线来自 refinery 新鲜状态的实际快照，按两分钟采样到 kg-hub 的备份卷，保留最近 48 小时；首次启用前及无人请求看板期间没有历史点，工作边界变化或采样中断时曲线断开。<br>
+live/backlog 剩余曲线由 refinery 每两分钟独立采样，保存在 refinery 状态卷，保留七天；看板无人访问时仍采样。旧版 backlog 的按请求快照仅补充剩余历史，不据此推算净速度。净速度是相邻有效快照的队列净减少量/实际小时数，可能包含过滤或移入待核对，不等于成功入图。<br>
 关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
@@ -1235,25 +1256,43 @@ function stack(target,rows,label,parts){const box=$(target);
 stack('daily',(B.daily||[]).slice().reverse(),r=>r.day_beijing_start.slice(5),[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
 
-const backlogData=[
- {title:'积压消化趋势（每小时）',unit:' 条',rows:(B.hourly||[]).map(r=>({
+const processingData=[
+ {title:'backlog 处理去向（每小时，非净速度）',unit:' 条',rows:(B.hourly||[]).map(r=>({
    at:r.hour+':00:00Z',label:r.hour_beijing+' 北京时间',
    consumed:r.backlog.ingested+r.backlog.rejected,ingested:r.backlog.ingested,
    rejected:r.backlog.rejected,deferred:r.backlog.deferred})),
   series:[['消化','consumed','#378ADD'],['入图','ingested','#1D9E75'],
           ['拒绝','rejected','#A8B5B0'],['推迟/重试','deferred','#E8A33D']]},
- {title:'积压剩余趋势（真实快照）',unit:' 条',rows:(D.backlog_remaining_history||[]).map(r=>({
-   at:r.at,label:r.at_beijing,remaining:r.remaining,boundary:r.boundary_id})),
-  series:[['剩余','remaining','#8250C4']]},
 ];
+const backlogData=[];
+const kgQueues=D.refinery_queue_trends||{rows:[],latest:null,stale:true};
+const kgLast=kgQueues.latest;
+$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核对 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
+['live','backlog'].forEach(k=>{
+ let rows=kgQueues.rows||[];
+ if(k==='backlog'){
+   const first=rows.length?Date.parse(rows[0].at):Infinity;
+   rows=(D.backlog_remaining_history||[]).filter(r=>Date.parse(r.at)<first).map(r=>({
+     at:r.at,label:r.at_beijing,backlog:r.remaining,boundary:r.boundary_id,process:'legacy-snapshot'})).concat(rows);
+ }
+ const color=k==='live'?'#378ADD':'#8250C4';
+ backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:10,continuity:true,rows,
+   series:[['剩余',k,color]]});
+ backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:10,continuity:true,zeroBaseline:true,
+   rows:(kgQueues.rows||[]).filter(r=>Date.parse(r.at)>=Date.parse(D.generated_at)-86400000),
+   series:[['净消化速度',k+'_rate',color]]});
+});
+backlogData.push(...processingData);
 const cmHosts=D.claude_mem_trends||[];
 $('cmcards').innerHTML=cmHosts.length?cmHosts.map(h=>'<div class=card><b>'+esc(h.host)+(h.stale?' · 数据过期':'')+'</b><div>'+h.current.map(w=>esc(w.worker==='current'?'新 worker':'旧 worker')+'：'+(Number.isFinite(w.depth)?w.depth+' 条':'不可用')).join(' · ')+'</div>'+Object.entries(h.unchanged_hours||{}).filter(([w,hours])=>hours>=2).map(([w,hours])=>'<div class=note style="color:#D97706">'+(w==='current'?'新 worker':'旧 worker')+'：截至采样，连续约 '+hours+' 小时队列未变化（按小时样本）</div>').join('')+(h.error?'<small>采样失败：'+esc(h.error)+'</small>':'')+'</div>').join(''):'<div class=note>等待 claude-mem 探针上报队列历史</div>';
 const cmOffset=backlogData.length;
 cmHosts.forEach(h=>{
- backlogData.push({title:esc(h.host)+' · claude-mem 队列剩余',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows,
- series:[['新 worker','current','#D97706'],['旧 worker','legacy','#9333EA'],['同期合计','total','#0F766E']]});
- backlogData.push({title:esc(h.host)+' · claude-mem 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:90,rows:h.rate_rows||[],
- series:[['新 worker','current_rate','#D97706'],['旧 worker','legacy_rate','#9333EA']]});
+ [['current','压缩新 worker','#D97706'],['legacy','压缩旧 worker','#9333EA']].forEach(([key,name,color])=>{
+   backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows,
+     series:[['剩余',key,color]]});
+   backlogData.push({title:esc(h.host)+' · '+name+' · 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:90,zeroBaseline:true,rows:h.rate_rows||[],
+     series:[['净消化速度',key+'_rate',color]]});
+ });
 });
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
 const backlogX=(spec,at)=>{
@@ -1265,15 +1304,15 @@ function backlogChart(spec,index){
  const rows=spec.rows;
  if(!rows.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无可用样本；积压剩余从首次采样后开始显示。</div></div>';
  const values=rows.flatMap(r=>spec.series.map(s=>r[s[1]]).filter(Number.isFinite));
- if(!values.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无连续有效样本；净消化速度等待相邻小时同一进程的实时采样，不从日志队列下降推定压缩成功。</div></div>';
- const low=spec.series.length===1&&values.length?Math.min(...values):Math.min(0,...values);
- const high=Math.max(low+1,...values),top=high+(high-low)*.1;
+ if(!values.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无有效样本；净消化速度需要连续、同一进程且统计边界一致的实时采样，缺测不记为 0。</div></div>';
+ const low=!spec.zeroBaseline&&spec.series.length===1&&values.length?Math.min(...values):Math.min(0,...values);
+ const high=Math.max(low+1,...values,...(spec.zeroBaseline?[0]:[])),top=high+(high-low)*.1;
  const y=v=>9+(125-9-24)*(1-(v-low)/(top-low));
  const curves=spec.series.map(s=>{
    const pieces=[];let part=[];
    rows.forEach((r,i)=>{
-     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(spec.gapMinutes||(index===1?10:90))*60000
-       ||(index===1&&r.boundary!==previous.boundary));
+     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(spec.gapMinutes||90)*60000
+       ||(spec.continuity&&(r.boundary!==previous.boundary||r.process!==previous.process)));
      if(gap&&part.length){pieces.push(part);part=[]}
      if(Number.isFinite(r[s[1]]))part.push(backlogX(spec,r.at).toFixed(1)+','+y(r[s[1]]).toFixed(1));
      else if(part.length){pieces.push(part);part=[]}
@@ -1282,11 +1321,12 @@ function backlogChart(spec,index){
    return pieces.map(p=>p.length===1?'<circle cx="'+p[0].split(',')[0]+'" cy="'+p[0].split(',')[1]+'" r="3" fill="'+s[2]+'"/>':
      '<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('');
  }).join('');
- const ticks=[low,(low+top)/2,top].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
+ const ticks=[low,spec.zeroBaseline&&low<0?0:(low+top)/2,top].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
+ const zeroLine=spec.zeroBaseline&&low<0?'<path d="M34 '+y(0).toFixed(1)+'H432" stroke="currentColor" opacity=".3" stroke-dasharray="3 3"/>':'';
  const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(rows[0].label.slice(5,16))+'</text>'+
   '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(rows[rows.length-1].label.slice(5,16))+'</text>';
  return '<div class=trend><h3>'+spec.title+'</h3><svg data-backlog-chart="'+index+'" tabindex="0" viewBox="0 0 440 125" role="img" aria-label="'+spec.title+'，用左右方向键查看数值">'+
-  '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+
+  '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+zeroLine+ticks+curves+labels+
   '<line data-hover-line x1="0" x2="0" y1="9" y2="101" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg>'+
   '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
   spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
