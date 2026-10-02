@@ -11,7 +11,8 @@ import unittest
 from unittest.mock import patch, AsyncMock
 
 from utils.graphiti_stage_adapter import StageArtifactStore
-from utils.graphiti_parallel import ReadDependencies, GraphReadConflict, finish_optimistic_episode
+from utils.graphiti_parallel import (ReadDependencies, GraphReadConflict,
+                                     _interval_wall_seconds, finish_optimistic_episode)
 
 
 class Graph:
@@ -32,6 +33,19 @@ class Driver:
 
 
 class ReadSetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_graph_read_wall_counts_overlaps_once_and_includes_other_reads(self):
+        self.assertEqual(_interval_wall_seconds([(1, 4), (2, 5), (8, 9)]), 5)
+        with tempfile.TemporaryDirectory() as temp:
+            reads = ReadDependencies(Driver(Graph()),
+                                     StageArtifactStore(Path(temp) / 'stage.db'),
+                                     ('source', 'sid', 'round', 'input'))
+            await reads.read('MATCH candidates RETURN version', {}, phase='prepare')
+            count, wall, other_wall = reads.read_summary('prepare')
+            self.assertEqual(count, 1)
+            self.assertGreater(wall, 0)
+            self.assertEqual(other_wall, wall)
+            self.assertEqual(reads.read_summary('validate'), (0, 0.0, 0.0))
+
     async def test_indexed_reads_serialize_across_observations_but_other_reads_overlap(self):
         class ConcurrentGraph:
             active = 0
@@ -249,7 +263,13 @@ class ParallelCommitTests(unittest.IsolatedAsyncioTestCase):
                 results=await asyncio.wait_for(asyncio.gather(run('a'),run('b')),5)
             timing=[m for m in logs.output if '[ingest:parallel_timing]' in m]
             conflict=[m for m in logs.output if '[ingest:parallel_conflict]' in m]
+            prepare=[m for m in logs.output if '[ingest:parallel_prepare]' in m]
             self.assertEqual((len(timing),len(conflict)),(2,1))
+            self.assertEqual(len(prepare), 3)
+            for field in ('nodes=', 'edges=', 'attributes=', 'embeddings=',
+                          'other=', 'graph_reads=1', 'graph_read_wall=',
+                          'graph_other_wall='):
+                self.assertTrue(all(field in m for m in prepare), field)
             for field in ('lock_wait=','commit=','fence=','validate=','select=','begin=',
                           'write=','receipt_save=','loop_lag=','validate_concurrency='):
                 self.assertTrue(all(field in m for m in timing),field)
