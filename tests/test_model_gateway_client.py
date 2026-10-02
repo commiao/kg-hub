@@ -109,6 +109,60 @@ class ProductionFileScanTests(unittest.TestCase):
 
 
 class GatewayClientContractTests(unittest.TestCase):
+    def test_local_admission_bounds_calls_and_cancelled_waiter_never_sends(self):
+        class BlockingMessages:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.calls = 0
+                self.two_entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def create(self, *args, **kwargs):
+                self.calls += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                if self.active == 2:
+                    self.two_entered.set()
+                try:
+                    await self.release.wait()
+                    return {"id": self.calls}
+                finally:
+                    self.active -= 1
+
+        client = FakeClient()
+        raw = client.messages = BlockingMessages()
+        mgc.install_gateway_request_contract(client, max_inflight=2)
+
+        async def request(index):
+            with mgc.model_operation("test.capacity", f"observation-{index}"):
+                return await client.messages.create(
+                    model="kg_hub.entity_extract",
+                    messages=[{"role": "user", "content": str(index)}],
+                )
+
+        async def scenario():
+            first = [asyncio.create_task(request(i)) for i in range(2)]
+            await asyncio.wait_for(raw.two_entered.wait(), timeout=1)
+            cancelled = asyncio.create_task(request(2))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            rest = [asyncio.create_task(request(i)) for i in range(3, 8)]
+            await asyncio.sleep(0)
+            self.assertEqual(raw.calls, 2)
+            raw.release.set()
+            await asyncio.wait_for(asyncio.gather(*first, *rest), timeout=1)
+
+        asyncio.run(scenario())
+        self.assertEqual(raw.calls, 7)
+        self.assertEqual(raw.peak, 2)
+
+    def test_local_admission_cannot_exceed_gateway_ceiling(self):
+        with self.assertRaisesRegex(ValueError, "8-call ceiling"):
+            mgc.install_gateway_request_contract(FakeClient(), max_inflight=9)
+
     def test_durable_operation_reuses_key_after_unknown_and_distinct_ops_differ(self):
         class UnknownGatewayMessages:
             def __init__(self):

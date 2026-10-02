@@ -937,7 +937,7 @@ async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
     return u
 
 
-_parallel_ingest_slots = asyncio.Semaphore(max(1, min(8, int(
+_parallel_ingest_slots = asyncio.Semaphore(max(1, min(12, int(
     os.environ.get("KG_HUB_PARALLEL_TASKS", "4")))))
 
 
