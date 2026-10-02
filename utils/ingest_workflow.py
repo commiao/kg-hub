@@ -10,10 +10,16 @@ import logging
 import uuid
 
 from model_gateway_client import manual_resume_stage, stable_operation_id
-from utils.graphiti_stage_adapter import StageArtifactStore, inspect_started_graph_commit
+from utils.graphiti_stage_adapter import (
+    StageArtifactStore, StageInputDrift, inspect_started_graph_commit,
+)
 
 _current = ContextVar("ingest_workflow", default=None)
 log = logging.getLogger("kg_hub.ingest_workflow")
+
+
+class WorkflowPlanDrift(RuntimeError):
+    """A previous plan exists for this source, but this run has another identity."""
 
 
 def current_workflow():
@@ -38,7 +44,6 @@ def bind_workflow(workflow):
 
 def open_workflow(body, reference_time, epoch, route, journal_factory):
     """Durably record the task plan; blocking, so async callers use a thread."""
-    workflow = None
     try:
         journal = journal_factory()
         if journal is None:
@@ -56,12 +61,31 @@ def open_workflow(body, reference_time, epoch, route, journal_factory):
                 "reference_time": reference_time.isoformat(),
                 "parent_uuid": str(uuid.uuid4()) if route in {"split", "catalog"} else None,
             })
-        workflow = {"store": store, "plan": plan, "digest": digest}
+        return {"store": store, "plan": plan, "digest": digest}
+    except StageInputDrift as exc:
+        # A refinery retry may have a new execution epoch. Resume the original
+        # model and graph identities only when all business inputs still match.
+        prior = store.locate(body.source_description, body.source_obs_id,
+                             "business-task", "task_plan")
+        old_digest, old_plan = prior if prior is not None else (None, None)
+        if old_plan is not None and all((
+            old_plan.get("name") == body.name,
+            old_plan.get("source_description") == body.source_description,
+            old_plan.get("source_obs_id") == body.source_obs_id,
+            old_plan.get("body_digest") == hashlib.sha256(body.episode_body.encode()).hexdigest(),
+            old_plan.get("reference_time") == reference_time.isoformat(),
+            old_plan.get("route") == route,
+        )):
+            log.info("[ingest:workflow_plan_reused] original business plan restored")
+            return {"store": store, "plan": old_plan, "digest": old_digest}
+        # Changed content/context cannot use old paid receipts or an
+        # uncheckpointed serial fallback.
+        raise WorkflowPlanDrift("existing ingest plan has another identity") from exc
     except Exception:
         if manual_resume_stage() is not None:
             raise
         log.exception("[ingest:checkpoint_unavailable] original worker continues")
-    return workflow
+        return None
 
 
 def split_observations(new_value=None, *, step_ids=()):

@@ -1369,15 +1369,30 @@ async def _run_recorded_extract(*args, **kwargs):
     graphiti = args[0] if args else kwargs["graphiti"]
 
     async def original_worker():
-        from utils.ingest_workflow import bind_workflow, open_workflow
+        from utils.ingest_workflow import WorkflowPlanDrift, bind_workflow, open_workflow
         ref_time = args[2] if len(args) > 2 else kwargs["ref_time"]
         epoch = args[3] if len(args) > 3 else kwargs.get("attempt_epoch")
         route = (predigest_route(body.name, body.episode_body)
                  if PREDIGEST_ENABLED else None) or "episode"
         with model_business_task(body.source_description, body.source_obs_id):
-            workflow = await asyncio.to_thread(
-                open_workflow, body, ref_time, epoch, route, journal_from_backup_env)
+            try:
+                workflow = await asyncio.to_thread(
+                    open_workflow, body, ref_time, epoch, route, journal_from_backup_env)
+            except WorkflowPlanDrift as exc:
+                await update_ingested_key_status(
+                    graphiti, body.source_description, body.source_obs_id,
+                    "needs_reconciliation", error_kind="workflow_plan_drift",
+                    error_message=str(exc))
+                logger.error("[ingest:workflow_plan_drift] source requires reconciliation")
+                return
             with bind_workflow(workflow):
+                original_epoch = workflow["plan"]["epoch"] if workflow is not None else epoch
+                if original_epoch != epoch:
+                    if len(args) > 3:
+                        original_args = (*args[:3], original_epoch, *args[4:])
+                        return await _do_extract_inner(*original_args, **kwargs)
+                    original_kwargs = dict(kwargs, attempt_epoch=original_epoch)
+                    return await _do_extract_inner(*args, **original_kwargs)
                 return await _do_extract_inner(*args, **kwargs)
 
     return await run_task_execution(

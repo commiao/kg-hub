@@ -10,11 +10,36 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import model_gateway_client as client
-from utils.ingest_workflow import workflow_context, verify_task_plan
+from utils.ingest_workflow import (
+    WorkflowPlanDrift, current_workflow, open_workflow, workflow_context,
+    verify_task_plan,
+)
 from utils.model_attempt_journal import ModelAttemptJournal, NeedsReconciliation
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_reuses_old_plan_but_changed_content_cannot_fall_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            body = SimpleNamespace(name="episode", episode_body="content",
+                source_description="source", source_obs_id="one")
+            ref = datetime(2026, 10, 2, tzinfo=timezone.utc)
+            with workflow_context(body, ref, "first-epoch", "episode", lambda: journal):
+                self.assertIsNotNone(current_workflow())
+                original_digest = current_workflow()["digest"]
+            with workflow_context(body, ref, "second-epoch", "episode", lambda: journal):
+                self.assertEqual(current_workflow()["digest"], original_digest)
+                self.assertEqual(current_workflow()["plan"]["epoch"], "first-epoch")
+            changed = SimpleNamespace(**vars(body))
+            changed.episode_body = "different content"
+            with self.assertRaises(WorkflowPlanDrift):
+                with workflow_context(changed, ref, "second-epoch", "episode", lambda: journal):
+                    self.fail("plan drift must stop before any model or graph work")
+            self.assertIsNone(current_workflow())
+            with self.assertLogs("kg_hub.ingest_workflow", level="ERROR"):
+                self.assertIsNone(open_workflow(body, ref, "first-epoch", "episode",
+                                                lambda: None))
+
     async def test_split_resume_reuses_plan_and_parent_then_completes_remaining_children(self):
         tree = ast.parse(Path("kg_hub_server.py").read_text())
         funcs = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
