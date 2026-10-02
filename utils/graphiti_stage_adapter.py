@@ -155,7 +155,8 @@ class StageArtifactStore:
 
     def locate(self, task_sd: str, task_sid: str, operation_id: str, stage: str):
         """Resolve a saved input digest without guessing a historical operation."""
-        with self._connect() as db:
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro",
+                                     uri=True, timeout=15)) as db:
             row = db.execute("""SELECT input_digest FROM graphiti_stage_artifacts
                 WHERE task_sd=? AND task_sid=? AND operation_id=? AND stage=?""",
                 (task_sd, task_sid, operation_id, stage)).fetchone()
