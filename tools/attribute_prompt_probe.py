@@ -527,6 +527,55 @@ def apply_delta(request, payload):
     return {uuid: result[f"entity_{i}"] for i, uuid in enumerate(request["uuids"])}
 
 
+
+def guarded_delta_output(request, payload):
+    """Offline admission audit, NOT a semantic validator or production fallback.
+
+    Existing descriptions require the baseline path for *any* proposed edit:
+    exact quotes alone cannot establish whether an old claim is superseded.
+    Reject the entire entity atomically, including its scalar edits. Even an
+    admitted entity still needs source-level semantic review before deployment.
+    """
+    edits = request["model"].model_validate(payload).model_dump()
+    output, fallback = {}, {}
+    for i, uuid in enumerate(request["uuids"]):
+        key = f"entity_{i}"
+        old = request["starting_records"][key]
+        changes = edits[key]
+        reason = None
+        if old.get("description") and changes.get("description"):
+            reason = "existing_description_edit_requires_semantic_resolution"
+        else:
+            # A single entity is audited independently. Never apply a partial
+            # batch and then describe every entity as accepted.
+            isolated = copy.copy(request)
+            isolated["uuids"] = [uuid]
+            isolated["starting_records"] = {"entity_0": old}
+            annotation = request["model"].model_fields[key].annotation
+            original = request["original_model"].model_fields[key].annotation
+            isolated["model"] = create_model("SingleEntityEdits", __config__={"extra": "forbid"},
+                                               entity_0=(annotation, ...))
+            isolated["original_model"] = create_model("SingleEntityAttributes", __config__={"extra": "forbid"},
+                                                       entity_0=(original, ...))
+            try:
+                candidate = apply_delta(isolated, {"entity_0": changes})[uuid]
+                for field, values in changes.items():
+                    if field != "description":
+                        for edit in values:
+                            if edit["value"] is None or edit["value"] not in edit["evidence"]:
+                                raise ValueError("scalar_value_not_literal_in_evidence")
+                for quote in request.get("required_source_quotes", {}).get(key, []):
+                    if quote not in (candidate.get("description") or ""):
+                        raise ValueError("required_source_clause_missing")
+                output[uuid] = candidate
+            except ValueError as exc:
+                reason = str(exc)
+        if reason:
+            fallback[uuid] = reason
+    return {"candidate_output": output, "fallback_required": fallback,
+            "semantic_review": "pending", "baseline_executed": False}
+
+
 def delta_experiment(sample, directory, replay_only=False, trials=0):
     request = delta_request(asyncio.run(capture(sample, 16))[0])
     experiment = "sp-delta-evidence-v3-20261001"

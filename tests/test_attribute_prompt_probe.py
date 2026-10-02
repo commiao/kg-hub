@@ -187,6 +187,40 @@ class AttributePromptProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at most one"):
             probe.apply_delta(request, payload)
 
+    def test_guarded_delta_blocks_even_verbatim_but_unjustified_old_deletion(self):
+        request = self.delta_fixture()
+        old = request["starting_records"]["entity_0"]["description"]
+        payload = {"entity_0": {"description": [
+            {"old": old, "evidence": "Nine files.", "value": "replacement"}]}}
+        result = probe.guarded_delta_output(request, payload)
+        self.assertFalse(result["candidate_output"])
+        self.assertIn(request["uuids"][0], result["fallback_required"])
+        self.assertFalse(result["baseline_executed"])
+        self.assertEqual(request["starting_records"]["entity_0"]["description"], old)
+        payload["entity_0"]["description"][0]["old"] = None
+        self.assertTrue(probe.guarded_delta_output(request, payload)["fallback_required"])
+
+    def test_guarded_delta_omitted_new_clause_is_not_accepted_as_unchanged(self):
+        request = self.delta_fixture()
+        request["required_source_quotes"] = {"entity_0": ["Nine files."]}
+        result = probe.guarded_delta_output(request, {"entity_0": {"description": []}})
+        self.assertFalse(result["candidate_output"])
+        self.assertEqual(list(result["fallback_required"].values()), ["required_source_clause_missing"])
+
+    def test_guarded_delta_scalar_evidence_is_required_but_not_semantic_proof(self):
+        request = probe.delta_request(asyncio.run(probe.capture(self.sample(), 16))[0])
+        payload = {key: {field: [] for field in value} for key, value in request["starting_records"].items()}
+        payload["entity_0"]["path"] = [{"evidence": "Nine files.", "value": "/invented.py"}]
+        result = probe.guarded_delta_output(request, payload)
+        self.assertIn(request["uuids"][0], result["fallback_required"])
+        self.assertNotIn(request["uuids"][0], result["candidate_output"])
+        self.assertTrue(result["candidate_output"])
+        # Literal inclusion still does not establish a path's meaning or owner.
+        payload["entity_0"]["path"][0]["value"] = "Nine"
+        result = probe.guarded_delta_output(request, payload)
+        self.assertEqual(result["semantic_review"], "pending")
+        self.assertFalse(result["baseline_executed"])
+
     def test_delta_rejects_fabricated_evidence(self):
         request = self.delta_fixture()
         with self.assertRaisesRegex(ValueError, "verbatim current-source"):
