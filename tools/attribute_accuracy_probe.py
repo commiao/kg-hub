@@ -43,6 +43,8 @@ def prepare(directory, revision=3):
         probe.omit_history(request)
         if revision == 5:
             probe.add_evidence_first_contract(request, sample["episode"].get("valid_at"))
+        elif revision == 6:
+            probe.add_claim_units_contract(request, sample["episode"].get("valid_at"))
         else:
             probe.add_unified_contract(request, sample["episode"].get("valid_at"), revision=revision)
         request["temperature"] = 0.0
@@ -59,7 +61,8 @@ def screen(directory, execute=False, revision=3, model_arm="flash", thinking=Fal
     if thinking and model_arm != "max":
         raise ValueError("thinking experiment requires Max")
     directory = Path(directory)
-    campaign = CAMPAIGN.replace("v3", "v" + str(revision))
+    campaign = ("accuracy-claim-units-v6-20261002" if revision == 6
+                else CAMPAIGN.replace("v3", "v" + str(revision)))
     if model_arm == "max":
         campaign = campaign.replace("20261001", "max-thinking-20261002" if thinking else "max-20261002")
     output = directory / campaign
@@ -100,7 +103,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("/backup/attribute-probe"))
     parser.add_argument("--execute", action="store_true", help="Send up to three isolated model requests")
-    parser.add_argument("--revision", type=int, choices=(3, 4, 5), default=3)
+    parser.add_argument("--revision", type=int, choices=(3, 4, 5, 6), default=3)
     parser.add_argument("--model-arm", choices=("flash", "max"), default="flash")
     parser.add_argument("--thinking", action="store_true")
     args = parser.parse_args()

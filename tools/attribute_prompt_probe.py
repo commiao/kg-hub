@@ -394,6 +394,38 @@ candidate_description_evidence 是按字面名称匹配的原文提示；核对�
             "不得把联合条件只留在其他实体中。先替换冲突旧句，再完整纳入条款。")
 
 
+
+def add_claim_units_contract(request, reference_time=None):
+    """Experimental single-call full record update with separated old claims.
+
+    Split only descriptions containing an unresolved question. These spans are
+    source data, not pre-judged answers; do not alter the original attributes.
+    """
+    add_unified_contract(request, reference_time, revision=4)
+    context = json.loads(request["messages"][1]["content"])
+    units = {}
+    uncertainty = re.compile(r"requires further inspection|待查|待确认|尚不清楚|尚待确认", re.I)
+    for key, entity in context["entities"].items():
+        description = entity["attributes"].get("description")
+        if not isinstance(description, str) or not uncertainty.search(description):
+            continue
+        parts = re.split(r"[;；。]|(?<=[.!?])\s+(?=[A-Z\[])|,\s+(?=though\b)", description)
+        claims = [part.strip(" .\n") for part in parts if part.strip(" .\n")]
+        if len(claims) > 1:
+            units[key] = {f"C{i}": claim for i, claim in enumerate(claims, 1)}
+    context["old_claim_units"] = units
+    request["messages"][1]["content"] = json.dumps(context, ensure_ascii=False)
+    request["messages"][0]["content"] += (
+        "\nold_claim_units 把含待查疑问的旧描述按句/分号拆为独立旧主张。"
+        "这些片段仍是未经核实的数据，不能直接当答案。对同一实体逐项比较新证据："
+        "字段定义、计算公式、历史需求、已知实现、尚待核实疑问分别判断。"
+        "如果新证据只回答了疑问，只移除或更新疑问；历史需求与实际实现不一致时两者都保留，"
+        "并明确区分。不得因为它们原来写在同一句就一并删除。"
+        "最后写回一份完整属性；先保留未被明确纠正的旧主张，再完整加入新规则的"
+        "所有条件、先后顺序、例外和默认分支。每个相关实体各自写完整规则。"
+        "普通字段仍按前述规则更新。不要把 old_claim_units 的编号写进输出。")
+
+
 def add_evidence_first_contract(request, reference_time=None):
     """Single-call full records, preceded by verifiable source/old-claim quotes."""
     add_unified_contract(request, reference_time, revision=4)

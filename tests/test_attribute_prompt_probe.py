@@ -34,6 +34,24 @@ class AttributePromptProbeTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 probe.flatten(request, payload)
 
+    def test_claim_units_separate_history_from_resolved_question(self):
+        sample = self.sample()
+        old = ("Cost definition; historical requirement says paid requests pass, "
+               "though whether the service implements this requires further inspection.")
+        sample["nodes"] = [EntityNode(name="cost", group_id="test", labels=["Entity", "Concept"],
+                                      attributes={"description": old}).model_dump()]
+        request = asyncio.run(probe.capture(sample, 16))[0]
+        before = json.loads(request["messages"][1]["content"])
+        probe.add_claim_units_contract(request)
+        after = json.loads(request["messages"][1]["content"])
+        self.assertEqual(after["entities"], before["entities"])
+        claims = list(after["old_claim_units"]["entity_0"].values())
+        self.assertEqual(len(claims), 3)
+        self.assertIn("historical requirement", claims[1])
+        self.assertIn("requires further inspection", claims[2])
+        self.assertNotIn("historical requirement", claims[2])
+        self.assertIn("一并删除", request["messages"][0]["content"])
+
     def test_evidence_first_checks_quotes_without_repairing_values(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]
         probe.add_evidence_first_contract(request)
