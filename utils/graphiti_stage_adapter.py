@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 from enum import Enum
 
@@ -84,6 +84,23 @@ class StageArtifactStore:
                      input_digest: str, stage: str, new_value: object | None = None):
         if not all((task_sd, task_sid, operation_id, input_digest, stage)):
             raise RuntimeError("graphiti stage identity is incomplete")
+        # Existing artifacts are immutable. A lookup needs a WAL read snapshot,
+        # not BEGIN IMMEDIATE's writer reservation. On a miss, the write path
+        # below rechecks under its transaction before inserting the artifact.
+        if new_value is None:
+            with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro",
+                                         uri=True, timeout=15)) as db:
+                row = db.execute("""SELECT input_digest, artifact_json, artifact_digest
+                    FROM graphiti_stage_artifacts WHERE task_sd=? AND task_sid=?
+                    AND operation_id=? AND stage=?""",
+                    (task_sd, task_sid, operation_id, stage)).fetchone()
+            if row is None:
+                return None
+            if row[0] != input_digest:
+                raise RuntimeError("graphiti stage input drift")
+            if hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
+                raise RuntimeError("graphiti stage artifact corrupted")
+            return json.loads(row[1])
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("""SELECT input_digest, artifact_json, artifact_digest

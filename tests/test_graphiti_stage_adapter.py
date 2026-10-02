@@ -1,9 +1,11 @@
 """Stage snapshots use actual pinned Graphiti node types and resolver helpers."""
 
 from datetime import datetime, timezone
+from contextlib import closing
 import importlib.util
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -21,6 +23,36 @@ HAS_GRAPHITI = importlib.util.find_spec("graphiti_core") is not None
 
 
 class StageStoreBoundaryTests(unittest.TestCase):
+    def test_artifact_lookup_does_not_wait_for_another_writer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StageArtifactStore(Path(temp) / "stages.sqlite3")
+            identity = ("source", "sid", "op", "input")
+            store.save_or_load(*identity, "existing", {"value": 1})
+            original_connect = sqlite3.connect
+
+            def short_timeout(*args, **kwargs):
+                return original_connect(*args, **{**kwargs, "timeout": 0.05})
+
+            with closing(original_connect(store.path)) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                with patch("utils.graphiti_stage_adapter.sqlite3.connect",
+                           side_effect=short_timeout):
+                    self.assertEqual(store.save_or_load(*identity, "existing"), {"value": 1})
+                    self.assertIsNone(store.save_or_load(*identity, "missing"))
+                    with self.assertRaisesRegex(RuntimeError, "input drift"):
+                        store.save_or_load("source", "sid", "op", "changed", "existing")
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.save_or_load(*identity, "new", {"value": 2})
+            self.assertEqual(store.save_or_load(*identity, "new", {"value": 2}),
+                             {"value": 2})
+            with closing(original_connect(store.path)) as db:
+                with db:
+                    db.execute("UPDATE graphiti_stage_artifacts SET artifact_json=? "
+                               "WHERE task_sd=? AND task_sid=? AND operation_id=? "
+                               "AND stage=?", ('{"value": 9}', *identity[:3], "existing"))
+            with self.assertRaisesRegex(RuntimeError, "corrupted"):
+                store.save_or_load(*identity, "existing")
+
     def test_exact_started_marker_can_be_reused_without_changing_identity(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StageArtifactStore(Path(temp) / "stages.sqlite3")
