@@ -48,6 +48,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import refinery_window
 import urllib.error
 import urllib.request
@@ -853,6 +854,24 @@ async def heartbeat_loop() -> None:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
+async def queue_sample_loop(wm: dict) -> None:
+    """Keep sampling through gate pauses; never trigger ingestion or model calls."""
+    from utils import refinery_queues
+    process = uuid.uuid4().hex
+    while True:
+        # Freeze sets on the event loop before handing them to the I/O thread.
+        snapshot = {key: set(wm.get(key, ())) for key in
+                    ("ingested", "rejected", "failed", "held")}
+        snapshot["boundary_id"] = wm.get("boundary_id")
+        try:
+            await asyncio.to_thread(refinery_queues.sample, DB_PATH,
+                                    STATE_DIR / "queue-remaining.sqlite3",
+                                    snapshot, process, time.time())
+        except Exception:
+            log.exception("[queue-sample] failed (non-fatal)")
+        await asyncio.sleep(refinery_queues.INTERVAL)
+
+
 # ---------- 主循环 ----------
 
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
@@ -1106,6 +1125,8 @@ async def main() -> int:
         wm["boundary_id"] = max_db_id()
         save_watermark(wm)
         log.info("[boundary] 首轮启动,boundary_id=%d(≤此为积压,夜间窗口烧)", wm["boundary_id"])
+
+    _queue_sample_task = asyncio.create_task(queue_sample_loop(wm))
 
     decided: dict[int, bool] = {}  # 进程内决策缓存
     decision_day = datetime.now(tz=CST).date()
