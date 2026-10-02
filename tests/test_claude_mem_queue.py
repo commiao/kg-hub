@@ -63,4 +63,31 @@ class QueueTests(unittest.TestCase):
         self.assertIn('claude-mem · 压缩队列积压',_HTML)
         self.assertIn('kg-hub · 入图积压消化',_HTML)
 
+class TrendRangeTests(unittest.TestCase):
+    def build(self, history, **kw):
+        return claude_mem_trends([dict(claude_mem_queue=dict(sampled_at=NOW,history=history), **kw)],datetime.fromtimestamp(NOW,timezone.utc))[0]
+
+    def point(self,hours,depth,pid='1',source='live'):
+        return dict(worker='current',at=NOW-hours*3600,depth=depth,pid=pid,source=source)
+
+    def test_rate_axis_does_not_include_week_of_null_log_rates(self):
+        h=[self.point(144,500,source='log'),self.point(3,100),self.point(2,90),self.point(1,None),self.point(0,80)]
+        data=self.build(h)
+        self.assertEqual(len(data['rows']),5)
+        self.assertEqual(len(data['rate_rows']),3)
+        self.assertEqual(data['rate_rows'][0]['current_rate'],10)
+        self.assertIsNone(data['rate_rows'][1]['current_rate'])
+        self.assertEqual(data['unchanged_hours']['current'],0)
+
+    def test_flat_live_queue_is_visible_but_gaps_restart_and_empty_are_not_stalls(self):
+        data=self.build([self.point(5,50),self.point(4,50),self.point(3,50),self.point(2,50),self.point(1,50),self.point(0,50)])
+        self.assertEqual(data['unchanged_hours']['current'],5)
+        self.assertEqual(self.build([self.point(5,50),self.point(0,50)])['unchanged_hours']['current'],0)
+        self.assertEqual(self.build([self.point(1,50),self.point(0,50,pid='2')])['unchanged_hours']['current'],0)
+        self.assertEqual(self.build([self.point(1,0),self.point(0,0)])['unchanged_hours']['current'],0)
+
+    def test_no_valid_rate_means_empty_chart_not_zero_filled_week(self):
+        data=self.build([self.point(120,90,source='log'),self.point(0,50)])
+        self.assertEqual(data['rate_rows'],[])
+
 if __name__=='__main__':unittest.main()
