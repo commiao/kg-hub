@@ -810,6 +810,7 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
         isolated_routes = {
             "http://kg-attribute-accuracy-probe:39000": "kg_hub.attribute_accuracy_probe",
             "http://kg-attribute-max-probe:39000": "kg_hub.attribute_max_probe",
+            "http://kg-cross-episode-nodes-probe:39000": "kg_hub.cross_episode_nodes_probe",
         }
         expected = isolated_routes.get(os.environ.get("ANTHROPIC_BASE_URL"))
         if expected is None or model != expected:
