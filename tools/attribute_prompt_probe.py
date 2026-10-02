@@ -724,8 +724,13 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
     if structured_output:
         if thinking_arm is not None:
             raise ValueError("structured output cannot combine experiment arms")
-        if os.environ.get("ANTHROPIC_BASE_URL") != "http://kg-attribute-accuracy-probe:39000":
-            raise RuntimeError("structured comparison requires the isolated experiment gateway")
+        isolated_routes = {
+            "http://kg-attribute-accuracy-probe:39000": "kg_hub.attribute_accuracy_probe",
+            "http://kg-attribute-max-probe:39000": "kg_hub.attribute_max_probe",
+        }
+        expected = isolated_routes.get(os.environ.get("ANTHROPIC_BASE_URL"))
+        if expected is None or model != expected:
+            raise RuntimeError("structured comparison requires the isolated experiment gateway and business key")
         schema = copy.deepcopy(schema)
         def close_objects(value):
             if isinstance(value, dict):

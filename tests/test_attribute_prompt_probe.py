@@ -424,7 +424,7 @@ class AttributePromptProbeTests(unittest.TestCase):
         response = SimpleNamespace(content=[SimpleNamespace(type="text", text='{"entity_0":{}}')],
                                    usage=SimpleNamespace(model_dump=lambda: {}), stop_reason="end_turn")
         with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
-                "ANTHROPIC_MODEL": "probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake",
+                "ANTHROPIC_MODEL": "kg_hub.attribute_accuracy_probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake",
                 "ANTHROPIC_BASE_URL": "http://model-gateway:39000"}), patch("anthropic.Anthropic") as client:
             with self.assertRaisesRegex(RuntimeError, "isolated"):
                 probe.call(request, Path(folder), structured_output=True)

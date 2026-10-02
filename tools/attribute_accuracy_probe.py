@@ -53,21 +53,27 @@ def prepare(directory, revision=3):
     return prepared
 
 
-def screen(directory, execute=False, revision=3):
+def screen(directory, execute=False, revision=3, model_arm="flash"):
+    if model_arm not in ("flash", "max"):
+        raise ValueError("invalid model arm")
     directory = Path(directory)
     campaign = CAMPAIGN.replace("v3", "v" + str(revision))
+    if model_arm == "max":
+        campaign = campaign.replace("20261001", "max-20261002")
     output = directory / campaign
     output.mkdir(mode=0o700, exist_ok=True)
     prepared = prepare(directory, revision)
     plan = {"campaign": campaign, "stage": "development-screen", "max_new_calls": 3,
             "thinking": "disabled", "output_format": "json_schema", "max_tokens": 8192,
+            **({"provider_model": "qwen3.8-max"} if model_arm == "max" else {}),
             "temperature_requested": 0.0,
             "steps": [{"sid": sid, "input_sha256": digest} for sid, _, _, digest in prepared]}
     freeze(output / "plan.json", plan)
     if not execute:
         print(json.dumps(plan, ensure_ascii=False))
         return
-    if os.environ.get("ANTHROPIC_MODEL") != "kg_hub.attribute_accuracy_probe":
+    expected_key = "kg_hub.attribute_max_probe" if model_arm == "max" else "kg_hub.attribute_accuracy_probe"
+    if os.environ.get("ANTHROPIC_MODEL") != expected_key:
         raise RuntimeError("isolated business key required")
     for sid, sample, request, digest in prepared:
         saved = probe.call(request, output, structured_output=True)
@@ -89,8 +95,9 @@ def screen(directory, execute=False, revision=3):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--directory", type=Path, default=Path("/tmp/kg-attribute-probe"))
+    parser.add_argument("--directory", type=Path, default=Path("/backup/attribute-probe"))
     parser.add_argument("--execute", action="store_true", help="Send up to three isolated model requests")
     parser.add_argument("--revision", type=int, choices=(3, 4, 5), default=3)
+    parser.add_argument("--model-arm", choices=("flash", "max"), default="flash")
     args = parser.parse_args()
-    screen(args.directory, execute=args.execute, revision=args.revision)
+    screen(args.directory, execute=args.execute, revision=args.revision, model_arm=args.model_arm)
