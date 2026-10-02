@@ -443,6 +443,12 @@ class AttributePromptProbeTests(unittest.TestCase):
                 self.assertEqual(body["extra_body"]["thinking"], {"type": "disabled"})
                 probe.call(request, Path(folder), structured_output=True, replay_only=True)
                 self.assertEqual(client.return_value.messages.create.call_count, 1)
+                with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://kg-attribute-max-probe:39000",
+                                              "ANTHROPIC_MODEL": "kg_hub.attribute_max_probe"}):
+                    on = probe.call(request, Path(folder), structured_output=True, structured_thinking=True)
+                    self.assertEqual(on["request_body"]["extra_body"]["thinking"],
+                                     {"type": "enabled", "budget_tokens": 2048})
+                    self.assertIn("format", on["request_body"]["extra_body"]["output_config"])
 
     def test_replay_only_missing_receipt_never_calls_provider(self):
         request = asyncio.run(probe.capture(self.sample(), 16))[0]

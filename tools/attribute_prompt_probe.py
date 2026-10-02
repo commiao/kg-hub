@@ -698,7 +698,7 @@ def lost_existing_values(sample, output):
 
 
 def call(request, directory, resume_rejected_digest=None, replay_only=False, trial_id=None,
-         thinking_arm=None, structured_output=False):
+         thinking_arm=None, structured_output=False, structured_thinking=False):
     from anthropic import Anthropic, APIStatusError
     model = os.environ["ANTHROPIC_MODEL"]
     schema = request["model"].model_json_schema()
@@ -721,6 +721,8 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
             body["extra_body"]["thinking"]["budget_tokens"] = 2048
         if thinking_arm == "enabled":
             body["extra_body"]["output_config"] = {"effort": "medium"}
+    if structured_thinking and not structured_output:
+        raise ValueError("structured thinking requires structured output")
     if structured_output:
         if thinking_arm is not None:
             raise ValueError("structured output cannot combine experiment arms")
@@ -746,6 +748,10 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
         body.pop("tool_choice")
         body["max_tokens"] = 8192
         body["extra_body"]["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+        if structured_thinking:
+            if model != "kg_hub.attribute_max_probe":
+                raise RuntimeError("structured thinking requires isolated Max route")
+            body["extra_body"]["thinking"] = {"type": "enabled", "budget_tokens": 2048}
     digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     body_digest = digest

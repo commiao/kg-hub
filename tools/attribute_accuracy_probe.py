@@ -53,18 +53,21 @@ def prepare(directory, revision=3):
     return prepared
 
 
-def screen(directory, execute=False, revision=3, model_arm="flash"):
+def screen(directory, execute=False, revision=3, model_arm="flash", thinking=False):
     if model_arm not in ("flash", "max"):
         raise ValueError("invalid model arm")
+    if thinking and model_arm != "max":
+        raise ValueError("thinking experiment requires Max")
     directory = Path(directory)
     campaign = CAMPAIGN.replace("v3", "v" + str(revision))
     if model_arm == "max":
-        campaign = campaign.replace("20261001", "max-20261002")
+        campaign = campaign.replace("20261001", "max-thinking-20261002" if thinking else "max-20261002")
     output = directory / campaign
     output.mkdir(mode=0o700, exist_ok=True)
     prepared = prepare(directory, revision)
     plan = {"campaign": campaign, "stage": "development-screen", "max_new_calls": 3,
-            "thinking": "disabled", "output_format": "json_schema", "max_tokens": 8192,
+            "thinking": "enabled" if thinking else "disabled",
+            **({"thinking_budget_tokens": 2048} if thinking else {}), "output_format": "json_schema", "max_tokens": 8192,
             **({"provider_model": "qwen3.8-max"} if model_arm == "max" else {}),
             "temperature_requested": 0.0,
             "steps": [{"sid": sid, "input_sha256": digest} for sid, _, _, digest in prepared]}
@@ -76,10 +79,10 @@ def screen(directory, execute=False, revision=3, model_arm="flash"):
     if os.environ.get("ANTHROPIC_MODEL") != expected_key:
         raise RuntimeError("isolated business key required")
     for sid, sample, request, digest in prepared:
-        saved = probe.call(request, output, structured_output=True)
+        saved = probe.call(request, output, structured_output=True, structured_thinking=thinking)
         result = {"sid": sid, "input_sha256": digest, "semantic_review": "pending",
                   **{key: saved.get(key) for key in ("body_digest", "elapsed", "usage",
-                      "stop_reason", "parse_error", "response_block_types")}}
+                      "stop_reason", "parse_error", "response_block_types", "response_model", "thinking_chars")}}
         try:
             if revision == 5:
                 result["output"], result["evidence_errors"] = probe.evidence_first_output(request, saved["payload"])
@@ -99,5 +102,6 @@ if __name__ == "__main__":
     parser.add_argument("--execute", action="store_true", help="Send up to three isolated model requests")
     parser.add_argument("--revision", type=int, choices=(3, 4, 5), default=3)
     parser.add_argument("--model-arm", choices=("flash", "max"), default="flash")
+    parser.add_argument("--thinking", action="store_true")
     args = parser.parse_args()
-    screen(args.directory, execute=args.execute, revision=args.revision, model_arm=args.model_arm)
+    screen(args.directory, execute=args.execute, revision=args.revision, model_arm=args.model_arm, thinking=args.thinking)
