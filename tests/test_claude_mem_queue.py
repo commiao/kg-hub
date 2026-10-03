@@ -60,7 +60,7 @@ class QueueTests(unittest.TestCase):
         row=claude_mem_trends([dict(_snapshot_stale=True,claude_mem_queue=dict(sampled_at=NOW,history=hist))],datetime.fromtimestamp(NOW,timezone.utc))[0]
         self.assertEqual(row['rows'][-1]['legacy_rate'],-10)
         self.assertTrue(row['stale'])
-        self.assertIn('claude-mem · 压缩队列积压',_HTML)
+        self.assertNotIn('claude-mem · 压缩队列积压',_HTML)
         self.assertIn('kg-hub · 入图积压消化',_HTML)
 
 class TrendRangeTests(unittest.TestCase):

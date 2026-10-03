@@ -1168,10 +1168,6 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <pre class=dt id=stdetail hidden></pre>
 
 <section id=queue-trends>
-<h2>claude-mem · 压缩队列积压</h2>
-<div class=cards id=cmcards></div>
-<div class=note>队列剩余：最近 7 天；净消化速度：最近 24 小时内的有效实时区间。北京时间 · 探针每 10 分钟采样，保留每小时最后样本。压缩新 worker、压缩旧 worker 分别展示。净消化速度 = 队列减少量 / 实际间隔，负值表示积压增加，0 表示队列持平，并非成功压缩数量。历史日志可补队列曲线；速度仅使用同一进程连续的实时样本，缺失、重启与离线不计为消化。</div>
-<div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
@@ -1283,17 +1279,6 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
    series:[['净消化速度',k+'_rate',color]]});
 });
 backlogData.push(...processingData);
-const cmHosts=D.claude_mem_trends||[];
-$('cmcards').innerHTML=cmHosts.length?cmHosts.map(h=>'<div class=card><b>'+esc(h.host)+(h.stale?' · 数据过期':'')+'</b><div>'+h.current.map(w=>esc(w.worker==='current'?'新 worker':'旧 worker')+'：'+(Number.isFinite(w.depth)?w.depth+' 条':'不可用')).join(' · ')+'</div>'+Object.entries(h.unchanged_hours||{}).filter(([w,hours])=>hours>=2).map(([w,hours])=>'<div class=note style="color:#D97706">'+(w==='current'?'新 worker':'旧 worker')+'：截至采样，连续约 '+hours+' 小时队列未变化（按小时样本）</div>').join('')+(h.error?'<small>采样失败：'+esc(h.error)+'</small>':'')+'</div>').join(''):'<div class=note>等待 claude-mem 探针上报队列历史</div>';
-const cmOffset=backlogData.length;
-cmHosts.forEach(h=>{
- [['current','压缩新 worker','#D97706'],['legacy','压缩旧 worker','#9333EA']].forEach(([key,name,color])=>{
-   backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows,
-     series:[['剩余',key,color]]});
-   backlogData.push({title:esc(h.host)+' · '+name+' · 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:90,zeroBaseline:true,rows:h.rate_rows||[],
-     series:[['净消化速度',key+'_rate',color]]});
- });
-});
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
 const backlogX=(spec,at)=>{
  const first=Date.parse(spec.rows[0].at);
@@ -1331,8 +1316,7 @@ function backlogChart(spec,index){
   '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
   spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
-$('backlogtrends').innerHTML=backlogData.slice(0,cmOffset).map(backlogChart).join('');
-$('cmtrends').innerHTML=backlogData.slice(cmOffset).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
+$('backlogtrends').innerHTML=backlogData.map(backlogChart).join('');
 function showBacklogPoint(svg,index){
  const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
  svg.dataset.pointIndex=index;
