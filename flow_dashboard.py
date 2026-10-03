@@ -1168,6 +1168,9 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <pre class=dt id=stdetail hidden></pre>
 
 <section id=queue-trends>
+<h2>claude-mem · 压缩队列</h2>
+<div class=cards id=cmcards></div>
+<div class=note>以下是采样时的队列数量；数量持平不能说明 worker 是否在正常处理。</div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
@@ -1207,6 +1210,15 @@ const $=id=>document.getElementById(id);
 const fmt=v=>(v===null||v===undefined)?'—':v;
 const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const compressionHosts=D.claude_mem_trends||[];
+$('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
+ [['current','新 worker'],['legacy','旧 worker']].map(([key,label])=>{
+   const w=(h.current||[]).find(w=>w.worker===key);
+   const at=w&&Number.isFinite(w.at)?new Date(w.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'未知';
+   const depth=w&&Number.isFinite(w.depth)?w.depth+' 条':'暂无数据';
+   const warning=h.stale?'数据过期':h.error||w?.error?'采样异常':'';
+   return '<div class=card><b>'+esc(h.host)+' · '+label+'</b><div>队列剩余：'+depth+'</div><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
+ })).join(''):'<div class=note>暂无 claude-mem 采样数据</div>';
 $('gen').textContent='快照 '+D.generated_at_beijing+' · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
 if(D.source_errors.length){$('errs').innerHTML='<div class=warn>部分数据源不可读：'+D.source_errors.map(esc).join('；')+'</div>'}
 
