@@ -34,7 +34,8 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(row["entities"][1]["checks"]["summary_completeness"]["verdict"], "unreviewed")
 
     def test_gate_counts_complete_semantic_reviews_only(self):
-        entity = {"uuid": "e", "labels": ["Entity", "File"],
+        entity = {"uuid": "e", "name": "x.py", "labels": ["Entity", "File"],
+                  "old_attributes": {"path": "old/x.py"}, "old_summary": "old",
                   "candidate_attributes": {"path": "x.py"}, "candidate_summary": "summary",
                   "checks": {name: {"verdict": "pass", "reason": "",
                                     "candidate_excerpt": "", "source_excerpt": ""}
@@ -42,10 +43,22 @@ class ReviewTests(unittest.TestCase):
                                           "project_and_file_ownership",
                                           "source_grounding", "summary_completeness")}}
         cohort = {"holdout_sha256": "hash", "sample_count": 15,
-                  "reviews": [{"sid": f"s{i}", "reviewer": "reviewer", "reviewed_at": "2026-10-03",
+                  "reviews": [{"sd": "g", "sid": f"s{i}", "operation_id": f"op{i}",
+                               "episode_content": "source", "previous_episodes": [],
+                               "reviewer": "reviewer", "reviewed_at": "2026-10-03",
                                "entities": [copy.deepcopy(entity)], "verdict": "pass"}
                               for i in range(15)]}
+        for row in cohort["reviews"]:
+            row["packet_sha256"] = review._packet_hash(row)
         self.assertTrue(review.score_cohort(cohort)["gate_90_percent"])
+        tampered = copy.deepcopy(cohort)
+        tampered["reviews"][0]["entities"].clear()
+        with self.assertRaisesRegex(ValueError, "packet changed"):
+            review.score_cohort(tampered)
+        tampered = copy.deepcopy(cohort)
+        tampered["reviews"][0]["entities"][0]["candidate_attributes"]["path"] = "other.py"
+        with self.assertRaisesRegex(ValueError, "packet changed"):
+            review.score_cohort(tampered)
         cohort["reviews"][0]["entities"][0]["checks"]["project_and_file_ownership"] = {
             "verdict": "fail", "reason": "wrong project", "candidate_excerpt": "wrong",
             "source_excerpt": "Project: correct"}

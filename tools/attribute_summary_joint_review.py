@@ -25,6 +25,18 @@ def _check(required: bool) -> dict:
             "source_excerpt": "", "candidate_excerpt": "", "reason": ""}
 
 
+def _packet_hash(row: dict) -> str:
+    """Seal source and candidate fields while leaving review decisions editable."""
+    immutable = {key: row[key] for key in (
+        "sd", "sid", "operation_id", "episode_content", "previous_episodes")}
+    immutable["entities"] = [{key: entity[key] for key in (
+        "uuid", "name", "labels", "old_attributes", "candidate_attributes",
+        "old_summary", "candidate_summary")}
+        for entity in row["entities"]]
+    return hashlib.sha256(json.dumps(immutable, ensure_ascii=False,
+                                    sort_keys=True).encode()).hexdigest()
+
+
 def make_sample_review(sample: dict, results: list[dict], targets: set[str]) -> dict:
     typed = {node.uuid for node, _ in typed_nodes(
         [EntityNode.model_validate(item) for item in sample["nodes"]])}
@@ -60,12 +72,14 @@ def make_sample_review(sample: dict, results: list[dict], targets: set[str]) -> 
                 "summary_completeness": _check(has_summary),
             },
         })
-    return {"sd": sample["sd"], "sid": sample["sid"],
-            "operation_id": sample["operation_id"],
-            "episode_content": sample["episode"].get("content", ""),
-            "previous_episodes": sample["previous_episodes"],
-            "entities": entities,
-            "reviewer": "", "reviewed_at": "", "verdict": "unreviewed"}
+    row = {"sd": sample["sd"], "sid": sample["sid"],
+           "operation_id": sample["operation_id"],
+           "episode_content": sample["episode"].get("content", ""),
+           "previous_episodes": sample["previous_episodes"],
+           "entities": entities,
+           "reviewer": "", "reviewed_at": "", "verdict": "unreviewed"}
+    row["packet_sha256"] = _packet_hash(row)
+    return row
 
 
 def make_cohort_review(holdout: Path, result_dir: Path, journal: Path) -> dict:
@@ -95,6 +109,8 @@ def score_cohort(review: dict) -> dict:
     passed = 0
     details = []
     for row in review["reviews"]:
+        if row.get("packet_sha256") != _packet_hash(row):
+            raise ValueError(f"observation {row['sid']} source or candidate packet changed")
         if not row.get("reviewer") or not row.get("reviewed_at"):
             raise ValueError(f"observation {row['sid']} lacks reviewer or time")
         failed = []
