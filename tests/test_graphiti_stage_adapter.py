@@ -38,6 +38,8 @@ class StageStoreBoundaryTests(unittest.TestCase):
                 with patch("utils.graphiti_stage_adapter.sqlite3.connect",
                            side_effect=short_timeout):
                     self.assertEqual(store.save_or_load(*identity, "existing"), {"value": 1})
+                    self.assertEqual(store.locate(*identity[:3], "existing"),
+                                     ("input", {"value": 1}))
                     self.assertIsNone(store.save_or_load(*identity, "missing"))
                     with self.assertRaisesRegex(RuntimeError, "input drift"):
                         store.save_or_load("source", "sid", "op", "changed", "existing")

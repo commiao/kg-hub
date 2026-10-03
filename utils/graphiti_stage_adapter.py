@@ -21,6 +21,10 @@ from datetime import date, datetime
 from enum import Enum
 
 
+class StageInputDrift(RuntimeError):
+    """An immutable stage exists under this identity with another input digest."""
+
+
 def _encoded(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -97,7 +101,7 @@ class StageArtifactStore:
             if row is None:
                 return None
             if row[0] != input_digest:
-                raise RuntimeError("graphiti stage input drift")
+                raise StageInputDrift("graphiti stage input drift")
             if hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
                 raise RuntimeError("graphiti stage artifact corrupted")
             return json.loads(row[1])
@@ -109,7 +113,7 @@ class StageArtifactStore:
                 (task_sd, task_sid, operation_id, stage)).fetchone()
             if row is not None:
                 if row[0] != input_digest:
-                    raise RuntimeError("graphiti stage input drift")
+                    raise StageInputDrift("graphiti stage input drift")
                 if hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
                     raise RuntimeError("graphiti stage artifact corrupted")
                 return json.loads(row[1])
@@ -137,7 +141,7 @@ class StageArtifactStore:
                     (task_sd, task_sid, operation_id, stage)).fetchone()
                 if row is not None:
                     if row[0] != input_digest:
-                        raise RuntimeError("graphiti stage input drift")
+                        raise StageInputDrift("graphiti stage input drift")
                     if hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
                         raise RuntimeError("graphiti stage artifact corrupted")
                     saved[stage] = json.loads(row[1])
@@ -151,7 +155,8 @@ class StageArtifactStore:
 
     def locate(self, task_sd: str, task_sid: str, operation_id: str, stage: str):
         """Resolve a saved input digest without guessing a historical operation."""
-        with self._connect() as db:
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro",
+                                     uri=True, timeout=15)) as db:
             row = db.execute("""SELECT input_digest FROM graphiti_stage_artifacts
                 WHERE task_sd=? AND task_sid=? AND operation_id=? AND stage=?""",
                 (task_sd, task_sid, operation_id, stage)).fetchone()

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 from model_gateway_client import model_business_task
 from utils.model_attempt_journal import ModelAttemptJournal
+from utils.ingest_workflow import open_workflow
 
 SERVER = Path(__file__).resolve().parents[1] / "kg_hub_server.py"
 
@@ -51,6 +52,8 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
                    "_do_extract_inner": self.worker,
                    "model_business_task": model_business_task,
                    "journal_from_backup_env": lambda: self.journal,
+                   "update_ingested_key_status": self.update_status,
+                   "logger": logging.getLogger("test.task_execution"),
                    "_persisted_business_result": AsyncMock(return_value=False),
                    "MIN_CLIENT_TIMEOUT_SEC": 180, "PREDIGEST_ENABLED": False}
         exec(compile(ast.Module(body=funcs, type_ignores=[]), str(SERVER), "exec"), self.ns)
@@ -60,6 +63,33 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     def finished(self):
         self.active -= 1
+
+    async def update_status(self, _graph, sd, sid, status, **fields):
+        self.assertEqual((sd, sid), ("source", "one"))
+        self.driver.row.update(status=status, **fields)
+
+    async def test_plan_drift_stops_before_legacy_worker_or_paid_call(self):
+        ref = datetime(2026, 9, 27, tzinfo=timezone.utc)
+        old_body = SimpleNamespace(**vars(self.body))
+        old_body.episode_body = "different content"
+        open_workflow(old_body, ref, "previous-epoch", "episode", lambda: self.journal)
+        with self.assertLogs("test.task_execution", level=logging.ERROR):
+            self.assertIsNone(await self.run_worker())
+        self.worker.assert_not_awaited()
+        self.assertEqual(self.driver.row["status"], "needs_reconciliation")
+        self.assertEqual(self.driver.row["error_kind"], "workflow_plan_drift")
+        self.assertEqual(self.journal.task_execution_summary("source", "one")
+                         ["executions"][0]["state"], "failed")
+        self.assertEqual(self.active, 0)
+
+    async def test_same_content_retry_uses_original_epoch_and_checkpoint(self):
+        ref = datetime(2026, 9, 27, tzinfo=timezone.utc)
+        open_workflow(self.body, ref, "previous-epoch", "episode", lambda: self.journal)
+        self.assertEqual(await self.run_worker(), "original-result")
+        self.worker.assert_awaited_once()
+        self.assertEqual(self.worker.await_args.kwargs["attempt_epoch"], "previous-epoch")
+        self.assertEqual(self.journal.task_execution_summary("source", "one")
+                         ["executions"][0]["state"], "failed")
 
     async def fail_worker(self, *args, **kwargs):
         self.assertEqual(self.active, 1)
