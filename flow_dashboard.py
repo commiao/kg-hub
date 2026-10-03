@@ -1170,7 +1170,8 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列</h2>
 <div class=cards id=cmcards></div>
-<div class=note>以下是采样时的队列数量；数量持平不能说明 worker 是否在正常处理。</div>
+<div class=note>队列剩余趋势：最近 7 天，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。数量持平不能说明 worker 是否在正常处理。</div>
+<div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
@@ -1291,6 +1292,13 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
    series:[['净消化速度',k+'_rate',color]]});
 });
 backlogData.push(...processingData);
+const cmOffset=backlogData.length;
+compressionHosts.forEach(h=>{
+ [['current','新 worker','#D97706'],['legacy','旧 worker','#9333EA']].forEach(([key,name,color])=>{
+   backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows||[],
+     series:[['剩余',key,color]]});
+ });
+});
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
 const backlogX=(spec,at)=>{
  const first=Date.parse(spec.rows[0].at);
@@ -1328,7 +1336,8 @@ function backlogChart(spec,index){
   '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
   spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
-$('backlogtrends').innerHTML=backlogData.map(backlogChart).join('');
+$('backlogtrends').innerHTML=backlogData.slice(0,cmOffset).map(backlogChart).join('');
+$('cmtrends').innerHTML=backlogData.slice(cmOffset).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
 function showBacklogPoint(svg,index){
  const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
  svg.dataset.pointIndex=index;
