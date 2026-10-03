@@ -135,6 +135,15 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
 
 def validate_output(request: dict, payload: dict) -> tuple[dict, dict]:
     """Project without repairing answers; semantic review remains separate."""
+    if not isinstance(payload, dict) or set(payload) != set(request["model"].model_fields):
+        raise ValueError("response entity keys are incomplete or unexpected")
+    for key, field in request["model"].model_fields.items():
+        row = payload[key]
+        if not isinstance(row, dict) or set(row) != {"attributes", "summary"}:
+            raise ValueError("response row fields are incomplete or unexpected")
+        expected = set(field.annotation.model_fields["attributes"].annotation.model_fields)
+        if not isinstance(row["attributes"], dict) or set(row["attributes"]) != expected:
+            raise ValueError("attribute fields are incomplete or unexpected")
     result = request["model"].model_validate(payload).model_dump()
     attributes, summaries = {}, {}
     for index, uuid in enumerate(request["uuids"]):
@@ -190,13 +199,16 @@ def main(argv=None):
     if args.sample_index is not None:
         samples = [samples[args.sample_index]]
     planned = []
+    target_counts = []
     for sample in samples:
         targets = summary_targets(args.journal, sample)
         requests = asyncio.run(build_requests(sample, targets))
         planned.append((sample, requests))
+        target_counts.append(len(targets))
     calls = sum(len(requests) for _, requests in planned)
     manifest = {"holdout_sha256": hashlib.sha256(raw).hexdigest(),
                 "sample_count": len(samples), "candidate_calls": calls,
+                "summary_target_counts": target_counts,
                 "candidate_batches": [len(reqs) for _, reqs in planned],
                 "prompt_schema_sha256": [hashlib.sha256(json.dumps(
                     {"messages": request["messages"],
@@ -211,11 +223,14 @@ def main(argv=None):
         raise RuntimeError(f"explicit approved budget of at least {calls} new calls required")
     args.save_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     _freeze(args.save_dir / "plan.json", manifest)
-    for sample, requests in planned:
+    for sample_index, (sample, requests) in enumerate(planned):
         for index, request in enumerate(requests):
             saved = probe.call(request, args.save_dir, structured_output=True)
             record = {"input_hash": manifest["holdout_sha256"],
-                      "sample_index": index, "elapsed": saved["elapsed"],
+                      "sample_index": sample_index, "batch_index": index,
+                      "sample_sid": sample["sid"],
+                      "body_digest": saved["body_digest"],
+                      "elapsed": saved["elapsed"],
                       "usage": saved["usage"], "schema_valid": False,
                       "semantic_review": "pending"}
             try:
@@ -223,6 +238,8 @@ def main(argv=None):
                 record["schema_valid"] = True
                 record["attribute_count"] = len(attributes)
                 record["summary_count"] = len(summaries)
+                record["attributes"] = attributes
+                record["summaries"] = summaries
                 record["existing_value_losses"] = probe.lost_existing_values(sample, attributes)
             except (ValidationError, ValueError, TypeError) as exc:
                 record["structural_error"] = type(exc).__name__

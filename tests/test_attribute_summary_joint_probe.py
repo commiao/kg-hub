@@ -64,11 +64,21 @@ class JointPlanTests(unittest.TestCase):
         for request in requests:
             context = json.loads(request["messages"][1]["content"])
             payload = {
-                key: {"attributes": item["attributes"],
+                key: {"attributes": {
+                          field: item["attributes"].get(field)
+                          for field in request["model"].model_fields[key].annotation
+                              .model_fields["attributes"].annotation.model_fields},
                       "summary": "Updated from source." if item["summary_required"] else None}
                 for key, item in context["entities"].items()
             }
             projections.append(joint.validate_output(request, payload))
+            first_key = next(iter(request["model"].model_fields))
+            field = next(iter(payload[first_key]["attributes"]), None)
+            if field is not None:
+                incomplete = json.loads(json.dumps(payload))
+                del incomplete[first_key]["attributes"][field]
+                with self.assertRaisesRegex(ValueError, "attribute fields are incomplete"):
+                    joint.validate_output(request, incomplete)
             if request["summary_targets"]:
                 bad = json.loads(json.dumps(payload))
                 first = next(iter(request["summary_targets"]))
