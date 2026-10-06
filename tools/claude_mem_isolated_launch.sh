@@ -31,14 +31,17 @@ env = dict(os.environ)
 config = root / 'gateway-queue.json'
 if config.exists():
     settings = json.loads(config.read_text())
-    allowed = {'CLAUDE_MEM_LLM_QUEUE_URL', 'CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE',
+    allowed = {'CLAUDE_MEM_LLM_QUEUE_URL', 'CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE', 'CLAUDE_MEM_LLM_QUEUE_TOKEN_ENV_FILE',
                'CLAUDE_MEM_LLM_BATCH_ITEMS', 'CLAUDE_MEM_LLM_BATCH_BYTES'}
     if set(settings) - allowed or not allowed.issuperset(settings):
         raise SystemExit('unexpected gateway queue setting')
-    for name in ('CLAUDE_MEM_LLM_QUEUE_URL', 'CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE'):
+    sources = [key for key in ('CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE', 'CLAUDE_MEM_LLM_QUEUE_TOKEN_ENV_FILE') if settings.get(key)]
+    if len(sources) != 1:
+        raise SystemExit('exactly one managed caller source is required')
+    for name in ('CLAUDE_MEM_LLM_QUEUE_URL', sources[0]):
         if not isinstance(settings.get(name), str) or not settings[name]:
             raise SystemExit('missing gateway queue setting: ' + name)
-    token = pathlib.Path(settings['CLAUDE_MEM_LLM_QUEUE_TOKEN_FILE'])
+    token = pathlib.Path(settings[sources[0]])
     if not token.is_absolute() or not token.is_file() or token.stat().st_mode & 0o077:
         raise SystemExit('gateway caller token must be an owner-only absolute file')
     env.update({key: str(value) for key, value in settings.items()})

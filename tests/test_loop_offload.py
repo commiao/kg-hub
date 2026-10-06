@@ -71,6 +71,9 @@ class _ThreadRecordingJournal:
         self._record()
         return []
 
+    def queue_business_receipts(self, *args):
+        self._record()
+
     def finish_task_execution(self, *args, **kwargs):
         self._record()
 
@@ -99,7 +102,7 @@ class TaskExecutionOffloadTests(unittest.IsolatedAsyncioTestCase):
             worker=worker, journal_factory=lambda: journal,
             business_result_persisted=persisted, deadline_seconds=180)
         self.assertEqual(result, "done")
-        self.assertEqual(len(journal.threads), 4)
+        self.assertEqual(len(journal.threads), 5)
         self.assertNotIn(threading.get_ident(), journal.threads)
 
 
