@@ -5535,10 +5535,11 @@ async def _application_lifespan(app):
     start_probe()
     await _start_reconciliation_mailbox()
     from utils.gateway_queue import receipt_loop
-    receipt_task = (asyncio.create_task(receipt_loop(journal_from_backup_env,
-        gateway_base_url(), gateway_token()), name='model-queue-business-receipts')
-        if INGEST_BACKUP_PATH else None)
+    receipt_task = None
     try:
+        if INGEST_BACKUP_PATH:
+            receipt_task = asyncio.create_task(receipt_loop(journal_from_backup_env,
+                gateway_base_url(), gateway_token()), name='model-queue-business-receipts')
         yield
     finally:
         if receipt_task is not None:

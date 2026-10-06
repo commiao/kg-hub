@@ -79,6 +79,11 @@ async def receipt_loop(journal_factory, base_url, token, *, interval=10):
                         response = await client.post(base_url+'/v1/queue/ack',
                             headers={'Authorization':'Bearer '+token}, json=payload)
                         response.raise_for_status()
+                        job = response.json().get('job', {})
+                        if (job.get('request_key') != payload['idempotency_key']
+                                or job.get('business_key') != payload['business_key']
+                                or job.get('business_receipt') != payload['receipt']):
+                            raise RuntimeError('business acknowledgement identity mismatch')
                         await asyncio.to_thread(journal.acknowledge_queue_receipt, payload['idempotency_key'])
             except asyncio.CancelledError:
                 raise

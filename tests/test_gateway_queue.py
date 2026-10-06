@@ -65,4 +65,22 @@ class QueueClientTests(unittest.IsolatedAsyncioTestCase):
             journal.complete('queue-k',json.dumps(ANSWER))
             self.assertEqual(json.loads(reopened.prepare(**args,queue_owned=True)),ANSWER)
 
+class BusinessReceiptTests(unittest.TestCase):
+    def test_only_durable_model_results_generate_receipts_and_receipts_survive_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            journal=ModelAttemptJournal(Path(root)/'journal.sqlite3')
+            args=dict(business_key=BODY['model'],source_description='s',source_obs_id='1',request_digest='d')
+            journal.prepare(key='complete',step_id='a',queue_owned=True,**args)
+            journal.prepare(key='pending',step_id='b',queue_owned=True,**args)
+            journal.prepare(key='legacy',step_id='c',**args)
+            journal.complete('complete',json.dumps(ANSWER))
+            journal.complete('legacy',json.dumps(ANSWER))
+            journal.queue_business_receipts('s','1','neo4j:episode:1')
+            reopened=ModelAttemptJournal(journal.path)
+            pending=reopened.pending_queue_receipts()
+            self.assertEqual([p['idempotency_key'] for p in pending],['complete'])
+            self.assertEqual(pending[0]['receipt'],{'state':'completed','reference':'neo4j:episode:1'})
+            reopened.acknowledge_queue_receipt('complete')
+            self.assertEqual(reopened.pending_queue_receipts(),[])
+
 if __name__ == '__main__': unittest.main()
