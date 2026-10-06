@@ -106,6 +106,8 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                       and not attempts["in_flight"]
                       and not attempts["unknown_without_http_evidence"]):
                     state = "failed"
+                    await asyncio.to_thread(journal.queue_business_receipts, sd, sid,
+                        'sqlite:task_execution:' + execution_id, 'failed')
                 await asyncio.to_thread(
                     journal.finish_task_execution,
                     sd, sid, execution_id, state=state,

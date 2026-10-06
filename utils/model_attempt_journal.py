@@ -194,15 +194,27 @@ class ModelAttemptJournal:
                  step_id, request_digest, stage, now, now, int(queue_owned)))
         return None
 
-    def queue_business_receipts(self, sd: str, sid: str, reference: str) -> None:
-        """Call only after the original graph receipt has been verified."""
+    def queue_business_receipts(self, sd: str, sid: str, reference: str, state: str = "completed") -> None:
+        """Call only after business completion/failure has been verified."""
+        if state not in {"completed", "failed"}:
+            raise ValueError("invalid business receipt state")
         with self._connect() as db:
-            receipt = json.dumps({'state': 'completed', 'reference': reference}, sort_keys=True)
+            receipt = json.dumps({'state': state, 'reference': reference}, sort_keys=True)
             db.execute("""INSERT OR IGNORE INTO queue_business_receipts
                 (idempotency_key,business_key,receipt)
                 SELECT idempotency_key,business_key,? FROM model_attempts
                 WHERE source_description=? AND source_obs_id=? AND queue_owned=1
-                AND phase='completed' AND result_json IS NOT NULL""", (receipt, sd, sid))
+                AND (phase='failed' OR (phase='completed' AND result_json IS NOT NULL))""", (receipt, sd, sid))
+
+    def missing_queue_receipt_tasks(self, after=("", ""), limit=50):
+        with self._connect() as db:
+            return db.execute("""SELECT DISTINCT a.source_description,a.source_obs_id
+                FROM model_attempts a LEFT JOIN queue_business_receipts r
+                ON r.idempotency_key=a.idempotency_key
+                WHERE a.queue_owned=1 AND a.phase='completed' AND a.result_json IS NOT NULL
+                AND r.idempotency_key IS NULL
+                AND (a.source_description,a.source_obs_id)>(?,?)
+                ORDER BY a.source_description,a.source_obs_id LIMIT ?""", (*after,limit)).fetchall()
 
     def pending_queue_receipts(self):
         with self._connect() as db:

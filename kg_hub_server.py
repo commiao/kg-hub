@@ -5538,8 +5538,16 @@ async def _application_lifespan(app):
     receipt_task = None
     try:
         if INGEST_BACKUP_PATH:
+            async def verify_queue_business_result(sd, sid):
+                from utils.task_execution import read_task
+                if graphiti is None:
+                    return None
+                row = await read_task(graphiti.driver, sd, sid)
+                if row and await _persisted_business_result(graphiti.driver, row):
+                    return 'neo4j:ingest:' + str(row.get('episode_uuid') or row.get('created_by_request'))
+                return None
             receipt_task = asyncio.create_task(receipt_loop(journal_from_backup_env,
-                gateway_base_url(), gateway_token()), name='model-queue-business-receipts')
+                gateway_base_url(), gateway_token(), verify_result=verify_queue_business_result), name='model-queue-business-receipts')
         yield
     finally:
         if receipt_task is not None:

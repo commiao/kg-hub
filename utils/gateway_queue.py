@@ -65,16 +65,35 @@ async def execute_queued(base_url, token, key, body, *, task_ids=None,
             response.raise_for_status()
 
 
-async def receipt_loop(journal_factory, base_url, token, *, interval=10):
+async def recover_business_receipts(journal, verify_result, cursor=("", "")):
+    """Recover the graph-commit/local-receipt crash gap using read-only evidence."""
+    rows = await asyncio.to_thread(journal.missing_queue_receipt_tasks, cursor)
+    for sd, sid in rows:
+        try:
+            reference = await verify_result(sd, sid)
+            if reference:
+                await asyncio.to_thread(journal.queue_business_receipts, sd, sid, reference)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            import logging
+            logging.getLogger('kg_hub.queue_receipts').exception('business result remains unverified')
+    return tuple(rows[-1]) if rows else ("", "")
+
+
+async def receipt_loop(journal_factory, base_url, token, *, interval=10, verify_result=None):
     """Retry only durable business acknowledgements, never a model invocation."""
     import logging
     import httpx
     log = logging.getLogger('kg_hub.queue_receipts')
+    cursor = ('', '')
     async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
         while True:
             try:
                 journal = await asyncio.to_thread(journal_factory)
                 if journal:
+                    if verify_result is not None:
+                        cursor = await recover_business_receipts(journal, verify_result, cursor)
                     for payload in await asyncio.to_thread(journal.pending_queue_receipts):
                         try:
                             response = await client.post(base_url+'/v1/queue/ack',

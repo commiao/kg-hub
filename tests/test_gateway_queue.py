@@ -83,4 +83,46 @@ class BusinessReceiptTests(unittest.TestCase):
             reopened.acknowledge_queue_receipt('complete')
             self.assertEqual(reopened.pending_queue_receipts(),[])
 
+class CrashGapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_graph_commit_receipt_gap_recovers_without_a_model_request(self):
+        from utils.gateway_queue import recover_business_receipts
+        with tempfile.TemporaryDirectory() as root:
+            journal=ModelAttemptJournal(Path(root)/'j.sqlite3')
+            for sid in ['1','2']:
+                journal.prepare(key=sid,business_key=BODY['model'],source_description='s',
+                    source_obs_id=sid,step_id=sid,request_digest=sid,queue_owned=True)
+                journal.complete(sid,json.dumps(ANSWER))
+            checked=[]
+            async def verify(sd,sid):
+                checked.append((sd,sid))
+                return 'neo4j:episode:2' if sid=='2' else None
+            cursor=await recover_business_receipts(ModelAttemptJournal(journal.path),verify)
+            self.assertEqual(cursor,('s','2'))
+            self.assertEqual(checked,[('s','1'),('s','2')])
+            self.assertEqual([r['idempotency_key'] for r in journal.pending_queue_receipts()],['2'])
+            self.assertEqual(await recover_business_receipts(journal,verify,cursor),('', ''))
+
+    async def test_queue_failure_records_authoritative_call_status(self):
+        import model_gateway_client as mgc
+        from unittest import mock
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as root:
+            journal=ModelAttemptJournal(Path(root)/'j.sqlite3')
+            direct=mock.AsyncMock(side_effect=AssertionError('direct model execution forbidden'))
+            async def queued(*args):
+                raise QueueOutcomeError({'state':'failed','error':{'code':'input_too_large'}})
+            client=SimpleNamespace(messages=SimpleNamespace(create=direct))
+            mgc.install_gateway_request_contract(client,queue_transport=queued)
+            with mock.patch.object(mgc,'journal_from_backup_env',return_value=journal), \
+                 mock.patch.object(mgc,'gateway_token',return_value='fixture'), \
+                 mock.patch.object(mgc,'query_gateway_attempt_status',return_value={
+                     'phase':'preflight','provider_call_started':False,'http_status':400}):
+                with mgc.model_business_task('s','1'), mgc.model_operation('ingest.episode','1'):
+                    with self.assertRaises(QueueOutcomeError):
+                        await client.messages.create(**BODY)
+            self.assertEqual(journal.find_task('s','1')[0]['provider_call_started'],0)
+            direct.assert_not_called()
+            journal.queue_business_receipts('s','1','sqlite:task:1','failed')
+            self.assertEqual(journal.pending_queue_receipts()[0]['receipt']['state'],'failed')
+
 if __name__ == '__main__': unittest.main()
