@@ -5540,10 +5540,9 @@ async def _application_lifespan(app):
         if INGEST_BACKUP_PATH:
             async def verify_queue_business_result(sd, sid):
                 from utils.task_execution import read_task
-                if graphiti is None:
-                    return None
-                row = await read_task(graphiti.driver, sd, sid)
-                if row and await _persisted_business_result(graphiti.driver, row):
+                driver = get_status_driver()
+                row = await read_task(driver, sd, sid)
+                if row and await _persisted_business_result(driver, row):
                     return 'neo4j:ingest:' + str(row.get('episode_uuid') or row.get('created_by_request'))
                 return None
             receipt_task = asyncio.create_task(receipt_loop(journal_from_backup_env,

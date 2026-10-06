@@ -125,4 +125,53 @@ class CrashGapTests(unittest.IsolatedAsyncioTestCase):
             journal.queue_business_receipts('s','1','sqlite:task:1','failed')
             self.assertEqual(journal.pending_queue_receipts()[0]['receipt']['state'],'failed')
 
+class LifespanReceiptWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_lifespan_callback_uses_status_driver_and_requires_persisted_result(self):
+        import ast
+        import asyncio
+        from contextlib import asynccontextmanager
+        from unittest import mock
+        import utils.gateway_queue as queue
+        import utils.task_execution as tasks
+        import utils.loop_block_probe as probe
+        source = Path(__file__).resolve().parents[1] / 'kg_hub_server.py'
+        tree = ast.parse(source.read_text())
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.AsyncFunctionDef) and node.name == '_application_lifespan')
+        module = ast.Module(body=[function], type_ignores=[])
+        row = {'episode_uuid': 'stored-episode'}
+        for stored, verified, expected in [(None, False, None), (row, False, None),
+                                           (row, True, 'neo4j:ingest:stored-episode')]:
+            driver = object()
+            observed = asyncio.get_running_loop().create_future()
+            async def receipt_loop(factory, url, token, *, verify_result):
+                try:
+                    observed.set_result(await verify_result('source', 'observation'))
+                except Exception as exc:
+                    observed.set_exception(exc)
+                await asyncio.Future()
+            verify = mock.AsyncMock(return_value=verified)
+            namespace = {'asyncio': asyncio, 'asynccontextmanager': asynccontextmanager,
+                         '_start_reconciliation_mailbox': mock.AsyncMock(),
+                         '_stop_reconciliation_mailbox': mock.AsyncMock(),
+                         'INGEST_BACKUP_PATH': '/owned/fixture',
+                         'get_status_driver': mock.Mock(return_value=driver),
+                         '_persisted_business_result': verify,
+                         'journal_from_backup_env': mock.Mock(),
+                         'gateway_base_url': lambda: 'http://fixture',
+                         'gateway_token': lambda: 'fixture'}
+            exec(compile(module, str(source), 'exec'), namespace)
+            with mock.patch.object(queue, 'receipt_loop', receipt_loop), \
+                 mock.patch.object(tasks, 'read_task', mock.AsyncMock(return_value=stored)) as read, \
+                 mock.patch.object(probe, 'start_probe'), \
+                 mock.patch.object(probe, 'stop_probe', mock.AsyncMock()):
+                async with namespace['_application_lifespan'](None):
+                    self.assertEqual(await asyncio.wait_for(observed, 2), expected)
+                read.assert_awaited_once_with(driver, 'source', 'observation')
+                namespace['get_status_driver'].assert_called_once_with()
+                if stored:
+                    verify.assert_awaited_once_with(driver, stored)
+                else:
+                    verify.assert_not_awaited()
+
 if __name__ == '__main__': unittest.main()
