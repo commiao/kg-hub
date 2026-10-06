@@ -99,6 +99,8 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                 state = "uncertain"
                 if complete:
                     state = "succeeded"
+                    await asyncio.to_thread(journal.queue_business_receipts, sd, sid,
+                        'neo4j:ingest:' + str(row.get('episode_uuid') or original_request_id))
                 elif (returned and owns_row and row.get("status") in {
                         "error", "needs_reconciliation", "failed"}
                       and not attempts["in_flight"]

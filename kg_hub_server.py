@@ -5534,9 +5534,20 @@ async def _application_lifespan(app):
     from utils.loop_block_probe import start_probe, stop_probe
     start_probe()
     await _start_reconciliation_mailbox()
+    from utils.gateway_queue import receipt_loop
+    receipt_task = None
     try:
+        if INGEST_BACKUP_PATH:
+            receipt_task = asyncio.create_task(receipt_loop(journal_from_backup_env,
+                gateway_base_url(), gateway_token()), name='model-queue-business-receipts')
         yield
     finally:
+        if receipt_task is not None:
+            receipt_task.cancel()
+            try:
+                await receipt_task
+            except asyncio.CancelledError:
+                pass
         await _stop_reconciliation_mailbox()
         await stop_probe()
 

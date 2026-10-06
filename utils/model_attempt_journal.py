@@ -56,6 +56,12 @@ class ModelAttemptJournal:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
+            if "queue_owned" not in columns:
+                db.execute("ALTER TABLE model_attempts ADD COLUMN queue_owned INTEGER NOT NULL DEFAULT 0")
+            db.execute("""CREATE TABLE IF NOT EXISTS queue_business_receipts (
+                idempotency_key TEXT PRIMARY KEY, business_key TEXT NOT NULL,
+                receipt TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)""")
             # Existing NAS journals predate the local HTTP-start marker.
             columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
             if "http_started_at" not in columns:
@@ -139,12 +145,12 @@ class ModelAttemptJournal:
 
     def prepare(self, *, key: str, business_key: str, source_description: str,
                 source_obs_id: str, step_id: str, request_digest: str,
-                stage: str | None = None) -> str | None:
+                stage: str | None = None, queue_owned: bool = False) -> str | None:
         """Commit exact identity before HTTP; return a prior complete response."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT phase, provider_call_started, step_id, request_digest, result_json, stage "
+                "SELECT phase, provider_call_started, step_id, request_digest, result_json, stage, queue_owned "
                 "FROM model_attempts WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if row and row[2:4] != (step_id, request_digest):
@@ -163,6 +169,10 @@ class ModelAttemptJournal:
             if completed:
                 return completed[0]
             if row:
+                if queue_owned and row[6]:
+                    # Resume only this exact durable queue identity. This does
+                    # not authorize a new paid attempt or legacy SDK replay.
+                    return row[4] if row[0] == 'completed' else None
                 if row[0] == "completed" and row[4]:
                     return row[4]
                 if row[0] == "preflight" and row[1] == 0:
@@ -178,11 +188,32 @@ class ModelAttemptJournal:
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, stage, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at, queue_owned)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)""",
                  (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, stage, now, now))
+                 step_id, request_digest, stage, now, now, int(queue_owned)))
         return None
+
+    def queue_business_receipts(self, sd: str, sid: str, reference: str) -> None:
+        """Call only after the original graph receipt has been verified."""
+        with self._connect() as db:
+            receipt = json.dumps({'state': 'completed', 'reference': reference}, sort_keys=True)
+            db.execute("""INSERT OR IGNORE INTO queue_business_receipts
+                (idempotency_key,business_key,receipt)
+                SELECT idempotency_key,business_key,? FROM model_attempts
+                WHERE source_description=? AND source_obs_id=? AND queue_owned=1
+                AND phase='completed' AND result_json IS NOT NULL""", (receipt, sd, sid))
+
+    def pending_queue_receipts(self):
+        with self._connect() as db:
+            return [{'idempotency_key': key, 'business_key': business, 'receipt': json.loads(receipt)}
+                    for key, business, receipt in db.execute(
+                        'SELECT idempotency_key,business_key,receipt FROM queue_business_receipts '
+                        'WHERE acknowledged=0 LIMIT 50')]
+
+    def acknowledge_queue_receipt(self, key):
+        with self._connect() as db:
+            db.execute('UPDATE queue_business_receipts SET acknowledged=1 WHERE idempotency_key=?', (key,))
 
     def complete(self, key: str, result_json: str) -> None:
         """The client received a model response; business completion is separate."""
@@ -532,7 +563,8 @@ class ModelAttemptJournal:
     def claim_retry(self, grant_id: str, *, source_description: str,
                     source_obs_id: str, step_id: str, request_digest: str,
                     business_key: str, base_key: str, deadline_seconds: float,
-                    stage: str | None = None, execution_id: str | None = None) -> str:
+                    stage: str | None = None, execution_id: str | None = None,
+                    queue_owned: bool = False) -> str:
         """Consume a grant and reserve a fresh exact-call identity atomically."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -578,10 +610,10 @@ class ModelAttemptJournal:
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, stage, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at, queue_owned)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)""",
                 (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, stage, now, now))
+                 step_id, request_digest, stage, now, now, int(queue_owned)))
             changed = db.execute("""UPDATE model_retry_grants SET state = 'consumed',
                 consumed_at = ? WHERE grant_id = ? AND state = 'granted'""",
                 (now, grant_id))
