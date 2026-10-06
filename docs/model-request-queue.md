@@ -38,5 +38,8 @@ Merge only `deploy/claude-mem/mac-office.settings-overlay.json` into both
 claude-mem `deploy/check_settings.py --approved ... --live ... --apply` tool.
 Preserve the remaining settings and owner-only permissions. This disables hook
 autostart so the managed isolated launcher owns process startup. Activate the
-13.29 artifact and capture handoff journal before stopping the drained isolated
-worker. Never stop the legacy RAM-only worker on port 37701.
+tested artifact matching each installed hook version, then activate the final
+managed worker artifact and capture handoff journal before stopping the drained
+isolated worker. The October 6 rollout uses the tested 13.29 bundle for the
+installed Codex hook and the tested 13.32 bundle for the managed worker and
+Claude hooks; do not downgrade a newer plugin installation. Never stop the legacy RAM-only worker on port 37701.
