@@ -76,15 +76,20 @@ async def receipt_loop(journal_factory, base_url, token, *, interval=10):
                 journal = await asyncio.to_thread(journal_factory)
                 if journal:
                     for payload in await asyncio.to_thread(journal.pending_queue_receipts):
-                        response = await client.post(base_url+'/v1/queue/ack',
-                            headers={'Authorization':'Bearer '+token}, json=payload)
-                        response.raise_for_status()
-                        job = response.json().get('job', {})
-                        if (job.get('request_key') != payload['idempotency_key']
-                                or job.get('business_key') != payload['business_key']
-                                or job.get('business_receipt') != payload['receipt']):
-                            raise RuntimeError('business acknowledgement identity mismatch')
-                        await asyncio.to_thread(journal.acknowledge_queue_receipt, payload['idempotency_key'])
+                        try:
+                            response = await client.post(base_url+'/v1/queue/ack',
+                                headers={'Authorization':'Bearer '+token}, json=payload)
+                            response.raise_for_status()
+                            job = response.json().get('job', {})
+                            if (job.get('request_key') != payload['idempotency_key']
+                                    or job.get('business_key') != payload['business_key']
+                                    or job.get('business_receipt') != payload['receipt']):
+                                raise RuntimeError('business acknowledgement identity mismatch')
+                            await asyncio.to_thread(journal.acknowledge_queue_receipt, payload['idempotency_key'])
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            log.exception('business receipt remains queued: %s', payload['idempotency_key'])
             except asyncio.CancelledError:
                 raise
             except Exception:

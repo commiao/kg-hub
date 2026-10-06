@@ -21,3 +21,9 @@ Model success and graph completion are therefore separate monitorable states.
 Deploy the gateway queue API before this client. No fallback to a direct paid
 model call occurs if the queue is unavailable. Existing graph ingest identifiers,
 result checks and unresolved legacy attempts are preserved.
+
+For the isolated Mac observer, the managed launcher reads the non-secret
+`~/.claude-mem-next/gateway-queue.json` manifest. It accepts only the queue URL,
+caller-token file path and business batch budgets. The token file must be
+absolute and owner-only. Removing this manifest is not a migration rollback:
+queue-owned work must keep its original executor and durable state.
