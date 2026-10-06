@@ -772,7 +772,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 future.cancel()
             raise
         except Exception as exc:
-            if journal and prepared and queue_transport is None:
+            from utils.gateway_queue import QueueOutcomeError
+            if journal and prepared and (queue_transport is None or isinstance(exc, QueueOutcomeError)):
                 try:
                     status = await asyncio.to_thread(
                         query_gateway_attempt_status, gateway_base_url(), gateway_token(),
@@ -780,6 +781,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     )
                 except Exception:
                     status = {"phase": "unknown", "provider_call_started": None}
+                if isinstance(exc, QueueOutcomeError) and exc.job['state'] == 'failed':
+                    status = {**status, 'phase': 'failed'}
                 reconciliation = await asyncio.to_thread(journal.update_gateway_status, key, status)
                 if reconciliation.provider_call_started is not False:
                     exc = reconciliation

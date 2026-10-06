@@ -1,9 +1,9 @@
 # Keep installed hook clients on the tested 13.29 queue-capable worker bundle.
-# Source: commiao/claude-mem PR #14 (92cae735 tree, merged to main).
+# Source: commiao/claude-mem PR #14 plus managed-caller token rotation support.
 # Publish the full immutable claude-mem release before activating this manifest.
 # Older plugin versions are deliberately excluded; the RAM-only worker is preserved.
 version=13.29.0
-sha256=528d2a88e627dab17d815a46575e7056799fda78fc37eff56f61309c6995e0b9
+sha256=0d24a8f11928d4094cbc5030892a274b1e73facccbd46de6f2d5c63c1b7311f8
 marker=cm-op
 source=~/.local/share/claude-mem/current/plugin/scripts/worker-service.cjs
 target=.claude/plugins/marketplaces/thedotmack/plugin
