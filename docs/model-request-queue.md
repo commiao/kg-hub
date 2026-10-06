@@ -27,3 +27,16 @@ For the isolated Mac observer, the managed launcher reads the non-secret
 caller-token file path and business batch budgets. The token file must be
 absolute and owner-only. Removing this manifest is not a migration rollback:
 queue-owned work must keep its original executor and durable state.
+
+The reviewed mac-office profile is `deploy/claude-mem/mac-office.queue.json`.
+Install it atomically at the manifest path with mode 0600 after backing up the
+previous file. It references the existing credvault-managed `.env`; no caller
+secret is copied into Git or another credential file.
+
+Merge only `deploy/claude-mem/mac-office.settings-overlay.json` into both
+`~/.claude-mem/settings.json` and `~/.claude-mem-next/settings.json` with the
+claude-mem `deploy/check_settings.py --approved ... --live ... --apply` tool.
+Preserve the remaining settings and owner-only permissions. This disables hook
+autostart so the managed isolated launcher owns process startup. Activate the
+13.29 artifact and capture handoff journal before stopping the drained isolated
+worker. Never stop the legacy RAM-only worker on port 37701.
