@@ -324,7 +324,7 @@ def kghub_stage(keys: dict | None, timing: dict, active: int | None) -> dict:
     sub = f"在飞 {active if active is not None else '?'} · pending {keys.get('pending', 0)}"
     detail = [f"IngestedKey 状态分布：{json.dumps(keys.get('by_status') or {}, ensure_ascii=False)}",
               f"最老 pending：{_human(oldest)}",
-              f"近 24h 失败/待核对：{json.dumps(keys.get('errors_24h') or {}, ensure_ascii=False)}",
+              f"近 24h 失败/待核验：{json.dumps(keys.get('errors_24h') or {}, ensure_ascii=False)}",
               f"领取→终态耗时 P50 {keys.get('duration_p50')}s · P90 {keys.get('duration_p90')}s"
               f"（近 24h {keys.get('duration_samples', 0)} 条成功）"]
     if timing.get("samples"):
@@ -488,6 +488,8 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
             row = grouped.setdefault(bucket, {"at": at, "current": None, "legacy": None,
                                               "current_rate": None, "legacy_rate": None,
                                               "total": None})
+            held = point.get("held")
+            row[worker+"_held"] = held if isinstance(held, int) and not isinstance(held, bool) and held >= 0 else None
             row[worker] = depth
             row[worker+"_rate"] = None
             row[worker+"_at"] = at
@@ -1170,12 +1172,12 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列</h2>
 <div class=cards id=cmcards></div>
-<div class=note>队列剩余趋势：最近 7 天，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。数量持平不能说明 worker 是否在正常处理。</div>
+<div class=note>队列剩余趋势：最近 7 天，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。数量持平不能说明 worker 是否在正常处理。</div>
 <div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
-<div class=note>剩余趋势：最近 7 天；净速度：最近 24 小时，单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核对单列，不算入图成功。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
+<div class=note>剩余趋势：最近 7 天；净速度：最近 24 小时，单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
 <div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
@@ -1199,7 +1201,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
 refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
-live/backlog 剩余曲线由 refinery 每两分钟独立采样，保存在 refinery 状态卷，保留七天；看板无人访问时仍采样。旧版 backlog 的按请求快照仅补充剩余历史，不据此推算净速度。净速度是相邻有效快照的队列净减少量/实际小时数，可能包含过滤或移入待核对，不等于成功入图。<br>
+live/backlog 剩余曲线由 refinery 每两分钟独立采样，保存在 refinery 状态卷，保留七天；看板无人访问时仍采样。旧版 backlog 的按请求快照仅补充剩余历史，不据此推算净速度。净速度是相邻有效快照的队列净减少量/实际小时数，可能包含过滤或移入待核验，不等于成功入图。<br>
 关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
@@ -1217,8 +1219,9 @@ $('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
    const w=(h.current||[]).find(w=>w.worker===key);
    const at=w&&Number.isFinite(w.at)?new Date(w.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'未知';
    const depth=w&&Number.isFinite(w.depth)?w.depth+' 条':'暂无数据';
+   const held=w&&Number.isFinite(w.held)?w.held+' 条':'未知';
    const warning=h.stale?'数据过期':h.error||w?.error?'采样异常':'';
-   return '<div class=card><b>'+esc(h.host)+' · '+label+'</b><div>队列剩余：'+depth+'</div><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
+   return '<div class=card><b>'+esc(h.host)+' · '+label+'</b><div>队列剩余：'+depth+'</div><div>待核验：'+held+'</div><small>'+esc(w?.held_error||'')+'</small><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
  })).join(''):'<div class=note>暂无 claude-mem 采样数据</div>';
 $('gen').textContent='快照 '+D.generated_at_beijing+' · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
 if(D.source_errors.length){$('errs').innerHTML='<div class=warn>部分数据源不可读：'+D.source_errors.map(esc).join('；')+'</div>'}
@@ -1276,7 +1279,7 @@ const processingData=[
 const backlogData=[];
 const kgQueues=D.refinery_queue_trends||{rows:[],latest:null,stale:true};
 const kgLast=kgQueues.latest;
-$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核对 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
+$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核验 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
 ['live','backlog'].forEach(k=>{
  let rows=kgQueues.rows||[];
  if(k==='backlog'){
@@ -1286,7 +1289,7 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
  }
  const color=k==='live'?'#378ADD':'#8250C4';
  backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:10,continuity:true,rows,
-   series:[['剩余',k,color]]});
+   series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
  backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:10,continuity:true,zeroBaseline:true,
    rows:(kgQueues.rows||[]).filter(r=>Date.parse(r.at)>=Date.parse(D.generated_at)-86400000),
    series:[['净消化速度',k+'_rate',color]]});
@@ -1296,7 +1299,7 @@ const cmOffset=backlogData.length;
 compressionHosts.forEach(h=>{
  [['current','新 worker','#D97706'],['legacy','旧 worker','#9333EA']].forEach(([key,name,color])=>{
    backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows||[],
-     series:[['剩余',key,color]]});
+     series:[['剩余',key,color],['待核验',key+'_held','#E07A5F']]});
  });
 });
 const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
