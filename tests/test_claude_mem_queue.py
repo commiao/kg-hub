@@ -1,5 +1,7 @@
 """Queue telemetry must not turn unavailable/restarted workers into digestion."""
 import json
+import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -8,7 +10,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from tools.claude_mem_queue import collect
+from tools.claude_mem_queue import collect, reconciliation_count
 from flow_dashboard import claude_mem_trends, _HTML
 
 NOW=1790863200.0
@@ -62,6 +64,50 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(row['stale'])
         self.assertNotIn('claude-mem · 压缩队列积压',_HTML)
         self.assertIn('kg-hub · 入图积压消化',_HTML)
+
+class HeldQueueTests(unittest.TestCase):
+    def test_current_states_not_steps_or_historical_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'worker.db'
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute('CREATE TABLE observer_tasks (id TEXT PRIMARY KEY, state TEXT)')
+                db.executemany('INSERT INTO observer_tasks VALUES (?,?)',
+                               [('a','reconciliation'),('b','reconciliation'),('c','succeeded'),('d','queued')])
+                db.execute('CREATE TABLE legacy_queue_evidence (disposition TEXT)')
+                db.execute("INSERT INTO legacy_queue_evidence VALUES ('needs_manual_reconciliation')")
+            self.assertEqual(reconciliation_count(path),(2,None))
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("UPDATE observer_tasks SET state='succeeded' WHERE state='reconciliation'")
+            self.assertEqual(reconciliation_count(path),(0,None))
+            self.assertIsNone(reconciliation_count(path.with_name('missing.db'))[0])
+            self.assertFalse(path.with_name('missing.db').exists())
+
+    def test_old_history_migration_leaves_missing_held_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp);state=home/'.kg-hub/state/claude-mem-queue.sqlite3'
+            state.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(state)) as db, db:
+                db.execute('CREATE TABLE samples (worker TEXT,bucket INTEGER,at REAL,depth INTEGER,pid TEXT,source TEXT,PRIMARY KEY(worker,bucket))')
+                db.execute('INSERT INTO samples VALUES (?,?,?,?,?,?)',('current',int(NOW-3600)//3600,NOW-3600,22,'42','live'))
+            source=home/'.claude-mem-next/claude-mem.db';source.parent.mkdir()
+            with closing(sqlite3.connect(source)) as db, db:
+                db.execute('CREATE TABLE observer_tasks (state TEXT)')
+                db.executemany('INSERT INTO observer_tasks VALUES (?)',[('reconciliation',),('running',)])
+            http=lambda url,**kw: ({'pid':42} if url.endswith('health') else {'queueDepth':20},None)
+            a=collect(home,http,NOW)
+            self.assertIsNone(a['history'][0]['held'])
+            self.assertEqual(a['current'][1]['held'],1)
+            self.assertIsNone(a['current'][0]['held'])
+            b=collect(home,http,NOW+60)
+            self.assertEqual(len(b['history']),3)
+            trend=claude_mem_trends([dict(claude_mem_queue=b)],datetime.fromtimestamp(NOW+60,timezone.utc))[0]
+            self.assertIsNone(trend['rows'][0]['current_held'])
+            self.assertEqual(trend['rows'][-1]['current_held'],1)
+
+    def test_invalid_held_is_not_zero(self):
+        history=[dict(worker='current',at=NOW-i*3600,depth=20,held=v) for i,v in enumerate([0,None,-1,True,'2'])]
+        trend=claude_mem_trends([dict(claude_mem_queue=dict(sampled_at=NOW,history=history))],datetime.fromtimestamp(NOW,timezone.utc))[0]
+        self.assertEqual([r['current_held'] for r in trend['rows']],[None,None,None,None,0])
 
 class TrendRangeTests(unittest.TestCase):
     def build(self, history, **kw):
