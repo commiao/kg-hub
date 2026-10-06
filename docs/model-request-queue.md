@@ -1,0 +1,23 @@
+# Shared model request queue
+
+The production `create_gateway_client` sends named Anthropic request parameters
+to the model gateway's durable `/v1/queue/submit` API and polls the same identity.
+Business operation IDs, exact request parameters, structured-output repair and
+stage checkpoints stay in kg-hub. Rate/quota/concurrency waiting is centralized
+in the gateway, with SDK and client-side paid-request retries disabled.
+
+Queue-owned model intents can resume after process interruption by submitting
+exactly the same key/body. Older direct HTTP attempts retain their existing
+reconciliation requirements. An unknown result does not authorize a new key.
+The raw result remains in the gateway; the local model journal stores the
+business-facing response. Human-authorized retries keep the original local
+attempt limits and are submitted as new, explicitly granted queue identities.
+
+After `business_result_persisted` verifies the graph result, a separate durable
+business receipt is created. The application lifespan runs a receipt sender;
+failed acknowledgements remain local and retry without a model invocation.
+Model success and graph completion are therefore separate monitorable states.
+
+Deploy the gateway queue API before this client. No fallback to a direct paid
+model call occurs if the queue is unavailable. Existing graph ingest identifiers,
+result checks and unresolved legacy attempts are preserved.
