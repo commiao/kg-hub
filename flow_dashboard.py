@@ -223,17 +223,38 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
 
 # ---------- 各段状态 ----------
 
-def probe_stages(snapshots: list[dict]) -> dict[str, dict]:
+def probe_stages(snapshots: list[dict], now: datetime | None = None) -> dict[str, dict]:
     """从探针快照里取前半段（工具 / claude-mem / 同步）的节点，按段合并成最坏状态。"""
     groups: dict[str, list[tuple[dict, dict]]] = {"tools": [], "claude_mem": [], "sync": []}
+    now = now or datetime.now(timezone.utc)
     for snap in snapshots or []:
+        # Migrated hosts still publish the old :37701/SQLite topology nodes.
+        # Their current-worker queue probe is the authoritative active source.
+        telemetry = snap.get("claude_mem_queue") or {}
+        current = next((w for w in telemetry.get("current", [])
+                        if w.get("worker") == "current"), None)
+        if current is not None:
+            depth, at = current.get("depth"), current.get("at")
+            stale = (not isinstance(at, (int, float))
+                     or not 0 <= now.timestamp() - at <= 1200)
+            valid = (isinstance(depth, int) and not isinstance(depth, bool)
+                     and depth >= 0 and current.get("pid") and not current.get("error"))
+            state = "grey" if stale else "red" if not valid else "amber" if current.get("held_error") else "green"
+            detail = ("新 worker 采样过期或缺失" if stale else
+                      current.get("error") or ("新 worker 健康或队列采样无效" if not valid else
+                      f"队列剩余 {depth} 条；待核验 {current.get('held', '未知')} 条"))
+            if current.get("held_error"):
+                detail += "；" + current["held_error"]
+            groups["claude_mem"].append((snap, {"id": "worker", "label": "claude-mem 新 worker",
+                "state": state, "detail": detail,
+                "metrics": {"queue_depth": depth if valid and not stale else None}}))
         for node in snap.get("nodes") or []:
             if not isinstance(node, dict):
                 continue
             layer, node_id = node.get("layer"), node.get("id")
             if layer in ("device", "tool", "hook"):
                 groups["tools"].append((snap, node))
-            elif node_id in ("worker", "sqlite"):
+            elif node_id in ("worker", "sqlite") and current is None:
                 groups["claude_mem"].append((snap, node))
             elif node_id in ("sync", "nasdb"):
                 groups["sync"].append((snap, node))
@@ -863,7 +884,7 @@ ARCH_MERMAID = """flowchart TB
 
 APP_ARCH_MERMAID = """flowchart LR
   subgraph MAC["Mac"]
-    CC["编码工具 + hook"] --> CMW["claude-mem worker :37701"]
+    CC["编码工具 + hook"] --> CMW["claude-mem worker :37721"]
     CMW --> CMDB[("claude-mem.db")]
     SYNC["sync_claude_mem_to_nas.sh（launchd）"]
     PROBE["capture_probe 探针（launchd）"]
@@ -904,7 +925,7 @@ def build_flow(*, status: dict, snapshots: list[dict], gateway_node: dict | None
                remaining_history: list[dict] | None = None,
                queue_trends: dict | None = None) -> dict:
     status = status if isinstance(status, dict) else {}
-    probed = probe_stages(snapshots)
+    probed = probe_stages(snapshots, now)
     per_stage = {
         **probed,
         "refinery": refinery_stage(status, now),

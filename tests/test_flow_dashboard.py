@@ -251,6 +251,23 @@ class StageTests(unittest.TestCase):
                                            "metrics": {"queue_depth": 42}}]}
         self.assertEqual(F.probe_stages([snap])["claude_mem"]["sub"], "内存队列 42")
 
+    def test_migrated_host_uses_current_worker_not_retired_probe(self):
+        snap = {"_host": "mac", "nodes": [
+            {"id": "worker", "state": "red", "detail": "old :37701 unavailable"},
+            {"id": "sqlite", "state": "amber", "detail": "old database stale"}],
+            "claude_mem_queue": {"current": [{"worker": "current", "at": NOW.timestamp(),
+                "depth": 0, "pid": "29149", "held": 0, "error": None}]}}
+        stage = F.probe_stages([snap], NOW)["claude_mem"]
+        self.assertEqual(stage["state"], "green")
+        self.assertNotIn("old", stage["detail"])
+        current = snap["claude_mem_queue"]["current"][0]
+        current.update(depth=None, error="队列接口不可用")
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "red")
+        current.update(depth=0, error=None, at=NOW.timestamp()-1201)
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "grey")
+        current.update(at=NOW.timestamp(), held_error="待核验账本不可读")
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "amber")
+
 
 class DiagramTests(unittest.TestCase):
     def test_topology_marks_the_choke_and_escapes_labels(self):
