@@ -705,8 +705,9 @@ async def health(request: Request) -> JSONResponse:
 async def model_readiness(request: Request) -> JSONResponse:
     """Authenticated, no-charge availability probe for refinery recovery."""
     import httpx
+    from utils.refinery_recovery import GATEWAY_READINESS_TIMEOUT
     try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=GATEWAY_READINESS_TIMEOUT, follow_redirects=False) as client:
             response = await client.get(f"{gateway_base_url()}/health/ready")
             ready = response.status_code == 200 and response.json().get("status") == "ok"
     except Exception:  # no upstream content or credentials in the response

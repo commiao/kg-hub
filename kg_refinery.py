@@ -1219,7 +1219,8 @@ async def main() -> int:
                     # No model request is used as a health check. A real durable
                     # terminal-write failure must remain paused until repaired.
                     code, health = await asyncio.to_thread(
-                        _http, "GET", f"{KG_HUB_URL}/api/model-readiness", None, 8)
+                        _http, "GET", f"{KG_HUB_URL}/api/model-readiness", None,
+                        recovery.READINESS_PROXY_TIMEOUT)
                     recovery.probe_result(quota_pause,
                                           code == 200 and health.get("status") == "ok")
                     save_recovery()
