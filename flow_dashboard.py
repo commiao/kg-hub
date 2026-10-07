@@ -1215,7 +1215,7 @@ const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const compressionHosts=D.claude_mem_trends||[];
 $('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
- [['current','新 worker'],['legacy','旧 worker']].map(([key,label])=>{
+ [['current','新 worker']].map(([key,label])=>{
    const w=(h.current||[]).find(w=>w.worker===key);
    const at=w&&Number.isFinite(w.at)?new Date(w.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'未知';
    const depth=w&&Number.isFinite(w.depth)?w.depth+' 条':'暂无数据';
@@ -1297,7 +1297,7 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
 backlogData.push(...processingData);
 const cmOffset=backlogData.length;
 compressionHosts.forEach(h=>{
- [['current','新 worker','#D97706'],['legacy','旧 worker','#9333EA']].forEach(([key,name,color])=>{
+ [['current','新 worker','#D97706']].forEach(([key,name,color])=>{
    backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows||[],
      series:[['剩余',key,color],['待核验',key+'_held','#E07A5F']]});
  });
