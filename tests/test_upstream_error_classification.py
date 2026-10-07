@@ -84,6 +84,14 @@ class ClassifyByStatusCodeTests(unittest.TestCase):
             exc = _Err("完全没见过的一句话", status_code=code, name="InternalServerError")
             self.assertEqual(self.classify(exc), "upstream_error", f"HTTP {code}")
 
+    def test_httpx_response_status_is_classified(self):
+        from types import SimpleNamespace
+        for code, expected in ((503, "upstream_error"), (502, "upstream_error"),
+                               (400, None)):
+            exc = _Err("queue submit rejected", name="HTTPStatusError")
+            exc.response = SimpleNamespace(status_code=code)
+            self.assertEqual(self.classify(exc), expected)
+
     def test_provider_circuit_code_identifies_a_zero_call_refusal(self):
         exc = _Err("localized text may change", status_code=503,
                    body={"type": "error", "error": {
