@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import math
 import os
 import sqlite3
 import time
@@ -105,6 +106,27 @@ def _hour_key(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
 
 
+RANGE_LABELS = {"month": "最近1月", "week": "最近1周", "day": "最近1天",
+                "6h": "最近6小时", "3h": "最近3小时", "1h": "最近1小时",
+                "yesterday": "昨天", "today": "今天"}
+
+
+def time_range(key: str, now: datetime) -> dict:
+    if key not in RANGE_LABELS:
+        raise ValueError("无效时间范围")
+    midnight = now.astimezone(timezone(timedelta(hours=8))).replace(
+        hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    end = midnight if key == "yesterday" else now
+    if key in ("today", "yesterday"):
+        start = midnight - timedelta(days=key == "yesterday")
+    else:
+        start = now - timedelta(hours={"month": 720, "week": 168, "day": 24,
+                                       "6h": 6, "3h": 3, "1h": 1}[key])
+    return {"key": key, "label": RANGE_LABELS[key], "start": start.isoformat(),
+            "end": end.isoformat(), "start_beijing": _beijing_time(start),
+            "end_beijing": _beijing_time(end), "timezone": "Asia/Shanghai"}
+
+
 def _model_attempt_rows(since: datetime) -> list[tuple]:
     """Read the existing journal without its schema setup or write transaction."""
     backup = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
@@ -122,12 +144,16 @@ def _model_attempt_rows(since: datetime) -> list[tuple]:
 def key_metric_trends(*, now: datetime, commits: list[dict],
                       attempts: list[tuple] | None,
                       outcomes: list[dict] | None,
-                      archived_commits: list[dict] | None = None) -> list[dict]:
+                      archived_commits: list[dict] | None = None,
+                      window_start: datetime | None = None) -> list[dict]:
     """Hourly UTC buckets. None means unavailable; zero means observed zero."""
-    start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+    start = (window_start or (now.replace(minute=0, second=0, microsecond=0)
+                             - timedelta(hours=23)))
+    first_hour = start.replace(minute=0, second=0, microsecond=0)
+    count = max(1, math.ceil((now-first_hour).total_seconds()/3600)) if window_start else 24
     buckets = []
-    for i in range(24):
-        hour = start + timedelta(hours=i)
+    for i in range(count):
+        hour = first_hour + timedelta(hours=i)
         buckets.append({"hour": _hour_key(hour), "ingested": None, "errors": None,
                         "lock_wait_avg": None, "lock_wait_p90": None,
                         "commit_avg": None, "commit_p50": None,
@@ -148,6 +174,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                 b["errors"] += int(row.get("count") or 0)
     grouped: dict[str, list[dict]] = {}
     for row in commits:
+        if window_start and not start.timestamp() <= row["at"] < now.timestamp():
+            continue
         key = _hour_key(datetime.fromtimestamp(row["at"], tz=timezone.utc))
         if key in by_hour:
             grouped.setdefault(key, []).append(row)
@@ -175,7 +203,9 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                      "validate_skipped", "conflict_rate")
     for archived in archived_commits or []:
         b = by_hour.get(archived.get("hour"))
-        if b and b["commit_attempts"] is None:
+        archived_at = _parse_ts(str(archived.get("hour")) + ":00:00+00:00")
+        if b and b["commit_attempts"] is None and (not window_start or
+                (archived_at and start <= archived_at and archived_at + timedelta(hours=1) <= now)):
             for field in commit_fields:
                 b[field] = archived.get(field)
             b["commit_source"] = "archived_hourly"
@@ -189,9 +219,9 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
             if not started or started > now:
                 continue
             b = by_hour.get(_hour_key(started))
-            if b:
+            if b and started >= start and started < now:
                 b["model_calls"] += 1
-                if phase == "completed" and ended and ended >= started:
+                if phase == "completed" and ended and started <= ended <= now:
                     duration_by_hour.setdefault(b["hour"], []).append(
                         (ended-started).total_seconds())
             # Integrate call-seconds over each hour, including calls spanning boundaries.
@@ -214,7 +244,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
             values = duration_by_hour.get(b["hour"], [])
             if values:
                 b["call_duration_avg"] = round(sum(values) / len(values), 1)
-            elapsed = min(3600, max(0, (now - _parse_ts(b["hour"] + ":00:00+00:00")).total_seconds()))
+            bucket_at = _parse_ts(b["hour"] + ":00:00+00:00")
+            elapsed = max(0, (min(now, bucket_at + timedelta(hours=1)) - max(start, bucket_at)).total_seconds())
             b["model_inflight_avg"] = round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None
             if b["ingested"] and b["model_calls"] is not None:
                 b["calls_per_ingested"] = round(b["model_calls"] / b["ingested"], 1)
@@ -467,7 +498,7 @@ def backlog_remaining_history(status: dict, now: datetime) -> list[dict]:
     path = Path(backup).with_name("flow-backlog-remaining.sqlite3")
     remaining = status.get("backlog_remaining")
     heartbeat = _parse_ts(status.get("heartbeat_at"))
-    cutoff = now.timestamp() - 48 * 3600
+    cutoff = now.timestamp() - 30 * 86400
     with closing(sqlite3.connect(path, timeout=2)) as db, db:
         db.execute("CREATE TABLE IF NOT EXISTS remaining_samples ("
                    "bucket INTEGER PRIMARY KEY, remaining INTEGER NOT NULL, "
@@ -501,7 +532,7 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
             at, worker, depth = point.get("at"), point.get("worker"), point.get("depth")
             if worker not in ("current", "legacy") or not isinstance(at, (int, float)):
                 continue
-            if not now.timestamp()-7*86400 <= at <= now.timestamp()+60:
+            if not now.timestamp()-30*86400 <= at <= now.timestamp()+60:
                 continue
             if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
                 depth = None
@@ -1034,18 +1065,65 @@ async def _graph_daily(driver, boundary: object, now: datetime) -> list[dict]:
             for r in rows]
 
 
-async def _hourly_outcomes(driver, now: datetime) -> list[dict]:
+async def _hourly_outcomes(driver, now: datetime, start: datetime | None = None) -> list[dict]:
     rows, _, _ = await driver.execute_query(
-        "MATCH (k:IngestedKey) WHERE k.updated_at >= $since "
+        "MATCH (k:IngestedKey) WHERE k.updated_at >= $since AND k.updated_at < $until "
         "AND k.status IN ['ok','error','failed','needs_reconciliation'] "
         "RETURN substring(k.updated_at,0,13) AS hour, k.status AS status, "
         "count(k) AS c ORDER BY hour",
-        since=(now - timedelta(hours=24)).isoformat())
+        since=(start or now - timedelta(hours=24)).isoformat(), until=now.isoformat())
     return [{"hour": r.get("hour"), "status": r.get("status"),
              "count": int(r.get("c") or 0)} for r in rows]
 
 
-async def collect_flow() -> dict:
+async def _graph_period(driver, boundary: object, start: datetime, end: datetime) -> list[dict]:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (n:Episodic) WHERE n.created_at >= $since AND n.created_at < $until "
+        "WITH n, substring(n.created_at,0,13) AS hour "
+        "WITH hour, CASE WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
+        "WHEN toInteger(substring(n.name,15)) <= $boundary THEN '积压线' "
+        "ELSE 'live 线' END AS lane RETURN hour, lane, count(*) AS c ORDER BY hour",
+        since=start.isoformat(), until=end.isoformat(), boundary=int(boundary or 0))
+    buckets = {}
+    for r in rows:
+        hour = r["hour"]
+        label = _beijing_hour(hour)
+        if end - start > timedelta(days=2):
+            label = label[:10]
+        bucket = buckets.setdefault(label, {"hour": hour, "label": label})
+        bucket[r["lane"]] = bucket.get(r["lane"], 0) + int(r.get("c") or 0)
+    return list(buckets.values())
+
+
+def selected_period(status: dict, window: dict, now: datetime, trends: list[dict],
+                    commits: list[dict], graph: list[dict] | None) -> dict:
+    start, end = _parse_ts(window["start"]), _parse_ts(window["end"])
+    # Refinery exposes whole-hour aggregates, not event timestamps. Exclude a
+    # partial leading/trailing hour instead of attributing outside events.
+    hours = []
+    raw = (status.get("budget_today") or {}).get("hourly") or {}
+    for hour, values in sorted(raw.items()):
+        at = _parse_ts(hour + ":00:00+00:00")
+        if at and at >= start and at < end and min(at + timedelta(hours=1), now) <= end:
+            hours.append({"hour": hour, "hour_beijing": _beijing_hour(hour),
+                          "backlog": _line(values, "backlog"), "live": _line(values, "live")})
+    totals = {k: sum(r["backlog"][k] for r in hours) if hours else None
+              for k in ("ingested", "rejected", "deferred")}
+    def total(field):
+        values = [r[field] for r in trends if r.get(field) is not None]
+        return sum(values) if values else None
+    success, calls = total("ingested"), total("model_calls")
+    good = [r for r in commits if start.timestamp() <= r["at"] < end.timestamp() and not r["conflict"]]
+    coverage = sum((min(_parse_ts(r["hour"]+":00:00+00:00")+timedelta(hours=1), end)
+                    - _parse_ts(r["hour"]+":00:00+00:00")).total_seconds() for r in hours)/3600
+    return {"hourly": hours, "graph": graph, "backlog": totals,
+            "coverage_h": round(coverage, 1), "model_calls": calls, "ingested": success,
+            "calls_per_ingested": round(calls/success, 1) if calls is not None and success else None,
+            "commit_p50": _percentile([r["commit_s"] for r in good if r["commit_s"] is not None], .5),
+            "wait_p50": _percentile([r["lock_wait_s"] for r in good], .5)}
+
+
+async def collect_flow(range_key: str = "today") -> dict:
     from dashboard_status import apply_gateway_health, gateway_health
     from kg_hub_server import active_extractions, get_status_driver
     from topology import (GATEWAY_USAGE_PATH, REFINERY_STATUS_PATH, _load_snapshots,
@@ -1053,6 +1131,8 @@ async def collect_flow() -> dict:
     from utils import ingest_timing, flow_metrics
 
     now = datetime.now(tz=timezone.utc)
+    window = time_range(range_key, now)
+    start, end = _parse_ts(window["start"]), _parse_ts(window["end"])
     errors: list[str] = []
     status = _read_json(REFINERY_STATUS_PATH) or {}
     if not status:
@@ -1082,15 +1162,15 @@ async def collect_flow() -> dict:
             errors.append(f"入图量查询失败：{type(exc).__name__}")
     outcomes = None
     try:
-        outcomes = await _hourly_outcomes(driver, now)
+        outcomes = await _hourly_outcomes(driver, end, start)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"小时入图状态不可读：{type(exc).__name__}")
     attempts = None
     try:
-        attempts = await asyncio.to_thread(_model_attempt_rows, now - timedelta(hours=24))
+        attempts = await asyncio.to_thread(_model_attempt_rows, start - timedelta(hours=24))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"模型调用账本不可读：{type(exc).__name__}")
-    since = (now - timedelta(hours=24)).timestamp()
+    since = start.timestamp()
     commits = await asyncio.to_thread(flow_metrics.recent, since=since)
     if flow_metrics.storage_error():
         errors.append("提交遥测持久库不可用：" + flow_metrics.storage_error())
@@ -1099,7 +1179,7 @@ async def collect_flow() -> dict:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         archived_commits = []
         errors.append(f"提交遥测历史快照不可读：{type(exc).__name__}")
-    trends = key_metric_trends(now=now, commits=commits, attempts=attempts,
+    trends = key_metric_trends(now=end, window_start=start, commits=commits, attempts=attempts,
                                outcomes=outcomes, archived_commits=archived_commits)
     try:
         remaining_history = await asyncio.to_thread(backlog_remaining_history, status, now)
@@ -1112,21 +1192,38 @@ async def collect_flow() -> dict:
             refinery_queue_trends, REFINERY_STATUS_PATH.with_name("queue-remaining.sqlite3"), now)
     except (OSError, sqlite3.Error) as exc:
         errors.append(f"live/backlog 队列历史不可用：{type(exc).__name__}")
-    return build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
+    data = build_flow(status=status, snapshots=snapshots, gateway_node=gateway_node,
                       keys=keys, timing=ingest_timing.summary(now=time.time()),
                       active=active_extractions(), graph_daily=graph_daily, now=now,
                       source_errors=errors, key_trends=trends,
                       remaining_history=remaining_history, queue_trends=queue_trends)
+    try:
+        graph_period = (await _graph_period(driver, status["boundary_id"], start, end)
+                        if status.get("boundary_id") is not None else None)
+    except Exception as exc:
+        graph_period = None
+        data["source_errors"].append(f"区间入图量不可读：{type(exc).__name__}")
+    data["time_range"] = window
+    data["range_options"] = RANGE_LABELS
+    data["period"] = selected_period(status, window, now, trends, commits, graph_period)
+    return data
+
 
 
 async def dashboard_flow(request: Request) -> HTMLResponse:
-    data = await collect_flow()
+    key = request.query_params.get("range", "today")
+    if key not in RANGE_LABELS:
+        return HTMLResponse("无效时间范围", status_code=400)
+    data = await collect_flow(key)
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return HTMLResponse(_HTML.replace("__DATA__", payload))
 
 
 async def dashboard_flow_json(request: Request) -> JSONResponse:
-    return JSONResponse(await collect_flow())
+    key = request.query_params.get("range", "today")
+    if key not in RANGE_LABELS:
+        return JSONResponse({"error": "无效时间范围"}, status_code=400)
+    return JSONResponse(await collect_flow(key))
 
 
 _HTML = r"""<!doctype html><html lang=zh><head><meta charset=utf-8>
@@ -1137,6 +1234,7 @@ body{font-family:-apple-system,system-ui,"PingFang SC",sans-serif;max-width:1180
 a.back{font-size:13px;color:GrayText;text-decoration:none}h1{font-size:20px;font-weight:500;margin:.3rem 0}
 h2{font-size:15px;font-weight:600;margin:1.6rem 0 .5rem}
 .ts,.note{color:GrayText;font-size:12px}
+#time-ranges{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0}#time-ranges a{padding:6px 12px;border:1px solid GrayText;border-radius:6px;text-decoration:none;color:inherit}#time-ranges a[aria-current="true"]{background:#2563eb;color:white;border-color:#2563eb}
 .verdict{border-radius:10px;padding:.8rem 1rem;margin:1rem 0;font-size:14px}
 .verdict.stop{background:#FDEDED;color:#8A1C1C}.verdict.slow{background:#FFF3CD;color:#715500}.verdict.ok{background:#E1F5EE;color:#085041}
 .verdict b{font-size:15px}.verdict .act{margin-top:4px;font-size:13px}
@@ -1183,6 +1281,9 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <a class=back href="/portal">← 报表门户</a>
 <h1>🔀 积压消化链路 · 工具 → claude-mem → refinery → kg-hub → 知识图谱</h1>
 <div class=ts id=gen></div>
+<nav id=time-ranges aria-label="时间范围"></nav>
+<div class=note id=range-caption></div>
+<h2>当前状态</h2><div class=note>队列当前剩余、服务健康和卡点诊断为实时快照，不随历史时间筛选变化。</div>
 <div id=errs></div>
 <div id=verdict></div>
 
@@ -1193,20 +1294,20 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列</h2>
 <div class=cards id=cmcards></div>
-<div class=note>队列剩余趋势：最近 7 天，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。数量持平不能说明 worker 是否在正常处理。</div>
+<div class=note>队列剩余趋势：所选时间范围，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。数量持平不能说明 worker 是否在正常处理。</div>
 <div class=trend-grid id=cmtrends></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
-<div class=note>剩余趋势：最近 7 天；净速度：最近 24 小时，单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
+<div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
-<div class=lg>近 14 个统计日入图 Episode（图内实数；横轴为北京时间 08:00，每日区间至次日 08:00）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
+<div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
 </section>
 <h2>kg-hub · 入图关键指标趋势</h2>
 <div class=cards id=ecards></div>
-<div class=note>最近 24 小时 · 北京时间整点分桶（UTC+8）· 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
+<div class=note>所选时间范围 · 北京时间整点分桶（UTC+8）· 每 2 分钟刷新；将光标移到图上查看该小时的各项数值。曲线中断表示该小时没有可用样本。当前小时截至快照时刻。</div>
 <div class=trend-grid id=keytrends></div>
 
 <h2>卡点清单（按影响排序：停流 → 慢流）</h2>
@@ -1221,9 +1322,9 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=note>
 「消化」= 积压观测进入终态（入图或被质量闸拒绝）；推迟不算消化。去向账来自 refinery（观测条数），入图量来自图内 Episode（按 claude-mem-obs 编号与 boundary 分线），模型调用量来自网关（调用次数）——三者单位不同。调用倍数 = 网关本统计日调用 ÷ 图内本统计日新增，两端都是持久计数；统计日按北京时间 08:00 切换，当日新增不足 10 条时不给数。<br>
 排队 / 抽取耗时来自 kg_hub_server 进程内最近 500 条样本，服务重启后清零；并行抽取模式下「排队」是等并发槽位，「抽取」含锁外抽取、冲突重算与提交；领取→终态耗时来自 IngestedKey 时间戳，包含排队。<br>
-refinery 的小时账保存在其进程内存，refinery 重启后从零开始积累；样本不足 20 小时不给按 24 小时推算的清空时间，改用近 7 天图内积压线入图量（未计过滤拒绝，偏保守）。<br>
-live/backlog 剩余曲线由 refinery 每两分钟独立采样，保存在 refinery 状态卷，保留七天；看板无人访问时仍采样。旧版 backlog 的按请求快照仅补充剩余历史，不据此推算净速度。净速度是相邻有效快照的队列净减少量/实际小时数，可能包含过滤或移入待核验，不等于成功入图。<br>
-关键指标按北京时间整点小时展示：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间，耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
+refinery 的处理去向只提供小时汇总，历史覆盖不足时不推算全区间总量；滚动范围的首个不完整小时不计入处理去向。其他事件统计严格按所选时间边界查询。<br>
+live/backlog 剩余曲线由 refinery 每两分钟独立采样，保存在 refinery 状态卷，逐步保留30天；看板无人访问时仍采样。旧版 backlog 的按请求快照仅补充剩余历史，不据此推算净速度。净速度是相邻有效快照的队列净减少量/实际小时数，可能包含过滤或移入待核验，不等于成功入图。<br>
+所有历史图表使用同一所选时间范围；今天/昨天按北京时间00:00切日。关键指标按北京时间整点小时展示（边界小时仅统计范围内事件）：成功/失败取 IngestedKey 当前终态的 updated_at；提交/冲突取持久采样（首次启用持久化前缺失的小时无法重建，已存档的整点小时沿用原汇总）；模型调用取持久账本的 HTTP 开始时间（看板趋势与区间卡片统一使用 kg-hub 账本），耗时只计已完成调用，在飞数用调用区间积分得到小时平均，未结调用最多计 15 分钟。调用/入图以同一小时开始的调用数除以该小时成功终态数，跨小时任务会带来偏差。<br>
 工作窗口外暂停、人工断路属于计划内停流，不标红，但仍列出——它们是积压消化慢的真实原因之一。
 </div>
 
@@ -1234,6 +1335,14 @@ const $=id=>document.getElementById(id);
 const fmt=v=>(v===null||v===undefined)?'—':v;
 const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const range=D.time_range;
+const chartStart=Date.parse(range.start),chartEnd=Date.parse(range.end);
+const axisLabel=ms=>new Date(ms).toLocaleString('sv-SE',{timeZone:'Asia/Shanghai'}).slice(5,16);
+const inRange=at=>Date.parse(at)>=chartStart&&Date.parse(at)<chartEnd;
+const filterRows=rows=>(rows||[]).filter(r=>inRange(r.at));
+const rangeX=at=>34+Math.max(0,Math.min(1,(Date.parse(at)-chartStart)/Math.max(1,chartEnd-chartStart)))*398;
+$('time-ranges').innerHTML=Object.entries(D.range_options).map(([key,label])=>'<a href="?range='+key+'" aria-current="'+(key===range.key)+'">'+label+'</a>').join('');
+$('range-caption').textContent=range.label+' · '+range.start_beijing+' — '+range.end_beijing+' · 最近1月按30天计算。历史数据仅展示实际留存部分，缺测不补零。自动刷新保留所选范围。';
 const compressionHosts=D.claude_mem_trends||[];
 $('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
  [['current','新 worker']].map(([key,label])=>{
@@ -1242,7 +1351,7 @@ $('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
    const depth=w&&Number.isFinite(w.depth)?w.depth+' 条':'暂无数据';
    const held=w&&Number.isFinite(w.held)?w.held+' 条':'未知';
    const warning=h.stale?'数据过期':h.error||w?.error?'采样异常':'';
-   return '<div class=card><b>'+esc(h.host)+' · '+label+'</b><div>队列剩余：'+depth+'</div><div>待核验：'+held+'</div><small>'+esc(w?.held_error||'')+'</small><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
+   return '<div class=card><b>'+esc(h.host)+' · '+label+'（当前）</b><div>队列剩余：'+depth+'</div><div>待核验：'+held+'</div><small>'+esc(w?.held_error||'')+'</small><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
  })).join(''):'<div class=note>暂无 claude-mem 采样数据</div>';
 $('gen').textContent='快照 '+D.generated_at_beijing+' · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
 if(D.source_errors.length){$('errs').innerHTML='<div class=warn>部分数据源不可读：'+D.source_errors.map(esc).join('；')+'</div>'}
@@ -1262,19 +1371,18 @@ D.stages.forEach(s=>{const el=document.createElement('div');
   if(!d.hidden&&d.dataset.id===s.id){d.hidden=true;return}d.textContent=txt;d.dataset.id=s.id;d.hidden=false};
  chain.append(el)});
 
-const B=D.backlog,L=B.last24||{},E=D.efficiency;
-const eta=B.eta_days!=null?(B.eta_days+' 天'):(B.graph_eta_days!=null?('≈'+B.graph_eta_days+' 天*'):'—');
-const etaNote=B.eta_days!=null?'按近 24h 终态速度':(B.graph_eta_days!=null?'*按近 7 天图内积压入图量（偏保守）':'样本不足');
+const B=D.backlog,Pd=D.period,totals=Pd.backlog;
+const consumed=totals.ingested==null?null:totals.ingested+totals.rejected;
 const cards=[
- ['积压剩余',fmt(B.remaining),'工作窗口'+(B.window_open?'开':'关')+' · boundary '+fmt(B.boundary_id)],
- ['近 24h 积压消化',fmt(L.backlog_terminal),'入图 '+fmt(L.backlog_ingested)+' · 拒绝 '+fmt(L.backlog_rejected)+' · 样本 '+fmt(L.coverage_h)+'h'],
- ['预计清空',eta,etaNote],
- ['入图率',B.accept_rate!=null?B.accept_rate+'%':'—','积压终态中进图的比例'],
+ ['当前积压剩余',fmt(B.remaining),'实时快照 · 工作窗口'+(B.window_open?'开':'关')],
+ [range.label+' · 积压消化',fmt(consumed),'入图 '+fmt(totals.ingested)+' · 拒绝 '+fmt(totals.rejected)],
+ ['统计覆盖',fmt(Pd.coverage_h)+' 小时','仅计实际留存的完整小时；滚动范围的首个不完整小时不计'],
+ ['区间入图率',consumed?Math.round(totals.ingested/consumed*100)+'%':'—','所选范围内已知积压终态中进图的比例'],
 ];
 const efficiencyCards=[
- ['调用 / 条入图',fmt(E.calls_per_observation),'本统计日网关调用 ÷ 图内新增（北京时间 08:00 切日）'],
- ['单条抽取耗时',E.extract_p50!=null?(E.extract_p50+'s'):(E.duration_p50!=null?(E.duration_p50+'s'):'—'),E.extract_p50!=null?('P90 '+fmt(E.extract_p90)+'s · 不含排队'):('领取→终态 P90 '+fmt(E.duration_p90)+'s · 含排队')],
- [(E.queue_label||'排队')+'占比',pct(E.wait_share),'排队 P50 '+fmt(E.wait_p50)+'s · 样本 '+fmt(E.timing_samples)],
+ ['区间调用 / 成功入图',fmt(Pd.calls_per_ingested),'模型调用 '+fmt(Pd.model_calls)+' 次 / 成功 '+fmt(Pd.ingested)+' 条'],
+ ['区间提交耗时 P50',Pd.commit_p50==null?'—':Pd.commit_p50+'s','所选范围内实际留存的成功提交样本'],
+ ['区间写锁等待 P50',Pd.wait_p50==null?'—':Pd.wait_p50+'s','所选范围内实际留存的成功提交样本'],
 ];
 const renderCards=rows=>rows.map(c=>'<div class=mc><div class=l>'+c[0]+'</div><div class=v>'+c[1]+'</div><div class=s>'+esc(c[2])+'</div></div>').join('');
 $('bcards').innerHTML=renderCards(cards);
@@ -1286,11 +1394,11 @@ function stack(target,rows,label,parts){const box=$(target);
  box.innerHTML=rows.map(r=>{const t=tot(r);return '<div class=row><span class=k>'+esc(label(r))+'</span><span class=bar>'
   +parts.map(p=>{const v=p[1](r)||0;return v?'<i title="'+p[0]+' '+v+'" style="width:'+(v*100/peak)+'%;background:'+p[2]+'"></i>':''}).join('')
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
-stack('daily',(B.daily||[]).slice().reverse(),r=>r.day_beijing_start.slice(5),[
+stack('daily',(Pd.graph||[]).slice().reverse(),r=>r.label.slice(5),[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
 
 const processingData=[
- {title:'backlog 处理去向（每小时，非净速度）',unit:' 条',rows:(B.hourly||[]).map(r=>({
+ {title:'backlog 处理去向（每小时，非净速度）',unit:' 条',rows:(Pd.hourly||[]).map(r=>({
    at:r.hour+':00:00Z',label:r.hour_beijing+' 北京时间',
    consumed:r.backlog.ingested+r.backlog.rejected,ingested:r.backlog.ingested,
    rejected:r.backlog.rejected,deferred:r.backlog.deferred})),
@@ -1300,7 +1408,7 @@ const processingData=[
 const backlogData=[];
 const kgQueues=D.refinery_queue_trends||{rows:[],latest:null,stale:true};
 const kgLast=kgQueues.latest;
-$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核验 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
+$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列（当前）'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核验 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
 ['live','backlog'].forEach(k=>{
  let rows=kgQueues.rows||[];
  if(k==='backlog'){
@@ -1309,26 +1417,21 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
      at:r.at,label:r.at_beijing,backlog:r.remaining,boundary:r.boundary_id,process:'legacy-snapshot'})).concat(rows);
  }
  const color=k==='live'?'#378ADD':'#8250C4';
- backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:10,continuity:true,rows,
+ backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',gapMinutes:10,continuity:true,rows:filterRows(rows),
    series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
- backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',windowHours:24,gapMinutes:10,continuity:true,zeroBaseline:true,
-   rows:(kgQueues.rows||[]).filter(r=>Date.parse(r.at)>=Date.parse(D.generated_at)-86400000),
+ backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,continuity:true,zeroBaseline:true,
+   rows:filterRows(kgQueues.rows),
    series:[['净消化速度',k+'_rate',color]]});
 });
 backlogData.push(...processingData);
 const cmOffset=backlogData.length;
 compressionHosts.forEach(h=>{
  [['current','新 worker','#D97706']].forEach(([key,name,color])=>{
-   backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',windowHours:168,gapMinutes:90,rows:h.rows||[],
+   backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',gapMinutes:90,rows:filterRows(h.rows),
      series:[['剩余',key,color],['待核验',key+'_held','#E07A5F']]});
  });
 });
-const chartEnd=Date.parse(D.generated_at),chartStart=chartEnd-48*3600000;
-const backlogX=(spec,at)=>{
- const first=Date.parse(spec.rows[0].at);
- const start=Math.max(chartEnd-(spec.windowHours||48)*3600000,Math.min(first-30*60000,chartEnd-2*3600000));
- return 34+Math.max(0,Math.min(1,(Date.parse(at)-start)/(chartEnd-start)))*398;
-};
+const backlogX=(spec,at)=>rangeX(at);
 function backlogChart(spec,index){
  const rows=spec.rows;
  if(!rows.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无可用样本；积压剩余从首次采样后开始显示。</div></div>';
@@ -1352,8 +1455,8 @@ function backlogChart(spec,index){
  }).join('');
  const ticks=[low,spec.zeroBaseline&&low<0?0:(low+top)/2,top].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
  const zeroLine=spec.zeroBaseline&&low<0?'<path d="M34 '+y(0).toFixed(1)+'H432" stroke="currentColor" opacity=".3" stroke-dasharray="3 3"/>':'';
- const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(rows[0].label.slice(5,16))+'</text>'+
-  '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(rows[rows.length-1].label.slice(5,16))+'</text>';
+ const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartStart))+'</text>'+
+  '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartEnd))+'</text>';
  return '<div class=trend><h3>'+spec.title+'</h3><svg data-backlog-chart="'+index+'" tabindex="0" viewBox="0 0 440 125" role="img" aria-label="'+spec.title+'，用左右方向键查看数值">'+
   '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+zeroLine+ticks+curves+labels+
   '<line data-hover-line x1="0" x2="0" y1="9" y2="101" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg>'+
@@ -1416,15 +1519,15 @@ const trendSpecs=[
 function trendChart(title,series,unit,index){
  const vals=trends.flatMap(r=>series.map(s=>r[s[1]]).filter(v=>Number.isFinite(v)));
  const peak=Math.max(1,...vals)*1.1,W=440,H=125,L=34,R=8,T=9,B=24;
- const x=i=>L+i*(W-L-R)/Math.max(1,trends.length-1), y=v=>T+(H-T-B)*(1-v/peak);
+ const x=i=>rangeX(trends[i].hour+':00:00Z'), y=v=>T+(H-T-B)*(1-v/peak);
  const curves=series.map(s=>{let pieces=[],part=[];
   trends.forEach((r,i)=>{const v=r[s[1]];if(Number.isFinite(v))part.push(x(i).toFixed(1)+','+y(v).toFixed(1));
    else if(part.length){pieces.push(part);part=[]}});if(part.length)pieces.push(part);
   return pieces.map(p=>'<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('')
    +trends.map((r,i)=>Number.isFinite(r[s[1]])?'<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[s[1]]).toFixed(1)+'" r="2.5" fill="'+s[2]+'"/>':'').join('')}).join('');
  const ticks=[0,peak/2,peak].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+(+v.toFixed(1))+'</text>').join('');
- const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[0].hour_beijing.slice(5))+'</text><text x="'+(W-69)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(trends[trends.length-1].hour_beijing.slice(5))+'</text>':'';
- return '<div class=trend><h3>'+title+'</h3><svg data-trend="'+index+'" tabindex="0" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' 最近24小时趋势，用左右方向键查看每小时数值"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'<line data-hover-line x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg><div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
+ const labels=trends.length?'<text x="'+L+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(axisLabel(chartStart))+'</text><text x="'+(W-69)+'" y="'+(H-2)+'" fill="currentColor" font-size="10">'+esc(axisLabel(chartEnd))+'</text>':'';
+ return '<div class=trend><h3>'+title+'</h3><svg data-trend="'+index+'" tabindex="0" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="'+title+' '+range.label+'趋势，用左右方向键查看每小时数值"><path d="M'+L+' '+T+'V'+(H-B)+'H'+(W-R)+'" stroke="currentColor" opacity=".25" fill="none"/>'+ticks+curves+labels+'<line data-hover-line x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg><div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
 }
 $('keytrends').innerHTML=trends.length?trendSpecs.map((s,i)=>trendChart(s[0],s[1],s[2],i)).join(''):'<div class=note>暂无趋势数据</div>';
 function showTrendHour(svg,index){
@@ -1432,7 +1535,7 @@ function showTrendHour(svg,index){
  if(!row||!spec)return;
  const parts=spec[1].map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+esc(s[0])+' '+(Number.isFinite(row[s[1]])?row[s[1]]+spec[2]:'无数据')+'</span>');
  readout.innerHTML='<b>'+esc(row.hour_beijing)+' 北京时间'+(row.commit_source==='archived_hourly'&&Number(svg.dataset.trend)>=1&&Number(svg.dataset.trend)<=4?' · 发布前小时汇总':'')+'</b>'+parts.join('');
- const line=svg.querySelector('[data-hover-line]'),x=34+index*(440-34-8)/Math.max(1,trends.length-1);
+ const line=svg.querySelector('[data-hover-line]'),x=rangeX(row.hour+':00:00Z');
  line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';svg.dataset.hourIndex=index;
 }
 function clearTrendHour(svg){
@@ -1444,7 +1547,7 @@ $('keytrends').addEventListener('pointermove',e=>{
  const svg=e.target.closest('svg[data-trend]');if(!svg)return;
  const point=svg.createSVGPoint();point.x=e.clientX;point.y=e.clientY;
  const local=point.matrixTransform(svg.getScreenCTM().inverse());
- const index=Math.max(0,Math.min(trends.length-1,Math.round((local.x-34)/(440-34-8)*(trends.length-1))));
+ const index=trends.reduce((best,r,i)=>Math.abs(rangeX(r.hour+':00:00Z')-local.x)<Math.abs(rangeX(trends[best].hour+':00:00Z')-local.x)?i:best,0);
  if(svg.dataset.hourIndex!==String(index))showTrendHour(svg,index);
 });
 $('keytrends').addEventListener('pointerout',e=>{

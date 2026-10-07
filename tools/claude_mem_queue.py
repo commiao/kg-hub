@@ -31,7 +31,7 @@ def collect(home: Path, http_json, now: float) -> dict:
     """
     state = home / '.kg-hub/state/claude-mem-queue.sqlite3'
     state.parent.mkdir(parents=True, exist_ok=True)
-    cutoff = now - 7 * 86400
+    cutoff = now - 30 * 86400
     current = []
     with closing(sqlite3.connect(state, timeout=5)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS samples (worker TEXT, bucket INTEGER, at REAL, depth INTEGER, pid TEXT, source TEXT, PRIMARY KEY(worker,bucket))')

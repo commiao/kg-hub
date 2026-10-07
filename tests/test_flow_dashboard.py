@@ -305,7 +305,7 @@ class RenderTests(unittest.TestCase):
     def test_page_embeds_data_without_breaking_out_of_script(self):
         flow = build(status=status(last_error="</script><img src=x>"))
         with patch.object(F, "collect_flow", AsyncMock(return_value=flow)):
-            response = asyncio.run(F.dashboard_flow(None))
+            response = asyncio.run(F.dashboard_flow(__import__("starlette.requests", fromlist=["Request"]).Request({"type":"http","query_string":b""})))
         html = response.body.decode()
         self.assertNotIn("</script><img", html)
         payload = html.split("const D=", 1)[1].split(";\nconst $", 1)[0]
@@ -314,7 +314,7 @@ class RenderTests(unittest.TestCase):
     def test_json_endpoint_returns_the_same_structure(self):
         flow = build()
         with patch.object(F, "collect_flow", AsyncMock(return_value=flow)):
-            response = asyncio.run(F.dashboard_flow_json(None))
+            response = asyncio.run(F.dashboard_flow_json(__import__("starlette.requests", fromlist=["Request"]).Request({"type":"http","query_string":b""})))
         self.assertEqual(json.loads(response.body)["generated_at"], flow["generated_at"])
 
     def test_beijing_labels_keep_utc_source_buckets_and_cross_midnight(self):
@@ -340,9 +340,99 @@ class RenderTests(unittest.TestCase):
         html = F._HTML
         self.assertIn("row.hour_beijing", html)
         self.assertIn("r.hour_beijing+' 北京时间'", html)
-        self.assertIn("r.day_beijing_start.slice(5)", html)
+        self.assertIn("r.label.slice(5)", html)
         self.assertIn("D.generated_at_beijing", html)
         self.assertIn("data-backlog-chart", html)
+
+
+class TimeRangeTests(unittest.TestCase):
+    def test_beijing_midnight_and_yesterday_are_half_open(self):
+        now = datetime(2026, 10, 7, 0, 30, tzinfo=timezone.utc)
+        today = F.time_range("today", now)
+        yesterday = F.time_range("yesterday", now)
+        self.assertEqual(today["start"], "2026-10-06T16:00:00+00:00")
+        self.assertEqual(yesterday["start"], "2026-10-05T16:00:00+00:00")
+        self.assertEqual(yesterday["end"], today["start"])
+        for key, hours in {"month":720,"week":168,"day":24,"6h":6,"3h":3,"1h":1}.items():
+            w = F.time_range(key, now)
+            self.assertEqual((F._parse_ts(w["end"])-F._parse_ts(w["start"])).total_seconds(), hours*3600)
+
+    def test_selected_partial_hour_filters_events_and_inflight_denominator(self):
+        start = NOW - timedelta(hours=1)
+        commits = [{"at":(start-timedelta(seconds=1)).timestamp(), "conflict":False,
+                    "lock_wait_s":900,"commit_s":900,"prevalidated_conflict":False,"validate_skipped":False},
+                   {"at":start.timestamp(),"conflict":False,"lock_wait_s":2,"commit_s":4,
+                    "prevalidated_conflict":False,"validate_skipped":False}]
+        rows = F.key_metric_trends(now=NOW, window_start=start, commits=commits,
+            attempts=[((start-timedelta(minutes=5)).isoformat(), (start+timedelta(minutes=15)).isoformat(), "completed"),
+                      (NOW.isoformat(), NOW.isoformat(), "completed")], outcomes=[])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sum(r["model_calls"] for r in rows), 0)
+        self.assertEqual(rows[0]["model_inflight_avg"], .5)
+        self.assertEqual(rows[0]["commit_p50"], 4)
+
+    def test_yesterday_has_24_hours_without_today_bucket(self):
+        w=F.time_range("yesterday", NOW)
+        rows=F.key_metric_trends(now=F._parse_ts(w["end"]),window_start=F._parse_ts(w["start"]),
+                                commits=[],attempts=None,outcomes=None)
+        self.assertEqual(len(rows),24)
+        self.assertEqual(F._beijing_hour(rows[0]["hour"]),"2026-09-27 00:00")
+        self.assertEqual(F._beijing_hour(rows[-1]["hour"]),"2026-09-27 23:00")
+        self.assertTrue(all(r["model_calls"] is None for r in rows))
+
+    def test_default_and_invalid_range_endpoints(self):
+        from starlette.requests import Request
+        with patch.object(F,"collect_flow",AsyncMock(return_value={})) as collect:
+            asyncio.run(F.dashboard_flow_json(Request({"type":"http","query_string":b""})))
+            collect.assert_awaited_once_with("today")
+        with patch.object(F,"collect_flow",AsyncMock()) as collect:
+            r=asyncio.run(F.dashboard_flow_json(Request({"type":"http","query_string":b"range=bad"})))
+            self.assertEqual(r.status_code,400)
+            collect.assert_not_awaited()
+
+    def test_queries_bound_both_ends(self):
+        driver=type("Driver",(),{"execute_query":AsyncMock(return_value=([],None,None))})()
+        start=NOW-timedelta(hours=1)
+        asyncio.run(F._hourly_outcomes(driver,NOW,start))
+        args,kw=driver.execute_query.call_args
+        self.assertIn("k.updated_at < $until",args[0])
+        self.assertEqual(kw,{"since":start.isoformat(),"until":NOW.isoformat()})
+        asyncio.run(F._graph_period(driver,100,start,NOW))
+        self.assertEqual(driver.execute_query.call_args.kwargs["until"],NOW.isoformat())
+
+    def test_all_presets_render_with_one_axis_and_preserve_url(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript smoke test")
+        for key in F.RANGE_LABELS:
+            w=F.time_range(key,NOW)
+            rows=F.key_metric_trends(now=F._parse_ts(w["end"]),window_start=F._parse_ts(w["start"]),
+                                    commits=[],attempts=[],outcomes=[])
+            data=build(key_trends=rows)
+            data.update(time_range=w,range_options=F.RANGE_LABELS,
+                        period=F.selected_period({},w,NOW,rows,[],[]))
+            script=F._HTML.split("<script>")[1].split("</script>")[0].replace("__DATA__",json.dumps(data))
+            harness = """const elements={};
+const element=()=>({innerHTML:'',textContent:'',dataset:{},classList:{toggle(){}},append(){},addEventListener(){}});
+const document={getElementById:id=>elements[id]??=(element()),createElement:element,querySelectorAll:()=>[]};
+const window={};
+"""
+            script += """
+if(!elements['time-ranges'].innerHTML.includes('href="?range='+range.key+'" aria-current="true"'))throw Error('selection');
+if((elements['time-ranges'].innerHTML.match(/<a /g)||[]).length!==8)throw Error('options');
+if(!elements.keytrends.innerHTML.includes(axisLabel(chartStart)))throw Error('axis start');
+if(!elements.keytrends.innerHTML.includes(axisLabel(chartEnd)))throw Error('axis end');
+"""
+            result=subprocess.run(["node","-e",harness+script],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_refinery_partial_leading_hour_is_not_counted(self):
+        w=F.time_range("1h",NOW)
+        st=status(budget_today={"hourly":{"2026-09-28T03":{"backlog":{"ingested":99}},
+                                          "2026-09-28T04":{"backlog":{"ingested":2}}}})
+        period=F.selected_period(st,w,NOW,[],[],None)
+        self.assertEqual(period["backlog"]["ingested"],2)
+        self.assertEqual(period["coverage_h"],.5)
 
 
 class WiringTests(unittest.TestCase):
