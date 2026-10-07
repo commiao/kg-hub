@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite3
 
 INTERVAL = 120
-RETENTION = 7 * 86400
+RETENTION = 30 * 86400
 MAX_GAP = 600
 
 
