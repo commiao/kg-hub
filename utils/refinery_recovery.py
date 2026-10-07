@@ -15,6 +15,11 @@ INFRA_FAILURES = frozenset({
 })
 PAUSING_FAILURES = INFRA_FAILURES | {"quota", "daily_quota", "rate_limited"}
 PROBE_DELAYS = (5, 15, 30, 60, 300)
+# Gateway readiness reads several durable ledgers (each may wait on SQLite).
+# Production returned healthy after 15.9s; the former 5s proxy timeout kept
+# refinery paused despite recovery. Leave room for those bounded local reads.
+GATEWAY_READINESS_TIMEOUT = 60
+READINESS_PROXY_TIMEOUT = GATEWAY_READINESS_TIMEOUT + 5
 
 
 def record_failure(state: dict, reason: str, *, cycle: int, interval: int,
