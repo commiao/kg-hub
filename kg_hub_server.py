@@ -476,6 +476,9 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
     # 所以这里改判据:不再问「它说了什么」,而是问「它回了几」。状态码是协议里定死的,
     # 不跟着文案漂(准则 22)。5xx 一律归上游,重试节奏由 1h 清理接管。
     status = getattr(exc, "status_code", None)
+    if status is None:
+        # Queue HTTP calls use httpx, whose status lives on the response.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int) and 500 <= status <= 599:
         # 与 gateway_unavailable 分开:那个是「够不着网关」,这个是「网关活着并回了
         # 一个 5xx」。两者的运维动作不同——把后者报成前者,值班的第一反应会是去重启
