@@ -92,6 +92,16 @@ def _vector_read_lock():
     return lock
 
 
+def _read_kind(query):
+    if 'e.fact_embedding' in query and 'cosineDistance' in query:
+        return "edge_similarity"
+    if 'n.name_embedding' in query and 'cosineDistance' in query:
+        return "node_similarity"
+    if 'db.idx.vector.' in query:
+        return "vector_index"
+    return "other"
+
+
 class ReadDependencies:
     """Record exact ordered read results without retaining graph content twice."""
     def __init__(self, driver, store, identity):
@@ -100,6 +110,11 @@ class ReadDependencies:
         if not callable(getattr(self.graph, "ro_query", None)):
             raise RuntimeError("optimistic extraction requires Falkor read-only queries")
         self.records = {}
+        # Which stage issued each read and which read went stale. In memory
+        # only: persisted records must stay byte-identical for replay.
+        self.current_phase = "restored"
+        self._read_phase = {}
+        self.last_stale = None
         self._read_times = []
         self._pending = {}
         self._flush_task = None
@@ -167,6 +182,7 @@ class ReadDependencies:
         if saved is not None and saved != record:
             raise GraphReadConflict("graph changed within an unfinished resolution stage")
         if key not in self.records:
+            self._read_phase.setdefault(key, self.current_phase)
             self._known_keys.add(key)
             self._pending[key] = record
             if self._flush_task is None:
@@ -192,22 +208,35 @@ class ReadDependencies:
         finally:
             self._flush_task = None
 
+    def _note_stale(self, key, record):
+        self.last_stale = {"kind": _read_kind(record["query"]),
+                           "phase": self._read_phase.get(key, "restored")}
+
+    def stale_detail(self):
+        stale = self.last_stale or {}
+        return "stale_kind=%s stale_phase=%s" % (stale.get("kind", "-"), stale.get("phase", "-"))
+
     async def validate(self, concurrency: int = 1, *, phase="validate"):
-        records = list(self.records.values())
+        records = list(self.records.items())
+        self.last_stale = None
         if concurrency <= 1:
-            for record in records:
+            for key, record in records:
                 current = await self.read(record["query"], record["params"], phase=phase)
                 if _stage_digest(current) != record["result_digest"]:
+                    self._note_stale(key, record)
                     return False
             return True
         slots = asyncio.Semaphore(concurrency)
 
-        async def unchanged(record):
+        async def unchanged(key, record):
             async with slots:
                 current = await self.read(record["query"], record["params"], phase=phase)
-            return _stage_digest(current) == record["result_digest"]
+            if _stage_digest(current) != record["result_digest"]:
+                self._note_stale(key, record)
+                return False
+            return True
 
-        checks = [asyncio.ensure_future(unchanged(record)) for record in records]
+        checks = [asyncio.ensure_future(unchanged(key, record)) for key, record in records]
         try:
             for check in asyncio.as_completed(checks):
                 if not await check:
@@ -298,12 +327,50 @@ async def finish_optimistic_episode(
             # for every round, never mutated objects from a rejected round.
             fresh = [EntityNode.model_validate(n.model_dump(mode="json"))
                      for n in extracted_nodes]
+            async def abandon_stale_round(before_phase, artifacts):
+                """Record a proven-stale round without paying for later stages."""
+                completed_steps = set()
+                for phase in artifacts:
+                    artifact = await load(*round_identity, phase)
+                    if artifact is not None:
+                        completed_steps.update(artifact.get("model_step_ids", []))
+                await load(*round_identity, "graph_conflict", {
+                    "validated": False, "early": True,
+                    "model_step_ids": sorted(completed_steps),
+                })
+                acknowledge_restored_steps(completed_steps)
+                log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
+                         "early=1 phase=%s %s", task_sid, round_number,
+                         len(dependencies.records), before_phase,
+                         dependencies.stale_detail())
+                flow_metrics.record(conflict=True, prevalidated_conflict=True)
+
+            async def stale_before(stage):
+                early_started = time.monotonic()
+                stale = not await dependencies.validate(
+                    VALIDATE_CONCURRENCY, phase="prevalidate")
+                log.info("[ingest:parallel_early_validation] sid=%s round=%d "
+                         "reads=%d seconds=%.3f stale=%d at=%s %s", task_sid,
+                         round_number, len(dependencies.records),
+                         time.monotonic() - early_started, int(stale), stage,
+                         dependencies.stale_detail())
+                return stale
+
             with model_operation("ingest.graph-round", round_id):
                 phase_started = time.monotonic()
+                dependencies.current_phase = "nodes"
                 nodes, uuid_map, _ = await resolve_nodes_with_candidate_snapshot(
                     view.clients, fresh, episode, previous_episodes, entity_types, **common)
                 phase_seconds["nodes"] = time.monotonic() - phase_started
+                # The edge stage is the most expensive (about 2.4 calls per
+                # observation). A node read already stale here condemns the
+                # round, so stop before paying for edges (2026-10-08: ~25% of
+                # tasks needed another round).
+                if PREVALIDATE and await stale_before("before_edges"):
+                    await abandon_stale_round("before_edges", ("resolved_nodes",))
+                    continue
                 phase_started = time.monotonic()
+                dependencies.current_phase = "edges"
                 resolved, invalidated, new = await extract_and_resolve_edges_with_snapshot(
                     view, episode, fresh, previous_episodes, edge_type_map, group_id,
                     edge_types, nodes, uuid_map, custom_extraction_instructions, **common)
@@ -311,32 +378,12 @@ async def finish_optimistic_episode(
                 # Most stale rounds can be identified before the attribute model
                 # calls. A false result only aborts this round; the final commit
                 # fence still validates every read under the writer lock.
-                early_stale = False
-                if PREVALIDATE:
-                    early_started = time.monotonic()
-                    early_stale = not await dependencies.validate(
-                        VALIDATE_CONCURRENCY, phase="prevalidate")
-                    log.info("[ingest:parallel_early_validation] sid=%s round=%d "
-                             "reads=%d seconds=%.3f stale=%d", task_sid,
-                             round_number, len(dependencies.records),
-                             time.monotonic() - early_started, int(early_stale))
-                if early_stale:
-                    completed_steps = set()
-                    for phase in ("resolved_nodes", "edge_phase"):
-                        artifact = await load(*round_identity, phase)
-                        if artifact is not None:
-                            completed_steps.update(artifact.get("model_step_ids", []))
-                    await load(*round_identity, "graph_conflict", {
-                        "validated": False, "early": True,
-                        "model_step_ids": sorted(completed_steps),
-                    })
-                    acknowledge_restored_steps(completed_steps)
-                    log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
-                             "early=1 phase=before_attributes", task_sid,
-                             round_number, len(dependencies.records))
-                    flow_metrics.record(conflict=True, prevalidated_conflict=True)
+                if PREVALIDATE and await stale_before("before_attributes"):
+                    await abandon_stale_round("before_attributes",
+                                              ("resolved_nodes", "edge_phase"))
                     continue
                 phase_started = time.monotonic()
+                dependencies.current_phase = "attributes"
                 hydrated = await extract_attributes_with_snapshot(
                     view, nodes, episode, previous_episodes, entity_types, new, **common)
                 phase_seconds["attributes"] = time.monotonic() - phase_started
@@ -390,9 +437,10 @@ async def finish_optimistic_episode(
                 await load(*round_identity, "graph_conflict", {"validated": False})
                 log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
                          "lock_wait=0.000s hold=0.000s validate=%.3fs loop_lag=0.000s "
-                         "validate_concurrency=%d prevalidated=1",
+                         "validate_concurrency=%d prevalidated=1 %s",
                          task_sid, round_number, len(dependencies.records),
-                         time.monotonic() - step, VALIDATE_CONCURRENCY)
+                         time.monotonic() - step, VALIDATE_CONCURRENCY,
+                         dependencies.stale_detail())
                 flow_metrics.record(conflict=True, prevalidated_conflict=True)
                 continue
             if generation % 2 == 0:
@@ -420,11 +468,11 @@ async def finish_optimistic_episode(
                     await load(*round_identity, "graph_conflict", {"validated": False})
                     log.info("[ingest:parallel_conflict] sid=%s round=%d reads=%d "
                              "lock_wait=%.3fs hold=%.3fs validate=%.3fs loop_lag=%.3fs "
-                             "validate_concurrency=%d",
+                             "validate_concurrency=%d %s",
                              task_sid, round_number, len(dependencies.records),
                              acquired-wait_started, time.monotonic()-acquired,
                              steps["validate"], _loop_lag.reading()-lag_at_acquire,
-                             VALIDATE_CONCURRENCY)
+                             VALIDATE_CONCURRENCY, dependencies.stale_detail())
                     conflict_inside_lock = True
                 else:
                     step = time.monotonic()
