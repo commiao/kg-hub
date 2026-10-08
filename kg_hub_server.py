@@ -1007,7 +1007,7 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
         if workflow["plan"]["route"] == "episode":
             await asyncio.to_thread(
                 workflow["store"].save_or_load,
-                task_sd, task_sid, "business-task", workflow["digest"],
+                task_sd, task_sid, workflow["operation"], workflow["digest"],
                 "episode_operation", {"operation_id": operation_id})
         return await add_episode_with_stage_checkpoint(
             graphiti, store=workflow["store"], task_sd=task_sd, task_sid=task_sid,
@@ -2076,7 +2076,9 @@ async def _enqueue_manual_resume(command: dict, task: dict, report: dict,
                 else "manual_retry_running"}
 
     from utils.graphiti_stage_adapter import StageArtifactStore
-    plan = StageArtifactStore(journal.path).locate(sd, sid, "business-task", "task_plan")
+    from utils.ingest_workflow import locate_plan
+    plan = locate_plan(StageArtifactStore(journal.path), sd, sid,
+                       task.get("execution_epoch") or task.get("created_at"))
     if plan is None:
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
