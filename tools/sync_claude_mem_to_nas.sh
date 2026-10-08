@@ -73,8 +73,14 @@ find /tmp -maxdepth 1 \( -name 'cm-snap.*' -o -name 'cm-delta.*' \) -type f -mmi
 
 # Dual capture sources are opt-in. The durable aggregate is never rebuilt here.
 if [ -n "${CLAUDE_MEM_SYNC_SOURCES_CONFIG:-}" ]; then
-  python3 "$(dirname "$0")/merge_claude_mem_sources.py" \
-    --config "$CLAUDE_MEM_SYNC_SOURCES_CONFIG" --output "$SRC" || exit 1
+  # 失败也要在 out 日志留一行：探针按这里的行数数「同步器跑过几次」。
+  # 只把 traceback 写进 err 日志时，10-03 起合并连续失败 5 天，out 日志里
+  # 一行都没有，探针看到的是「同步器根本没轮到跑」。
+  if ! python3 "$(dirname "$0")/merge_claude_mem_sources.py" \
+      --config "$CLAUDE_MEM_SYNC_SOURCES_CONFIG" --output "$SRC"; then
+    echo "$(ts) FAIL 双源合并失败（原因见 claude-mem-sync.err.log）"
+    exit 1
+  fi
 fi
 
 # ── 本地 watermark ─────────────────────────────────────────────────────
