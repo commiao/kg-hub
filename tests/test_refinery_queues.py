@@ -50,6 +50,35 @@ class QueueTests(unittest.TestCase):
         self.sample(self.now + 240)
         self.assertEqual(Q.read(self.history, self.now + 240)[-1]["backlog_rate"], 30)
 
+    def test_delayed_sync_landing_at_once_is_a_burst_not_a_rate(self):
+        self.sample()
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.executemany("INSERT INTO observations VALUES (?)",
+                           [(x,) for x in range(1000, 1000 + Q.BURST_ROWS)])
+        self.sample(self.now + 120)
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("INSERT INTO observations VALUES (5000)")
+        self.sample(self.now + 240)
+        burst, after = Q.read(self.history, self.now + 240)[1:]
+        self.assertEqual(burst["live"], 2 + Q.BURST_ROWS)
+        self.assertEqual(burst["live_burst"], Q.BURST_ROWS)
+        self.assertIsNone(burst["live_rate"])
+        self.assertEqual((burst["backlog_rate"], burst["backlog_burst"]), (0, None))
+        self.assertEqual((after["live_rate"], after["live_burst"]), (-30, None))
+
+    def test_history_written_before_source_totals_still_reads(self):
+        with closing(sqlite3.connect(self.history)) as db, db:
+            db.execute("CREATE TABLE samples (at REAL PRIMARY KEY, process TEXT, boundary INTEGER, "
+                       "live INTEGER, backlog INTEGER, live_held INTEGER, backlog_held INTEGER)")
+            db.execute("INSERT INTO samples VALUES (?, 'a', 10, 2581, 1, 0, 1)", (self.now - 120,))
+        self.sample()
+        old, new = Q.read(self.history, self.now)
+        self.assertIsNone(old["live_total"])
+        self.assertEqual(new["live_total"], 3)
+        # Without a prior total the jump cannot be attributed, so the rate stays.
+        self.assertEqual(new["live_rate"], (2581 - 2) * 30)
+        self.assertIsNone(new["live_burst"])
+
     def test_restart_gap_and_boundary_do_not_create_rates(self):
         self.sample()
         self.wm["ingested"].add(50)
