@@ -415,9 +415,10 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
     line = lines.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
     line.setdefault("result_counts", {})
     line.setdefault("filter_counts", {})
+    line.setdefault("deferred_counts", {})
     for t in _BUDGET_TALLIES:
         line[t] = int(line.get(t, 0)) + int(stats.get(t, 0) or 0)
-    for bucket in ("result_counts", "filter_counts"):
+    for bucket in ("result_counts", "filter_counts", "deferred_counts"):
         for name, n in (stats.get(bucket) or {}).items():
             line[bucket][name] = int(line[bucket].get(name, 0)) + int(n)
     # 小时桶:看板要画的是逐小时柱状图,只有当日合计画不出"什么时候烧的"。
@@ -428,6 +429,11 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
     hline = bucket.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
     for t in _BUDGET_TALLIES:
         hline[t] = int(hline.get(t, 0)) + int(stats.get(t, 0) or 0)
+    # 推迟原因也进小时桶：看板的推迟占比按近 24h 小时桶算，原因必须取同一批桶，
+    # 否则「占比」是 24h、「原因」是当日账，两个数说的不是同一批推迟。
+    reasons = hline.setdefault("deferred_counts", {})
+    for name, n in (stats.get("deferred_counts") or {}).items():
+        reasons[name] = int(reasons.get(name, 0)) + int(n)
     for name in sorted(_budget_hourly)[:-BUDGET_HOURS]:
         _budget_hourly.pop(name, None)
 
@@ -896,12 +902,18 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     # 仅有 deferred 总数无法判断卡在本地过滤、幂等键、网络还是服务端，运维会
     # 被迫猜测；这两个小计让下一轮状态直接说明哪一层作出了决定。
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0,
-             "filter_counts": {}, "result_counts": {}}
+             "filter_counts": {}, "result_counts": {}, "deferred_counts": {}}
     wm.setdefault("held", set())
 
     def count(bucket: str, label: str) -> None:
         values = stats[bucket]
         values[label] = values.get(label, 0) + 1
+
+    def defer(label: str) -> None:
+        # result_counts 记的是每条的全部结果（含 ok、冷却跳过）；deferred_counts 只记
+        # 计入 deferred 的那些，二者之和恒等于 deferred —— 看板的「推迟原因」读它。
+        stats["deferred"] += 1
+        count("deferred_counts", label or "unknown")
 
     to_ingest: list[dict] = []
     for obs in rows:
@@ -968,7 +980,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             n = (backoff.get(oid, [0, 0])[0]) + 1
             wait = min(2 ** (n - 1), BACKOFF_MAX_CYCLES)
             backoff[oid] = [n, cycle + wait]
-            stats["deferred"] += 1
+            defer(st)
             # 只在前 3 次打 warning,之后降 debug —— 日志量本身也是故障放大器
             (log.warning if n <= 3 else log.debug)(
                 "[%s] obs-%d → 409(第 %d 次,退避 %d 轮≈%dmin)",
@@ -977,7 +989,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             # A partially persisted business result requires an operator. Keep
             # the original observation out of the automatic submission loop.
             wm["held"].add(oid)
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → 预拆结果未完成,暂停自动提交并等待人工核实", kind, oid)
         elif st in recovery.PAUSING_FAILURES:
             # The error key can remain for an hour. Cool down this observation,
@@ -991,11 +1003,11 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     quota_delay=QUOTA_PAUSE_CYCLES * INTERVAL)
             stats["quota_paused" if st in {"quota", "daily_quota"} else
                   "rate_limited" if st == "rate_limited" else "upstream_error"] = 1
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → %s; observation cooling, queue awaits readiness",
                         kind, oid, st)
         else:  # error/timeout/net → 不记水印,下轮重试
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
         save_watermark(wm)
         if on_progress is not None:
@@ -1009,12 +1021,12 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 
         async def run(obs: dict) -> None:
             if stopped():
-                stats["deferred"] += 1      # 没发出去,下轮重试
+                defer("halted")             # 没发出去,下轮重试
                 count("result_counts", "halted")
                 return
             async with gate:
                 if stopped():
-                    stats["deferred"] += 1
+                    defer("halted")
                     count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs, kind)

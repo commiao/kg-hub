@@ -134,6 +134,24 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertEqual(live["deferred"], 6)
         self.assertEqual(live["result_counts"], {"halted": 6, "409": 4})
 
+    def test_deferred_reasons_land_in_the_same_hourly_bucket_as_the_tally(self):
+        out = refinery.note_budget("backlog", {"deferred": 3, "ingested": 2,
+                                               "result_counts": {"ok": 2, "409": 3},
+                                               "deferred_counts": {"409": 3}})
+        hour = out["hourly"][max(out["hourly"])]["backlog"]
+        self.assertEqual(hour["deferred"], 3)
+        self.assertEqual(hour["deferred_counts"], {"409": 3})
+        self.assertEqual(out["lines"]["backlog"]["deferred_counts"], {"409": 3})
+
+    def test_topology_lists_only_deferred_reasons(self):
+        out = refinery.note_budget("live", {"ingested": 5, "deferred": 1,
+                                            "result_counts": {"ok": 5, "timeout": 1},
+                                            "deferred_counts": {"timeout": 1}})
+        lines, _ = topology.budget_detail({"budget_today": out}, None)
+        reason = next(l for l in lines if "推迟原因" in l)
+        self.assertIn("timeout 1", reason)
+        self.assertNotIn("ok", reason)
+
     def test_lines_are_kept_apart(self):
         refinery.note_budget("live", {"ingested": 10, "rejected": 1})
         out = refinery.note_budget("backlog", {"ingested": 2})
