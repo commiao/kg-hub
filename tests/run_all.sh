@@ -10,6 +10,12 @@ cd "$(dirname "$0")/.." || exit 1
 # than the repository root on sys.path. Keep the project modules importable.
 PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
+# 测试只认自己 patch.dict 设的值，不继承宿主的模型客户端与服务配置。2026-10-08 实测：
+# 在 Claude Code 里跑，进程自带 ANTHROPIC_BASE_URL，网关客户端改连那个地址，
+# 5 个文件红得像付费重试逻辑坏了，而这些提交在干净环境里全绿。
+for name in $(env | awk -F= '/^(ANTHROPIC|KG_HUB)_[A-Za-z0-9_]*=/ {print $1}'); do
+    unset "$name" 2>/dev/null
+done
 PY=spike-graphiti/.venv/bin/python
 [ -x "$PY" ] || PY=python3
 fail=0
