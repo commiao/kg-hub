@@ -43,6 +43,9 @@ def _interval_wall_seconds(intervals):
 VALIDATE_CONCURRENCY = max(1, int(os.environ.get("KG_HUB_COMMIT_VALIDATE_CONCURRENCY", "8")))
 # 0 restores validating only under the lock.
 PREVALIDATE = os.environ.get("KG_HUB_COMMIT_PREVALIDATE", "1") != "0"
+# Reuse an earlier round's edge stage after a conflict when its inputs that the
+# edge stage actually depends on are unchanged and its reads still hold.
+EDGE_REUSE = os.environ.get("KG_HUB_PARALLEL_EDGE_REUSE", "1") != "0"
 
 
 class _LoopLag:
@@ -92,6 +95,20 @@ def _vector_read_lock():
     return lock
 
 
+def edge_reuse_key(episode, extracted_nodes, previous_episodes, edge_type_map,
+                   group_id, edge_types, nodes, uuid_map, custom_extraction_instructions):
+    """What the edge stage depends on (graphiti-core 0.29.0).
+
+    extract_edges uses the original extracted nodes; resolve_extracted_edges
+    uses resolved entities only by uuid and labels. Entity summaries, which
+    other observations rewrite constantly, are deliberately excluded.
+    """
+    projected = sorted((n.uuid, sorted(n.labels or [])) for n in nodes)
+    return _stage_digest([episode, extracted_nodes, previous_episodes, edge_type_map,
+                          group_id, edge_types, projected, uuid_map,
+                          custom_extraction_instructions])
+
+
 def _read_kind(query):
     if 'e.fact_embedding' in query and 'cosineDistance' in query:
         return "edge_similarity"
@@ -114,6 +131,7 @@ class ReadDependencies:
         # only: persisted records must stay byte-identical for replay.
         self.current_phase = "restored"
         self._read_phase = {}
+        self._touched = {}
         self.last_stale = None
         self._read_times = []
         self._pending = {}
@@ -181,6 +199,7 @@ class ReadDependencies:
         saved = self.records.get(key) or self._pending.get(key)
         if saved is not None and saved != record:
             raise GraphReadConflict("graph changed within an unfinished resolution stage")
+        self._touched.setdefault(self.current_phase, set()).add(key)
         if key not in self.records:
             self._read_phase.setdefault(key, self.current_phase)
             self._known_keys.add(key)
@@ -211,6 +230,52 @@ class ReadDependencies:
     def _note_stale(self, key, record):
         self.last_stale = {"kind": _read_kind(record["query"]),
                            "phase": self._read_phase.get(key, "restored")}
+
+    def phase_keys(self, phase):
+        """Every read a stage issued in this process, including repeated ones."""
+        return sorted(self._touched.get(phase, ()))
+
+    async def records_unchanged(self, records, concurrency=1):
+        """Re-read another round's dependencies against the current graph."""
+        slots = asyncio.Semaphore(max(1, concurrency))
+
+        async def unchanged(key, record):
+            async with slots:
+                current = await self.read(record["query"], record["params"], phase="reuse_check")
+            if _stage_digest(current) != record["result_digest"]:
+                self._note_stale(key, record)
+                return False
+            return True
+
+        self.last_stale = None
+        results = await asyncio.gather(*(unchanged(k, r) for k, r in records.items()))
+        return all(results)
+
+    async def adopt(self, records, phase):
+        """Make verified reads of an earlier round dependencies of this round.
+
+        Persisted before the reused stage output, so a restart validates them
+        at commit exactly like reads this round issued itself.
+        """
+        if self._flush_task is not None:
+            await asyncio.shield(self._flush_task)
+        if self._flush_error is not None:
+            raise self._flush_error
+        new = {k: v for k, v in records.items() if k not in self.records}
+        if any(self.records[k] != v for k, v in records.items() if k in self.records):
+            return False
+        if len(self._known_keys | set(new)) > MAX_READS:
+            return False
+        if new:
+            saved = await asyncio.to_thread(self.store.save_batch_or_load, *self.identity, new)
+            if saved != new:
+                return False
+            self.records.update(saved)
+            self._known_keys.update(saved)
+        for key in records:
+            self._read_phase.setdefault(key, phase)
+            self._touched.setdefault(phase, set()).add(key)
+        return True
 
     def stale_detail(self):
         stale = self.last_stale or {}
@@ -281,6 +346,7 @@ async def finish_optimistic_episode(
     from utils.graphiti_stage_adapter import (
         resolve_nodes_with_candidate_snapshot, extract_and_resolve_edges_with_snapshot,
         extract_attributes_with_snapshot, commit_episode_with_receipt,
+        edge_stage_inputs,
     )
     task_sd, task_sid, operation_id, input_digest = identity
     # SQLite commits fsync and can wait on the write lock; keep them off the loop.
@@ -345,6 +411,59 @@ async def finish_optimistic_episode(
                          dependencies.stale_detail())
                 flow_metrics.record(conflict=True, prevalidated_conflict=True)
 
+            async def reuse_earlier_edges(reuse_key, inputs):
+                """Seed this round's edge_phase from the latest earlier round.
+
+                Only when its edge-relevant inputs match and every read its edge
+                stage issued still returns the same result. The attribute stage
+                always reruns: it rewrites entity summaries.
+                """
+                for earlier in range(round_number - 1, -1, -1):
+                    earlier_identity = (task_sd, task_sid,
+                                        operation_id + f":graph-round:{earlier}", input_digest)
+                    marker = await load(*earlier_identity, "edge_reuse")
+                    edge = await load(*earlier_identity, "edge_phase")
+                    if marker is None or edge is None:
+                        continue
+                    reason = None
+                    records = {}
+                    if not isinstance(edge.get("groups"), list):
+                        reason = "edge_artifact_incomplete"
+                    elif marker["key"] != reuse_key:
+                        reason = "inputs_changed"
+                    else:
+                        for key in marker["read_keys"]:
+                            record = await load(*earlier_identity, key)
+                            if record is None:
+                                reason = "reads_missing"
+                                break
+                            records[key] = record
+                    if reason is None and records and not await dependencies.records_unchanged(
+                            records, VALIDATE_CONCURRENCY):
+                        reason = "reads_changed"
+                    if reason is None and records and not await dependencies.adopt(records, "edges"):
+                        reason = "reads_conflict"
+                    if reason is not None:
+                        log.info("[ingest:edge_reuse] sid=%s round=%d from_round=%d result=miss "
+                                 "reason=%s reads=%d %s", task_sid, round_number, earlier,
+                                 reason, len(marker["read_keys"]),
+                                 dependencies.stale_detail() if reason == "reads_changed" else "")
+                        return False
+                    await load(*round_identity, "edge_reuse", marker)
+                    await load(*round_identity, "edge_phase", {
+                        "stage_input_digest": _stage_digest(inputs),
+                        "model_step_ids": edge["model_step_ids"],
+                        "groups": edge["groups"],
+                        "reused_from_round": earlier,
+                    })
+                    log.info("[ingest:edge_reuse] sid=%s round=%d from_round=%d result=hit "
+                             "reads=%d saved_steps=%d", task_sid, round_number, earlier,
+                             len(records), len(edge["model_step_ids"]))
+                    return True
+                log.info("[ingest:edge_reuse] sid=%s round=%d result=miss reason=no_earlier_edges",
+                         task_sid, round_number)
+                return False
+
             async def stale_before(stage):
                 early_started = time.monotonic()
                 stale = not await dependencies.validate(
@@ -370,10 +489,23 @@ async def finish_optimistic_episode(
                     await abandon_stale_round("before_edges", ("resolved_nodes",))
                     continue
                 phase_started = time.monotonic()
+                reuse_key = edge_reuse_key(
+                    episode, fresh, previous_episodes, edge_type_map, group_id,
+                    edge_types, nodes, uuid_map, custom_extraction_instructions)
+                edge_existed = await load(*round_identity, "edge_phase") is not None
+                if EDGE_REUSE and round_number > 0 and not edge_existed:
+                    edge_existed = await reuse_earlier_edges(
+                        reuse_key, edge_stage_inputs(
+                            episode, fresh, previous_episodes, edge_type_map, group_id,
+                            edge_types, nodes, uuid_map, custom_extraction_instructions))
                 dependencies.current_phase = "edges"
                 resolved, invalidated, new = await extract_and_resolve_edges_with_snapshot(
                     view, episode, fresh, previous_episodes, edge_type_map, group_id,
                     edge_types, nodes, uuid_map, custom_extraction_instructions, **common)
+                if not edge_existed:
+                    # Only an edge stage that really ran here knows its reads.
+                    await load(*round_identity, "edge_reuse", {
+                        "key": reuse_key, "read_keys": dependencies.phase_keys("edges")})
                 phase_seconds["edges"] = time.monotonic() - phase_started
                 # Most stale rounds can be identified before the attribute model
                 # calls. A false result only aborts this round; the final commit

@@ -1,6 +1,8 @@
 # 冲突重来时复用上一轮的关系阶段（设计）
 
-状态：设计稿，待批准。来源：T-0195（2026-10-08）。
+状态：已批准并实现（`utils/graphiti_parallel.py`，开关 `KG_HUB_PARALLEL_EDGE_REUSE`，默认开启）。来源：T-0195（2026-10-08）。
+
+日志：`[ingest:edge_reuse] ... result=hit|miss reason=inputs_changed|reads_changed|reads_conflict|reads_missing|edge_artifact_incomplete|no_earlier_edges`。
 
 ## 问题
 

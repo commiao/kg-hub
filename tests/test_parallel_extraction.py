@@ -625,4 +625,192 @@ class PrevalidatedCommitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wl.read_generation(),2,'only the final commit took the lock')
 
 
+class TwoReadGraph:
+    """Node-candidate and edge reads that can change independently."""
+    def __init__(self):
+        self.node_value = 0
+        self.edge_value = 0
+    async def ro_query(self, query, params):
+        value = {'MATCH candidates RETURN version': self.node_value,
+                 'MATCH edges RETURN version': self.edge_value}.get(query)
+        if value is None and query not in ('MATCH candidates RETURN version', 'MATCH edges RETURN version'):
+            raise RuntimeError('read-only rejects mutation')
+        return SimpleNamespace(header=[[1, 'version']], result_set=[[value]])
+
+
+class EdgeReuseTests(unittest.IsolatedAsyncioTestCase):
+    """A conflict round reuses the earlier edge stage only when it provably applies."""
+
+    async def asyncSetUp(self):
+        from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = StageArtifactStore(Path(self.temp.name) / 'stage.db')
+        # A restart restores these from the durable snapshot: keep them stable.
+        self.now = datetime(2026, 10, 8, tzinfo=timezone.utc)
+        self.node = EntityNode(uuid='n-1', name='kg-hub', group_id='kg_hub', labels=['Entity'],
+                               name_embedding=[1.0], created_at=self.now)
+        self.episode = EpisodicNode(uuid='ep-1', name='e', group_id='kg_hub',
+                                    source=EpisodeType.text, content='x',
+                                    source_description='s', valid_at=self.now,
+                                    created_at=self.now)
+
+    async def asyncTearDown(self):
+        self.temp.cleanup()
+
+    async def run_episode(self, graph, *, on_attrs=None, uuid_map_for_round=None,
+                          crash_on_reused_edge=False):
+        from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+        import utils.graphiti_stage_adapter as stage
+        driver = Driver(graph)
+        graphiti = SimpleNamespace(driver=driver, clients=SimpleNamespace(driver=driver))
+        calls = self.calls = getattr(self, 'calls', collections.Counter())
+        node, episode, now = self.node, self.episode, self.now
+
+        async def resolve(clients, nodes, episode, previous, types, **kwargs):
+            calls['resolve'] += 1
+            await clients.driver.execute_query('MATCH candidates RETURN version')
+            round_number = int(kwargs['operation_id'].rsplit(':', 1)[1])
+            resolved = [n.model_copy(update={'summary': f'v{graph.node_value}'}) for n in nodes]
+            uuid_map = (uuid_map_for_round or {}).get(round_number) or {n.uuid: n.uuid for n in nodes}
+            return resolved, uuid_map, []
+
+        real_edges = stage.extract_and_resolve_edges_with_snapshot
+
+        async def edges(view, *args, **kwargs):
+            async def graphiti_edges(*inputs):
+                calls['edge_model'] += 1
+                await view.driver.execute_query('MATCH edges RETURN version')
+                return [], [], []
+            view._extract_and_resolve_edges = graphiti_edges
+            return await real_edges(view, *args, **kwargs)
+
+        async def attrs(g, nodes, *args, **kwargs):
+            calls['attrs'] += 1
+            if on_attrs:
+                on_attrs(calls['attrs'])
+            return nodes
+
+        async def commit(g, episode, nodes, edge_list, now, group, *args, **kwargs):
+            calls['commit'] += 1
+            return [], episode
+
+        original_save = StageArtifactStore.save_or_load
+
+        def save_or_load(store, *args):
+            value = args[5] if len(args) > 5 else None
+            if (crash_on_reused_edge and args[4] == 'edge_phase' and isinstance(value, dict)
+                    and 'reused_from_round' in value and not calls['crashed']):
+                calls['crashed'] += 1
+                raise RuntimeError('simulated crash between adopted reads and edge_phase')
+            return original_save(store, *args)
+
+        with patch.object(stage, 'resolve_nodes_with_candidate_snapshot', resolve), \
+             patch.object(stage, 'extract_and_resolve_edges_with_snapshot', edges), \
+             patch.object(stage, 'extract_attributes_with_snapshot', attrs), \
+             patch.object(stage, 'commit_episode_with_receipt', commit), \
+             patch.object(StageArtifactStore, 'save_or_load', save_or_load), \
+             self.assertLogs('kg_hub.parallel', 'INFO') as logs:
+            try:
+                await finish_optimistic_episode(
+                    graphiti, store=self.store, identity=('s', 'i', 'o', 'd'),
+                    episode=episode, previous_episodes=[], extracted_nodes=[node],
+                    node_episode_index_map={}, now=now, entity_types=None,
+                    edge_type_map={}, group_id='kg_hub', edge_types=None,
+                    custom_extraction_instructions=None)
+            except RuntimeError as exc:
+                if 'simulated crash' not in str(exc):
+                    raise
+        return calls, logs.output
+
+    def artifact(self, round_number, stage):
+        return self.store.save_or_load('s', 'i', f'o:graph-round:{round_number}', 'd', stage)
+
+    def reads(self, round_number):
+        import sqlite3
+        with sqlite3.connect(self.store.path) as db:
+            return {r[0] for r in db.execute(
+                "SELECT stage FROM graphiti_stage_artifacts WHERE operation_id=? "
+                "AND stage LIKE 'graph_read:%'", (f'o:graph-round:{round_number}',))}
+
+    async def test_unchanged_mapping_reuses_edges_but_reruns_attributes(self):
+        graph = TwoReadGraph()
+
+        def change_node_candidates(n):
+            if n == 1:
+                graph.node_value = 1     # a similar entity committed meanwhile
+        calls, logs = await self.run_episode(graph, on_attrs=change_node_candidates)
+        self.assertEqual(calls['resolve'], 2)
+        self.assertEqual(calls['edge_model'], 1, 'round 1 must replay round 0 edges')
+        self.assertEqual(calls['attrs'], 2, 'attributes always rerun')
+        self.assertEqual(calls['commit'], 1)
+        self.assertEqual(self.artifact(1, 'edge_phase')['reused_from_round'], 0)
+        self.assertTrue(self.reads(0) - self.reads(1) == set(),
+                        'round 1 must own every read the reused edges depend on')
+        self.assertTrue(any('edge_reuse' in l and 'result=hit' in l for l in logs))
+
+    async def test_changed_mapping_runs_edges_again(self):
+        graph = TwoReadGraph()
+
+        def change(n):
+            if n == 1:
+                graph.node_value = 1
+        calls, logs = await self.run_episode(
+            graph, on_attrs=change, uuid_map_for_round={1: {'n-1': 'existing-entity'}})
+        self.assertEqual(calls['edge_model'], 2)
+        self.assertTrue(any('reason=inputs_changed' in l for l in logs))
+        self.assertNotIn('reused_from_round', self.artifact(1, 'edge_phase'))
+
+    async def test_changed_edge_read_runs_edges_again(self):
+        graph = TwoReadGraph()
+
+        def change_both(n):
+            if n == 1:
+                graph.node_value = 1
+                graph.edge_value = 1
+        calls, logs = await self.run_episode(graph, on_attrs=change_both)
+        self.assertEqual(calls['edge_model'], 2)
+        self.assertTrue(any('reason=reads_changed' in l for l in logs))
+        self.assertEqual(calls['commit'], 1)
+
+    async def test_edge_read_changing_after_reuse_is_caught_before_commit(self):
+        graph = TwoReadGraph()
+
+        def change(n):
+            if n == 1:
+                graph.node_value = 1     # round 0 conflicts; round 1 reuses edges
+            if n == 2:
+                graph.edge_value = 1     # the reused edge read goes stale
+        calls, logs = await self.run_episode(graph, on_attrs=change)
+        self.assertEqual(self.artifact(1, 'edge_phase')['reused_from_round'], 0)
+        conflicts = [l for l in logs if 'parallel_conflict' in l and 'round=1' in l]
+        self.assertTrue(conflicts and 'stale_phase=edges' in conflicts[0])
+        self.assertEqual(calls['edge_model'], 2, 'round 2 must run edges for the new read')
+        self.assertEqual(calls['commit'], 1)
+
+    async def test_crash_between_adopted_reads_and_edge_phase_recovers_without_paying_again(self):
+        graph = TwoReadGraph()
+
+        def change(n):
+            if n == 1:
+                graph.node_value = 1
+        calls, _ = await self.run_episode(graph, on_attrs=change, crash_on_reused_edge=True)
+        self.assertEqual(calls['crashed'], 1)
+        self.assertEqual(calls['commit'], 0)
+        self.assertIsNone(self.artifact(1, 'edge_phase'))
+        calls, logs = await self.run_episode(graph)
+        self.assertEqual(calls['edge_model'], 1, 'recovery must still reuse round 0 edges')
+        self.assertEqual(calls['commit'], 1)
+        self.assertEqual(self.artifact(1, 'edge_phase')['reused_from_round'], 0)
+
+    async def test_reuse_can_be_disabled(self):
+        graph = TwoReadGraph()
+
+        def change(n):
+            if n == 1:
+                graph.node_value = 1
+        with patch('utils.graphiti_parallel.EDGE_REUSE', False):
+            calls, _ = await self.run_episode(graph, on_attrs=change)
+        self.assertEqual(calls['edge_model'], 2)
+
+
 if __name__=='__main__':unittest.main()
