@@ -152,7 +152,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(NeedsReconciliation):
                     await run()
                 journal.finish_task_execution("source", "one", "original", state="failed")
-                row = dict(source_description="source", source_obs_id="one")
+                row = dict(source_description="source", source_obs_id="one", execution_epoch="epoch")
                 self.assertFalse(await verify_task_plan(driver, journal, row,
                                                        observation_body=lambda *_: ""))
                 failed = next(r for r in journal.find_task("source", "one")
@@ -170,6 +170,67 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(paid, ["extract", "edge", "edge", "attributes"])
                 self.assertEqual(len(committed), 1)
                 graph.retrieve_episodes.assert_awaited_once()
+
+
+class PlanPerAttemptTests(unittest.TestCase):
+    """A retry gets a new epoch; it must not inherit the failed attempt's plan."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.journal = ModelAttemptJournal(Path(self.temp.name) / "attempts.sqlite3")
+        self.ref = datetime(2026, 10, 6, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def body(self, text="content"):
+        return SimpleNamespace(name="episode", episode_body=text,
+                               source_description="source", source_obs_id="one")
+
+    def open(self, epoch, text="content"):
+        from utils.ingest_workflow import open_workflow
+        return open_workflow(self.body(text), self.ref, epoch, "episode", lambda: self.journal)
+
+    def store(self):
+        from utils.graphiti_stage_adapter import StageArtifactStore
+        return StageArtifactStore(self.journal.path)
+
+    def test_retry_with_new_epoch_opens_its_own_plan(self):
+        first = self.open("2026-10-06T14:39:55+00:00")
+        retry = self.open("2026-10-08T05:55:50+00:00")
+        self.assertIsNotNone(retry, "retry fell back to the serial writer-lock path")
+        self.assertNotEqual(first["operation"], retry["operation"])
+        self.assertEqual(retry["plan"]["epoch"], "2026-10-08T05:55:50+00:00")
+        self.assertEqual(self.open("2026-10-06T14:39:55+00:00")["plan"], first["plan"])
+
+    def test_same_epoch_with_different_input_still_fails_closed(self):
+        self.assertIsNotNone(self.open("e1"))
+        with self.assertLogs("kg_hub.ingest_workflow", "ERROR") as logs:
+            self.assertIsNone(self.open("e1", text="changed"))
+        self.assertIn("graphiti stage input drift", "\n".join(logs.output))
+
+    def test_plan_under_shared_legacy_key_is_kept_for_its_own_epoch(self):
+        from utils import ingest_workflow as wf
+        with patch.object(wf, "plan_operation", return_value=wf.PLAN_OPERATION):
+            legacy = self.open("e1")
+        self.assertEqual(legacy["operation"], wf.PLAN_OPERATION)
+        resumed = self.open("e1")
+        self.assertEqual(resumed["operation"], wf.PLAN_OPERATION)
+        self.assertEqual(resumed["plan"], legacy["plan"])
+        with self.assertLogs("kg_hub.ingest_workflow", "ERROR"):
+            self.assertIsNone(self.open("e1", text="changed"))
+        retry = self.open("e2")
+        self.assertEqual(retry["operation"], wf.plan_operation("e2"))
+
+    def test_locate_plan_selects_the_attempt_by_epoch(self):
+        from utils import ingest_workflow as wf
+        with patch.object(wf, "plan_operation", return_value=wf.PLAN_OPERATION):
+            self.open("e1")
+        self.open("e2")
+        store = self.store()
+        self.assertEqual(wf.locate_plan(store, "source", "one", "e1")[2]["epoch"], "e1")
+        self.assertEqual(wf.locate_plan(store, "source", "one", "e2")[2]["epoch"], "e2")
+        self.assertIsNone(wf.locate_plan(store, "source", "one", "e3"))
 
 
 if __name__ == "__main__":

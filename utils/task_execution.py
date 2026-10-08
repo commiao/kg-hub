@@ -19,7 +19,8 @@ async def read_task(driver, sd, sid):
         "k.worker_execution_id AS worker_execution_id, k.worker_state AS worker_state, "
         "k.manual_resume_command_id AS manual_resume_command_id, "
         "k.episode_uuid AS episode_uuid, k.name AS name, k.stage AS stage, "
-        "k.predigest_children AS predigest_children, k.failed_children AS failed_children",
+        "k.predigest_children AS predigest_children, k.failed_children AS failed_children, "
+        "k.execution_epoch AS execution_epoch, k.created_at AS created_at",
         sd=sd, sid=sid)
     return dict(rows[0]) if rows else None
 
