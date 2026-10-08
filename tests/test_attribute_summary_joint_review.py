@@ -26,7 +26,8 @@ class ReviewTests(unittest.TestCase):
                   "previous_episodes": []}
         row = review.make_sample_review(sample, [{"sample_sid": "s", "schema_valid": True,
             "attributes": {file_node["uuid"]: {"path": "x.py", "project_id": "new"}},
-            "summaries": {bare_node["uuid"]: "new fact"}}], {bare_node["uuid"]})
+            "summaries": {bare_node["uuid"]: "new fact"},
+            "persisted_summaries": {bare_node["uuid"]: "new fact"}}], {bare_node["uuid"]})
         file_checks = row["entities"][0]["checks"]
         self.assertEqual(file_checks["old_value_and_correction"]["verdict"], "unreviewed")
         self.assertEqual(file_checks["project_and_file_ownership"]["verdict"], "unreviewed")
@@ -37,6 +38,7 @@ class ReviewTests(unittest.TestCase):
         entity = {"uuid": "e", "name": "x.py", "labels": ["Entity", "File"],
                   "old_attributes": {"path": "old/x.py"}, "old_summary": "old",
                   "candidate_attributes": {"path": "x.py"}, "candidate_summary": "summary",
+                  "candidate_raw_summary": "summary",
                   "checks": {name: {"verdict": "pass", "reason": "",
                                     "candidate_excerpt": "", "source_excerpt": ""}
                              for name in ("old_value_and_correction",

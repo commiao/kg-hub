@@ -14,6 +14,7 @@ from pathlib import Path
 from tools.attribute_summary_joint_probe import summary_targets
 from tools.attribute_prompt_probe import typed_nodes
 from graphiti_core.nodes import EntityNode
+from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS, truncate_at_sentence
 
 
 REVIEWED = {"pass", "fail"}
@@ -31,7 +32,7 @@ def _packet_hash(row: dict) -> str:
         "sd", "sid", "operation_id", "episode_content", "previous_episodes")}
     immutable["entities"] = [{key: entity[key] for key in (
         "uuid", "name", "labels", "old_attributes", "candidate_attributes",
-        "old_summary", "candidate_summary")}
+        "old_summary", "candidate_summary", "candidate_raw_summary")}
         for entity in row["entities"]]
     return hashlib.sha256(json.dumps(immutable, ensure_ascii=False,
                                     sort_keys=True).encode()).hexdigest()
@@ -40,7 +41,7 @@ def _packet_hash(row: dict) -> str:
 def make_sample_review(sample: dict, results: list[dict], targets: set[str]) -> dict:
     typed = {node.uuid for node, _ in typed_nodes(
         [EntityNode.model_validate(item) for item in sample["nodes"]])}
-    attributes, summaries = {}, {}
+    attributes, summaries, raw_summaries = {}, {}, {}
     for result in results:
         if result.get("schema_valid") is not True or result.get("sample_sid") != sample["sid"]:
             raise ValueError("missing or invalid candidate batch")
@@ -48,10 +49,16 @@ def make_sample_review(sample: dict, results: list[dict], targets: set[str]) -> 
             if key in attributes:
                 raise ValueError("duplicate typed entity output")
             attributes[key] = value
+        if set(result["summaries"]) != set(result["persisted_summaries"]):
+            raise ValueError("persisted summary target set changed")
         for key, value in result["summaries"].items():
             if key in summaries:
                 raise ValueError("duplicate summary output")
-            summaries[key] = value
+            persisted = result["persisted_summaries"][key]
+            if persisted != truncate_at_sentence(value, MAX_SUMMARY_CHARS):
+                raise ValueError("persisted summary differs from Graphiti truncation")
+            summaries[key] = persisted
+            raw_summaries[key] = value
     if set(attributes) != typed or set(summaries) != targets:
         raise ValueError("candidate output does not cover exact typed and summary targets")
     entities = []
@@ -65,6 +72,7 @@ def make_sample_review(sample: dict, results: list[dict], targets: set[str]) -> 
             "candidate_attributes": attributes.get(uuid),
             "old_summary": node.get("summary") or "",
             "candidate_summary": summaries.get(uuid),
+            "candidate_raw_summary": raw_summaries.get(uuid),
             "checks": {
                 "old_value_and_correction": _check(is_typed),
                 "project_and_file_ownership": _check(is_typed and bool({"File", "Project"} & set(labels))),

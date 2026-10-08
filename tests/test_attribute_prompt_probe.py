@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 import httpx
-from anthropic import InternalServerError
+from anthropic import AuthenticationError, InternalServerError
 from pydantic import ValidationError
 
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
@@ -548,6 +548,31 @@ class AttributePromptProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unknown prior outcome"):
                     probe.call(request, Path(folder), receipt.stem)
                 self.assertEqual(create.call_count, 2)
+
+    def test_verified_caller_auth_rejection_reuses_exact_identity(self):
+        request = asyncio.run(probe.capture(self.sample(), 16))[0]
+        error = AuthenticationError("unauthorized", response=httpx.Response(
+            401, request=httpx.Request("POST", "http://test/v1/messages")),
+            body={"request_id": "auth-rejected", "error": {"code": "unauthorized"}})
+        response = SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", name="EntityAttributeBatch", input={})],
+            usage=SimpleNamespace(model_dump=lambda: {"input_tokens": 1, "output_tokens": 2}),
+            stop_reason="tool_use")
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", {
+                "ANTHROPIC_MODEL": "probe", "KG_HUB_MODEL_GATEWAY_TOKEN": "fake"}):
+            with patch("anthropic.Anthropic") as client:
+                create = client.return_value.messages.create
+                create.side_effect = [error, response]
+                with self.assertRaises(AuthenticationError):
+                    probe.call(request, Path(folder))
+                receipt = next(Path(folder).glob("*.json"))
+                with self.assertRaisesRegex(RuntimeError, "unknown prior outcome"):
+                    probe.call(request, Path(folder), "wrong-digest")
+                saved = probe.call(request, Path(folder), receipt.stem)
+                self.assertEqual(saved["phase"], "completed")
+                self.assertEqual(saved["prior_error"]["status"], 401)
+                self.assertEqual(saved["prior_error"]["error_code"], "unauthorized")
+                self.assertEqual(create.call_args_list[0], create.call_args_list[1])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools import attribute_summary_joint_probe as joint
@@ -63,6 +64,10 @@ class JointPlanTests(unittest.TestCase):
         projections = []
         for request in requests:
             context = json.loads(request["messages"][1]["content"])
+            for key, row in request["model"].model_fields.items():
+                attributes = row.annotation.model_fields["attributes"].annotation
+                self.assertTrue(all(field.is_required()
+                                    for field in attributes.model_fields.values()))
             payload = {
                 key: {"attributes": {
                           field: item["attributes"].get(field)
@@ -72,6 +77,13 @@ class JointPlanTests(unittest.TestCase):
                 for key, item in context["entities"].items()
             }
             projections.append(joint.validate_output(request, payload))
+            non_target = next((key for key in payload
+                               if key not in request["summary_targets"]), None)
+            if non_target is not None:
+                wrong_summary = json.loads(json.dumps(payload))
+                wrong_summary[non_target]["summary"] = "Unexpected summary"
+                with self.assertRaises((ValidationError, ValueError)):
+                    joint.validate_output(request, wrong_summary)
             first_key = next(iter(request["model"].model_fields))
             field = next(iter(payload[first_key]["attributes"]), None)
             if field is not None:
@@ -84,6 +96,10 @@ class JointPlanTests(unittest.TestCase):
                 first = next(iter(request["summary_targets"]))
                 bad[first]["summary"] = None
                 with self.assertRaises(ValueError):
+                    joint.validate_output(request, bad)
+                bad = json.loads(json.dumps(payload))
+                bad[first]["summary"] = "x" * (joint.MAX_SUMMARY_CHARS + 1)
+                with self.assertRaises(ValidationError):
                     joint.validate_output(request, bad)
         self.assertEqual(sum(len(summaries) for _, summaries in projections), 2)
         self.assertEqual(sum(len(attributes) for attributes, _ in projections), 9)

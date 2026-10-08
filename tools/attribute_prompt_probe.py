@@ -852,10 +852,20 @@ def call(request, directory, resume_rejected_digest=None, replay_only=False, tri
         saved = json.loads(receipt.read_text())
         if saved.get("phase") == "completed":
             return saved
-        if (saved.get("phase") == "http_error" and saved.get("status") == 503
-                and resume_rejected_digest == digest and not saved.get("prior_error")):
+        recoverable_gateway_rejection = (
+            saved.get("phase") == "http_error"
+            and (
+                saved.get("status") == 503
+                or (saved.get("status") == 401
+                    and saved.get("error_code") == "unauthorized")
+            )
+        )
+        if (recoverable_gateway_rejection and resume_rejected_digest == digest
+                and not saved.get("prior_error")):
             # Explicit operator recovery only after checking the gateway ledger,
             # HTTP-start index AND independent witness for this exact identity.
+            # A caller-auth 401 is rejected before provider dispatch. Its
+            # isolated gateway ledger must still be checked before recovery.
             # Keep the old evidence and the EXACT original key/body. Never
             # recover a prepared/unknown result, or automatically loop on 503.
             prior_error = saved

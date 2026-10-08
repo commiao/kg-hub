@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+from typing import Literal
 
 from pydantic import ConfigDict, Field, ValidationError, create_model
+from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS, truncate_at_sentence
 
 from tools import attribute_prompt_probe as probe
 
@@ -69,12 +72,15 @@ def summary_targets(journal: Path, sample: dict) -> set[str]:
 async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
     """Keep the production batch size of eight and add only targeted summaries."""
     requests = await probe.capture(sample, 8)
+    for request in requests:
+        probe.require_complete_fields(request)
     nodes_by_uuid = {node["uuid"]: node for node in sample["nodes"]}
     covered: set[str] = set()
     typed_uuids = {uuid for request in requests for uuid in request["uuids"]}
     extra_nodes = [node for node in sample["nodes"]
                    if node["uuid"] in targets and node["uuid"] not in typed_uuids]
     for request_index, request in enumerate(requests):
+        request["batch_index"] = request_index
         context = json.loads(request["messages"][1]["content"])
         fields = {}
         for index, uuid in enumerate(request["uuids"]):
@@ -86,10 +92,24 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
             context["entities"][key]["summary"] = node.get("summary") or ""
             context["entities"][key]["summary_required"] = wanted
             attribute_schema = request["model"].model_fields[key].annotation
+            if "Project" in node["labels"]:
+                path_field = copy.deepcopy(attribute_schema.model_fields["path"])
+                path_field.description = (
+                    "Directory of this code project only. A Java/Python/Markdown "
+                    "file or class path is NOT a Project.path. Keep null when no "
+                    "explicit project directory is supplied."
+                )
+                attribute_schema = create_model(
+                    f"JointProjectAttributes{request_index}_{index}",
+                    __base__=attribute_schema,
+                    path=(str | None, path_field),
+                )
             row_schema = create_model(
                 f"JointRecord{index}", __config__=ConfigDict(extra="forbid"),
                 attributes=(attribute_schema, Field(...)),
-                summary=(str | None, Field(...)),
+                summary=(str if wanted else Literal[None],
+                         Field(..., max_length=MAX_SUMMARY_CHARS) if wanted
+                         else Field(...)),
             )
             fields[key] = (row_schema, Field(...))
         request["summary_only_uuids"] = {}
@@ -106,7 +126,7 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
                 row_schema = create_model(
                     f"SummaryOnlyRecord{index}", __config__=ConfigDict(extra="forbid"),
                     attributes=(empty_attributes, Field(...)),
-                    summary=(str | None, Field(...)),
+                    summary=(str, Field(..., max_length=MAX_SUMMARY_CHARS)),
                 )
                 fields[key] = (row_schema, Field(...))
                 request["summary_only_uuids"][key] = node["uuid"]
@@ -119,13 +139,29 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
             "\nUpdate attributes first using only the supplied episode, previous episodes "
             "and each entity's existing attributes. Then, for each entity marked "
             "summary_required=true, write its updated summary using the just-updated "
-            "attributes, its existing summary and the same source evidence. Preserve "
-            "supported old facts, resolve explicit corrections, and retain conditions, "
-            "exceptions and negation. Do not move facts between entities or invent "
-            "implementation details. For summary_required=false return summary=null. "
+            "attributes, its existing summary and the same source evidence. Examine "
+            "the CURRENT episode's narrative and every Key facts bullet for each "
+            "summary target. The summary field is the COMPLETE text to persist "
+            "and MUST be at most 1000 characters; write current evidence FIRST, "
+            "then compress older supported background into the remaining space. "
+            "Never place current facts beyond the persisted limit. Include "
+            "directly relevant new facts even when they "
+            "report an empty query, failed probe, unresolved question or negative "
+            "result; do not turn uncertainty into a conclusion. Preserve supported "
+            "old facts, resolve explicit corrections, and retain conditions, "
+            "exceptions and negation. When the current episode adds a relevant "
+            "fact, do not merely copy the old summary unchanged. Project.path "
+            "is a project DIRECTORY, not a source-file path, even if an entity "
+            "was mislabeled Project. Do not "
+            "move facts between entities or invent implementation details. "
+            "For summary_required=false return summary=null. "
             "Return every entity key with both attributes and summary fields."
         )
-        request["messages"][1]["content"] = json.dumps(context, ensure_ascii=False)
+        request["messages"][1]["content"] = json.dumps({
+            "previous_episodes": context["previous_episodes"],
+            "entities": context["entities"],
+            "episode_content": context["episode_content"],
+        }, ensure_ascii=False)
         request["summary_targets"] = {key for key, item in context["entities"].items()
                                       if item["summary_required"]}
     if covered != targets:
@@ -188,8 +224,14 @@ def main(argv=None):
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--approved-new-calls", type=int, default=0,
                         help="Explicitly authorized additional paid calls for this run")
+    parser.add_argument("--resume-rejected-digest",
+                        help="Exact digest of a verified pre-provider gateway rejection")
     parser.add_argument("--sample-index", type=int,
                         help="Development screen only; omit for the frozen 15-sample holdout")
+    parser.add_argument("--batch-index", type=int,
+                        help="Development screen of one batch; requires --sample-index")
+    parser.add_argument("--execute-first-samples", type=int,
+                        help="Stage the first N frozen observations while retaining the full plan")
     args = parser.parse_args(argv)
     raw = args.holdout.read_bytes()
     holdout = json.loads(raw)
@@ -198,11 +240,15 @@ def main(argv=None):
         raise ValueError("expected 15 distinct frozen observations")
     if args.sample_index is not None:
         samples = [samples[args.sample_index]]
+    elif args.batch_index is not None:
+        raise ValueError("--batch-index requires --sample-index")
     planned = []
     target_counts = []
     for sample in samples:
         targets = summary_targets(args.journal, sample)
         requests = asyncio.run(build_requests(sample, targets))
+        if args.batch_index is not None:
+            requests = [requests[args.batch_index]]
         planned.append((sample, requests))
         target_counts.append(len(targets))
     calls = sum(len(requests) for _, requests in planned)
@@ -221,11 +267,17 @@ def main(argv=None):
         return
     if args.approved_new_calls < calls:
         raise RuntimeError(f"explicit approved budget of at least {calls} new calls required")
+    if args.execute_first_samples is not None and not 1 <= args.execute_first_samples <= len(planned):
+        raise ValueError("--execute-first-samples is outside the frozen cohort")
     args.save_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     _freeze(args.save_dir / "plan.json", manifest)
-    for sample_index, (sample, requests) in enumerate(planned):
-        for index, request in enumerate(requests):
-            saved = probe.call(request, args.save_dir, structured_output=True)
+    execution = planned[:args.execute_first_samples] if args.execute_first_samples else planned
+    for sample_index, (sample, requests) in enumerate(execution):
+        for request in requests:
+            index = request["batch_index"]
+            saved = probe.call(request, args.save_dir,
+                              resume_rejected_digest=args.resume_rejected_digest,
+                              structured_output=True)
             record = {"input_hash": manifest["holdout_sha256"],
                       "sample_index": sample_index, "batch_index": index,
                       "sample_sid": sample["sid"],
@@ -240,11 +292,17 @@ def main(argv=None):
                 record["summary_count"] = len(summaries)
                 record["attributes"] = attributes
                 record["summaries"] = summaries
+                record["persisted_summaries"] = {
+                    uuid: truncate_at_sentence(value, MAX_SUMMARY_CHARS)
+                    for uuid, value in summaries.items()}
                 record["existing_value_losses"] = probe.lost_existing_values(sample, attributes)
             except (ValidationError, ValueError, TypeError) as exc:
                 record["structural_error"] = type(exc).__name__
             _freeze(args.save_dir / (sample["sid"] + f"-batch-{index}-result.json"), record)
-            print(json.dumps(record, ensure_ascii=False), flush=True)
+            print(json.dumps({key: value for key, value in record.items()
+                              if key not in ("attributes", "summaries",
+                                             "persisted_summaries")},
+                             ensure_ascii=False), flush=True)
             if not record["schema_valid"]:
                 raise RuntimeError("joint answer failed structure; stop before further paid calls")
 
