@@ -23,11 +23,12 @@ class JournalPruneTests(unittest.TestCase):
         self.journal = ModelAttemptJournal(self.path)
         self.store = StageArtifactStore(self.path)
 
-    def seed(self, sid, *, execution="succeeded", grant=False):
+    def seed(self, sid, *, execution="succeeded", grant=False, queue=None):
         sd = "source"
         key = f"key-{sid}"
         self.journal.prepare(key=key, business_key="kg-hub", source_description=sd,
-                             source_obs_id=sid, step_id="step", request_digest="digest")
+                             source_obs_id=sid, step_id="step", request_digest="digest",
+                             queue_owned=queue is not None)
         self.journal.complete(key, '{"answer": 1}')
         self.journal.record_gateway_step(sd, sid, key, "wire", "body")
         self.journal.save_episode_context(sd, sid, "op", "input", [])
@@ -39,7 +40,16 @@ class JournalPruneTests(unittest.TestCase):
             with sqlite3.connect(self.path) as db:
                 db.execute("INSERT INTO model_retry_grants VALUES (?,?,?,?,?,?,?,?,?)",
                            ("grant", sd, sid, "step", "digest", None, "granted", "now", None))
+        if queue in ("receipt", "acknowledged"):
+            self.journal.queue_business_receipts(sd, sid, f"neo4j:episode:{sid}")
+        if queue == "acknowledged":
+            self.journal.acknowledge_queue_receipt(key)
         return sd, sid
+
+    def receipts(self, sid):
+        with sqlite3.connect(self.path) as db:
+            return db.execute("SELECT count(*) FROM queue_business_receipts "
+                              "WHERE idempotency_key=?", (f"key-{sid}",)).fetchone()[0]
 
     def rows(self, sd, sid):
         tid = task_uuid(sd, sid)
@@ -79,6 +89,22 @@ class JournalPruneTests(unittest.TestCase):
         self.assertEqual((report["pruned"], report["skipped_guarding"]), (0, 3))
         for task in (running, uncertain, granted):
             self.assertTrue(all(self.rows(*task).values()), task)
+
+    def test_queue_answer_without_acknowledged_receipt_is_kept(self):
+        # No receipt yet: recovery rebuilds it from model_attempts, which must survive.
+        missing = self.seed("missing", queue="answer")
+        pending = self.seed("pending", queue="receipt")
+        report = prune(self.path, [missing, pending], apply=True, pause=0)
+        self.assertEqual((report["pruned"], report["skipped_guarding"]), (0, 2))
+        self.assertTrue(all(self.rows(*missing).values()))
+        self.assertEqual(self.receipts("pending"), 1)
+
+    def test_acknowledged_receipt_is_pruned_with_its_task(self):
+        done, kept = self.seed("done", queue="acknowledged"), self.seed("kept", queue="acknowledged")
+        report = prune(self.path, [done], apply=True, pause=0)
+        self.assertEqual(report["rows"]["queue_business_receipts"], 1)
+        self.assertEqual(set(self.rows(*done).values()), {0})
+        self.assertEqual((self.receipts("done"), self.receipts("kept")), (0, 1))
 
     def test_time_budget_stops_between_batches_and_reports_the_rest(self):
         tasks = [self.seed(f"t{i}") for i in range(3)]

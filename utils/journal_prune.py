@@ -4,8 +4,10 @@ Only IngestedKey rows with status 'ok' older than the retention window are
 eligible. Such a task cannot be dispatched again (duplicate intake is refused),
 resumed or reconciled, so its model answers, stage artifacts and commit fences
 guard nothing any more. Every other status keeps its full evidence, and so does
-an 'ok' task whose journal still shows an unsettled execution or an open human
-retry grant.
+an 'ok' task whose journal still shows an unsettled execution, an open human
+retry grant, or a gateway-queue answer whose business receipt the gateway has
+not acknowledged yet (the receipt is derived from model_attempts, so deleting
+the attempt first would strand the queue job).
 
 Safe while the service runs: short batched transactions, no VACUUM. SQLite
 reuses the freed pages, so the file stops growing rather than shrinking.
@@ -33,7 +35,9 @@ log = logging.getLogger("kg_hub.journal_prune")
 UNSETTLED_EXECUTIONS = ("running", "uncertain")
 
 # (table, key columns): "task" rows are keyed by task_uuid, the rest by sd/sid.
+# Acknowledged receipts are keyed through model_attempts, so they go first.
 _TABLES = (
+    ("queue_business_receipts", ("idempotency_key",)),
     ("graphiti_stage_artifacts", ("task_sd", "task_sid")),
     ("model_attempts", ("source_description", "source_obs_id")),
     ("episode_contexts", ("source_description", "source_obs_id")),
@@ -72,9 +76,17 @@ def _still_guarding(db, tables, sd: str, sid: str, tid: str) -> bool:
             "SELECT 1 FROM task_executions WHERE task_id=? AND state IN (?, ?) LIMIT 1",
             (tid, *UNSETTLED_EXECUTIONS)).fetchone():
         return True
-    return "model_retry_grants" in names and bool(db.execute(
-        "SELECT 1 FROM model_retry_grants WHERE source_description=? "
-        "AND source_obs_id=? AND state='granted' LIMIT 1", (sd, sid)).fetchone())
+    if "model_retry_grants" in names and db.execute(
+            "SELECT 1 FROM model_retry_grants WHERE source_description=? "
+            "AND source_obs_id=? AND state='granted' LIMIT 1", (sd, sid)).fetchone():
+        return True
+    # Same answer set queue_business_receipts() turns into receipts.
+    return "queue_business_receipts" in names and bool(db.execute(
+        "SELECT 1 FROM model_attempts a LEFT JOIN queue_business_receipts r "
+        "ON r.idempotency_key=a.idempotency_key "
+        "WHERE a.source_description=? AND a.source_obs_id=? AND a.queue_owned=1 "
+        "AND (a.phase='failed' OR (a.phase='completed' AND a.result_json IS NOT NULL)) "
+        "AND coalesce(r.acknowledged, 0)=0 LIMIT 1", (sd, sid)).fetchone())
 
 
 def _task_rows(db, tables, sd: str, sid: str, tid: str, *, delete: bool) -> dict:
@@ -82,6 +94,9 @@ def _task_rows(db, tables, sd: str, sid: str, tid: str, *, delete: bool) -> dict
     for table, keys in tables:
         where = " AND ".join(f"{key}=?" for key in keys)
         values = (tid,) if keys == ("task_id",) else (sd, sid)
+        if keys == ("idempotency_key",):
+            where = ("acknowledged=1 AND idempotency_key IN (SELECT idempotency_key "
+                     "FROM model_attempts WHERE source_description=? AND source_obs_id=?)")
         if delete:
             counts[table] = db.execute(f"DELETE FROM {table} WHERE {where}", values).rowcount
         else:
