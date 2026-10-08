@@ -455,6 +455,34 @@ if(!elements.keytrends.innerHTML.includes(axisLabel(chartEnd)))throw Error('axis
             result=subprocess.run(["node","-e",harness+script],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
 
+    def test_rate_chart_outlier_neither_flattens_the_axis_nor_overprints_ticks(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript")
+        script=F._HTML.split("<script>")[1]
+        helpers=script[script.index("function chartRange"):script.index("function backlogChart")]
+        # 2026-10-08: one -129876/h sample among normal 0–60/h rates.
+        check = """
+const spec={zeroBaseline:true,robust:true,series:[['净消化速度','live_rate']]};
+// Max ~270/h puts the padded top at ≈13248, 8px above zero — the label clash seen.
+const values=Array.from({length:200},(_,i)=>i%3*30).concat([-129876.4,270]);
+const {low,top}=chartRange(values,spec);
+if(!(low<0&&low>-1000&&top>=60&&top<1000))throw Error('range '+low+' '+top);
+const y=v=>9+92*(1-(Math.min(top,Math.max(low,v))-low)/(top-low));
+const ticks=chartTicks(low,top,spec,y);
+if(y(-129876.4)-y(0)<5)throw Error('pinned outlier drawn on the zero line');
+if(!ticks.includes(0))throw Error('zero tick');
+for(let i=1;i<ticks.length;i++)if(Math.abs(y(ticks[i])-y(ticks[i-1]))<12)throw Error('overlap '+ticks);
+const raw=chartRange(values,{...spec,robust:false});
+if(raw.low!==-129876.4)throw Error('non-robust charts keep full range');
+const t=chartTicks(raw.low,raw.top,spec,v=>9+92*(1-(v-raw.low)/(raw.top-raw.low)));
+if(Math.round(raw.top)!==13285||t.length!==2||!t.includes(0)||!t.includes(raw.low))throw Error('crowded top tick dropped '+t);
+const few=chartRange([0,30,-5000],spec);
+if(few.low!==-5000)throw Error('too few samples to call an outlier');
+"""
+        result=subprocess.run(["node","-e",helpers+check],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_refinery_partial_leading_hour_is_not_counted(self):
         w=F.time_range("1h",NOW)
         st=status(budget_today={"hourly":{"2026-09-28T03":{"backlog":{"ingested":99}},

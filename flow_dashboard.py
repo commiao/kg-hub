@@ -1326,7 +1326,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
-<div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。北京时间，光标或方向键可查看数值。</div>
+<div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。单个采样间隔内源库增减 ≥200 条记为同步补灌（橙色虚线），不计入速度；极端值贴边显示，光标仍读出原值。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
 <div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
@@ -1445,9 +1445,9 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
  }
  const color=k==='live'?'#378ADD':'#8250C4';
  backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',gapMinutes:10,continuity:true,rows:filterRows(rows),
-   series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
- backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,continuity:true,zeroBaseline:true,
-   rows:filterRows(kgQueues.rows),
+   burst:k+'_burst',series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
+ backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,continuity:true,zeroBaseline:true,robust:true,
+   rows:filterRows(kgQueues.rows),burst:k+'_burst',
    series:[['净消化速度',k+'_rate',color]]});
 });
 backlogData.push(...processingData);
@@ -1459,14 +1459,37 @@ compressionHosts.forEach(h=>{
  });
 });
 const backlogX=(spec,at)=>rangeX(at);
+// A single outlier (e.g. a delayed sync from before bursts were flagged) must not
+// flatten every normal point onto the zero line: robust charts scale to P2–P98
+// and pin the rest to the edge, still reading out the real value.
+function chartRange(values,spec){
+ let lo=Math.min(...values),hi=Math.max(...values);
+ if(spec.robust&&values.length>=20){
+   const v=[...values].sort((a,b)=>a-b),at=q=>v[Math.round(q*(v.length-1))];
+   lo=at(.02);hi=at(.98);
+ }
+ let low=!spec.zeroBaseline&&spec.series.length===1?lo:Math.min(0,lo);
+ const high=Math.max(low+1,hi,...(spec.zeroBaseline?[0]:[]));
+ // Pinned points must not sit on the zero line and read as "flat".
+ if(Math.min(...values)<low)low-=(high-low)*.1;
+ return {low,top:high+(high-low)*.1};
+}
+// Tick labels are 10px tall; drop any that would overprint an earlier one.
+function chartTicks(low,top,spec,y){
+ const kept=[];
+ [spec.zeroBaseline&&low<0?0:(low+top)/2,low,top].forEach(v=>{
+   if(kept.every(k=>Math.abs(y(k)-y(v))>=12))kept.push(v);
+ });
+ return kept.sort((a,b)=>a-b);
+}
 function backlogChart(spec,index){
  const rows=spec.rows;
  if(!rows.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无可用样本；积压剩余从首次采样后开始显示。</div></div>';
  const values=rows.flatMap(r=>spec.series.map(s=>r[s[1]]).filter(Number.isFinite));
  if(!values.length)return '<div class=trend><h3>'+spec.title+'</h3><div class=note>暂无有效样本；净消化速度需要连续、同一进程且统计边界一致的实时采样，缺测不记为 0。</div></div>';
- const low=!spec.zeroBaseline&&spec.series.length===1&&values.length?Math.min(...values):Math.min(0,...values);
- const high=Math.max(low+1,...values,...(spec.zeroBaseline?[0]:[])),top=high+(high-low)*.1;
- const y=v=>9+(125-9-24)*(1-(v-low)/(top-low));
+ const {low,top}=chartRange(values,spec);
+ const y=v=>9+(125-9-24)*(1-(Math.min(top,Math.max(low,v))-low)/(top-low));
+ const clipped=values.filter(v=>v<low||v>top).length;
  const curves=spec.series.map(s=>{
    const pieces=[];let part=[];
    rows.forEach((r,i)=>{
@@ -1480,15 +1503,21 @@ function backlogChart(spec,index){
    return pieces.map(p=>p.length===1?'<circle cx="'+p[0].split(',')[0]+'" cy="'+p[0].split(',')[1]+'" r="3" fill="'+s[2]+'"/>':
      '<polyline points="'+p.join(' ')+'" fill="none" stroke="'+s[2]+'" stroke-width="2" stroke-linejoin="round"/>').join('');
  }).join('');
- const ticks=[low,spec.zeroBaseline&&low<0?0:(low+top)/2,top].map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
+ const bursts=spec.burst?rows.filter(r=>Number.isFinite(r[spec.burst])).map(r=>{
+   const x=backlogX(spec,r.at).toFixed(1);
+   return '<path d="M'+x+' 9V101" stroke="#E8A33D" stroke-dasharray="2 2"><title>同步补灌 '+r[spec.burst]+' 条</title></path>';
+ }).join(''):'';
+ const ticks=chartTicks(low,top,spec,y).map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
  const zeroLine=spec.zeroBaseline&&low<0?'<path d="M34 '+y(0).toFixed(1)+'H432" stroke="currentColor" opacity=".3" stroke-dasharray="3 3"/>':'';
  const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartStart))+'</text>'+
   '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartEnd))+'</text>';
  return '<div class=trend><h3>'+spec.title+'</h3><svg data-backlog-chart="'+index+'" tabindex="0" viewBox="0 0 440 125" role="img" aria-label="'+spec.title+'，用左右方向键查看数值">'+
-  '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+zeroLine+ticks+curves+labels+
+  '<path d="M34 9V101H432" stroke="currentColor" opacity=".25" fill="none"/>'+zeroLine+ticks+bursts+curves+labels+
   '<line data-hover-line x1="0" x2="0" y1="9" y2="101" stroke="currentColor" opacity=".5" stroke-dasharray="3 3" style="display:none"/></svg>'+
   '<div class=trend-readout data-trend-readout>移动光标到图上查看数值</div><div class=legend>'+
-  spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+'</div></div>';
+  spec.series.map(s=>'<span><i style="background:'+s[2]+'"></i>'+s[0]+'</span>').join('')+
+  (bursts?'<span><i style="background:#E8A33D"></i>同步补灌（不计入速度）</span>':'')+
+  (clipped?'<span>'+clipped+' 个点超出坐标范围，贴边显示</span>':'')+'</div></div>';
 }
 $('backlogtrends').innerHTML=backlogData.slice(0,cmOffset).map(backlogChart).join('');
 $('cmtrends').innerHTML=backlogData.slice(cmOffset).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
@@ -1496,6 +1525,7 @@ function showBacklogPoint(svg,index){
  const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
  svg.dataset.pointIndex=index;
  const parts=spec.series.map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+s[0]+' '+(Number.isFinite(r[s[1]])?r[s[1]]+spec.unit:'无样本')+'</span>');
+ if(spec.burst&&Number.isFinite(r[spec.burst]))parts.push('<span>同步补灌 '+(r[spec.burst]>0?'+':'')+r[spec.burst]+' 条，不计入速度</span>');
  if(r.boundary!==undefined)parts.push('<span>boundary '+esc(r.boundary)+'</span>');
  svg.parentElement.querySelector('[data-trend-readout]').innerHTML='<b>'+esc(r.label)+'</b>'+parts.join('');
  const line=svg.querySelector('[data-hover-line]'),x=backlogX(spec,r.at);
