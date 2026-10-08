@@ -27,9 +27,58 @@ NAS device_liveness 容器 ── 每分钟读取 host Tailscale LocalAPI ──
 | `openclaw-sync.sh` | VPS | `/root/uptime/` | clawd 胶囊 → NAS openclaw-src(持续同步) | cron `19 * * * *` | — |
 | `status.sh` | VPS | `/root/uptime/` | 全景:汇总 VPS+NAS 所有探针/容器/进度 | 手动/被 `tools/monitoring-status.sh` 调用 | — |
 | `nas_probe.py`+`loop.sh` | NAS | `/volume1/docker/nas-probe/` | 反向探 openclaw@VPS(公网),补"VPS 整体挂"盲区 | 容器 `kg-hub-nas-probe` 每 60s | `targets.conf` + `webhook.conf` |
-| `watchdog.py` | NAS | 仓库 `tools/`,容器内 `/app` | kg-hub 内部:/health、falkordb 慢查询、队列积压/卡死/错误 | 容器 `kg-hub-watchdog` 每 ~90s | `/config/notify.json`(热读,见 `notify.json.example`) |
+| `watchdog.py` | NAS | 仓库 `tools/`,容器内 `/app` | kg-hub 本体健康(server/falkordb/入图队列/refinery/采集链路);另搭载网关状态与 NAS 盘温告警,边界见「watchdog 的归属与边界」 | 容器 `kg-hub-watchdog` 每 ~90s | `/config/notify.json`(热读,见 `notify.json.example`) |
 | `tailscale-liveness-snapshot.sh` | NAS `device_liveness` 容器 | 镜像内 `/app/deploy/monitoring/nas/` | 独立判断采集设备 online/offline；校验后原子写 Tailscale JSON | 容器内每分钟 | `/volume2/4T/kg-hub-data/device-liveness/` |
 | MCP 预警 | Mac | `mcp_server.py` | kg-hub 连不上/超时主动飞书(冷却 10min) | 用时触发 | `KG_HUB_FEISHU_WEBHOOK` env |
+
+## watchdog 的归属与边界(2026-10-08 判定)
+
+> 问过「watchdog 该不该迁到 fleet-ops」。结论:**留在 kg-hub**。写在这里免得重问,
+> 也免得再往它身上加不属于 kg-hub 的职责。
+
+### 为什么留在 kg-hub,不迁 fleet-ops
+
+1. **判断逻辑是 kg-hub 的业务语义。** 入图队列、抽取失败、胶囊隔离区、refinery 停摆、
+   采集链路三态这些判据只对 kg-hub 有意义;代码直接 import `utils.device_liveness` 与
+   `kg_hub_env`,与 server 同一个镜像、随同一份 `docker-compose.yml` 部署。搬走等于把
+   业务逻辑放进治理仓库,kg-hub 每改一次接口都要两边同改。
+2. **fleet-ops 按自己的定义不收它。** fleet-ops README 第一句:装的是「管别的东西的那些
+   东西,**本身没有常驻服务**」。watchdog 是 90 秒一轮的常驻容器。
+3. **它必须跑在 NAS 里。** 它走 docker 内网直连 `kg_hub_server`;fleet-ops 跑在 Mac。
+   2026-07 在 Mac 上经 Tailscale 轮询 NAS 的 watchdog 规律性假报超时,已经退役过一次。
+4. **fleet-ops 准则 32 担心的问题另有解法。** 「检查不能依赖被检查项」:watchdog 与
+   kg-hub 同镜像、同一台 NAS,NAS 整体挂了它也挂 —— 这个担心成立。但补这个盲区的是
+   上文拓扑里异地独立的 VPS `check.sh`,不是把 watchdog 搬家。watchdog 的角色是
+   「被检查对象活着时看细节」,细节判断必须贴着它。
+
+### 它现在装了什么(22 种告警,按归属分)
+
+| 归属 | 告警 | 定性 |
+|---|---|---|
+| kg-hub 本体(12) | `server_down` `queue_backlog` `stuck_jobs` `recent_errors` `extraction_failing` `capsule_stale` `falkordb_slow` `falkordb_unreachable` `refinery_stalled` `capture_blocked` `capture_probe_stale` `capture_monitor_unhealthy` | 本职 |
+| kg-hub 作为网关消费方(2) | `gateway_consumer_config_drift` `gateway_consumer_contract_unhealthy`(`check_model_gateway_consumer_contract`) | 本职:核对的是 kg-hub 自己的调用合同 |
+| 模型网关自身(7) | `gateway_monitor_unhealthy` 与 `GATEWAY_ALERTS` 六项(`gateway_not_ready` … `gateway_provider_circuit_open`),经 kg-hub 拓扑取数(`check_gateway_monitor`) | **搭车**:网关属 credvault(T-0046);09-08 接入 readiness 告警,09-18 加上自动断路告警,都是为复用现成的飞书通道 |
+| NAS 宿主机(1) | `disk_temp_high` | **搭车**:2026-08-16 过热停机 24 小时无人知,临时加入 |
+
+另有一处**不是监控**的搭车:compose 里 watchdog 的循环顺带跑 `tools.export_gateway_usage`
+(成本看板的数据导出),为的是不新起一个常驻服务。
+
+这张表的数字以 `tools/watchdog.py` 为准 —— **增删告警时回来改这里**,否则它会变成
+一张说谎的清单。
+
+### 现在不拆,但要知道代价
+
+三处搭车都是刻意的(复用告警去重与飞书通道、少一个常驻服务),拆出去要各自重建
+告警通道,所以**暂不动**。代价是一个真实的准则 32 风险:**网关的 7 种告警寄生在
+kg-hub 的镜像里,kg-hub 一次坏部署会让它们一起哑掉。** 目前 Mac 侧
+`com.credvault.connection-status` 对网关连通性有部分兜底,所以不紧急。
+
+### 什么时候重新评估
+
+- 又要往 watchdog 里接一样**不属于 kg-hub** 的东西时 —— 先读这一节;第四样搭车就该
+  另起家了;
+- 出现一次「kg-hub 部署坏了,网关同时出事却没人报」;
+- 要动盘温告警时(比如散热治理改阈值),先想清它该归 NAS 宿主机层,而不是继续留在这里。
 
 ## webhook 约定(防泄密)
 - 真实飞书 webhook **只存在各机 `webhook.conf`**(权限 600),**已 .gitignore,绝不入库**。
