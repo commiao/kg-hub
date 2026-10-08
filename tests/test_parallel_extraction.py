@@ -272,6 +272,64 @@ class ParallelCommitTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any('parallel_early_validation' in line and 'stale=1' in line
                                 for line in logs.output))
 
+    async def test_node_read_stale_skips_edge_and_attribute_calls(self):
+        from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
+        import utils.graphiti_stage_adapter as stage
+        with tempfile.TemporaryDirectory() as temp:
+            store = StageArtifactStore(Path(temp) / 'stage.db')
+            graph = Graph()
+            driver = Driver(graph)
+            graphiti = SimpleNamespace(driver=driver, clients=SimpleNamespace(driver=driver))
+            calls = collections.Counter()
+
+            async def resolve(clients, nodes, episode, previous, types, **kwargs):
+                calls['resolve'] += 1
+                await clients.driver.execute_query('MATCH candidates RETURN version')
+                if calls['resolve'] == 1:
+                    graph.value = 1          # another observation commits meanwhile
+                    store.save_or_load(kwargs['task_sd'], kwargs['task_sid'],
+                                       kwargs['operation_id'], kwargs['input_digest'],
+                                       'resolved_nodes', {'model_step_ids': ['nodes-paid']})
+                return nodes, {node.uuid: node.uuid for node in nodes}, []
+
+            async def edges(*args, **kwargs):
+                calls['edges'] += 1
+                return [], [], []
+
+            async def attrs(g, nodes, *args, **kwargs):
+                calls['attrs'] += 1
+                return nodes
+
+            async def commit(g, episode, nodes, edges, now, group, *args, **kwargs):
+                calls['commit'] += 1
+                return [], episode
+
+            now = datetime.now(timezone.utc)
+            node = EntityNode(name='test', group_id='kg_hub', name_embedding=[1.0])
+            episode = EpisodicNode(name='test', group_id='kg_hub',
+                                   source=EpisodeType.text, content='x',
+                                   source_description='s', valid_at=now)
+            with patch.object(stage, 'resolve_nodes_with_candidate_snapshot', resolve), \
+                 patch.object(stage, 'extract_and_resolve_edges_with_snapshot', edges), \
+                 patch.object(stage, 'extract_attributes_with_snapshot', attrs), \
+                 patch.object(stage, 'commit_episode_with_receipt', commit), \
+                 self.assertLogs('kg_hub.parallel', 'INFO') as logs:
+                await finish_optimistic_episode(
+                    graphiti, store=store, identity=('s', 'i', 'o', 'd'),
+                    episode=episode, previous_episodes=[], extracted_nodes=[node],
+                    node_episode_index_map={}, now=now, entity_types=None,
+                    edge_type_map={}, group_id='kg_hub', edge_types=None,
+                    custom_extraction_instructions=None)
+            self.assertEqual(calls['resolve'], 2)
+            self.assertEqual(calls['edges'], 1, 'the stale round must not pay for edges')
+            self.assertEqual(calls['attrs'], 1, 'the stale round must not pay for attributes')
+            self.assertEqual(calls['commit'], 1)
+            conflict = store.save_or_load('s', 'i', 'o:graph-round:0', 'd', 'graph_conflict')
+            self.assertEqual(conflict['model_step_ids'], ['nodes-paid'])
+            self.assertTrue(conflict['early'])
+            self.assertTrue(any('stale=1 at=before_edges stale_kind=other stale_phase=nodes' in line
+                                for line in logs.output))
+
     async def test_two_overlapping_models_rebase_conflict_and_keep_original_receipts(self):
         from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
         from graphiti_core.graphiti import AddEpisodeResults
@@ -514,7 +572,7 @@ class PrevalidatedCommitTests(unittest.IsolatedAsyncioTestCase):
         async def ro_query(query,params):
             result=await original(query,params)
             graph.reads+=1
-            if during_prevalidate and graph.reads==3: during_prevalidate()
+            if during_prevalidate and graph.reads==4: during_prevalidate()
             return result
         graph.reads=0;graph.ro_query=ro_query
         now=datetime.now(timezone.utc)
@@ -536,7 +594,7 @@ class PrevalidatedCommitTests(unittest.IsolatedAsyncioTestCase):
         graph=Graph()
         rounds,commits,logs=await self._run(graph)
         self.assertEqual(len(commits),1)
-        self.assertEqual(graph.reads,3,'one prepare read and two pre-lock re-reads only')
+        self.assertEqual(graph.reads,4,'one prepare read and three pre-lock re-reads only')
         self.assertIn('validate_skipped=1',[m for m in logs if 'parallel_timing' in m][0])
 
     async def test_holder_after_prevalidation_forces_validation_under_the_lock(self):
@@ -561,7 +619,7 @@ class PrevalidatedCommitTests(unittest.IsolatedAsyncioTestCase):
         rounds,commits,logs=await self._run(graph,after_prepare_read=other_writer)
         conflicts=[m for m in logs if 'parallel_conflict' in m]
         self.assertEqual(len(conflicts),1)
-        self.assertIn('early=1 phase=before_attributes',conflicts[0])
+        self.assertIn('early=1 phase=before_edges stale_kind=other stale_phase=nodes',conflicts[0])
         self.assertEqual(rounds,['o:graph-round:0','o:graph-round:1'])
         self.assertEqual(commits,['o'])
         self.assertEqual(wl.read_generation(),2,'only the final commit took the lock')
