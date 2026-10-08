@@ -218,9 +218,10 @@ def probe_tools() -> tuple[list[dict], dict]:
     seen: dict[str, dict] = {}
     stats: dict[str, tuple[int, float | None]] = {}
 
-    if CM_DB.exists():
+    db = active_capture_db()
+    if db.exists():
         try:
-            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=8)
             for src, obs, last_ms in con.execute("""
                 SELECT s.platform_source AS src,
                        COUNT(o.id)       AS obs,
@@ -701,17 +702,18 @@ def probe_worker() -> dict:
 
 def probe_sqlite() -> tuple[dict, int | None]:
     """SQLite 层：WAL 模式下主库 mtime 会骗人，所以三个都量。"""
-    if not CM_DB.exists():
+    db = active_capture_db()
+    if not db.exists():
         return ({"id": "sqlite", "layer": "storage", "label": "SQLite",
-                 "state": RED, "detail": "claude-mem.db 不存在"}, None)
-    wal = CM_DB.with_name(CM_DB.name + "-wal")
+                 "state": RED, "detail": f"{db} 不存在"}, None)
+    wal = db.with_name(db.name + "-wal")
     now = time.time()
-    main_idle = now - CM_DB.stat().st_mtime
+    main_idle = now - db.stat().st_mtime
     wal_idle = (now - wal.stat().st_mtime) if wal.exists() else None
     wal_mb = (wal.stat().st_size / 1048576) if wal.exists() else 0.0
     max_id, mode = None, "?"
     try:
-        con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=8)
         mode = con.execute("PRAGMA journal_mode;").fetchone()[0]
         max_id = con.execute("SELECT MAX(id) FROM observations;").fetchone()[0]
         con.close()
@@ -721,7 +723,7 @@ def probe_sqlite() -> tuple[dict, int | None]:
     # 真正的新鲜度看 WAL（WAL 模式下），不看主库
     eff_idle = wal_idle if (mode == "wal" and wal_idle is not None) else main_idle
     state = GREEN if eff_idle < TOOL_FRESH_S else AMBER
-    detail = (f"journal_mode={mode}｜MAX(obs.id)={max_id}｜"
+    detail = (f"{db.parent.name}/{db.name}｜journal_mode={mode}｜MAX(obs.id)={max_id}｜"
               f"WAL {wal_mb:.1f}MB 更新于 {human_idle(wal_idle)}前｜"
               f"主库 mtime {human_idle(main_idle)}前")
     if mode == "wal" and wal_idle is not None and main_idle - wal_idle > 3600:
@@ -732,14 +734,20 @@ def probe_sqlite() -> tuple[dict, int | None]:
              "detail": detail}, max_id)
 
 
-def _epoch_seconds(value) -> float | None:
-    # created_at_epoch 是**毫秒**(claude-mem 用 JS 时间戳)。按秒算会
-    # 得到 -1.78e12 这种负数，被 max(0,..) 夹成 0 → 看起来"刚积压"，
-    # 永远绿灯 —— 又一个"命令成功但语义错"的静默失效。
-    if not value:
-        return None
-    ep = float(value)
-    return ep / 1000.0 if ep > 1e11 else ep
+def active_capture_db() -> Path:
+    """当前一代采集写入的库。双源启用后旧库不再增长，读它会把工具判成久未使用。
+
+    新一代库从旧库克隆了完整历史（见 claude-mem-sources.json 的 after_id），
+    所以单读它就能得到各工具的完整统计。读不到配置时退回旧库。
+    """
+    if not DUAL_MARKER.exists():
+        return CM_DB
+    try:
+        marker = json.loads(DUAL_MARKER.read_text())
+        sources = json.loads(Path(marker["source_config"]).read_text())["sources"]
+        return Path(sources[-1]["path"])
+    except Exception:  # noqa: BLE001 - 同步节点会单独把读不到配置判红
+        return CM_DB
 
 
 def dual_capture_state() -> dict | None:

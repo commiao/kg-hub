@@ -27,7 +27,7 @@ README = ROOT / "deploy" / "mac" / "README.md"
 
 EXPECTED = {
     "com.kg-hub.capsule-watch", "com.kg-hub.capture-probe",
-    "com.kg-hub.claude-mem-guard", "com.kg-hub.claude-mem-ingest",
+    "com.kg-hub.claude-mem-guard",
     "com.kg-hub.feedback-digest", "com.kg-hub.weekly-report",
     # 日更的源码漂移巡检：查 NAS 上跑的源码是不是等于 git 里的某个 commit。
     "com.kg-hub.source-drift",

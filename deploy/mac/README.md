@@ -21,13 +21,18 @@
 |---|---|---|---|
 | `claude-mem-guard` | 5 分钟 | 杀 claude-mem 空转 hook（插件 CPU 死循环）+ 同步断路器开关 | 断路器失灵；空转进程烧 CPU |
 | `capture-probe` | 10 分钟 | 采集链路 Mac 侧探针，拓扑图数据来源 | 拓扑图变瞎 |
-| `claude-mem-ingest` | 15 分钟 | 同步 claude-mem 库到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
+| `claude-mem-dual-ingest`（在 `optional/`） | 15 分钟 | 合并新旧两代 claude-mem 库，同步到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |
 | `weekly-report` | 周日 9:00 | 周报 | 少一封周报 |
 | `com.claude-mem.worker` | 常驻 | claude-mem 采集 worker 的**兜底看门人** | 见下 |
 
 前三个是链路的一部分，中间三个是报表，最后一个见下。
+
+旧的单源同步 `claude-mem-ingest` 已于 2026-10-08 退役：双源启用后它每轮只写一行
+「已隔离」就退出，而它那行日志曾把探针「同步器跑了几次」的计数撑满。同步作业现在
+只有 `claude-mem-dual-ingest`，与新 worker `capture-next` 一起按下文「临时隔离采集」
+单独安装。
 
 ### 为什么 `com.claude-mem.worker` 在这里
 
