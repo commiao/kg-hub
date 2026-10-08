@@ -30,8 +30,6 @@
 #   deploy/nas/release.sh --refinery-window-22-08 [<commit>]
 #                                         # 发布时仅把已验证的 22:00–10:00 改为 22:00–08:00
 #   DRY_RUN=1 deploy/nas/release.sh       # 只打印要做什么，不碰 NAS
-#   KG_HUB_JOURNAL_PRUNE=1 deploy/nas/release.sh
-#                                         # 排空后顺带清理已成功任务的账本（见 4.6）
 set -euo pipefail
 
 NAS="${KG_HUB_NAS_SSH:-commiao@100.123.208.32}"
@@ -696,28 +694,6 @@ if [ "$drained" != 1 ]; then
   restore_producers
   drain_note "abort waited=${waited}s budget=${DRAIN_BUDGET_S}s"
   die "${DRAIN_BUDGET_S}s 没排空干净，已中止（生产者已恢复）"
-fi
-
-# ---- 4.6 账本清理（可选）：删掉早已成功入图的任务留下的续跑证据 -------------
-# 规则在 utils/journal_prune.py：只删图里 status='ok' 且超过保留期的任务，
-# 其余状态一条不动。它本来就能在线跑（短事务、不 VACUUM），放在这里只是
-# 趁在飞归零、生产者停着，少跟写入方抢那一把 SQLite 写锁。
-#
-# 此刻跑着的还是**旧容器**，它的镜像里没有新脚本；拷进去再执行，用的是它自己
-# 的环境、挂载和网络 —— FalkorDB 密码不经过命令行。容器随第 5 步重建，拷进去
-# 的文件跟着消失。清理是维护不是发布的前提：失败只告警，不中止发布。
-if [ "${KG_HUB_JOURNAL_PRUNE:-0}" = 1 ]; then
-  prune_seconds="${KG_HUB_JOURNAL_PRUNE_SECONDS:-300}"
-  say "  账本清理：只删已成功且超过保留期的任务（上限 ${prune_seconds}s）"
-  if on_nas "set -eu
-    $DK cp '$SRC/utils/journal_prune.py' kg-hub-server:/app/utils/journal_prune.py
-    $DK exec -w /app kg-hub-server python -m utils.journal_prune --apply \
-      --max-seconds '$prune_seconds'"; then
-    drain_note "journal_prune ok max_seconds=${prune_seconds}"
-  else
-    say "  ⚠ 账本清理没跑完（不影响发布；下次再跑会接着删）"
-    drain_note "journal_prune failed"
-  fi
 fi
 
 # ---- 5. 切标签 + 起容器 ----------------------------------------------------
