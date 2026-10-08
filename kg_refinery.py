@@ -1144,6 +1144,15 @@ async def main() -> int:
     decision_day = datetime.now(tz=CST).date()
     first_seen_at: dict[int, datetime] = {}  # created_at 无效时的最长等待起点
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
+    backoff_path = STATE_DIR / "backoff.json"
+    try:
+        backoff.update(recovery.load_backoff(
+            json.loads(backoff_path.read_text()) if backoff_path.exists() else {},
+            cycle=0, interval=INTERVAL))
+    except (OSError, ValueError, TypeError) as exc:
+        # 读不到只损失冷却信息（多试几次 409），不影响入图正确性。
+        log.warning("[backoff] 退避记录不可读，按空表启动：%s", exc)
+    saved_backoff = {"text": None}
     recovery_path = STATE_DIR / "recovery.json"
     try:
         quota_pause = json.loads(recovery_path.read_text()) if recovery_path.exists() else {}
@@ -1160,6 +1169,13 @@ async def main() -> int:
         tmp = recovery_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(quota_pause))
         os.replace(tmp, recovery_path)
+        text = json.dumps(recovery.dump_backoff(backoff, cycle=cycle, interval=INTERVAL),
+                          sort_keys=True)
+        if text != saved_backoff["text"]:
+            tmp = backoff_path.with_suffix(".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, backoff_path)
+            saved_backoff["text"] = text
 
     def can_submit():
         return in_backlog_window() and not breakers.is_tripped(BREAKER_KEY)[0]
