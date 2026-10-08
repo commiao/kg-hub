@@ -377,6 +377,14 @@ def _stage_record(store, identity, stage, inputs, *, allow_retry: bool = False):
     return None, digest
 
 
+def edge_stage_inputs(episode, extracted_nodes, previous_episodes, edge_type_map,
+                      group_id, edge_types, nodes, uuid_map,
+                      custom_extraction_instructions):
+    """The exact edge-stage inputs; their digest identifies a replayable edge_phase."""
+    return (episode, extracted_nodes, previous_episodes, edge_type_map,
+            group_id, edge_types, nodes, uuid_map, custom_extraction_instructions)
+
+
 async def extract_and_resolve_edges_with_snapshot(
     graphiti, episode, extracted_nodes, previous_episodes, edge_type_map,
     group_id, edge_types, nodes, uuid_map, custom_extraction_instructions,
@@ -390,9 +398,9 @@ async def extract_and_resolve_edges_with_snapshot(
         raise RuntimeError("unsupported Graphiti version for edge-stage adapter")
     identity = (task_sd, task_sid, operation_id, input_digest)
     from model_gateway_client import collect_model_steps, acknowledge_restored_steps
-    inputs = (episode, extracted_nodes, previous_episodes, edge_type_map,
-              group_id, edge_types, nodes, uuid_map,
-              custom_extraction_instructions)
+    inputs = edge_stage_inputs(episode, extracted_nodes, previous_episodes, edge_type_map,
+                               group_id, edge_types, nodes, uuid_map,
+                               custom_extraction_instructions)
     saved, digest = await asyncio.to_thread(
         _stage_record, store, identity, "edge_phase", inputs,
         allow_retry=_active_manual_stage() == "edge_phase")
