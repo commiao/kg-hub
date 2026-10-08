@@ -62,6 +62,8 @@ def summary(window_s: float = 86400, now: float | None = None) -> dict:
         "samples": len(rows),
         "window_s": int(window_s),
         "process_started_at": started_at,
+        # 窗口内最早一条样本：分位数实际从这一刻算起（重启清空、500 条上限都会把它往后推）。
+        "earliest_at": min((s["at"] for s in rows), default=None),
         "wait_p50": _percentile(waits, 0.5),
         "wait_p90": _percentile(waits, 0.9),
         "extract_p50": _percentile(extracts, 0.5),
