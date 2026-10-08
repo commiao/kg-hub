@@ -106,17 +106,26 @@ watchdog 容器与 dashboard 所在 server 容器都不读取 Tailscale socket�
 `device_liveness` 容器只读挂载 NAS 的 CLI 与 LocalAPI socket，查询真实 tailnet，
 再把同一份动态快照只读挂入两个消费者；静态配置只声明
 “capture host 对应哪台 Tailscale 设备”，不能声明 online。这里不能假设两套名字
-相同：当前探针 uname 是 `MacBook-Pro-4`，Tailscale 实际是 HostName
-`MacBook Pro (3)` / DNSName `mac-office...`，因此 `device-liveness.json` 必须包含：
+相同：探针的 OS 主机名会被 macOS 自动改号（曾是 `MacBook Pro (3)`，后来变成
+`MacBook-Pro-4`），所以自 2026-09-03 起探针优先上报固定的 `KG_HUB_CAPTURE_HOST`
+（Mac 上设为 `mac-office`，与 Tailscale DNSName 一致），OS 主机名只作回退。
+`device-liveness.json` 因此写成：
 
 ```json
 {
-  "capture_probe_hosts": ["MacBook-Pro-4"],
+  "capture_probe_hosts": ["mac-office"],
   "capture_device_aliases": {
-    "MacBook-Pro-4": ["MacBook Pro (3)", "mac-office"]
+    "mac-office": ["MacBook Pro (3)", "MacBook-Pro-4"]
   }
 }
 ```
+
+`capture_probe_hosts` 必须等于探针**实际上报**的 host：watchdog 按它去找快照，
+别名只用于判在线、不用于找快照。这里原先写的是旧名 `MacBook-Pro-4`，与探针上报的
+`mac-office` 对不上，`capture_probe_stale` 曾因此持续假红（2026-09-07，T-0059 修复）。
+别名里保留 HostName 与旧名，是为了快照 stale 时仍能靠 Tailscale 身份判到在线。
+`deploy-device-liveness.sh` 只在线上**没有**该文件时才用示例初始化，已存在则保留；
+所以改示例只影响全新安装，改线上要直接改 `/volume2/4T/kg-hub-data/device-liveness/device-liveness.json`。
 
 完整示例见 `deploy/monitoring/nas/device-liveness.json.example`。部署命令：
 
