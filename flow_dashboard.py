@@ -451,6 +451,14 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
     b_ing = sum(h["backlog"]["ingested"] for h in recent)
     b_rej = sum(h["backlog"]["rejected"] for h in recent)
     b_dfr = sum(h["backlog"]["deferred"] for h in recent)
+    # 推迟原因与推迟占比取同一批小时桶、同一条积压线；当日账的 result_counts 还混着
+    # ok 与冷却跳过，窗口也不同（UTC 日切或 refinery 重启起），不能拿来解释这个占比。
+    deferred_reasons: dict[str, int] = {}
+    for h in recent:
+        bucket = hourly_raw.get(h["hour"]) if isinstance(hourly_raw.get(h["hour"]), dict) else {}
+        line = bucket.get("backlog") if isinstance(bucket.get("backlog"), dict) else {}
+        for name, n in (line.get("deferred_counts") or {}).items():
+            deferred_reasons[name] = deferred_reasons.get(name, 0) + int(n or 0)
     l_ing = sum(h["live"]["ingested"] for h in recent)
     l_rej = sum(h["live"]["rejected"] for h in recent)
     active_hours = sum(1 for h in recent
@@ -497,7 +505,7 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         "eta_days": eta_days,
         "backlog_ingested_per_day_7d": backlog_7d,
         "graph_eta_days": graph_eta_days,
-        "result_counts": ((budget.get("lines") or {}).get("backlog") or {}).get("result_counts") or {},
+        "deferred_reasons": deferred_reasons,
     }
 
 
@@ -746,9 +754,12 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
             "降低调用倍数：合批抽取、属性合批、减少重试", since=day_start)
     share = digest.get("deferred_share")
     if isinstance(share, (int, float)) and share >= DEFERRED_SHARE_SLOW:
-        top = "、".join(f"{k} {v}" for k, v in sorted(
-            (digest.get("result_counts") or {}).items(), key=lambda kv: -kv[1])[:4])
-        add("refinery", "slow", "推迟/重试占比高", f"近 24h 推迟占 {_share(share)}；{top}",
+        reasons = digest.get("deferred_reasons") or {}
+        top = "、".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:4])
+        last24 = digest.get("last24") or {}
+        add("refinery", "slow", "推迟/重试占比高",
+            f"近 24h 推迟 {last24.get('backlog_deferred', 0)} 次，占 {_share(share)}；原因："
+            + (top or "未记录（这段小时桶早于按原因计数）"),
             "按推迟原因处理（409 退避、网关错误、超时）", since=last24_since)
     last24 = digest.get("last24") or {}
     if last24.get("coverage_h", 0) >= 20 and last24.get("active_hours", 0) <= 12 \

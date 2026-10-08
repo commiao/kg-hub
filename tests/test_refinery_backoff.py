@@ -128,6 +128,11 @@ check("上游限流等待超过一小时", R.RATE_LIMIT_PAUSE_CYCLES * R.INTERVA
 check("记录上游限流到期轮次", rlp.get("until_cycle") == 8 and rlp.get("reason") == "rate_limited")
 check("stats 暴露 rate_limited", stats_rl.get("rate_limited") == 1)
 check("stats 暴露 rate_limited 类别", stats_rl["result_counts"].get("rate_limited") == 1)
+for name, st_ in (("quota", stats_q), ("rate_limited", stats_rl)):
+    check(f"{name}：推迟原因之和等于推迟数（看板的原因与占比同源）",
+          sum(st_["deferred_counts"].values()) == st_["deferred"] > 0)
+    check(f"{name}：推迟原因里没有成功或冷却跳过",
+          not {"ok", "skipped", "backoff"} & set(st_["deferred_counts"]))
 
 # 已在飞的第二条晚完成时，较短的速率等待不能覆盖更长的额度等待。
 async def run_mixed_limits():

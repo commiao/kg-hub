@@ -136,8 +136,7 @@ class BottleneckTests(unittest.TestCase):
         self.assertIn("近 24h 积压零消化", titles(flow))
 
     def test_each_bottleneck_says_when_its_evidence_starts(self):
-        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(10, 1, deferred=2),
-                                  "lines": {"backlog": {"result_counts": {"409": 6}}}})
+        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(10, 1, deferred=2)})
         keys = {"by_status": {}, "pending": 0, "pending_oldest_s": None,
                 "errors_24h": {"model_outcome_unknown": 250}, "duration_p50": None,
                 "duration_p90": None, "duration_samples": 0}
@@ -165,11 +164,27 @@ class BottleneckTests(unittest.TestCase):
         self.assertIsNone(flow["primary"]["since"])
 
     def test_high_deferred_share_names_its_reasons(self):
-        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(24, 1, deferred=2),
-                                  "lines": {"backlog": {"result_counts": {"409": 30, "upstream_error": 5}}}})
+        hours = hourly(24, 1, deferred=2)
+        for i, key in enumerate(sorted(hours)):
+            hours[key]["backlog"]["deferred_counts"] = {"timeout": 2} if i % 3 == 0 else {"409": 2}
+        # 当日账的 result_counts 含 ok，且窗口不同：不得出现在证据里
+        st = status(budget_today={"day": "2026-09-28", "hourly": hours,
+                                  "lines": {"backlog": {"result_counts": {"ok": 999, "409": 30}}}})
         flow = build(status=st)
         item = next(b for b in flow["bottlenecks"] if b["title"] == "推迟/重试占比高")
-        self.assertIn("409 30", item["evidence"])
+        self.assertIn("推迟 48 次", item["evidence"])
+        self.assertIn("409 32、timeout 16", item["evidence"])
+        self.assertNotIn("ok", item["evidence"])
+
+    def test_deferred_reasons_ignore_hours_outside_the_share_window(self):
+        hours = hourly(24, 1, deferred=2)
+        stale = (NOW - timedelta(hours=30)).strftime("%Y-%m-%dT%H")
+        hours[stale] = {"backlog": {"ingested": 0, "rejected": 0, "deferred": 50,
+                                    "deferred_counts": {"halted": 50}}}
+        digest = F.backlog_digest(status(budget_today={"day": "2026-09-28", "hourly": hours}),
+                                  None, NOW)
+        self.assertNotIn("halted", digest["deferred_reasons"])
+        self.assertEqual(digest["last24"]["backlog_deferred"], 48)
 
     def test_red_capture_stage_is_reported_without_blaming_the_backlog(self):
         snap = {"_host": "mac", "nodes": [{"id": "worker", "layer": "worker",

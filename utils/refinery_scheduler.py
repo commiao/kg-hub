@@ -151,7 +151,8 @@ class ProgressLedger:
     """Convert repeated cumulative callbacks to nonnegative, once-only deltas."""
     def __init__(self):
         self.totals = {kind: {"ingested": 0, "rejected": 0, "deferred": 0,
-                            "backoff_skipped": 0, "result_counts": {}, "filter_counts": {}}
+                            "backoff_skipped": 0, "result_counts": {}, "filter_counts": {},
+                            "deferred_counts": {}}
                        for kind in ("backlog", "live")}
         self.partials = {}
 
