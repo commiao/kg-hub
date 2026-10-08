@@ -3,11 +3,11 @@
 
 The refinery moves an observation to ``held`` when the server answers
 needs_reconciliation, and nothing ever moves it back. On 2026-10-08 it held
-5192 observations. Each was matched against the durable model journal: none
-had a call with an unknown outcome. 4274 had only failed calls that never
-reached the provider (gateway ``absent``: external_calls 0) — no paid result
-to reuse, nothing written to the graph. Resubmitting them costs exactly what a
-new observation costs.
+5194 observations. Each was matched against the durable model journal: none
+had a call with an unknown outcome. 4563 had no successful call at all — every
+failed call either never reached the gateway (``absent``: external_calls 0)
+or was settled as failed by it (e.g. provider 429). No paid result to reuse,
+nothing written to the graph: resubmitting costs what a new observation costs.
 
 Three steps, run in this order:
 
@@ -31,7 +31,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
-NOT_REACHED_PROVIDER = {"absent", "failed"}
+# Settled with no result: never reached the gateway, or a definitive failure.
+SETTLED_WITHOUT_RESULT = {"absent", "failed"}
 RESET, RESUME, UNKNOWN, ALL_COMPLETED = "reset", "resume", "unknown_outcome", "all_completed"
 
 
@@ -43,7 +44,7 @@ def classify(phases: list[str]) -> str:
     rest = {p for p in phases if p != "completed"}
     if not rest:
         return ALL_COMPLETED
-    if not rest <= NOT_REACHED_PROVIDER:
+    if not rest <= SETTLED_WITHOUT_RESULT:
         return UNKNOWN              # prepared / http_started / unknown: may have been paid
     return RESUME if completed else RESET
 
@@ -88,13 +89,19 @@ async def plan(watermark: Path, driver) -> list[dict]:
     return out
 
 
-async def reset_keys(items: list[dict], driver, *, limit: int, apply: bool) -> list[int]:
-    """Delete the server claim for up to ``limit`` RESET items; return the oids reset."""
+async def reset_keys(items: list[dict], driver, *, limit: int, apply: bool,
+                     above: int = 0) -> list[int]:
+    """Delete the server claim for up to ``limit`` RESET items with oid > ``above``.
+
+    ``above`` set to the refinery boundary selects the live line only.
+    """
     db = journal()
     done = []
     for item in items:
         if len(done) >= limit:
             break
+        if item["oid"] <= above:
+            continue
         if item["category"] != RESET or item["server"] != "needs_reconciliation":
             continue
         rows = journal_rows(db, item["oid"])
@@ -131,6 +138,7 @@ def main() -> int:
     p = sub.add_parser("plan"); p.add_argument("--watermark", type=Path, default=Path("/refinery-state/watermark.json"))
     r = sub.add_parser("reset-keys"); r.add_argument("--plan", type=Path, required=True)
     r.add_argument("--limit", type=int, required=True); r.add_argument("--apply", action="store_true")
+    r.add_argument("--above", type=int, default=0, help="only oids greater than this (refinery boundary = live line)")
     u = sub.add_parser("unhold"); u.add_argument("--watermark", type=Path, required=True)
     u.add_argument("--released", type=Path, required=True); u.add_argument("--plan", type=Path, required=True)
     args = parser.parse_args()
@@ -149,7 +157,7 @@ def main() -> int:
         if args.cmd == "plan":
             return await plan(args.watermark, driver)
         return await reset_keys(json.loads(args.plan.read_text()), driver,
-                                limit=args.limit, apply=args.apply)
+                                limit=args.limit, apply=args.apply, above=args.above)
     print(json.dumps(asyncio.run(run()), ensure_ascii=False))
     return 0
 

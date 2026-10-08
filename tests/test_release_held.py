@@ -110,6 +110,11 @@ class ResetKeysTests(unittest.TestCase):
         got = asyncio.run(H.reset_keys(self.plan(), self.driver, limit=1, apply=True))
         self.assertEqual(got, [1])
 
+    def test_above_selects_the_live_line(self):
+        self.driver.keys[(SD.format(3), "s3")]["worker_state"] = None
+        got = asyncio.run(H.reset_keys(self.plan(), self.driver, limit=10, apply=False, above=1))
+        self.assertEqual(got, [3])
+
     def test_unhold_moves_only_held_ids(self):
         result = H.unhold(self.watermark, release=[1, 99], ingested=[4])
         wm = json.loads(self.watermark.read_text())
