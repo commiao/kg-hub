@@ -491,7 +491,12 @@ for(let i=1;i<ticks.length;i++)if(Math.abs(y(ticks[i])-y(ticks[i-1]))<12)throw E
 const raw=chartRange(values,{...spec,robust:false});
 if(raw.low!==-129876.4)throw Error('non-robust charts keep full range');
 const t=chartTicks(raw.low,raw.top,spec,v=>9+92*(1-(v-raw.low)/(raw.top-raw.low)));
-if(Math.round(raw.top)!==13285||t.length!==2||!t.includes(0)||!t.includes(raw.low))throw Error('crowded top tick dropped '+t);
+if(Math.round(raw.top)!==13285||t.length!==2||!t.includes(0)||!t.includes(Math.round(raw.low)))throw Error('crowded top tick dropped '+t);
+// An all-zero rate (backlog drained) gives a 0–1.1 axis: no label may repeat,
+// and each label must sit where its own value is.
+const flat=chartRange(Array(30).fill(0),spec),fy=v=>9+92*(1-(v-flat.low)/(flat.top-flat.low));
+const ft=chartTicks(flat.low,flat.top,spec,fy);
+if(ft.join()!=='0,1')throw Error('flat axis ticks '+ft);
 const few=chartRange([0,30,-5000],spec);
 if(few.low!==-5000)throw Error('too few samples to call an outlier');
 """
