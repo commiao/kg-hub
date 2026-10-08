@@ -201,6 +201,36 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertIn("note_budget(kind, delta)", SOURCE)
         self.assertNotIn('note_budget("backlog", s_back)', SOURCE)
 
+    def test_same_observation_processed_twice_in_one_cycle(self):
+        # 2026-10-08 线上：409 推迟 → 冷却后同一轮内再处理并入图，账本报
+        # "progress counter regressed"，整个调度池停止取任务直到槽位排空。
+        from utils.refinery_scheduler import ProgressLedger
+        ledger = ProgressLedger()
+        update, finish = ledger.run("live", 40719)
+        update({"deferred": 1, "result_counts": {"409": 1}})
+        finish()
+        update, finish = ledger.run("live", 40719)
+        delta = update({"ingested": 1, "result_counts": {"ok": 1}})
+        self.assertEqual(delta["ingested"], 1)
+        totals = ledger.totals["live"]
+        self.assertEqual((totals["deferred"], totals["ingested"]), (1, 1))
+        self.assertEqual(totals["result_counts"], {"409": 1, "ok": 1})
+        finish()
+        self.assertEqual(ledger.partials, {})
+
+    def test_one_run_still_rejects_regression_and_dedupes(self):
+        from utils.refinery_scheduler import ProgressLedger
+        ledger = ProgressLedger()
+        update, _ = ledger.run("live", 7)
+        update({"ingested": 1})
+        self.assertEqual(update({"ingested": 1})["ingested"], 0)
+        with self.assertRaisesRegex(ValueError, "regressed"):
+            update({"ingested": 0})
+
+    def test_consume_records_progress_per_run(self):
+        self.assertIn("update, finish = ledger.run(kind, oid)", SOURCE)
+        self.assertNotIn("ledger.update(kind, oid, stats)", SOURCE)
+
 
 class PerCycleFreshnessTests(unittest.TestCase):
     """状态里的每轮名额不许比进程里的旧。"""

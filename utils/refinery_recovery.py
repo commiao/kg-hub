@@ -74,3 +74,43 @@ def cooling(entry, cycle: int, now: float | None = None) -> bool:
     if len(entry) >= 3:
         return (time.time() if now is None else now) < entry[2]
     return cycle < entry[1]
+
+
+# Server error keys expire after 24h; an older cooldown no longer predicts a 409.
+BACKOFF_RETENTION_SECONDS = 86400
+
+
+def dump_backoff(backoff: dict, *, cycle: int, interval: int,
+                 now: float | None = None) -> dict:
+    """Cycle-relative cooldowns → wall-clock deadlines that survive a restart.
+
+    The cycle counter restarts at zero with the process. Before this, every
+    restart (2026-10-08: five releases in two hours) retried every cooling
+    observation at once — 100+ instant 409s — and reset the exponential
+    backoff to its first step.
+    """
+    now = time.time() if now is None else now
+    out = {}
+    for oid, entry in backoff.items():
+        until = entry[2] if len(entry) >= 3 else now + (entry[1] - cycle) * interval
+        if until >= now - BACKOFF_RETENTION_SECONDS:
+            out[str(oid)] = [int(entry[0]), round(until, 3)]
+    return out
+
+
+def load_backoff(data: dict, *, cycle: int, interval: int,
+                 now: float | None = None) -> dict:
+    """Wall-clock deadlines → cooldowns for a process whose first cycle is ``cycle + 1``.
+
+    Expired entries keep their consecutive-409 count so the next 409 continues
+    the exponential sequence instead of starting over.
+    """
+    now = time.time() if now is None else now
+    out = {}
+    for oid, (count, until) in data.items():
+        if until < now - BACKOFF_RETENTION_SECONDS:
+            continue
+        remaining = until - now
+        out[int(oid)] = [int(count),
+                         cycle + 1 + math.ceil(remaining / interval) if remaining > 0 else 0]
+    return out
