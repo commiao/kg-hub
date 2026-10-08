@@ -176,3 +176,22 @@ class ProgressLedger:
                 delta[key] = diff
         self.partials[(kind, oid)] = {k: dict(v) if isinstance(v, dict) else v for k, v in stats.items()}
         return delta
+
+    def run(self, kind, oid):
+        """One processing attempt of ``oid``: an updater plus its release.
+
+        The pool re-offers deferred rows after a checkpoint, so one cycle can
+        process the same observation twice. Keyed by observation alone, the
+        second attempt's counters start from zero and look like a regression
+        (2026-10-08: a 409 retried and then ingested raised "progress counter
+        regressed", which stopped the whole pool until every slot drained).
+        The pool never runs one observation twice at once, so releasing the
+        partial when an attempt ends is enough.
+        """
+        def update(stats):
+            return self.update(kind, oid, stats)
+
+        def finish():
+            self.partials.pop((kind, oid), None)
+
+        return update, finish

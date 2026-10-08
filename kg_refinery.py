@@ -1315,9 +1315,10 @@ async def main() -> int:
             async def consume(kind, row):
                 nonlocal backlog_remaining
                 oid = row["id"]
+                update, finish = ledger.run(kind, oid)
                 def progress(stats):
                     nonlocal backlog_remaining
-                    delta = ledger.update(kind, oid, stats)
+                    delta = update(stats)
                     budget = note_budget(kind, delta)
                     # Held tasks are excluded from the runnable queue but never
                     # counted as successful graph ingestion.
@@ -1325,10 +1326,13 @@ async def main() -> int:
                     backlog_remaining = sum(r["id"] not in terminal_now for r in initial_backlog)
                     snapshot(backlog_processed=totals["backlog"], live_processed=totals["live"],
                              backlog_remaining=backlog_remaining, budget_today=budget)
-                stats = await process_batch(
-                    [row], wm, cfg, None, decided, backoff, cycle, kind,
-                    quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
-                progress(stats)
+                try:
+                    stats = await process_batch(
+                        [row], wm, cfg, None, decided, backoff, cycle, kind,
+                        quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
+                    progress(stats)
+                finally:
+                    finish()
 
             def advance_cursor():
                 nonlocal cursor
