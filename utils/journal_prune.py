@@ -13,8 +13,25 @@ Safe while the service runs: short batched transactions, no VACUUM. SQLite
 reuses the freed pages, so the file stops growing rather than shrinking.
 Without ``--apply`` nothing is deleted; the report shows what would be.
 
+Cost shapes the design. On the NAS the journal is ~16 GiB on a spinning disk
+and the live service writes to it; on 2026-10-08 a dry run that probed every
+eligible task took 33 minutes, and a full-table ``sum(length(...))`` next to it
+stalled ingestion for ten minutes. So:
+
+* only tasks that still have journal rows are visited — the candidate set is
+  read from the model_attempts task index and task_executions, then
+  intersected with the graph's settled tasks (over 90% of those have no rows);
+* oldest first, so a run cut short by ``--max-seconds`` resumes where the
+  previous one stopped instead of re-walking the same prefix;
+* small batches with a pause in both modes, to leave the disk to the service;
+* it runs on its own, off-peak — not inside a release, where producers are
+  stopped for as long as it takes.
+
+A task whose only rows are stage artifacts (no attempt, no execution) is not
+found; finding it would mean scanning the artifact index, the very cost above.
+
     python -m utils.journal_prune                 # dry run
-    python -m utils.journal_prune --apply --max-seconds 300
+    python -m utils.journal_prune --apply --max-seconds 1800
 """
 from __future__ import annotations
 
@@ -48,13 +65,24 @@ _TABLES = (
 
 
 def settled_tasks(graph, *, older_than: str) -> list[tuple[str, str]]:
-    """Business-complete task identities last touched before ``older_than``."""
+    """Business-complete task identities last touched before ``older_than``, oldest first."""
     result = graph.ro_query(
         "MATCH (k:IngestedKey) WHERE k.status = 'ok' "
         "AND coalesce(k.updated_at, k.created_at) < $cutoff "
-        "RETURN k.source_description, k.source_obs_id",
+        "RETURN k.source_description, k.source_obs_id "
+        "ORDER BY coalesce(k.updated_at, k.created_at)",
         {"cutoff": older_than})
     return [(sd, sid) for sd, sid in result.result_set if sd and sid]
+
+
+def journal_tasks(db, names: set[str]) -> set[tuple[str, str]]:
+    """Tasks that still have journal rows, read from small or indexed sources only."""
+    found: set[tuple[str, str]] = set()
+    for table in ("model_attempts", "task_executions"):
+        if table in names:
+            found.update(db.execute(
+                f"SELECT DISTINCT source_description, source_obs_id FROM {table}"))
+    return found
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -105,16 +133,23 @@ def _task_rows(db, tables, sd: str, sid: str, tid: str, *, delete: bool) -> dict
     return counts
 
 
-def prune(journal_path: Path, tasks: list[tuple[str, str]], *, apply: bool,
-          batch: int = 25, pause: float = 0.2, max_seconds: float = 600) -> dict:
-    """Delete (or count) the journal rows of ``tasks`` in short transactions."""
+def prune(journal_path: Path, settled: list[tuple[str, str]], *, apply: bool,
+          batch: int = 5, pause: float = 1.0, max_seconds: float = 1800) -> dict:
+    """Delete (or count) the journal rows of ``settled`` tasks in short transactions.
+
+    ``settled`` keeps its order (oldest first); only tasks that still have
+    journal rows are visited.
+    """
     started = time.monotonic()
     rows = {table: 0 for table, _ in _TABLES}
-    report = {"apply": apply, "eligible": len(tasks), "pruned": 0,
+    report = {"apply": apply, "eligible": len(settled), "with_journal": 0, "pruned": 0,
               "skipped_guarding": 0, "remaining": 0, "rows": rows}
     db = _connect(journal_path)
     try:
         tables = _present_tables(db)
+        present = journal_tasks(db, {table for table, _ in tables})
+        tasks = [task for task in settled if task in present]
+        report["with_journal"] = len(tasks)
         index = 0
         while index < len(tasks):
             if time.monotonic() - started >= max_seconds:
@@ -137,7 +172,8 @@ def prune(journal_path: Path, tasks: list[tuple[str, str]], *, apply: bool,
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
-            if apply and pause:
+            # Counting reads the same pages deleting would; both yield the disk.
+            if pause:
                 time.sleep(pause)
         report["remaining"] = len(tasks) - index
         if apply:
@@ -174,9 +210,11 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true", help="delete; default only counts")
     parser.add_argument("--retention-days", type=float, default=1,
                         help="'ok' is terminal; the window only keeps recent evidence for humans")
-    parser.add_argument("--batch", type=int, default=25)
-    parser.add_argument("--pause", type=float, default=0.2)
-    parser.add_argument("--max-seconds", type=float, default=600)
+    parser.add_argument("--batch", type=int, default=5, help="tasks per transaction")
+    parser.add_argument("--pause", type=float, default=1.0,
+                        help="seconds between batches, in dry runs too")
+    parser.add_argument("--max-seconds", type=float, default=1800,
+                        help="stop between batches; the next run resumes at the oldest left")
     parser.add_argument("--journal", help="default: next to KG_HUB_INGEST_BACKUP_PATH")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")

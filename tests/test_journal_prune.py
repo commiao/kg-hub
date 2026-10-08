@@ -4,8 +4,10 @@ import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from utils.graphiti_stage_adapter import StageArtifactStore
+from utils import journal_prune
 from utils.journal_prune import prune, settled_tasks
 from utils.model_attempt_journal import ModelAttemptJournal
 from utils.reconciliation_mailbox import task_uuid
@@ -124,17 +126,29 @@ class JournalPruneTests(unittest.TestCase):
         query, params = graph.calls[0]
         self.assertIn("k.status = 'ok'", query)
         self.assertIn("< $cutoff", query)
+        self.assertIn("ORDER BY coalesce(k.updated_at, k.created_at)", query)
         self.assertEqual(params, {"cutoff": "2026-09-22"})
 
-    def test_release_prunes_after_drain_and_before_switch_only_when_asked(self):
-        src = (ROOT / "deploy/nas/release.sh").read_text(encoding="utf-8")
-        drained = src.index('没排空干净，已中止')
-        hook = src.index('if [ "${KG_HUB_JOURNAL_PRUNE:-0}" = 1 ]; then')
-        switch = src.index("# ---- 5. 切标签 + 起容器")
-        self.assertLess(drained, hook)
-        self.assertLess(hook, switch)
-        self.assertIn("python -m utils.journal_prune --apply", src[hook:switch])
+    def test_tasks_without_journal_rows_are_not_visited(self):
+        # Over 90% of settled tasks on the NAS have no rows; probing them cost 33 minutes.
+        done = self.seed("done")
+        ghosts = [("source", f"ghost{i}") for i in range(3)]
+        with mock.patch.object(journal_prune, "_task_rows", wraps=journal_prune._task_rows) as rows:
+            report = prune(self.path, [*ghosts, done], apply=True, pause=0)
+        self.assertEqual((report["eligible"], report["with_journal"], report["pruned"]), (4, 1, 1))
+        self.assertEqual([call.args[2:4] for call in rows.call_args_list], [done])
 
+    def test_settled_order_is_kept_so_a_cut_short_run_resumes_at_the_oldest(self):
+        tasks = [self.seed(sid) for sid in ("old", "mid", "new")]
+        with mock.patch.object(journal_prune, "_task_rows", wraps=journal_prune._task_rows) as rows:
+            prune(self.path, tasks, apply=True, batch=1, pause=0)
+        self.assertEqual([call.args[2:4] for call in rows.call_args_list], tasks)
+
+    def test_release_no_longer_prunes_while_producers_are_stopped(self):
+        # A full pass takes over half an hour; inside a release that is half an hour of no intake.
+        src = (ROOT / "deploy/nas/release.sh").read_text(encoding="utf-8")
+        self.assertNotIn("utils.journal_prune", src)
+        self.assertNotIn("KG_HUB_JOURNAL_PRUNE", src)
 
 if __name__ == "__main__":
     unittest.main()
