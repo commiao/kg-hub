@@ -135,6 +135,35 @@ class BottleneckTests(unittest.TestCase):
         flow = build(status=st)
         self.assertIn("近 24h 积压零消化", titles(flow))
 
+    def test_each_bottleneck_says_when_its_evidence_starts(self):
+        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(10, 1, deferred=2),
+                                  "lines": {"backlog": {"result_counts": {"409": 6}}}})
+        keys = {"by_status": {}, "pending": 0, "pending_oldest_s": None,
+                "errors_24h": {"model_outcome_unknown": 250}, "duration_p50": None,
+                "duration_p90": None, "duration_samples": 0}
+        earliest = (NOW - timedelta(hours=3)).timestamp()
+        flow = build(status=st, keys=keys,
+                     timing={"samples": 50, "wait_share": 0.82, "parallel": True,
+                             "wait_p50": 188.6, "extract_p50": 22.2,
+                             "earliest_at": earliest})
+        since = {b["title"]: b["since_beijing"] for b in flow["bottlenecks"]}
+        # 进程内耗时样本：从窗口里最早一条样本起
+        self.assertEqual(since["并发槽位排队是主要耗时"], "2026-09-28 09:30")
+        # 小时桶只留了 10 小时，起点是最早那个桶，不是假装的 24 小时前
+        self.assertEqual(since["推迟/重试占比高"], "2026-09-28 03:00")
+        self.assertEqual(since["近 24h 抽取失败偏多"], "2026-09-27 12:30")
+
+    def test_calls_per_observation_starts_at_the_utc_day_boundary(self):
+        flow = build(status=status(), gateway_node={
+            "state": "green", "metrics": {"keys": {"kg_hub.entity_extract": {"today": 1180}}}},
+            graph_daily=[{"bucket": "2026-09-28", "lane": "积压线", "count": 100}])
+        item = next(b for b in flow["bottlenecks"] if b["title"] == "每条观测模型调用次数高")
+        self.assertEqual(item["since_beijing"], "2026-09-28 08:00")
+
+    def test_snapshot_bottlenecks_have_no_start_time(self):
+        flow = build(status=status(heartbeat_at=None))
+        self.assertIsNone(flow["primary"]["since"])
+
     def test_high_deferred_share_names_its_reasons(self):
         st = status(budget_today={"day": "2026-09-28", "hourly": hourly(24, 1, deferred=2),
                                   "lines": {"backlog": {"result_counts": {"409": 30, "upstream_error": 5}}}})

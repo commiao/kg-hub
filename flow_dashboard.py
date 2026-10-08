@@ -91,6 +91,16 @@ def _beijing_day_start(value: str) -> str:
     return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:00") if parsed else "—"
 
 
+def _utc_day_start(now: datetime) -> datetime:
+    """本统计日起点：网关额度与 refinery 当日账都按 UTC 日切，即北京时间 08:00。"""
+    return now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _since_beijing(value: object) -> str | None:
+    parsed = _parse_ts(value)
+    return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M") if parsed else None
+
+
 def _percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -476,6 +486,7 @@ def backlog_digest(status: dict, graph_daily: list[dict] | None, now: datetime) 
         "window_open": bool(status.get("backlog_window_open")),
         "hourly": hours,
         "daily": daily,
+        "last24_since": recent[0]["hour"] + ":00:00+00:00" if recent else None,
         "last24": {"backlog_ingested": b_ing, "backlog_rejected": b_rej,
                    "backlog_deferred": b_dfr, "backlog_terminal": terminal,
                    "live_ingested": l_ing, "live_rejected": l_rej,
@@ -623,9 +634,16 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
     from topology import refinery_halt
     found: list[dict] = []
 
-    def add(stage, level, title, evidence, action, deliberate=False):
+    def add(stage, level, title, evidence, action, deliberate=False, since=None):
+        # since：证据里的统计从何时算起；None 表示当前快照，不是累计量。
+        if isinstance(since, datetime):
+            since = since.isoformat(timespec="seconds")
         found.append({"stage": stage, "level": level, "title": title,
-                      "evidence": evidence, "action": action, "deliberate": deliberate})
+                      "evidence": evidence, "action": action, "deliberate": deliberate,
+                      "since": since, "since_beijing": _since_beijing(since)})
+
+    day_start = _utc_day_start(now)
+    last24_since = digest.get("last24_since")
 
     heartbeat = _parse_ts(status.get("heartbeat_at"))
     if heartbeat is None or (now - heartbeat).total_seconds() > 900:
@@ -644,7 +662,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         add("refinery", "stop", "盘温门控歇工",
             f"盘温 {status.get('disk_temp')}°C；今日已歇 "
             f"{(status.get('thermal') or {}).get('minutes', 0)} 分钟",
-            "改善散热；门控阈值是保护整机的决定，不建议直接调高")
+            "改善散热；门控阈值是保护整机的决定，不建议直接调高", since=day_start)
     if status.get("idle_outside_window"):
         add("refinery", "stop", "工作窗口外，积压暂停",
             "refinery 只在工作窗口内消化；窗口外只写心跳",
@@ -667,7 +685,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
             .get("kg_hub.entity_extract", {}).get("ratio")
         if isinstance(ratio, (int, float)) and 0.8 <= ratio < 1:
             add("gateway", "slow", "本额度日接近上限", f"已用 {ratio * 100:.0f}%",
-                "关注窗口尾部；额度不是消化速度的上限，调用倍数才是")
+                "关注窗口尾部；额度不是消化速度的上限，调用倍数才是", since=day_start)
     for stage in ("tools", "claude_mem", "sync"):
         info = stages.get(stage) or {}
         if info.get("state") == "red":
@@ -683,14 +701,18 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         if isinstance(oldest, (int, float)) and oldest > PENDING_STUCK_S:
             add("kghub", "stop", "有抽取任务卡在 pending",
                 f"最老 pending 已 {_human(oldest)}，超过合法上限 {_human(PENDING_STUCK_S)}",
-                "检查 kg_hub_server 日志与写锁持有者；清理器会接管过期键")
+                "检查 kg_hub_server 日志与写锁持有者；清理器会接管过期键",
+                since=now - timedelta(seconds=oldest))
         errors = keys.get("errors_24h") or {}
         total_errors = sum(errors.values())
         if total_errors >= ERRORS_24H_SLOW:
             top = "、".join(f"{k} {v}" for k, v in sorted(errors.items(), key=lambda kv: -kv[1])[:4])
             add("kghub", "slow", "近 24h 抽取失败偏多", f"{total_errors} 条：{top}",
-                "按错误类型处理；失败的调用已计费，重试会再次计费")
+                "按错误类型处理；失败的调用已计费，重试会再次计费",
+                since=now - timedelta(hours=24))
 
+    timing_since = (datetime.fromtimestamp(timing["earliest_at"], tz=timezone.utc)
+                    if isinstance(timing.get("earliest_at"), (int, float)) else None)
     if timing.get("samples", 0) >= 5:
         share = timing.get("wait_share")
         if isinstance(share, (int, float)) and share >= LOCK_WAIT_SHARE_SLOW:
@@ -699,49 +721,54 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
                     f"等槽位占 {_share(share)}；排队 P50 {timing.get('wait_p50')}s，"
                     f"抽取+提交 P50 {timing.get('extract_p50')}s",
                     "槽位一直满载，吞吐由单条耗时决定：先压单条调用次数与冲突重算；"
-                    "加槽位前确认网关并发上限")
+                    "加槽位前确认网关并发上限", since=timing_since)
             else:
                 add("kghub", "slow", "写锁排队是主要耗时",
                     f"排队占 {_share(share)}；排队 P50 {timing.get('wait_p50')}s，"
                     f"抽取 P50 {timing.get('extract_p50')}s",
-                    "把模型抽取移出写锁（KG_HUB_PARALLEL_EXTRACTION）；在此之前加并发只会拉长锁队列")
+                    "把模型抽取移出写锁（KG_HUB_PARALLEL_EXTRACTION）；在此之前加并发只会拉长锁队列",
+                    since=timing_since)
         extract_p50 = timing.get("extract_p50")
         if isinstance(extract_p50, (int, float)) and extract_p50 >= EXTRACT_P50_SLOW_S:
             add("kghub", "slow", "单条抽取耗时高",
                 f"抽取 P50 {extract_p50}s / P90 {timing.get('extract_p90')}s",
-                "graphiti 每条观测多轮调用；合批联合抽取（吞吐方案 P2）")
+                "graphiti 每条观测多轮调用；合批联合抽取（吞吐方案 P2）", since=timing_since)
     elif keys is not None and isinstance(keys.get("duration_p50"), (int, float)) \
             and keys["duration_p50"] >= EXTRACT_P50_SLOW_S:
         add("kghub", "slow", "单条入图耗时高",
             f"领取→终态 P50 {keys['duration_p50']}s / P90 {keys.get('duration_p90')}s（含排队）",
-            "graphiti 每条观测多轮调用；合批联合抽取（吞吐方案 P2）")
+            "graphiti 每条观测多轮调用；合批联合抽取（吞吐方案 P2）",
+            since=now - timedelta(hours=24))
 
     if isinstance(calls_per_obs, (int, float)) and calls_per_obs >= CALLS_PER_OBS_SLOW:
         add("gateway", "slow", "每条观测模型调用次数高",
             f"本统计日约 {calls_per_obs} 次调用 / 条入图",
-            "降低调用倍数：合批抽取、属性合批、减少重试")
+            "降低调用倍数：合批抽取、属性合批、减少重试", since=day_start)
     share = digest.get("deferred_share")
     if isinstance(share, (int, float)) and share >= DEFERRED_SHARE_SLOW:
         top = "、".join(f"{k} {v}" for k, v in sorted(
             (digest.get("result_counts") or {}).items(), key=lambda kv: -kv[1])[:4])
         add("refinery", "slow", "推迟/重试占比高", f"近 24h 推迟占 {_share(share)}；{top}",
-            "按推迟原因处理（409 退避、网关错误、超时）")
+            "按推迟原因处理（409 退避、网关错误、超时）", since=last24_since)
     last24 = digest.get("last24") or {}
     if last24.get("coverage_h", 0) >= 20 and last24.get("active_hours", 0) <= 12 \
             and (digest.get("remaining") or 0) > 0:
         add("refinery", "slow", "每天真正干活的小时数少",
             f"近 24h 只有 {last24.get('active_hours')} 个小时有产出",
-            "窗口、温度、暂停都会吃掉工作时间；见上面的停流项", deliberate=True)
+            "窗口、温度、暂停都会吃掉工作时间；见上面的停流项", deliberate=True,
+            since=last24_since)
     remaining = digest.get("remaining")
     eta = digest.get("eta_days") or digest.get("graph_eta_days")
     if isinstance(remaining, int) and remaining > 0:
         if last24.get("coverage_h", 0) >= 20 and last24.get("backlog_terminal", 0) == 0:
             add("refinery", "stop", "近 24h 积压零消化", f"剩余 {remaining} 条，24 小时内终态 0 条",
-                "先解决上面的停流项")
+                "先解决上面的停流项", since=last24_since)
         elif isinstance(eta, (int, float)) and eta > ETA_DAYS_SLOW:
             add("kghub", "slow", "按当前速度清空积压需要很久",
                 f"剩余 {remaining} 条，预计约 {eta} 天",
-                "结构性瓶颈在单条耗时 × 并发数：先看上面的慢流项，合批抽取降低调用倍数")
+                "结构性瓶颈在单条耗时 × 并发数：先看上面的慢流项，合批抽取降低调用倍数",
+                since=last24_since if digest.get("eta_days")
+                else _utc_day_start(now - timedelta(days=7)))
 
     found.sort(key=lambda b: (SEVERITY_RANK[b["level"]], b["deliberate"],
                               SLOW_IMPACT_ORDER.index(b["title"])
@@ -1311,7 +1338,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=trend-grid id=keytrends></div>
 
 <h2>卡点清单（按影响排序：停流 → 慢流）</h2>
-<table><thead><tr><th style="width:90px">位置</th><th style="width:60px">类型</th><th>现象</th><th>证据</th><th>建议</th></tr></thead><tbody id=bn></tbody></table>
+<table><thead><tr><th style="width:90px">位置</th><th style="width:60px">类型</th><th>现象</th><th>证据</th><th style="width:130px">数据起点（北京时间）</th><th>建议</th></tr></thead><tbody id=bn></tbody></table>
 
 <h2>链路图</h2>
 <div class=tabs id=tabs></div>
@@ -1567,7 +1594,7 @@ $('keytrends').addEventListener('keydown',e=>{
 });
 
 const names=Object.fromEntries(D.stages.map(s=>[s.id,s.label]));
-$('bn').innerHTML=D.bottlenecks.length?D.bottlenecks.map(b=>'<tr><td>'+esc(names[b.stage]||b.stage)+'</td><td><span class="lv '+(b.deliberate?'plan':b.level)+'">'+(b.deliberate?'计划内':(b.level==='stop'?'停流':'慢流'))+'</span></td><td>'+esc(b.title)+'</td><td>'+esc(b.evidence)+'</td><td>'+esc(b.action)+'</td></tr>').join(''):'<tr><td colspan=5 class=note>无</td></tr>';
+$('bn').innerHTML=D.bottlenecks.length?D.bottlenecks.map(b=>'<tr><td>'+esc(names[b.stage]||b.stage)+'</td><td><span class="lv '+(b.deliberate?'plan':b.level)+'">'+(b.deliberate?'计划内':(b.level==='stop'?'停流':'慢流'))+'</span></td><td>'+esc(b.title)+'</td><td>'+esc(b.evidence)+'</td><td>'+(b.since_beijing?esc(b.since_beijing)+' 起':'<span class=note>当前快照</span>')+'</td><td>'+esc(b.action)+'</td></tr>').join(''):'<tr><td colspan=6 class=note>无</td></tr>';
 
 const TABS=[['topology','拓扑图（实时）','节点颜色=当前状态；虚线粗框=当前卡点；连线上是积压剩余与在飞抽取数。'],
  ['usecase','用例图','谁在这条链路上做什么。'],['flow','流程图','一条 observation 从落库到入图的判定路径，每个菱形都是可能卡住的位置。'],
