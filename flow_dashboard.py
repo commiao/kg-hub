@@ -1485,11 +1485,13 @@ function chartRange(values,spec){
  if(Math.min(...values)<low)low-=(high-low)*.1;
  return {low,top:high+(high-low)*.1};
 }
-// Tick labels are 10px tall; drop any that would overprint an earlier one.
+// Labels are whole numbers, so ticks sit at the rounded value: a 0–1.1 axis
+// otherwise prints "1" at both 0.55 and 1.1. Labels are 10px tall; drop any
+// tick that repeats or would overprint an earlier one.
 function chartTicks(low,top,spec,y){
  const kept=[];
- [spec.zeroBaseline&&low<0?0:(low+top)/2,low,top].forEach(v=>{
-   if(kept.every(k=>Math.abs(y(k)-y(v))>=12))kept.push(v);
+ [spec.zeroBaseline&&low<0?0:(low+top)/2,low,top].map(Math.round).forEach(v=>{
+   if(kept.every(k=>k!==v&&Math.abs(y(k)-y(v))>=12))kept.push(v);
  });
  return kept.sort((a,b)=>a-b);
 }
@@ -1518,7 +1520,7 @@ function backlogChart(spec,index){
    const x=backlogX(spec,r.at).toFixed(1);
    return '<path d="M'+x+' 9V101" stroke="#E8A33D" stroke-dasharray="2 2"><title>同步补灌 '+r[spec.burst]+' 条</title></path>';
  }).join(''):'';
- const ticks=chartTicks(low,top,spec,y).map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+Math.round(v)+'</text>').join('');
+ const ticks=chartTicks(low,top,spec,y).map(v=>'<text x="1" y="'+(y(v)+4).toFixed(1)+'" fill="currentColor" font-size="10">'+v+'</text>').join('');
  const zeroLine=spec.zeroBaseline&&low<0?'<path d="M34 '+y(0).toFixed(1)+'H432" stroke="currentColor" opacity=".3" stroke-dasharray="3 3"/>':'';
  const labels='<text x="34" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartStart))+'</text>'+
   '<text x="355" y="123" fill="currentColor" font-size="10">'+esc(axisLabel(chartEnd))+'</text>';
