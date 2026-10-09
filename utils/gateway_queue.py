@@ -22,6 +22,61 @@ def request_body(kwargs):
     return body
 
 
+# A submit whose answer is lost may still have been enqueued and paid for. On
+# 2026-10-09 six tasks failed this way while the gateway rebuilt an image: four
+# accepted jobs ran with nobody collecting them, and the twelve paid steps
+# before them were discarded with their tasks (a later retry gets a new key).
+SUBMIT_ATTEMPTS = 3
+SUBMIT_BACKOFF_SECONDS = (2, 5)
+
+
+async def _queued_job(client, base_url, headers, business_key, key):
+    """Read-only lookup; it does not wait on the queue's write lock.
+
+    None means "not found" or "could not tell" -- both let the caller submit
+    the identical content again, which the gateway's unique key keeps single.
+    """
+    import httpx
+    try:
+        response = await client.post(base_url+'/v1/queue/status', headers=headers,
+            json={'business_key': business_key, 'idempotency_key': key})
+    except (httpx.TimeoutException, httpx.TransportError):
+        return None
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response
+
+
+async def _submit(client, base_url, headers, payload, business_key, key, backoff):
+    """Enqueue exactly once, recovering an ambiguous or refused submit.
+
+    Timeout / broken connection: the job may exist, so look it up first and
+    only then resubmit the byte-identical payload. 503: nothing was enqueued
+    (busy or draining), resubmit after a pause. Anything else -- notably 409
+    for different content under the same key -- is not retried.
+    """
+    import httpx
+    last = None
+    for attempt in range(SUBMIT_ATTEMPTS):
+        try:
+            response = await client.post(base_url+'/v1/queue/submit', headers=headers, json=payload)
+            response.raise_for_status()
+            return response
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last = exc
+            found = await _queued_job(client, base_url, headers, business_key, key)
+            if found is not None:
+                return found
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 503:
+                raise
+            last = exc
+        if attempt + 1 < SUBMIT_ATTEMPTS:
+            await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
+    raise last
+
+
 def body_digest(body):
     return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True,
                                     separators=(',', ':'), allow_nan=False).encode()).hexdigest()
@@ -29,7 +84,8 @@ def body_digest(body):
 
 async def execute_queued(base_url, token, key, body, *, task_ids=None,
                          scenario='unclassified', before_submit=None,
-                         transport=None, wait_seconds=1800, poll_seconds=2):
+                         transport=None, wait_seconds=1800, poll_seconds=2,
+                         submit_backoff=SUBMIT_BACKOFF_SECONDS):
     import httpx
     from anthropic.types import Message
     payload = {'request': body, 'scenario': scenario}
@@ -38,11 +94,11 @@ async def execute_queued(base_url, token, key, body, *, task_ids=None,
     headers = {'Authorization':'Bearer '+token, 'Idempotency-Key':key}
     if before_submit:
         await before_submit(body_digest(body))
-    # HTTP retries are disabled. On ambiguous submission the producer can
-    # submit the exact key/body again; the gateway's durable unique key owns it.
+    # SDK/HTTP-library retries stay disabled. An ambiguous submit is recovered
+    # explicitly: the gateway's durable unique key keeps the same content single.
     async with httpx.AsyncClient(transport=transport, timeout=15, follow_redirects=False) as client:
-        response = await client.post(base_url+'/v1/queue/submit', headers=headers, json=payload)
-        response.raise_for_status()
+        response = await _submit(client, base_url, headers, payload, body['model'], key,
+                                 submit_backoff)
         deadline = time.monotonic()+wait_seconds
         while True:
             value = response.json()
