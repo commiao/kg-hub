@@ -29,14 +29,37 @@ def record_failure(state: dict, reason: str, *, cycle: int, interval: int,
         tomorrow = datetime.fromtimestamp(now, timezone.utc).date() + timedelta(days=1)
         retry_at = datetime.combine(tomorrow, datetime.min.time(), timezone.utc).timestamp()
     else:
-        delay = quota_delay if reason == "quota" else (60 if reason == "rate_limited" else 5)
+        # Pauses before this one in the current run of provider 429s.
+        earlier = state.get("rate_streak", 0) - (state.get("reason") == "rate_limited")
+        delay = (quota_delay if reason == "quota" else
+                 rate_limit_delay(earlier) if reason == "rate_limited" else 5)
         retry_at = now + delay
     # An infrastructure refusal from a second in-flight task must not shorten
     # a daily quota wait. The readiness endpoint does not guarantee quota left.
     if retry_at >= state.get("retry_at", 0):
+        if reason == "rate_limited" and state.get("reason") != "rate_limited":
+            # One more pause in an unbroken run of provider 429s (siblings
+            # refused in the same pause do not count again).
+            state["rate_streak"] = state.get("rate_streak", 0) + 1
         state.update(reason=reason, retry_at=retry_at, probe_attempt=0,
                      until_cycle=cycle + max(1, math.ceil((retry_at - now) / interval)))
     state["hits"] = state.get("hits", 0) + 1
+
+
+# Provider 429s can last minutes or hours (2026-10-08: 80 minutes; 10-09:
+# 15:40 until the token plan reset at 22:00). Each resume sends real tasks,
+# so back off like the gateway's own hold: 60s doubling to 15 minutes.
+RATE_LIMIT_BASE_DELAY = 60
+RATE_LIMIT_MAX_DELAY = 900
+
+
+def rate_limit_delay(streak: int) -> int:
+    return min(RATE_LIMIT_BASE_DELAY * 2 ** max(0, streak), RATE_LIMIT_MAX_DELAY)
+
+
+def note_success(state: dict) -> None:
+    """A model-backed success ends the run of provider 429s."""
+    state.pop("rate_streak", None)
 
 
 def probe_due(state: dict, now: float | None = None) -> bool:
@@ -46,9 +69,12 @@ def probe_due(state: dict, now: float | None = None) -> bool:
 def probe_result(state: dict, ready: bool, *, now: float | None = None) -> None:
     now = time.time() if now is None else now
     if ready:
-        hits = state.get("hits", 0)
+        hits, streak = state.get("hits", 0), state.get("rate_streak")
         state.clear()
         state["hits"] = hits
+        # Readiness says nothing about the provider's quota; only a success does.
+        if streak:
+            state["rate_streak"] = streak
     else:
         attempt = min(state.get("probe_attempt", 0) + 1, len(PROBE_DELAYS) - 1)
         state.update(probe_attempt=attempt, retry_at=now + PROBE_DELAYS[attempt])

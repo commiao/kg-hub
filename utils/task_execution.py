@@ -10,6 +10,12 @@ from utils.model_attempt_journal import summarize_attempts
 
 log = logging.getLogger("kg_hub.task_execution")
 
+# error_kind values for refusals that left no model result and no charge
+# (provider 429, gateway quota). The observation itself is fine: such a run is
+# "deferred" -- not reviewed, and not one of the task's three failed attempts.
+REFUSED_BEFORE_RESULT = frozenset({
+    "rate_limited", "quota_exhausted", "daily_quota_exhausted"})
+
 
 async def read_task(driver, sd, sid):
     rows, _, _ = await driver.execute_query(
@@ -20,7 +26,8 @@ async def read_task(driver, sd, sid):
         "k.manual_resume_command_id AS manual_resume_command_id, "
         "k.episode_uuid AS episode_uuid, k.name AS name, k.stage AS stage, "
         "k.predigest_children AS predigest_children, k.failed_children AS failed_children, "
-        "k.execution_epoch AS execution_epoch, k.created_at AS created_at",
+        "k.execution_epoch AS execution_epoch, k.created_at AS created_at, "
+        "k.error_kind AS error_kind",
         sd=sd, sid=sid)
     return dict(rows[0]) if rows else None
 
@@ -102,6 +109,10 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                     state = "succeeded"
                     await asyncio.to_thread(journal.queue_business_receipts, sd, sid,
                         'neo4j:ingest:' + str(row.get('episode_uuid') or original_request_id))
+                elif (returned and owns_row and row.get("status") == "error"
+                      and row.get("error_kind") in REFUSED_BEFORE_RESULT
+                      and not attempts["in_flight"]):
+                    state = "deferred"
                 elif (returned and owns_row and row.get("status") in {
                         "error", "needs_reconciliation", "failed"}
                       and not attempts["in_flight"]
@@ -112,7 +123,9 @@ async def run_task_execution(*, driver, sd, sid, worker, journal_factory,
                 await asyncio.to_thread(
                     journal.finish_task_execution,
                     sd, sid, execution_id, state=state,
-                    reason="business_result_persisted" if complete else "business_result_missing")
+                    reason=("business_result_persisted" if complete
+                            else "refused_before_result" if state == "deferred"
+                            else "business_result_missing"))
                 summary = (await asyncio.to_thread(journal.task_execution_summary, sd, sid)
                            if state == "failed" else None)
                 if summary and summary["failed_attempts"] >= 3:

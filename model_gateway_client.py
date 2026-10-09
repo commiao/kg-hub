@@ -772,8 +772,15 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 future.cancel()
             raise
         except Exception as exc:
-            from utils.gateway_queue import QueueOutcomeError
-            if journal and prepared and (queue_transport is None or isinstance(exc, QueueOutcomeError)):
+            from utils.gateway_queue import QueueOutcomeError, QueueProviderRefused
+            if journal and prepared and isinstance(exc, QueueProviderRefused):
+                # The provider's 429 is a settled outcome: no answer, no charge.
+                # Record it as "no model call" (the same accounting as a
+                # pre-provider refusal) instead of asking reconciliation.
+                await asyncio.to_thread(journal.update_gateway_status, key, {
+                    "phase": "failed", "provider_call_started": False,
+                    "http_status": 429})
+            elif journal and prepared and (queue_transport is None or isinstance(exc, QueueOutcomeError)):
                 try:
                     status = await asyncio.to_thread(
                         query_gateway_attempt_status, gateway_base_url(), gateway_token(),

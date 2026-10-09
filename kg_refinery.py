@@ -684,6 +684,17 @@ def _http(method: str, url: str, body: dict | None = None, timeout: int = 30,
 # 正常干活时记一次假 timeout,下一轮重推撞上自己刚建的键,换来 409 和指数退避。
 POLL_MAX_WAIT_S = int(ingest_ceiling_sec())
 
+# Last time a poll saw kg-hub report that the gateway is holding its model
+# calls for a provider rate limit (credvault #67). Those tasks wait it out;
+# meanwhile no batch sends anything new.
+PROVIDER_WAIT_FRESH_S = 120
+_provider_wait_seen = [0.0]
+
+
+def provider_waiting(now: float | None = None) -> bool:
+    return ((time.time() if now is None else now) - _provider_wait_seen[0]
+            < PROVIDER_WAIT_FRESH_S)
+
 
 async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) -> str:
     import urllib.parse
@@ -712,11 +723,17 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
                     return kind
             if st in ("ok", "skipped", "error", "needs_reconciliation"):
                 return st
+        held = code == 200 and st == "pending" and bool(d.get("provider_wait"))
+        if held:
+            _provider_wait_seen[0] = time.time()
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
         delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
         step += 1
         await asyncio.sleep(delay)
-        waited += delay
+        # 网关因供应商限流把作业留在队列里:它迟早会执行并计费,先放弃只会让结果
+        # 没人收、下一轮重推撞 409。限流多久不由我们定,所以这段时间不计入上限。
+        if not held:
+            waited += delay
     return "timeout"
 
 
@@ -963,6 +980,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 
     def stopped() -> bool:
         return (halt["stop"] or bool(quota_pause and quota_pause.get("reason"))
+                or provider_waiting()
                 or (can_submit is not None and not can_submit()))
 
     def settle(obs: dict, st: str) -> None:
@@ -973,6 +991,8 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["ingested"] += 1
             decided.pop(oid, None)
             backoff.pop(oid, None)   # 成功即清退避,恢复后立刻全速
+            if quota_pause is not None:
+                recovery.note_success(quota_pause)
             log.info("[%s] obs-%d → %s", kind, oid, st)
         elif st == "409":
             # 指数退避:n 次连续 409 → 等 2^(n-1) 轮再试(上限 BACKOFF_MAX_CYCLES)。
@@ -1276,6 +1296,7 @@ async def main() -> int:
                     **cycle_budget_fields(),
                     backoff_pending=len(backoff),
                     **recovery.status_fields(quota_pause),
+                    provider_wait=provider_waiting(),
                     breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
