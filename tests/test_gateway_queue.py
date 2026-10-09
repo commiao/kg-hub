@@ -65,6 +65,74 @@ class QueueClientTests(unittest.IsolatedAsyncioTestCase):
             journal.complete('queue-k',json.dumps(ANSWER))
             self.assertEqual(json.loads(reopened.prepare(**args,queue_owned=True)),ANSWER)
 
+class SubmitRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-09: submits accepted after kg-hub gave up were paid and orphaned."""
+
+    def job(self, state):
+        return {'version': 1, 'job': {'request_key': 'k', 'business_key': BODY['model'],
+                                      'state': state, 'response': ANSWER}}
+
+    async def submit_and_wait(self, handle):
+        return await execute_queued('http://model-gateway:39000', 'token', 'k', BODY,
+            transport=httpx.MockTransport(handle), poll_seconds=0, submit_backoff=(0,))
+
+    async def test_lost_submit_answer_is_found_by_status_not_resubmitted(self):
+        seen = []
+        def handle(req):
+            seen.append(req.url.path)
+            if req.url.path.endswith('/submit'):
+                raise httpx.ReadTimeout('gateway answered after 15s', request=req)
+            return httpx.Response(200, json=self.job('succeeded'))
+        result = await self.submit_and_wait(handle)
+        self.assertEqual(result.content[0].text, 'answer')
+        self.assertEqual(seen, ['/v1/queue/submit', '/v1/queue/status'])
+
+    async def test_submit_that_never_landed_is_resubmitted_with_identical_content(self):
+        submits = []
+        def handle(req):
+            if req.url.path.endswith('/submit'):
+                submits.append((req.headers['Idempotency-Key'], json.loads(req.content)))
+                if len(submits) == 1:
+                    raise httpx.ConnectError('connection reset', request=req)
+                return httpx.Response(202, json=self.job('succeeded'))
+            return httpx.Response(404, json={'error': {'code': 'not_found'}})
+        result = await self.submit_and_wait(handle)
+        self.assertEqual(result.content[0].text, 'answer')
+        self.assertEqual(len(submits), 2)
+        self.assertEqual(submits[0], submits[1], 'same key and byte-identical content')
+
+    async def test_busy_or_draining_gateway_is_retried(self):
+        submits = []
+        def handle(req):
+            submits.append(req.url.path)
+            if len(submits) == 1:
+                return httpx.Response(503, json={'error': {'code': 'gateway_busy'}})
+            return httpx.Response(202, json=self.job('succeeded'))
+        await self.submit_and_wait(handle)
+        self.assertEqual(submits, ['/v1/queue/submit', '/v1/queue/submit'])
+
+    async def test_conflicting_content_is_not_retried(self):
+        seen = []
+        def handle(req):
+            seen.append(req.url.path)
+            return httpx.Response(409, json={'error': {'code': 'idempotency_conflict'}})
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self.submit_and_wait(handle)
+        self.assertEqual(seen, ['/v1/queue/submit'])
+
+    async def test_retries_are_bounded(self):
+        seen = []
+        def handle(req):
+            seen.append(req.url.path)
+            if req.url.path.endswith('/submit'):
+                raise httpx.ReadTimeout('slow', request=req)
+            raise httpx.ReadTimeout('status also slow', request=req)
+        with self.assertRaises(httpx.ReadTimeout):
+            await self.submit_and_wait(handle)
+        self.assertEqual(seen.count('/v1/queue/submit'), 3)
+        self.assertEqual(seen.count('/v1/queue/status'), 3)
+
+
 class BusinessReceiptTests(unittest.TestCase):
     def test_only_durable_model_results_generate_receipts_and_receipts_survive_restart(self):
         with tempfile.TemporaryDirectory() as root:
