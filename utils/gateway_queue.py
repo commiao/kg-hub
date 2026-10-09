@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
+
+log = logging.getLogger('kg_hub.gateway_queue')
 
 
 class QueueOutcomeError(RuntimeError):
@@ -26,8 +29,10 @@ def request_body(kwargs):
 # 2026-10-09 six tasks failed this way while the gateway rebuilt an image: four
 # accepted jobs ran with nobody collecting them, and the twelve paid steps
 # before them were discarded with their tasks (a later retry gets a new key).
-SUBMIT_ATTEMPTS = 3
-SUBMIT_BACKOFF_SECONDS = (2, 5)
+# About two minutes in total: long enough to ride out a gateway restart
+# (2026-10-09 08:56: three attempts over ~7s did not).
+SUBMIT_ATTEMPTS = 8
+SUBMIT_BACKOFF_SECONDS = (2, 5, 10, 20, 30, 30, 30)
 
 
 async def _queued_job(client, base_url, headers, business_key, key):
@@ -67,11 +72,17 @@ async def _submit(client, base_url, headers, payload, business_key, key, backoff
             last = exc
             found = await _queued_job(client, base_url, headers, business_key, key)
             if found is not None:
+                log.warning("[queue:submit_recovered] key=%s attempt=%d via=status after=%s",
+                            key[:16], attempt + 1, type(exc).__name__)
                 return found
+            log.warning("[queue:submit_retry] key=%s attempt=%d reason=%s",
+                        key[:16], attempt + 1, type(exc).__name__)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 503:
                 raise
             last = exc
+            log.warning("[queue:submit_retry] key=%s attempt=%d reason=http_503",
+                        key[:16], attempt + 1)
         if attempt + 1 < SUBMIT_ATTEMPTS:
             await asyncio.sleep(backoff[min(attempt, len(backoff) - 1)])
     raise last
@@ -116,9 +127,20 @@ async def execute_queued(base_url, token, key, body, *, task_ids=None,
             if time.monotonic() >= deadline:
                 raise TimeoutError('model queue remains pending; resume with the same request key')
             await asyncio.sleep(poll_seconds)
-            response = await client.post(base_url+'/v1/queue/status', headers=headers,
-                json={'business_key':body['model'], 'idempotency_key':key})
-            response.raise_for_status()
+            # The job is durable in the gateway and this read changes nothing:
+            # a gateway restart while polling must not fail a paid task
+            # (2026-10-09 08:56: two accepted jobs were orphaned this way).
+            try:
+                fresh = await client.post(base_url+'/v1/queue/status', headers=headers,
+                    json={'business_key':body['model'], 'idempotency_key':key})
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                log.warning("[queue:poll_retry] key=%s reason=%s", key[:16], type(exc).__name__)
+                continue
+            if fresh.status_code == 503:
+                log.warning("[queue:poll_retry] key=%s reason=http_503", key[:16])
+                continue
+            fresh.raise_for_status()
+            response = fresh
 
 
 async def recover_business_receipts(journal, verify_result, cursor=("", "")):

@@ -129,8 +129,61 @@ class SubmitRecoveryTests(unittest.IsolatedAsyncioTestCase):
             raise httpx.ReadTimeout('status also slow', request=req)
         with self.assertRaises(httpx.ReadTimeout):
             await self.submit_and_wait(handle)
-        self.assertEqual(seen.count('/v1/queue/submit'), 3)
-        self.assertEqual(seen.count('/v1/queue/status'), 3)
+        self.assertEqual(seen.count('/v1/queue/submit'), 8)
+        self.assertEqual(seen.count('/v1/queue/status'), 8)
+
+
+    async def test_submit_rides_out_a_gateway_restart(self):
+        submits = []
+        def handle(req):
+            if req.url.path.endswith('/submit'):
+                submits.append(1)
+                if len(submits) <= 4:
+                    raise httpx.ConnectError('All connection attempts failed', request=req)
+                return httpx.Response(202, json=self.job('succeeded'))
+            raise httpx.ConnectError('All connection attempts failed', request=req)
+        with self.assertLogs('kg_hub.gateway_queue', 'WARNING') as logs:
+            result = await self.submit_and_wait(handle)
+        self.assertEqual(result.content[0].text, 'answer')
+        self.assertEqual(len(submits), 5)
+        self.assertEqual(sum('[queue:submit_retry]' in line for line in logs.output), 4)
+
+    async def test_gateway_restart_while_polling_does_not_fail_the_task(self):
+        polls = []
+        def handle(req):
+            if req.url.path.endswith('/submit'):
+                return httpx.Response(202, json=self.job('queued'))
+            polls.append(1)
+            if len(polls) == 1:
+                raise httpx.ConnectError('All connection attempts failed', request=req)
+            if len(polls) == 2:
+                return httpx.Response(503, json={'error': {'code': 'draining'}})
+            if len(polls) == 3:
+                raise httpx.ReadTimeout('slow', request=req)
+            return httpx.Response(200, json=self.job('succeeded'))
+        with self.assertLogs('kg_hub.gateway_queue', 'WARNING') as logs:
+            result = await self.submit_and_wait(handle)
+        self.assertEqual(result.content[0].text, 'answer')
+        self.assertEqual(len(polls), 4)
+        self.assertEqual(sum('[queue:poll_retry]' in line for line in logs.output), 3)
+
+    async def test_polling_still_gives_up_at_the_deadline(self):
+        def handle(req):
+            if req.url.path.endswith('/submit'):
+                return httpx.Response(202, json=self.job('queued'))
+            raise httpx.ConnectError('gateway gone', request=req)
+        with self.assertRaises(TimeoutError):
+            await execute_queued('http://model-gateway:39000', 'token', 'k', BODY,
+                transport=httpx.MockTransport(handle), poll_seconds=0, wait_seconds=0.05,
+                submit_backoff=(0,))
+
+    async def test_missing_job_while_polling_is_not_swallowed(self):
+        def handle(req):
+            if req.url.path.endswith('/submit'):
+                return httpx.Response(202, json=self.job('queued'))
+            return httpx.Response(404, json={'error': {'code': 'not_found'}})
+        with self.assertRaises(httpx.HTTPStatusError):
+            await self.submit_and_wait(handle)
 
 
 class BusinessReceiptTests(unittest.TestCase):
