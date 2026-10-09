@@ -86,6 +86,32 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.worker.await_count, 3)
         self.assertEqual(self.active, 0)
 
+    async def test_provider_refusal_is_deferred_not_a_failed_attempt(self):
+        # 2026-10-09: a provider 429 left no result and no charge. It must not
+        # spend one of the task's three attempts or end in review.
+        async def refused_worker(*args, **kwargs):
+            self.driver.row.update(status="error", error_kind="rate_limited",
+                                   worker_state=None)
+            return "original-result"
+        self.worker.side_effect = refused_worker
+        await self.run_worker()
+        summary = self.journal.task_execution_summary("source", "one")
+        self.assertEqual(summary["failed_attempts"], 0)
+        self.assertFalse(summary["active"])
+        self.assertEqual(summary["executions"][0]["state"], "deferred")
+        self.assertEqual(summary["executions"][0]["reason"], "refused_before_result")
+        self.assertEqual(self.driver.row["status"], "error")
+
+    async def test_other_errors_still_count_as_failed_attempts(self):
+        async def broken_worker(*args, **kwargs):
+            self.driver.row.update(status="error", error_kind="model_offscript",
+                                   worker_state=None)
+            return "original-result"
+        self.worker.side_effect = broken_worker
+        await self.run_worker()
+        summary = self.journal.task_execution_summary("source", "one")
+        self.assertEqual(summary["failed_attempts"], 1)
+
     async def test_record_store_unavailable_does_not_skip_original_ingestion(self):
         def unavailable():
             raise OSError("journal disk unavailable")

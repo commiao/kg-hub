@@ -676,10 +676,17 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
             "refinery 只在工作窗口内消化；窗口外只写心跳",
             "若要提速，评估扩大工作窗口（refinery_window 配置）", deliberate=True)
     reason = status.get("recovery_reason")
-    if reason or status.get("quota_paused") or status.get("rate_limited") \
-            or status.get("upstream_error_paused"):
-        label = reason or ("配额耗尽" if status.get("quota_paused") else
-                           "限流" if status.get("rate_limited") else "上游 5xx")
+    if status.get("provider_wait"):
+        add("gateway", "stop", "供应商限流：网关暂停发送，在途任务排队等待",
+            "已提交的任务留在网关队列里等供应商恢复（不放弃、不重复付费）；refinery 暂不送新任务",
+            "等待自动恢复：网关定时放一条真实请求试探；额度恢复时间以供应商控制台为准")
+    elif reason == "rate_limited" or (not reason and status.get("rate_limited")):
+        add("gateway", "stop", "供应商限流（HTTP 429）：refinery 暂停",
+            f"下次试探 {_beijing_time(status.get('recovery_retry_at'))}；被拒任务不计失败、"
+            "不进待核验，约 1 小时后自动重试",
+            "等待自动恢复（退避 1 分钟起翻倍，最长 15 分钟）；额度恢复时间以供应商控制台为准")
+    elif reason or status.get("quota_paused") or status.get("upstream_error_paused"):
+        label = reason or ("配额耗尽" if status.get("quota_paused") else "上游 5xx")
         add("gateway", "stop", f"网关/供应商暂停：{label}",
             f"下次探测 {_beijing_time(status.get('recovery_retry_at'))}；停工闸门 "
             + ("、".join(halt["gates"]) or "—"),

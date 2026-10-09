@@ -81,6 +81,7 @@ from utils import ingest_budget  # noqa: E402
 from utils import ingest_timing  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
+from utils.gateway_queue import provider_wait  # noqa: E402
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
 from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
@@ -447,7 +448,11 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
         code = error.get("code") if isinstance(error, dict) else None
         if code in {"daily_quota_exhausted", "package_quota_exhausted"}:
             return "daily_quota_exhausted"
-        if code in {"rate_limit_exceeded", "concurrency_limit_exceeded"}:
+        # provider_rate_limited: the provider answered 429 (a queue job's
+        # failed/provider_error/429, or credvault #67 holding the route). The
+        # body does not say quota vs. rate; both end the same way here.
+        if code in {"rate_limit_exceeded", "concurrency_limit_exceeded",
+                    "provider_rate_limited"}:
             return "rate_limited"
         return "quota_exhausted"
     # Some Anthropic SDK versions expose a 429 as RateLimitError without a
@@ -1073,9 +1078,15 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         return True
     except Exception as exc:  # noqa: BLE001
         logger.exception("[ingest:predigest_llm_failed] name=%s", body.name)
+        # Nothing is written to the graph before the split, so a refusal that
+        # says nothing about this observation is an ordinary retryable error.
+        from utils.task_execution import REFUSED_BEFORE_RESULT
+        refused = classify_extract_error(exc) in REFUSED_BEFORE_RESULT
         await update_ingested_key_status(
-            graphiti, sd, sid, "needs_reconciliation",
-            error_kind="predigest_model_failed", error_message=str(exc))
+            graphiti, sd, sid, "error" if refused else "needs_reconciliation",
+            error_kind=(classify_extract_error(exc) if refused
+                        else "predigest_model_failed"),
+            error_message=str(exc))
         return True
     if not obs_list:
         await update_ingested_key_status(
@@ -1693,6 +1704,9 @@ async def ingest_status(request: Request) -> JSONResponse:
         "error_kind": row.get("error_kind"),
         "predigest_children": row.get("predigest_children"),
         "failed_children": row.get("failed_children"),
+        # Still pending because the gateway holds our model calls for a
+        # provider rate limit: the refinery keeps waiting and sends nothing new.
+        "provider_wait": (provider_wait() if row.get("status") == "pending" else None),
     })
 
 
@@ -1917,13 +1931,17 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
                                         reason="business_result_persisted")
             elif (row.get("status") not in {"pending", "running"}
                   and row.get("worker_state") != "running"):
+                from utils.task_execution import REFUSED_BEFORE_RESULT
                 execution_state = ("uncertain" if summary["in_flight"]
                                    or summary["unknown_without_http_evidence"]
+                                   else "deferred" if row.get("status") == "error"
+                                   and row.get("error_kind") in REFUSED_BEFORE_RESULT
                                    else "failed")
                 await asyncio.to_thread(
                     journal.finish_task_execution,
                     sd, sid, execution_id, state=execution_state,
                     reason=("model_call_outcome_unknown" if execution_state == "uncertain"
+                            else "refused_before_result" if execution_state == "deferred"
                             else "business_result_missing"))
         except RuntimeError:
             # A settled execution is immutable; the exact graph receipt may

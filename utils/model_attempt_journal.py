@@ -336,7 +336,9 @@ class ModelAttemptJournal:
         """Settle one whole worker run; sibling HTTP failures cannot double count."""
         from utils.reconciliation_mailbox import task_uuid
 
-        if state not in {"succeeded", "failed", "uncertain", "unrecoverable"}:
+        # deferred: refused before any model result (provider 429, quota). It
+        # settles the run without spending one of the task's three attempts.
+        if state not in {"succeeded", "failed", "uncertain", "unrecoverable", "deferred"}:
             raise ValueError("invalid task execution state")
         task_id = task_uuid(source_description, source_obs_id)
         with self._connect() as db:

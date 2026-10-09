@@ -15,6 +15,63 @@ class QueueOutcomeError(RuntimeError):
         super().__init__('model queue '+job['state']+': '+str((job.get('error') or {}).get('code', 'unknown')))
 
 
+class QueueProviderRefused(QueueOutcomeError):
+    """The provider answered 429: no result and nothing billed for this job.
+
+    2026-10-09 15:40 the shared token plan ran out of quota. Each refused job
+    came back as failed/provider_error/429; kg-hub only saw "the provider call
+    started" and held 464 tasks for review. The refusal itself is the outcome,
+    so it needs no reconciliation. ``status_code``/``body`` mirror the SDK's
+    429 so the ingest classifier treats it as rate limiting.
+    """
+
+    status_code = 429
+
+    def __init__(self, job):
+        super().__init__(job)
+        self.body = {'error': {'code': PROVIDER_RATE_LIMITED,
+                               'message': (job.get('error') or {}).get('message', '')}}
+
+
+# The gateway's own code for "provider is rate limiting, not sent" (credvault
+# #67). It holds such a job as queued and records the refusal in job.error.
+PROVIDER_RATE_LIMITED = 'provider_rate_limited'
+
+
+def provider_refused(job):
+    """True when a failed job's only outcome is the provider's 429."""
+    error = job.get('error') or {}
+    return (job.get('state') == 'failed' and error.get('code') == 'provider_error'
+            and error.get('http_status') == 429)
+
+
+def held_for_rate_limit(job):
+    """True while the gateway keeps this job queued because of provider 429s."""
+    return (job.get('state') == 'queued'
+            and (job.get('error') or {}).get('code') == PROVIDER_RATE_LIMITED)
+
+
+# Process-wide view for the refinery: "the gateway is holding our jobs for a
+# provider rate limit". Refreshed by every poll that sees the hold, cleared by
+# any success; a view nobody refreshed for PROVIDER_WAIT_TTL is dropped.
+PROVIDER_WAIT_TTL = 300
+_provider_wait = {}
+
+
+def _note_provider_wait(job):
+    now = time.time()
+    ready_at = job.get('ready_at')
+    _provider_wait.update(seen_at=now, since=_provider_wait.get('since', now),
+                          retry_at=ready_at if isinstance(ready_at, (int, float)) else None)
+
+
+def provider_wait():
+    """{'since', 'retry_at'} while the gateway holds kg-hub jobs, else None."""
+    if not _provider_wait or time.time() - _provider_wait['seen_at'] > PROVIDER_WAIT_TTL:
+        return None
+    return {'since': _provider_wait['since'], 'retry_at': _provider_wait['retry_at']}
+
+
 def request_body(kwargs):
     from anthropic import NOT_GIVEN
     body = {k: v for k, v in kwargs.items()
@@ -96,7 +153,7 @@ def body_digest(body):
 async def execute_queued(base_url, token, key, body, *, task_ids=None,
                          scenario='unclassified', before_submit=None,
                          transport=None, wait_seconds=1800, poll_seconds=2,
-                         submit_backoff=SUBMIT_BACKOFF_SECONDS):
+                         submit_backoff=SUBMIT_BACKOFF_SECONDS, held_poll_seconds=30):
     import httpx
     from anthropic.types import Message
     payload = {'request': body, 'scenario': scenario}
@@ -119,14 +176,25 @@ async def execute_queued(base_url, token, key, body, *, task_ids=None,
             if job.get('request_key') != key or job.get('business_key') != body['model']:
                 raise RuntimeError('model queue identity mismatch')
             if job['state'] == 'succeeded':
+                _provider_wait.clear()
                 return Message.model_validate(job['response'])
+            if provider_refused(job):
+                raise QueueProviderRefused(job)
             if job['state'] in {'failed', 'reconciliation'}:
                 raise QueueOutcomeError(job)
             if job['state'] not in {'queued', 'running'}:
                 raise RuntimeError('invalid model queue state')
-            if time.monotonic() >= deadline:
+            held = held_for_rate_limit(job)
+            if held:
+                # The job stays durable and will run once the provider accepts
+                # again; giving up here would leave a paid call nobody collects.
+                # How long a rate limit lasts is not ours to bound, so the hold
+                # (not elapsed time) decides: wait it out, then restart the clock.
+                _note_provider_wait(job)
+                deadline = time.monotonic()+wait_seconds
+            elif time.monotonic() >= deadline:
                 raise TimeoutError('model queue remains pending; resume with the same request key')
-            await asyncio.sleep(poll_seconds)
+            await asyncio.sleep(held_poll_seconds if held else poll_seconds)
             # The job is durable in the gateway and this read changes nothing:
             # a gateway restart while polling must not fail a paid task
             # (2026-10-09 08:56: two accepted jobs were orphaned this way).
