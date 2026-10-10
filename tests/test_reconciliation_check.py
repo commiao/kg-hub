@@ -9,7 +9,7 @@ import tempfile
 from utils.predigest import obs_to_episode_body
 from unittest.mock import Mock
 
-from utils.model_attempt_journal import summarize_attempts
+from utils.model_attempt_journal import AttemptStatusPacer, summarize_attempts
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "kg_hub_server.py"
@@ -81,7 +81,7 @@ def attempt(index, started):
 
 
 class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
-    async def run_check(self, driver, journal, *, model_step_id=None):
+    async def run_check(self, driver, journal, *, model_step_id=None, extra=None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         if journal is not None:
@@ -98,6 +98,8 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
             "datetime": datetime, "timezone": timezone,
             "MAX_OBS": 20, "asyncio": asyncio,
             "obs_to_episode_body": obs_to_episode_body,
+            "_attempt_status_pacer": AttemptStatusPacer(),
+            **(extra or {}),
         }
         exec(compile(module, str(SOURCE), "exec"), namespace)
         return await namespace["ingest_reconciliation_check"](
@@ -225,6 +227,30 @@ class ReconciliationCheckTests(unittest.IsolatedAsyncioTestCase):
         response = await self.run_check(driver, Journal([row]))
         self.assertEqual(response.data["task"]["status"], "needs_reconciliation")
         self.assertEqual(driver.writes, [])
+
+    async def test_unchanged_gateway_answer_is_not_reread_every_cycle(self):
+        # 2026-10-10: 77 stuck tasks were re-queried about every 10s (~108/min).
+        now = [0.0]
+        queried, recorded = [], []
+
+        class StatusJournal(Journal):
+            def update_gateway_status(self, key, status):
+                recorded.append(key)
+
+        def query(url, token, business_key, key):
+            queried.append(key)
+            return {"version": 1, "phase": "unknown", "provider_call_started": None}
+
+        row = attempt(1, None)
+        extra = {"_attempt_status_pacer": AttemptStatusPacer(clock=lambda: now[0]),
+                 "query_gateway_attempt_status": query,
+                 "gateway_base_url": lambda: "http://gw", "gateway_token": lambda: "t"}
+        for at in (0, 5, 10, 25, 30):
+            now[0] = at
+            await self.run_check(Driver(), StatusJournal([row]), extra=extra)
+        # 0: first read (wait 10) / 5: skipped / 10: read (wait 20) / 25: skipped / 30: read
+        self.assertEqual(queried, ["key-1"] * 3)
+        self.assertEqual(recorded, ["key-1"] * 3)
 
 
 if __name__ == "__main__":

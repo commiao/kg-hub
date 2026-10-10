@@ -99,8 +99,8 @@ from model_gateway_client import (  # noqa: E402
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
     offscript_total, stable_operation_id)
 from utils.model_attempt_journal import (
-    NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
-    summarize_attempts,
+    AttemptStatusPacer, NeedsReconciliation, journal_from_backup_env,
+    query_gateway_attempt_status, summarize_attempts,
 )
 from utils.reconciliation_mailbox import BUSINESS_KEY, MailboxStore
 from utils.reconciliation_worker import run_mailbox_cycle, _task_report_data
@@ -1863,6 +1863,10 @@ async def _persisted_business_result(driver, row: dict) -> bool:
                for i in range(1, expected + 1))
 
 
+# One per process: pacing is advisory and safe to forget on restart.
+_attempt_status_pacer = AttemptStatusPacer()
+
+
 async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     """Read model/graph evidence and settle only a proven business outcome."""
     try:
@@ -1907,10 +1911,14 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             # A malformed durable identity cannot be queried at the gateway.
             # Its explicit failed-list classification happens below.
             continue
+        if not _attempt_status_pacer.due(attempt["idempotency_key"]):
+            # The journal already holds the last answer; it is the evidence.
+            continue
         try:
             evidence = await asyncio.to_thread(
                 query_gateway_attempt_status, gateway_base_url(), gateway_token(),
                 attempt["business_key"], attempt["idempotency_key"])
+            _attempt_status_pacer.observed(attempt["idempotency_key"], evidence)
             await asyncio.to_thread(
                 journal.update_gateway_status, attempt["idempotency_key"], evidence)
         except Exception:
