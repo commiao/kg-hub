@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 import hashlib
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -282,17 +283,22 @@ class ModelAttemptJournal:
             started = None
         identity = status.get("identity")
         http_status = status.get("http_status")
+        values = (phase, None if started is None else int(started),
+                  identity if isinstance(identity, str) else None,
+                  http_status if isinstance(http_status, int) else None)
         with self._connect() as db:
-            db.execute("""UPDATE model_attempts SET phase = ?,
-                provider_call_started = ?, gateway_identity = ?,
-                gateway_http_status = ?, updated_at = ?
-                WHERE idempotency_key = ?""",
-                (phase, None if started is None else int(started),
-                 identity if isinstance(identity, str) else None,
-                 http_status if isinstance(http_status, int) else None,
-                 _now(), key))
-            row = db.execute("SELECT step_id FROM model_attempts WHERE idempotency_key = ?",
-                             (key,)).fetchone()
+            row = db.execute("""SELECT step_id, phase, provider_call_started,
+                gateway_identity, gateway_http_status
+                FROM model_attempts WHERE idempotency_key = ?""", (key,)).fetchone()
+            # 2026-10-10: the reconciliation loop re-read the same unresolved
+            # status every ~10s and rewrote it each time -- one FULL-sync write
+            # transaction per stuck attempt on the NAS spinning disk. An
+            # unchanged status is not new evidence, so it is not a write.
+            if row and tuple(row[1:]) != values:
+                db.execute("""UPDATE model_attempts SET phase = ?,
+                    provider_call_started = ?, gateway_identity = ?,
+                    gateway_http_status = ?, updated_at = ?
+                    WHERE idempotency_key = ?""", (*values, _now(), key))
         return NeedsReconciliation(row[0] if row else "unknown", phase, started)
 
     def find_task(self, source_description: str, source_obs_id: str) -> list[dict]:
@@ -673,6 +679,41 @@ def query_gateway_attempt_status(base_url: str, token: str, business_key: str,
     if not isinstance(value, dict) or value.get("version") != 1:
         raise RuntimeError("invalid gateway attempt-status response")
     return value
+
+
+class AttemptStatusPacer:
+    """Per-attempt pacing for reconciliation reads of gateway attempt-status.
+
+    2026-10-10: the reconciliation loop asked the gateway about every unresolved
+    attempt of every tracked task each ~10s (77 stuck tasks, ~108 reads/min),
+    though the answer had not changed for a day. Unchanged answers now double the
+    wait up to MAX_DELAY; any change resets it. MAX_DELAY matches the gateway's
+    own reconciliation recheck ceiling (credvault RECONCILE_MAX_DELAY), so a
+    late outcome is still seen within one gateway recheck period.
+    """
+    FIRST_DELAY = 10.0
+    MAX_DELAY = 300.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self._state: dict[str, tuple[float, float, tuple]] = {}
+
+    def due(self, key: str) -> bool:
+        state = self._state.get(key)
+        return state is None or self.clock() >= state[0]
+
+    def observed(self, key: str, status: dict) -> float:
+        # Only the fields the journal keeps; anything else in the response
+        # (timestamps, diagnostics) must not count as "changed".
+        answer = tuple(status.get(field) for field in
+                       ("phase", "provider_call_started", "identity", "http_status"))
+        previous = self._state.get(key)
+        if previous is None or previous[2] != answer:
+            delay = self.FIRST_DELAY
+        else:
+            delay = min(previous[1]*2, self.MAX_DELAY)
+        self._state[key] = (self.clock()+delay, delay, answer)
+        return delay
 
 
 _journals: dict[Path, ModelAttemptJournal] = {}
