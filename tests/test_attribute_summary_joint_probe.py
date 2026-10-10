@@ -120,6 +120,57 @@ class JointPlanTests(unittest.TestCase):
                 paid.assert_not_called()
                 self.assertFalse((Path(directory) / "results").exists())
 
+    def test_project_constraint_reaches_request_without_changing_file_schema(self):
+        # Regression: a class mislabeled Project received a Java file path in v3.
+        sample = self.sample()
+        project = sample["nodes"][0]
+        project.update(name="GlobalExceptionHandler", labels=["Entity", "Project"],
+                       attributes={"path": None, "repo": "owner/service"})
+        requests = asyncio.run(joint.build_requests(sample, {project["uuid"]}))
+        fields = requests[0]["model"].model_fields
+        project_schema = fields["entity_0"].annotation.model_fields["attributes"].annotation
+        file_schema = fields["entity_1"].annotation.model_fields["attributes"].annotation
+        description = project_schema.model_json_schema()["properties"]["path"]["description"]
+        self.assertIn("Directory", description)
+        self.assertIn("NOT a Project.path", description)
+        self.assertIn("Preserve an existing", description)
+        system = requests[0]["messages"][0]["content"]
+        self.assertIn("OWN existing summary", system)
+        self.assertIn("current explicit correction takes priority", system)
+        self.assertIn("not automatic ownership", system)
+        self.assertIn("planned, approved, locally tested", system)
+        self.assertEqual(set(project_schema.model_fields), {"path", "repo"})
+        self.assertTrue(all(field.is_required() for field in project_schema.model_fields.values()))
+        self.assertEqual(project_schema(path=None, repo="owner/service").path, None)
+        self.assertEqual(file_schema(path="src/Handler.java", project_id="service").path,
+                         "src/Handler.java")
+        context = json.loads(requests[0]["messages"][1]["content"])
+        self.assertEqual(context["entities"]["entity_0"]["attributes"], project["attributes"])
+        # Field descriptions guide the model; they are not semantic validators.
+        self.assertEqual(project_schema(path="src/Handler.java", repo=None).path,
+                         "src/Handler.java")
+
+    def test_accepted_summary_survives_real_graphiti_persistence_unchanged(self):
+        sample = self.sample()
+        target = sample["nodes"][0]["uuid"]
+        request = asyncio.run(joint.build_requests(sample, {target}))[0]
+        context = json.loads(request["messages"][1]["content"])
+        payload = {
+            key: {"attributes": {
+                name: context["entities"][key]["attributes"].get(name)
+                for name in field.annotation.model_fields["attributes"].annotation.model_fields},
+                "summary": None}
+            for key, field in request["model"].model_fields.items()
+        }
+        current_fact = "当前批准修复①②③④，时区问题仍未确认。"
+        text = current_fact + "旧" * (joint.MAX_SUMMARY_CHARS - len(current_fact))
+        payload["entity_0"]["summary"] = text
+        _, summaries = joint.validate_output(request, payload)
+        self.assertEqual(joint.truncate_at_sentence(summaries[target], joint.MAX_SUMMARY_CHARS), text)
+        payload["entity_0"]["summary"] = text + "溢"
+        with self.assertRaises(ValidationError):
+            joint.validate_output(request, payload)
+
 
 if __name__ == "__main__":
     unittest.main()

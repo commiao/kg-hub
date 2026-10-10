@@ -1,0 +1,68 @@
+{
+  "sample_sid": "1f5157044e917576",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "server/ui.html",
+          "project_id": "task-hub"
+        },
+        "summary": "当前核对 server/ui.html 与 /health，确认顶部三处独立展示：#anomaly 为红/琥珀告警条，由reconciler时间阈值决定（interval_s=300、stale_hours=2.0、blocked_alert_hours=72.0、paused_alert_days=7.0）；#focus 为蓝调焦点区，用 .frow 渲染；#board 按status列出卡片，左边框随 active/idle/blocked/paused/done 变色。#anomaly 的 .alert 默认红底红边，.alert.warn 琥珀底；.card.idle 规则是“灯变色但不进告警区”。徽章 holder绿、stale琥珀、block红，last表示非进行中的上一持有者。/health有63个任务，/top?n=20的排名池只有17条，且top按评分选取，所以红框与top3不一致是不同规则和样本池的结果。旧功能仍保留：此文件由task-hub的app.py在/ui提供，零构建SPA；看板/项目视图偏好存taskhub_view，项目页bigStats展示active/backlog，#focus有核实进度入口，代码路径提示已改为~/work-ai/task-hub。"
+      },
+      "entity_1": {
+        "attributes": {
+          "description": "task-hub系统中用于在网络恢复后通过一致性算法自动同步本地持久化任务状态与中心节点的机制。Reconciler在2026-09-08新增了规则7：每日Top-N飞书推送，按本地日期用reconciler_marks幂等去重。规则7插在server/app.py约1487行、既有「规则6：未完成任务的中途结晶」之前，属reconciler巡检循环内的新分支。触发三条件：FEISHU_WEBHOOK已配置、datetime.now().hour >= DAILY_PUSH_HOUR（默认9）、当日标记不存在。日幂等实现为查询SELECT 1 FROM reconciler_marks WHERE task_id='_daily' AND rule='top:{YYYY-MM-DD}'，复用跨重启持久的标记表而非内存状态。推送条目格式：序号 + [status] ID 标题；有blocked_on则附「卡在：」，有next_line则附「下一步：」（截断80字）。每条末尾输出「为什么是它：{why前3个因子}（{score}分）」。推送尾部附消解提醒的操作指引：面板 /ui 上「延后N天/降影响面/标记完成」，或命令行task snooze T-xxxx --days 3。alerts元组(tid, rule, msg)由下游统一消费（app.py:1527 for tid, rule, msg in alerts）。tops为空时不产生任何推送。Reconciliation pipeline follows three phases: Phase A generates alerts (tuples of task_id, rule, message); Phase B executes external calls outside the database transaction; Phase C persists all successful marks to reconciler_marks using INSERT OR IGNORE, ensuring idempotency. The entire flow runs in an infinite _reconcile_loop() that calls reconcile_once() with exception handling. 已执行的多条失联自动降级 active→paused 操作包括：T-0021（2026-08-20 claude-code@mac最后心跳16:48、2026-08-26 codex@mac最后心跳10:18）、T-0052（2026-09-08 codex@mac最后心跳09:59:35）、T-0006（2026-09-08 claude-code@mac最后心跳13:02:27）、T-0045（2026-09-08 claude-code@mac最后心跳13:02:27之后）。另外，T-0094的发布脚本(release.sh)在第5.5步引入了基于check_source_drift.py --list-extra输出的prune逻辑，确保NAS部署目录与Git提交内容严格一致（删除git中已不存在的文件），该机制遵循准则28（两边共用一份IGNORE定义，防止清单各自演化），并受安全边界约束（绝对路径与含..一律拒绝，检测exit 2时整段跳过不删）。此外，T-0091确立了NAS发布顺序门禁，要求路由表工件发布与标准发布串行执行以避免并发cutover重建网关容器。T-0088涉及模型网关失败处置，确认quarantine只消告警不放键，idempotency-resolve才释放；离线操作必须依赖gateway_service_lock且先排空；在线无法安全枚举非在飞集合。当前实现已让具备exact provider/witness持久证据的inactive unknown自动重试，而无exact链接的legacy unknown继续fail-closed。T-0097处理kg-hub Mac发布产物落后问题，采用symlink切换投放定时作业，常驻claude-mem worker刻意不重启以保护付费调用方。FEATURE更新指出MODEL_GATEWAY_START_DRAINED环境变量允许网关以drain模式启动，使候选容器在绑定端口后仅响应健康检查而拒绝付费请求，直到收到显式SIGUSR2信号才开启流量。这为credvault reconciler rollout提供了安全的cutover故事，控制平面可在零财务损失风险下运行wait_gateway_ready-style双视角验证并持久提交转换。该机制与drain_container流程互补：USR1关闭旧current的准入，USR2重新开启；同样的USR2现在也作为新drained候选的提交时门控释放。\n本次确认其告警成员由时间阈值而非/top评分决定：interval_s=300、stale_hours=2.0、blocked_alert_hours=72.0、paused_alert_days=7.0。"
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "description": "task-hub server/ui.html 的红/琥珀告警容器，以.alert和.alert.warn条目呈现；由reconciler时间阈值选成员，不共享/top评分或#focus排序。"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "description": "task-hub server/ui.html 的蓝调焦点区，以.frow逐行呈现；与#anomaly告警和#board状态看板独立。"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "description": "Grouped display view in task-hub's Web UI: a \"视图: 看板 / 视图: 按项目\" toggle button. The kanban view groups tasks in status columns and shows project badges (📁) on cards, while the project view groups tasks by project label. View preference persisted in localStorage as taskhub_view.\n本次确认#board按status列展示卡片，active/idle/blocked/paused/done的左边框颜色各异；idle只是灯色变化，不进入#anomaly。"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "/health",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "task ranking API",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": "/Users/mac/workspace_claudeCode",
+          "repo": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "severity": null,
+          "status": "explained"
+        },
+        "summary": null
+      }
+    }
+  ]
+}

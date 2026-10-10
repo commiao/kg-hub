@@ -1,0 +1,100 @@
+{
+  "sample_sid": "1b782a2659ba0e04",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "/Users/mac/workspace_claudeCode/kg-hub",
+          "repo": "commiao/kg-hub"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "category": "container",
+          "version": null
+        },
+        "summary": "本次 NAS 取证显示 .effective-quota.Q0rDgi 下三个 candidate.json 都只有 services.<name>.image=sha256 镜像钉，没有环境变量、卷或命令覆写。watchdog 的补丁以短服务键 watchdog 钉 sha256:b8caf1ec…，与当时运行的 kg-hub-watchdog 镜像ID一致；但容器名不等于 Compose 服务名，仍须核对 docker-compose.yml 的真实服务键，不能仅凭匹配镜像断言此补丁实际生效。新基底 0718f054 含所需源码且六文件哈希已核对，剥离这些临时指针不应丢独有配置；本条是安全性取证，并未说剥离重启已经执行。旧资料：watchdog 每90秒巡检服务器健康、队列、搜索、慢查询、磁盘温度并报飞书；用witness导出usage.json。更早误报CLEAR已以三态捕获修复。先前称它共享 kg_hub_server 镜像不适用于当前这次 server8940/watchdog b8ca 的不同镜像ID。"
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "containerized server",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "category": "containerized watchdog",
+          "version": "sha256:b8caf1ec…"
+        },
+        "summary": "该观测时 kg-hub-watchdog 容器实际运行镜像ID sha256:b8caf1ec…；NAS临时 effective-quota-u0_et4p8/candidate.json 只写 services.watchdog.image 指向相同摘要，没有独有环境变量、挂载或命令。此证明镜像钉值匹配运行容器，不证明 Compose 服务键必然正确：短名 watchdog 与容器名 kg-hub-watchdog 不同，仍须查 base docker-compose.yml 服务名。新基底0718f054已包含改动且经六文件哈希比对；移除镜像钉是待执行部署动作。本容器在NAS kg-hub栈运行，镜像内COPY代码，无/app源码热挂载；watchdog.py变更需重建并重启，状态和告警持久化。旧镜像 df640…是更早状态，不能覆盖本次b8ca。它拥有gateway_provider_circuit_open告警，旧记录的网络/卷配置属于历史部署信息，若Compose键不符需再确认实际加载情况。"
+      },
+      "entity_4": {
+        "attributes": {
+          "path": "/volume1/docker/kg-hub-src/.effective-quota.Q0rDgi/effective-quota-p4o7rqvr/candidate.json",
+          "project_id": "kg-hub"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "/volume1/docker/kg-hub-src/.effective-quota.Q0rDgi/history-wording/candidate.json",
+          "project_id": "kg-hub"
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "path": "/volume1/docker/kg-hub-src/.effective-quota.Q0rDgi/effective-quota-u0_et4p8/candidate.json",
+          "project_id": "kg-hub"
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": "/volume1/docker/kg-hub-src/.effective-quota.Q0rDgi/",
+          "project_id": "kg-hub"
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "path": null,
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": null,
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "Docker image digest",
+          "version": "sha256:b8caf1ec…"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "/Users/mac/workspace_claudeCode",
+          "repo": null
+        },
+        "summary": "本次在 workspace_claudeCode 项目上下文中，经SSH读取NAS /volume1/docker/kg-hub-src/.effective-quota.Q0rDgi 下三个 candidate.json，确认它们只是镜像摘要钉而非配置；history-wording 的server摘要8940eb2f及 effective-quota-u0_et4p8 的watchdog摘要b8caf1ec与当时运行容器一致，新基底0718f054经六文件哈希证明已含所需源码。不能因此把NAS临时文件说成存于本机 workspace_claudeCode；此项目元数据只是会话归属。旧资料：/Users/mac/workspace_claudeCode 是迁往 /Users/mac/work-ai 前的旧工作区，曾含kg-hub等多个副本；fleet-ops旧副本缺部署清单，实际运行版在 ~/.local/share/fleet-ops/current。旧路径仍可能出现在 task-hub 记录或帮助文本中，应与当前工作树位置分开看。"
+      },
+      "entity_4": {
+        "attributes": {
+          "category": "server",
+          "version": null
+        },
+        "summary": null
+      }
+    }
+  ]
+}

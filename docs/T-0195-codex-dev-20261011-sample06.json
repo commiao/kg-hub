@@ -1,0 +1,85 @@
+{
+  "sample_sid": "b0588eb568129e35",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "hot config reconciliation method",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "/Users/mac/workspace_claudeCode/credvault/.claude/worktrees/credvault-tasks-review-fbff65",
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "path": "deploy/hot_config_reconciliation.py",
+          "project_id": "credvault/credvault-tasks-review-fbff65"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "category": "hot route verifier",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "path": "runtime/state/dashboard-audit.jsonl",
+          "project_id": "credvault/credvault-tasks-review-fbff65"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "runtime/config/routes.json",
+          "content_hash": null
+        },
+        "summary": "本次实现让 hot_config_reconciliation.verify() 对 routes.json 热改从无条件硬拒转为三项闸门审查：①沿 dashboard-audit.jsonl 中 route.update 的 before/after SHA-256 从旧哈希逐跳走到新哈希，缺链即拒，覆盖连续多次热改及未审计直写；②若 state-manifest.json 同时变化，仅允许 cost_policy_ceiling 与 hmac_sha256 改动，ceiling 键集合及各项形状必须保持，数值只能单调收紧，且用网关原生 StateManifest.load 在私有临时目录验签；③闸门独立重算新路由 limits，各键集合须与已签名 ceiling 匹配，值须为整数且不超上限，新路由无对应签名ceiling即拒。passphrase/callers 仍硬拒。该功能本轮源码语法验证通过，不能据此宣称已发布。routes.json 原为运行时路由配置，路径 runtime/config/routes.json，改动会影响组合 config hash，须按受控变更处理。"
+      },
+      "entity_6": {
+        "attributes": {
+          "path": "/volume2/4T/model-gateway/runtime/secrets/state-manifest.json",
+          "project_id": "credvault/credvault-tasks-review-fbff65"
+        },
+        "summary": "本次 hot_config_reconciliation.verify() 允许在严格条件下接纳 state-manifest.json 与 routes 的审计热改：除 cost_policy_ceiling、hmac_sha256 外，清单结构任何变化都拒绝；ceiling 键及各 limit 形状逐项不变，数值不得抬高；清单变化时由 _manifest_authenticates 调网关自己的 mg.StateManifest.load 验签，临时目录/文件权限为0700/0600，不复制HMAC派生逻辑。路由 limits 须由闸门重新检查，不信看板先前的验证。清单在 /volume2/4T/model-gateway/runtime/secrets/state-manifest.json，旧资料记录 artifacts、business_keys、deployment_id、key_derivation、thinking_policy_permission、version 等顶层键；HMAC保护与部署身份、vault KDF和配置哈希绑定。此次只是源码实现且 ast 解析通过，尚非发布证明。"
+      },
+      "entity_7": {
+        "attributes": {
+          "category": "manifest signature verifier",
+          "version": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "manifest load method",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "category": "route audit chain verifier",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "description": "Routes artifact variable referenced in deploy/nas-release.sh line 227; previously caused a syntax defect when written bare before a Chinese comma, now fixed by bracing it as ${ROUTES_ARTIFACT}."
+        },
+        "summary": null
+      }
+    }
+  ]
+}

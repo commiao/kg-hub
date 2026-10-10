@@ -1,0 +1,42 @@
+{
+  "8c24286363309f98": [
+    {
+      "entity_0": {"attributes": {"path": "src/main/java/com/liblibai/sd/web/ai/schedule/GeniusPollDispatchSchedule.java", "project_id": "sd-server/libtv-task-failure-9393c7"}, "summary": "用户批准修复 feature/genius-poll-fallback 审查①②：doReconcile 空页退出时 pageCursor 停在段起点并原值写回 Redis，需调整它与 doDispatchOldLink 的游标推进；deferIds=candidates-minus-dispatched 会再次推后已投递且有 gen 标记任务的 ZSET score，需排除 gen-marked 成员，并把 queue/skip/retry 冷却移出 ZSET score。本次是修复授权，尚非修复完成。文件位于 sd-server/libtv-task-failure-9393c7 的 src/main/java/com/liblibai/sd/web/ai/schedule/GeniusPollDispatchSchedule.java，本地副本在 /Users/mac/workspace/sd-server/.claude/worktrees/libtv-task-failure-9393c7/ 下。dispatch 取得分层 Redisson 锁后计算 genMarkTtlMs=max(60000,wide?wideScanIntervalMs*2:scanIntervalMs*2)，通过 doDispatch(windowSeconds,layer,genMarkTtlMs) 传给 tryMarkGen。batchQuerySkipMarked 用 GENIUS_POLL_SKIP_MARK 格式键和一次 multiGet 替代逐候选 EXISTS；旧链扫描 score 修复已将该调用改为 batchQueryMarked。doReconcile 约299–310行用 removeRangeByScore 清除早于整个回看窗口的僵尸成员；reconcileScan 定义在本文件，失败日志带 layer:reconcile。ae356a36e..HEAD 审查中本文件为新增、约618行，是最大增量。"},
+      "entity_1": {"attributes": {"path": "/Users/mac/workspace/sd-server/src/main/java/com/liblibai/sd/web/ai/createx/executor/core/ProcessExecutor.java", "project_id": "sd-server/libtv-task-failure-9393c7"}, "summary": null},
+      "entity_2": {"attributes": {"path": "src/main/java/com/liblibai/sd/web/ai/createx/executor/core/GenerationExecutor.java", "project_id": "sd-server/libtv-task-failure-9393c7"}, "summary": null},
+      "entity_3": {"attributes": {"path": ".review-tmp/review-out.txt", "project_id": "sd-server/libtv-task-failure-9393c7"}, "summary": null},
+      "entity_4": {"attributes": {"path": null, "repo": "commiao/sd-server"}, "summary": null},
+      "entity_5": {"attributes": {"category": "code review", "version": "GPT-5.6"}, "summary": null},
+      "entity_6": {"attributes": {"path": "src/main/java/com/liblibai/sd/web/ai/finalpush/TaskFinalStatePushService.java", "project_id": "sd-server/libtv-task-failure-9393c7"}, "summary": null},
+      "entity_7": {"attributes": {"category": "publisher confirmation", "version": null}, "summary": null}
+    },
+    {
+      "entity_0": {"attributes": {"filename": "T-0055 Feishu design doc", "category": "design-doc", "path": null}, "summary": null},
+      "entity_1": {"attributes": {"path": null, "repo": "commiao/sd-server"}, "summary": null},
+      "entity_2": {"attributes": {"severity": null, "status": "open"}, "summary": null},
+      "entity_3": {"attributes": {"severity": null, "status": "open"}, "summary": null},
+      "entity_4": {"attributes": {"severity": null, "status": "open"}, "summary": null},
+      "entity_5": {"attributes": {"severity": null, "status": "open"}, "summary": null},
+      "entity_6": {"attributes": {"description": "问题⑤涉及幂等标记与 RabbitMQ publisher confirm 的至多一次推送取舍。审查会话此前称其为已接受的取舍，但用户表示未理解，要求先解释；是否增加 outbox 或 publisher-confirm 状态机尚未决定。"}, "summary": null},
+      "summary_only_0": {"attributes": {}, "summary": "outbox 或 publisher-confirm 状态机是 feature/genius-poll-fallback 问题⑤的待决方案，用于讨论幂等标记与 RabbitMQ 发布确认、至多一次推送之间的取舍。用户尚未理解该取舍，要求先用通俗语言解释，再决定是否加入；本轮仅批准修复①②③④，未批准实施此方案。"}
+    }
+  ],
+  "711285d4c36d733c": [
+    {
+      "entity_0": {"attributes": {"path": null, "repo": "admin"}, "summary": null},
+      "entity_1": {"attributes": {"path": "/Users/mac/work-ai/libtv-m", "repo": "libtv-m"}, "summary": "LibTV APP 弹窗投放接口已在 libtv-m 实现：自定义 cache.Cmdable 包装 go-redis v9，服务通过 Redis 读取 admin 生成的快照，缺失时降级，不直接回查 admin DB；compareVersion 支持预发布版本，PopupHandler 经 Hertz 暴露/转发弹窗列表。Redis 为不可靠的共享基础设施，生产使用 redisStore{}；服务文件 /Users/mac/workspace/libtv-m/api/internal/service/popup/popup.go 提供 Service.List(ctx)→ListResp，并读取 appliaction/base/ctxutil。项目为 Go 1.24 微服务，module=liblibai.com/libtv-m，目录 /Users/mac/work-ai/libtv-m（亦引用 /Users/mac/workspace/libtv-m）；使用 Hertz v0.9.7（缓存另有v0.10.3）、Nacos、GORM/MySQL、Redis、阿里云KMS/Secrets Manager、Prometheus、gRPC、lumberjack。Codeup origin=https://codeup.aliyun.com/663dc7b313a39cc55c4cb5b8/backend/libtv-m.git，推送合并须用组织批准的HTTPS凭证。网关白名单转发原始 token，而 oss-service 的 TokenAuthenticationMiddleware 读取 login-user（JSON LoginUser），两者不同；multipart/complete 属于本项目OSS域、POST且不转发。网关写 X-Gateway:libtv-m 及 X-Client-Terminal:app。T-0129记录1个提交6b35ea8且未推送；旧资料将sd_av_review表列为本项目的sd-server组件。"},
+      "entity_2": {"attributes": {"path": null, "repo": null}, "summary": null},
+      "entity_3": {"attributes": {"category": "cache", "version": null}, "summary": null},
+      "entity_4": {"attributes": {"category": "service", "version": null}, "summary": null},
+      "entity_5": {"attributes": {"category": "scheduled cache repair job", "version": null}, "summary": null},
+      "entity_6": {"attributes": {"org": null}, "summary": null},
+      "entity_7": {"attributes": {"path": null, "repo": "admin"}, "summary": null}
+    },
+    {
+      "entity_0": {"attributes": {"description": "The cache.Cmdable interface (infra/cache/cache.go) exposes SetNX, Eval (Lua script), pipeline, and all standard commands including SetCmdable/SIsMember; redis impl is infra/cache/impl/redis.RedisClient. Lua scripts via Eval must keep keys in the same Redis Cluster hash slot (shared hash tag). cache.Pipeliner embeds StatefulCmdable, which embeds full Cmdable, so pipeline structs must implement SIsMember to satisfy it. libtv-m's read-only delivery endpoint accesses Redis through this abstraction over go-redis v9."}, "summary": null},
+      "entity_1": {"attributes": {"category": "Redis client", "version": "v9"}, "summary": null},
+      "entity_2": {"attributes": {"category": "HTTP handler", "version": null}, "summary": null},
+      "entity_3": {"attributes": {"category": "HTTP framework", "version": null}, "summary": null}
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "sample_sid": "cb072c641611cdb5",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "path": null,
+          "content_hash": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "~/.aliyun/config.json",
+          "content_hash": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "org": null
+        },
+        "summary": "本次用户把新建的 mps-ak AccessKey 配置设为 aliyun CLI 的星标活动档案，region=cn-beijing，以便下一步重试此区域 liblibai-gen-images 测试MP4的同步 MPS SubmitMediaInfoJob；这一步只配置凭据，尚未证明新RAM身份具备 mts:SubmitMediaInfoJob 权限或调用成功。旧档案 dms-oauth 仍可用于DMS/SLS，但现在省略--profile的命令会改用 mps-ak，须显式 --profile dms-oauth 才能保持原身份。cn-beijing 也是该OSS bucket与MPS服务必须匹配的区域，旧记录显示此区域承载 sd-server、task-center、genius-studio-prod及多个SLS日志项目，曾用于任务日志和审计排查；cn-beijing 是地理云区域，旧图将其标为Person并不成立。"
+      },
+      "entity_3": {
+        "attributes": {
+          "severity": "medium",
+          "status": "open"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "description": "Aliyun MPS API for submitting media info jobs. Used by MediaDurationServiceImpl.queryDuration with Async=false, Input JSON {Bucket, Location: \"oss-\"+regionId, Object: URLEncoder.encode(key).replace(\"+\",\"%20\")}. Success requires job.getState() equals exactly \"Success\", non-null Properties, and non-blank Duration that is strictly positive BigDecimal. RuntimeOptions for this synchronous path uses configurable mpsProperties.getReadTimeoutMs(). Only @Scheduled-method callers use hardcoded 3000ms readTimeout/1000ms connectTimeout. Also reused asynchronously by DurationJobService via the same strict OSS allowlist guard resolveOssObject(fileUrl) returning Map{bucket, objectKey}. Official quota: single user 50 QPS; exceeding it is rate-limited, which is why idempotency keyed on sdAssetId is required so the same product submits only one job. Async=true is the officially recommended value and is the chosen mode for the duration-persistence design: sd-server submits analysis in the background, the HTTP request thread only performs sdAssetId-keyed idempotent bookkeeping and returns PENDING immediately, avoiding stacking a further blocking wait (e.g. libtv's former 75s) on top of the existing default 60s readTimeoutMs which would exhaust the Tomcat worker thread pool under concurrency. In async mode the job is not yet generated on return and enters Pipeline queueing without guaranteed timeliness; results must be obtained by polling QueryMediaInfoJobList or by binding MNS message notification to the Pipeline — that choice remains an open implementation decision since the existing synchronous call cannot simply be re-exposed as a long-blocking HTTP entry. Properties.Duration unit is seconds. UserData max length 1024 bytes, usable to carry business identifiers (e.g. sdAssetId/generateId) for result matching. Input.Object must be UTF-8 URL encoded and the OSS region must match the MPS region or the job fails. Precondition: the file must already be successfully uploaded to OSS before submitting, otherwise execution fails. Known defect pending fix: failures uniformly throw IllegalStateException while FileController.queryDuration catches only IllegalArgumentException, so exceptions leak out as HTTP 500; the 429 + retryAfterMs response path is also not yet implemented. CLI usage (`aliyun mts SubmitMediaInfoJob`): requires --Input (OSS Object URL must be UTF-8 URL-encoded), OSS region must match MPS region; --Async true is the recommended async mode; optional --PipelineId requires MNS message binding for async callbacks; optional --UserData max 1024 bytes. Two-step flow: submit then poll QueryMediaInfoJobList by MediaInfoJobId. No dedicated mts plugin installed locally — falls back to built-in OpenAPI-style commands. API version 2014-06-18. Job State values are Success / Fail / Analyzing; failure responses carry Code and Message pairs such as InvalidParameter.JsonObjectFormatInvalid when the Input JSON is malformed. Synchronous mode available via --Async false as the simpler request/response option. Example Input JSON shape: {\"Bucket\":\"example-bucket\",\"Location\":\"example-location\",\"Object\":\"example%2Fexample.flv\"}. First real attempt against liblibai-gen-images returned HTTP 403 Forbidden due to RAM permission gap. A real sync call (--Async false) against the cn-beijing test MP4 via `aliyun mts submit-media-info-job` returned 403 ImplicitDeny from AccountLevelIdentityBasedPolicy against RAM SubUser 202616504889403 under account 1652080434541916, proving the request was well-formed and reached the correct regional endpoint; denial is purely authorization. Duration appears at MediaInfoJob.Properties.Duration in sync mode; per-stream Duration includes width/height/codec/fps/bitrate, plus Format.Duration. Retry-ready minimal RAM policy JSON was produced for admin attachment. Next step after permission grant is re-running the sync call to see whether MPS can actually read the object, then comparing output against validated x-oss-process results before wiring duration into sd-server video persistence.\n本次用户新建并激活cn-beijing区域mps-ak档案，为此前403 ImplicitDeny后的同步重试做准备；仅配置凭据，尚未验证新身份授权或实际调用结果。"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": "本次 mps-ak 档案配置于 cn-beijing，用于后续对 liblibai-gen-images 桶中测试 MP4 重试同步 MPS SubmitMediaInfoJob。此前用 dms-oauth 请求该桶时已到达 cn-beijing MPS 端点，但因RAM身份策略缺少 mts:SubmitMediaInfoJob 权限返回403 ImplicitDeny；新AK的实际权限和重试结果尚未知，不能写成已经成功。该OSS桶域名 liblibai-gen-images.oss-cn-beijing.aliyuncs.com，MPS区域需与桶一致。旧资料记录此桶供sd-server音视频使用，也验证过带签名的OSS x-oss-process/IMM DetectMediaMeta：测试视频返回Duration 5.1秒、1280×720、H.264；这项IMM成功不能外推为MPS已成功。IMM要求桶绑定Project、签名及相应权限，处理可能计费。桶不是代码仓库，不应把解释文字写入Project.repo。"
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "Java generation server",
+          "version": null
+        },
+        "summary": "本次 sd-server 视频时长能力的下一步是使用已设为活动档案的 mps-ak，在 cn-beijing 对 liblibai-gen-images 测试MP4重试同步 MPS SubmitMediaInfoJob；此前 dms-oauth 身份请求返回403 ImplicitDeny。配置新档案不代表RAM授权或MPS结果已经验证，理想权限仅包含 mts:SubmitMediaInfoJob。CLI默认已切换到mps-ak，相关SLS查询若要维持 dms-oauth 应显式指定 --profile。旧记录：sd-server是Java图像/视频生成服务，代码目录 /Users/mac/workspace/sd-server，通过task-center提交GPU任务；它的OSS x-oss-process/IMM签名请求曾成功取回测试视频5.1秒、1280×720、H.264元数据。当前正评估MPS集成，先前没有已录入的现成MPS依赖；原“本地没有AK凭据”是此前状态，不能再当作现在的默认CLI状态。"
+      },
+      "entity_7": {
+        "attributes": {
+          "category": "Aliyun CLI profile listing",
+          "version": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "Aliyun CLI profile switch",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "category": "Aliyun CLI profile configuration",
+          "version": null
+        },
+        "summary": null
+      }
+    }
+  ]
+}

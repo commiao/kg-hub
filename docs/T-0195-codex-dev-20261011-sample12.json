@@ -1,0 +1,97 @@
+{
+  "sample_sid": "ccd4a57f6bb437cc",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "Go panic-recovery helper",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "category": "verification",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "analysis-tool",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "appliaction/consumer/content_report/scheduler.go",
+          "project_id": "libtv"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "path": "pkg/safego/safego.go",
+          "project_id": "libtv"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "Go library/bot client",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": null,
+          "repo": "libtv"
+        },
+        "summary": "本次在 libtv 把报表 scheduler.go Start() 的裸 go run(ctx) 改为 safego.Go(ctx,func(){run(ctx)})，使每日飞书投递循环中的意外panic（如deliverWindow内）由safego恢复并记堆栈，避免单个后台goroutine杀掉进程。domain/report、feishubot、consumer/content_report及handler包 go vet 通过，相关测试通过，git diff --check干净；这是代码和本地验证记录，未说明生产已发布。旧事实：libtv为Newtake的Go服务，负责图像任务扣费与资源、auth-center鉴权；邮件登录在业务门后消耗验证码，验证码改阿里云DirectMail。风险盾对appSource=libtv返回false，注册发UserRegisterEvent，海外bizTypeStr LIBTV→26；终端标识遵循unknown省略，T-0129只改出站序列化名，4b3ec6a4f当时未推送。弹窗功能要求Redis失效回退、上传错误可读提示，名单UUID不做格式校验。"
+      },
+      "entity_2": {
+        "attributes": {
+          "description": "libtv报表调度的后台goroutine；本次在scheduler.go Start()从裸go run(ctx)改成safego.Go(ctx,func(){run(ctx)})，panic会恢复并记堆栈，避免日报飞书投递循环异常终止整个进程。"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "description": "libtv每日飞书报表投递循环，由scheduler.go后台goroutine运行；本次改由safego.Go包装，deliverWindow等处panic由safego恢复并记录。"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "description": "libtv报表每日投递窗口处理函数；意外panic是本次scheduler.go把裸goroutine改为safego.Go时明确考虑的风险。"
+        },
+        "summary": "deliverWindow 是 libtv 报表每日飞书投递循环内的窗口处理逻辑。此次 scheduler.go 的 Start() 从裸 go run(ctx) 改为 safego.Go(ctx,func(){run(ctx)})；若 deliverWindow 或循环其他位置意外panic，safego会恢复并记录堆栈，避免杀掉整个进程。改动后的相关包 go vet 与报表测试通过，git diff --check干净。当前来源没有说 deliverWindow 本身代码改过或已在生产发布。"
+      }
+    }
+  ]
+}

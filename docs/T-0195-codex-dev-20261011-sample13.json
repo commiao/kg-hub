@@ -1,0 +1,86 @@
+{
+  "sample_sid": "fe38b2c42bd5e8b9",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "/Users/mac/work-ai/task-hub/.claude/worktrees/workspace-claude-migration-4220c2",
+          "repo": "task-hub"
+        },
+        "summary": "这次 task-hub 从 workspace_claudeCode 到 work-ai 路径切换后，按改动文件逐一选了四套离线回归：test_printed_commands 4项（含打印命令真实存在及参数解析器来自实现本体）、test_mac_install_reload 4项（install.sh 的 fleet-ops 提示改为 ~/work-ai）、test_deployment_worker 2项（REPO_ROOT默认路径改为work-ai）、test_release_marker 18项，总28项通过；此前桥接断言35项也通过。tests/test_m1.py 四处改写及 server/app.py 文档字符串尚未在此轮专项覆盖，不能把28项说成全量切换验收。旧资料：项目工作树在 /Users/mac/work-ai/task-hub/.claude/worktrees/workspace-claude-migration-4220c2；release_collect曾因旧扫描根误报，部分任务记录仍留旧workdir；Python3.9的PEP604注解问题通过future annotations防护。"
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "tests/test_printed_commands.py",
+          "project_id": "task-hub"
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "path": "tests/test_mac_install_reload.py",
+          "project_id": "task-hub"
+        },
+        "summary": "本次在 /usr/bin/python3 下运行 tests/test_mac_install_reload.py 的4项测试，全部通过；对应 deploy/mac/install.sh 的fleet-ops前提提示从旧 workspace_claudeCode 路径改为 ~/work-ai。这是针对安装脚本改动的定向回归，不覆盖 tests/test_m1.py 与 server/app.py 文档字符串，也不等于全量发布验收。旧资料显示该文件属于task-hub，曾通过源码反模式及真实子进程检查中央launchd_reload契约；过去的变异检查曾发现一个未被捕获的missing-library fallback弱点，后续强化过断言。旧摘要里说它属于fleet-ops项目与本次明确的task-hub归属不符。"
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "tests/test_deployment_worker.py",
+          "project_id": "task-hub"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "path": "/Users/mac/work-ai/task-hub-wt-mcp-session/tests/test_release_marker.py",
+          "project_id": "task-hub"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "deploy/mac/install.sh",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "path": "deploy/mac/install.sh",
+          "project_id": "task-hub/workspace-claude-migration-4220c2"
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": "client/deployment_worker.py",
+          "project_id": "task-hub"
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "tests/test_m1.py",
+          "project_id": "task-hub"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "/Users/mac/.local/share/task-hub/current/server/app.py",
+          "content_hash": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "system Python interpreter",
+          "version": "3.9"
+        },
+        "summary": "本次用 /usr/bin/python3 运行四套 task-hub 离线测试：test_printed_commands 4项、test_mac_install_reload 4项、test_deployment_worker 2项、test_release_marker 18项，均通过；累计另有35项桥接断言。测试覆盖的是选定改动脚本，tests/test_m1.py 与 server/app.py 文档字符串仍待核查，不代表整个迁移已通过。旧资料说明 Mac 上 /usr/bin/python3 对应系统 Python 3.9，task-hub 的 deployment-worker plist 用它以 --once 运行；它不能直接求值 dict | None 等PEP604注解，release_collect用 future annotations规避。其他项目依赖缺失或网络权限问题属历史环境记录，不能据这次28项测试认为全部消失。"
+      }
+    }
+  ]
+}

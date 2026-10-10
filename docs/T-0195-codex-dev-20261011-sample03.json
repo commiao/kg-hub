@@ -1,0 +1,24 @@
+{
+  "sample_sid": "608aa405e7e1c5c6",
+  "batches": [
+    {
+      "entity_0": {"attributes": {"path": "tests/test_hot_config_reconciliation.py", "project_id": "credvault/credvault-tasks-review-fbff65"}, "summary": null},
+      "entity_1": {"attributes": {"path": "tests/test_dashboard.py", "project_id": "credvault/credvault-tasks-review-fbff65"}, "summary": null},
+      "entity_2": {"attributes": {"path": "/Users/mac/workspace_claudeCode/credvault/.claude/worktrees/credvault-tasks-review-fbff65", "repo": null}, "summary": null},
+      "entity_3": {"attributes": {"category": "Dashboard write handler function", "version": null}, "summary": "本次发现：HotConfigReconciliationTests 可复用 DashboardTests 私有 runtime fixture，通过 self.dashboard.store.update_route 构造真实 route.update 审计链；before/after SHA-256 会写入 dashboard-audit.jsonl，适合验证有审计的 routes 热改可放行。_update_route 在 credvault_dashboard.py 中由 /api/routes/update 调用，直接改生产 routes.json，带 generation 哈希并用 hmac.compare_digest 做乐观并发检查。它依次执行 audit.preflight()、签名清单、routes.json 写入，并用 PolicyMutationJournal.begin 记录意图，失败边界按关闭处理；候选路由还要满足清单签署的 cost_policy_ceiling 和 thinking_policy_permission。旧 T-0078 曾提出改为只经 Git，但该路径后来按用户期望支持即时热生效，不能把历史提议说成当前禁写规则。verify() 对 routes/manifest 热改的正向接纳与反向拒绝尚需新测试；现有15项绿测没有覆盖其新分支。"},
+      "entity_4": {"attributes": {"category": "manifest load method", "version": null}, "summary": null},
+      "entity_5": {"attributes": {"path": "config/routes.json", "content_hash": null}, "summary": null},
+      "entity_6": {"attributes": {"path": "secrets/vault.json", "project_id": "credvault/credvault-tasks-review-fbff65"}, "summary": null},
+      "entity_7": {"attributes": {"path": "runtime/state/dashboard-audit.jsonl", "project_id": "credvault/credvault-tasks-review-fbff65"}, "summary": "本次热改测试可借 DashboardTests fixture 的 store.update_route 生成真实 route.update 事件，使 routes.json 修改前后的 SHA-256 自然写入 dashboard-audit.jsonl；判据①据此验证连续审计链，不能手写字节替代。该文件在 NAS /volume2/4T/model-gateway/runtime/state/dashboard-audit.jsonl，亦是 reconcile() 的默认审计路径和历史锁竞争分析的关联证据。已有 route.update 事件带 before_sha256、after_sha256、mutation_id，不必为新判据增加审计字段；其余事件包括 credential.create/delete/rotate、reconciliation.recheck、route.probe、session.login。_read_audit() 要求私有文件、完整末尾换行、大小不越界、每行 JSON 合法，读取前后字节一致，否则关闭处理。旧 T-0146 01:2xZ 慢尾窗口无 dashboard-admin 事务，最后一次操作早于10.5小时，故当时看板点击致卡顿的假设缺少支持。"}
+    },
+    {
+      "entity_0": {"attributes": {"obs_id": null, "source_device": null}, "summary": null},
+      "entity_1": {"attributes": {"description": "六个数值成本控制字段之一；实际生效的日额度值(如5000)来自运行时注入的配置或持久化状态而非 model_gateway.py 源码硬编码，整文件 grep 'daily_requests.*5000' 无命中。要提额度必须找到并修改该 current 值的产生处(路由显式 daily_requests 或其默认来源)，仅抬高 witness 上限不会改变日常限流值。当前热改测试以收紧 limits.daily_requests 为例，字段位于 limits 子对象。"}, "summary": null},
+      "entity_2": {"attributes": {"description": "StateManifest 是 credvault/网关部署体系中的一个锚定机制（state_manifest）。manifest readiness 校验通过 validate_route_policy 比较路由 cost_policy_ceiling() 与 witness 上限。现于 model_gateway.py:686 定义，为带 HMAC 验签的清单类：load() 于 847 行做 hmac.compare_digest 验签（838 行签名、863 行格式正则），另有 load_for_migration()。本次测试可用 mg.StateManifest.load(secrets/state-manifest.json, passphrase, expected_vault_kdf=mg.StateManifest.vault_kdf(self.vault)) 构造合法签名清单修改，并对比允许的单调收紧与违规抬高。"}, "summary": null},
+      "entity_3": {"attributes": {"path": "/volume2/4T/model-gateway/runtime/secrets/state-manifest.json", "project_id": "credvault/credvault-tasks-review-fbff65"}, "summary": null},
+      "entity_4": {"attributes": {"category": "reconciliation logic", "version": null}, "summary": null},
+      "entity_5": {"attributes": {"description": "_config_hash is a function/mechanism in deploy/deployment_state.py that computes the aggregate configuration hash (config_sha256). It digests each file as filename + NUL + 8-byte big-endian length + bytes, giving domain-separated aggregate hashing. Snapshot validation re-derives the aggregate and rejects mismatch (\"configuration snapshot aggregate hash mismatch\"). The config_sha256 covers six files: config/routes.json, secrets/vault.json, secrets/vault.json.anchor, secrets/passphrase, secrets/callers.json, secrets/state-manifest.json; the live policy flock is deliberately excluded to avoid inode split between dashboard/CLI writers."}, "summary": null},
+      "entity_6": {"attributes": {"description": "Atomic file write pattern: write to a temp file then rename/move onto the target path (tmp+mv), so readers never observe a partially-written file. Used by kg_refinery.py write_status() for status.json on a shared volume read by the kg-hub server, and mirrored by report-portal/deploy/redeploy.sh which syncs project files to the NAS via SSH using tmp+mv to prevent partial writes."}, "summary": null}
+    }
+  ]
+}

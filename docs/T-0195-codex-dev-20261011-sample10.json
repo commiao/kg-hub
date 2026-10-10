@@ -1,0 +1,72 @@
+{
+  "sample_sid": "9db3de8871fd0d9a",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "server image",
+          "version": "5f8c180f2ec9"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "server",
+          "version": null
+        },
+        "summary": "该观测时，NAS 成功完成 kg-hub 的非秘密 .env 漂移检查器提交 5f8c180 发布：deploy/nas/release.sh 六阶段均成功，kg-hub-server 镜像 5f8c180f2ec9，旧镜像 e972418e5de9 留作回滚。发布后 check_source_drift.py 对 origin/main 校验显示源码一致、ghost文件0，kg-hub-ingester与kg-hub-server在排除在飞噪声后正常重启；T-0052只读鉴权变更与新检查器一同在线。这是该时点的验收，不能冒称2026-10-11现状。旧记录显示NAS还承载credvault网关、report-portal、task-hub等服务；更早一次独立检测曾发现源码与当时 origin/main 不一致，此次发布后重新核对才得到无漂移。NAS有既有SSH/Docker维护路径，其他历史看板健康信息各属不同采样时刻，不由本次kg-hub发布更新。"
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "deploy/nas/check_source_drift.py",
+          "project_id": "kg-hub/view-assigned-tasks-91de86"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "path": "deploy/nas-release.sh",
+          "project_id": "credvault/credvault-tasks-review-fbff65"
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "containerized service on kg-hub_default bridge network (NAS); exposes 8080 internally only with no host port mapping; used to execute tools/delivery_stats.py against /backup/delivery-hits.jsonl; recreated during knowledge quick-view search-backend convergence; has no quota or historical-health override, so compose rebuild is lowest risk",
+          "version": "sha256:0718f0546ab7 (unified base image after Plan A deployment; replaced previous digest sha256:dc2a2be738d1...). Now joined to both kg-hub_default and model-gateway-private networks."
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": "/Users/mac/workspace_claudeCode/kg-hub/.claude/worktrees/view-assigned-tasks-91de86",
+          "repo": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "deploy/nas/check_source_drift.py",
+          "project_id": "kg-hub/view-assigned-tasks-91de86"
+        },
+        "summary": null
+      }
+    }
+  ]
+}

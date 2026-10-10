@@ -1,0 +1,96 @@
+{
+  "sample_sid": "082ba8eaffd4bcb3",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": "T-0146 当前不能标记done：可观测性实现提交 c806831 仍只在 claude/task-t-0146-6a4f00 工作树分支，未rebase到 origin/main、未推送、未合并。调查及实现已完成（新增10项测试，全套1215项回归），剩余交付门是获批准后检查 T-0156 的 a3fe83b 与 model_gateway.py、credvault_dashboard.py 冲突，rebase、push、合入，之后才 task_done。日志把原“等待关闭决定”更正为“阻塞于合并”，并正式撤回标题里“scrypt导致/health/ready慢尾”的说法；实证根因是 policy_mutation_lock 的进程内RLock排队，NAS 20ms跟踪曾见成对READ持锁约0.5s及1.8s、合计可达2.4s，关联付费请求前的持久写和见证准备。用户批准的C方案仅加观测，不改锁行为。缩短付费前约1.8s区段或把readiness从共享锁解耦是后续独立任务A/B，须先证明付费边界线性化仍成立；此处没有执行这些延迟修复。旧图把任务误标为Project且path指向另一个工作树，不能作为本任务目录。"
+      },
+      "entity_1": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "crypto-kdf",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "applied_at": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "statement": "合入main也不等于已部署，仍需运行态验收；尚未合入main的c806831更不能视作已落地，T-0146不能提前标记done。",
+          "derived_at": null
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "/Users/mac/work-ai/task-hub",
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "severity": "medium",
+          "status": "open"
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "description": "付费请求边界保持线性化的性质；T-0146只完成可观测性。若后续缩短约1.8秒付费前区段或使readiness脱离共享policy锁，必须先证明该性质不被破坏。"
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "applied_at": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "applied_at": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "path": "/Users/mac/workspace_codex/credvault/credvault_dashboard.py",
+          "project_id": "credvault"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "model_gateway.py",
+          "project_id": "credvault"
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "severity": null,
+          "status": null
+        },
+        "summary": null
+      }
+    }
+  ]
+}

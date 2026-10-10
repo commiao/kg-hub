@@ -1,0 +1,91 @@
+{
+  "sample_sid": "42c5310e51b622d1",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "description": "A review skill validated end-to-end on the production VPS (oc-vps-aliyun-us), installed cleanly as the admin user using the production skill-sync-sidecar venv-0.1.3. Executed three-step workflow (dry-run, apply, scan) with runuser ensuring correct file permissions. Files modified: /tmp/openclaw-admission-p1-wave7-validate-20260616-0959/target/review/, /tmp/openclaw-admission-p1-wave7-validate-20260616-0959/target/.skill-sync-backups/20260616T095909.675693Z/.apply-record.json. Project: workspace_codex. Additionally, a gstack /review skill exists at ~/.codex/skills/gstack/review/SKILL.md used for pre-landing code review workflows in the wechat-editorial-gateway-release project. This skill detects hosting platform from git remote URL, resolves base branch with git-native fallbacks, performs scope drift detection comparing git diff --stat against stated intent, and analyzes diffs for SQL safety, LLM trust boundary violations, and conditional side effects. The gstack review skill at /Users/mac/.agents/skills/gstack/review/SKILL.md is 1642 lines; it performs pre-landing diff analysis against the base branch for SQL safety, LLM-trust-boundary violations, and conditional side effects. It shares preamble/config machinery with other gstack skills (telemetry, session markers, spawned-session handling under OPENCLAW_SESSION, AskUserQuestion decision-brief format) and adds routing-rule injection into project CLAUDE.md files. Its steps 2–3.5 define: Greptile PR-comment triage (Step 2.5, skips silently without a PR or gh access), VERSION queue check (Step 3.4, advisory), bun-based slop scan of AI-code smells like empty catches and redundant 'return await' (Step 3.5, advisory-only), completion audit comparing delivered diff vs plan intent with SCOPE CREEP gating via AskUserQuestion for HIGH-impact discrepancies, and Step 3 fetching origin/<base> then diffing so uncommitted working-tree edits count. A mandatory checklist gates the process. Internals further include: every finding needs calibrated confidence with tiered display suppression; a search-before-recommending rule requires verifying fix patterns against current framework docs; Review Army step launches independent fresh-context specialist subagents in parallel with structured JSON finding output and optional test_stub generation in detected framework (jest/vitest/rspec/pytest/go-test); results are cross-checked between Claude structured, Claude adversarial, and Codex passes with convergence summary; final outcome persisted with gstack-review-log so downstream /ship recognizes the review. Findings carry 1–10 confidence score with display rules: 9–10 show normally, below 7 shown with caveat, 5–6 show with caveat, 3–4 suppressed to appendix, 1–2 only if P0 or severity would be P0; format is [SEVERITY] (confidence: N/10) file:line — description. Step 4 critical categories: SQL & Data Safety, Race Conditions, LLM Output Trust Boundary, Shell Injection, Enum & Value Completeness; enum category requires reading code outside the diff via Grep/Read when new constants are introduced. Fix-first rule set: AUTO-FIX items applied directly, ASK items need approval, but the review skill itself never commits, pushes, or creates PRs — that is /ship's job. Learnings from past sessions are searchable and cited inline (Prior learning applied: [key]). In the finance trend-window context, pre-landing validation of the spending-trend fix was planned using the gstack review and qa-only skills rather than ad-hoc checking. Used in the zhaopin tree (/Users/mac/work-ai/zhaopin) to drive a structured code review of the large uncommitted migration surface (50 tracked files modified plus untracked backend modules). The gstack review skill's pre-landing workflow was also invoked in the finance project to dispatch three pre-commit subagents (precommit_verify, precommit_antipatterns, precommit_review) over the final handoff-correction diff (four files, 139 insertions, 23 deletions vs baseline e2f8852). Specialist dispatch: Testing and Maintainability are always-on for diffs of 50+ changed lines while diffs under 50 lines skip all specialists; Security and Data-Migration specialists are tagged NEVER_GATE and always dispatch as insurance policy; specialists with 0 findings across 10+ dispatches are auto-gated via gstack-specialist-stats. Specialists are dispatched as parallel general-purpose subagents emitting per-finding JSON lines with severity/confidence/path/category/summary/specialist fields plus optional test_stub. Additional workflow features: continuous checkpoint mode auto-commits logical units as \"WIP:\" commits carrying a [gstack-context] block (Decisions/Remaining/Tried/Skill), staging only intentional files and never git add -A, with /ship squashing WIP commits; question-preference tuning writes gated on user-origin where tune events are accepted only when \"tune:\" appears in the user's own chat message (exit code 2 means rejected, do not retry); REPO_MODE controls out-of-branch issue handling — solo = investigate and offer to fix, collaborative/unknown = flag only and don't fix. Key architecture includes: a preamble config probe, parallel-ish foreground specialist subagents each emitting JSON findings, deterministic fingerprint-based dedup with multi-specialist confirmation boosts, confidence-thresholded presentation, and a conditional adversarial Red Team pass for large or critical-laden diffs. Specialist reviewers (testing, maintainability, security, performance, data-migration, api-contract, design, red-team) are dispatched as foreground general-purpose Agent subagents; failures/timeouts are logged and the run continues with successful specialists since results are additive. Findings merge in Step 4.6 by fingerprint {path}:{line}:{category}; duplicates keep highest confidence, get tagged \"MULTI-SPECIALIST CONFIRMED\", and receive +1 confidence boost capped at 10. Confidence gates: 7+ shown normally, 5-6 shown with verify caveat, 3-4 demoted to appendix, 1-2 suppressed entirely. PR Quality Score formula: max(0, 10 − (critical_count × 2 + informational_count × 0.5)), capped at 10, logged in the review result. Red Team dispatch activates only when DIFF_LINES > 200 or any specialist returns a CRITICAL finding; it receives merged findings plus its checklist and hunts for cross-cutting/integration-boundary misses. Each finding may carry a test_stub field — a minimal skeleton test in the detected framework that would catch the issue. Merged specialist findings flow into the Step 5 Fix-First stage, where the same AUTO-FIX vs ASK heuristic applies as for Step 4 critical-pass findings. Per-specialist dispatch/findings stats are compiled for a review-log entry in Step 5.8. Steps 2–5.8 govern how a migration diff is assessed pre-landing: the diff source is `git diff origin/<base>` including uncommitted changes (relevant caveat: the zhaopin repo has no remote configured, which affects base resolution); the plan-completion audit can cross-reference the migration handoff doc as an intent source; and every review run leaves a durable gstack-review-log entry that /ship consumes to confirm Eng Review coverage. Core rules: read the full diff before commenting, fix-first but never commit/push/PR (that is /ship's job), terse one-line findings, flag only real problems. Prior-learnings search uses gstack-learnings-search with an optional cross_project_learnings config gated by a first-time AskUserQuestion, project-scoped by default. The multi-pass structure (structured critical pass, specialist fan-out, adversarial Claude subagent, optional Codex pass, Greptile comments) converges through fingerprinted dedup and confidence gates into the Fix-First flow.\n当前观测确认该Codex /review SKILL.md共1642行，含GBrain同步模式及隐私选择闸、远端平台与基线分支识别、Step 1.5范围漂移检查、审查结束遥测及简洁可定位的输出风格。"
+        },
+        "summary": "当前检查了 /Users/mac/.codex/skills/gstack/review/SKILL.md（1642行）：它定义落地前PR审查，含平台识别（github.com→GitHub、GitLab及gh/glab/git回退）、基线分支判断、Step 1.5对TODOS.md/PR正文/提交信息与diff stat的范围漂移检测、AskUserQuestion关口和遥测。启动时GBrain读取gstack-config的off/full/artifacts-only及.gstack-brain-remote.txt，跨机同步前要求用户选择范围；末尾写本地skill-usage.jsonl，可选远端遥测。输出要求给具体文件/行号与结果，避免指定AI套话；旧技能还含SQL/数据安全、LLM信任边界、副作用审查、独立审查者和修复优先机制。该文件是libtv会话可参考的审查材料；文件本身位于用户Codex技能目录，不属于libtv代码仓库。"
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "/Users/mac/.codex/skills/gstack/review/SKILL.md",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "description": "Cross-machine memory sync convention used by gstack skills: presence of ~/.gstack-brain-remote.txt plus bin/gstack-brain-sync enables restoring memory across machines via `gstack-brain-restore`; enabled only when gstack-config key gbrain_sync_mode is set to something other than its default of off.\n本次审查的GBrain启动流程通过gstack-config读取gbrain_sync_mode=off|full|artifacts-only，并配合.gstack-brain-remote.txt；用户首次选择同步范围。"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": null,
+          "content_hash": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "category": "CLI configuration utility",
+          "version": null
+        },
+        "summary": "当前在 Codex /review 技能启动时，gstack-config 决定 GBrain 跨机记忆恢复的 gbrain_sync_mode（off、full、artifacts-only），结合 .gstack-brain-remote.txt；首次同步须让用户选择 full allowlist、仅工件或全留本机，不得把未选择当默认上传。gstack-config 同时配置审查技能和遥测；技能末尾本地写 ~/.gstack/analytics/skill-usage.jsonl，可选经 gstack-telemetry-log 远端记录。旧资料还记载其配置跨项目学习检索、技能路由及Codex技能包装；这些与本次GBrain设置是不同用途。"
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "~/.gstack-brain-remote.txt",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "CLI",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "category": "CLI",
+          "version": null
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "path": "TODOS.md",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "path": "~/.gstack/analytics/skill-usage.jsonl",
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "Telemetry Logging",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": null,
+          "repo": null
+        },
+        "summary": null
+      }
+    }
+  ]
+}

@@ -96,8 +96,10 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
                 path_field = copy.deepcopy(attribute_schema.model_fields["path"])
                 path_field.description = (
                     "Directory of this code project only. A Java/Python/Markdown "
-                    "file or class path is NOT a Project.path. Keep null when no "
-                    "explicit project directory is supplied."
+                    "file or class path is NOT a Project.path. Preserve an existing "
+                    "project directory unless explicit evidence contradicts it. "
+                    "For a missing or invalid value, use only an explicitly supplied "
+                    "directory of this project; otherwise return null."
                 )
                 attribute_schema = create_model(
                     f"JointProjectAttributes{request_index}_{index}",
@@ -136,8 +138,19 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
             **fields,
         )
         request["messages"][0]["content"] += (
-            "\nUpdate attributes first using only the supplied episode, previous episodes "
-            "and each entity's existing attributes. Then, for each entity marked "
+            "\nFor this joint task, supplied source evidence also includes each entity's "
+            "OWN existing summary. Update attributes first using the supplied episode, "
+            "previous episodes, and that entity's existing attributes and summary. "
+            "An explicit field fact in its own summary may fill a missing field or "
+            "correct a conflicting old attribute; a current explicit correction takes "
+            "priority over old summaries. Do not infer a project directory from a "
+            "source-file path or treat work on another project as repository ownership. "
+            "Project metadata names the observation context, not automatic ownership "
+            "of every mentioned file: an absolute global tool path or file under "
+            "another project keeps its own ownership. Entity labels can be wrong; "
+            "an Issue, class, region, image digest or OSS bucket labeled Project "
+            "does not become a project directory or code repository. "
+            "Then, for each entity marked "
             "summary_required=true, write its updated summary using the just-updated "
             "attributes, its existing summary and the same source evidence. Examine "
             "the CURRENT episode's narrative and every Key facts bullet for each "
@@ -150,7 +163,12 @@ async def build_requests(sample: dict, targets: set[str]) -> list[dict]:
             "result; do not turn uncertainty into a conclusion. Preserve supported "
             "old facts, resolve explicit corrections, and retain conditions, "
             "exceptions and negation. When the current episode adds a relevant "
-            "fact, do not merely copy the old summary unchanged. Project.path "
+            "fact, do not merely copy the old summary unchanged. "
+            "Keep lifecycle and time exact: planned, approved, locally tested, "
+            "merged and deployed are distinct states. A result with zero CI checks "
+            "is not a passing CI run; a former production snapshot is not the "
+            "present state. Preserve explicit deferrals and failed results. "
+            "Project.path "
             "is a project DIRECTORY, not a source-file path, even if an entity "
             "was mislabeled Project. Do not "
             "move facts between entities or invent implementation details. "

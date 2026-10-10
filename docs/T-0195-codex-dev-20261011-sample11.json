@@ -1,0 +1,103 @@
+{
+  "sample_sid": "4deb934a7e631f42",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "severity": null,
+          "status": "executing"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "category": "Java Maven service",
+          "version": "3.0.80-SNAPSHOT"
+        },
+        "summary": "T-0129 本次决定：community 的数美文本审核链路仍在出站发送 terminal 字段，未参与 cerberus/image-center 的 source: app 定稿；用户说“先记录在案，看后续需要”，明确暂缓改名，不能表述为已经统一或要求立即修改。若以后要求统一，只需调整 community 链路单独的 terminalValue 映射，保留这条有意的字段差异。旧资料：community 是 liblibai-community 的Java Maven多模块服务（api/common/core/service），历史creator_datacenter分支的依赖属性升级到3.0.80-SNAPSHOT；这个版本信息来自自身旧摘要，和本次审核字段决策是不同话题。"
+      },
+      "entity_2": {
+        "attributes": {
+          "category": "text audit integration",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": "/Users/mac/workspace/cerberus",
+          "repo": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "category": "audit service",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": null,
+          "repo": "libtv"
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "Java generation server",
+          "version": null
+        },
+        "summary": "T-0129 中 sd-server 的 Cerberus/image-center 审核端标识已按 source: app 定稿，提交 f6fc2b651 完成字段名更改；libtv 对应提交为4b3ec6a4f。community 数美文本审核链路仍出站 terminal，用户要求暂缓统一并记为遗留项，不能把它当作sd-server仍未改。sd-server内部枚举/上下文与 ClientForwardParam.terminal 可保留 terminal 命名，只改出站wire表示；旧摘要记录异步buildSubmitReq与同步callCerberusSync都要传端标识，f6fc2b651前的两次提交实现与补救，相关612项Java测试当时0失败1跳过。该服务是Java图像/视频生成服务，位于 /Users/mac/workspace/sd-server，亦曾独立验证OSS/IMM视频元数据。这里的提交与测试是该观测时点，不证明已上线。"
+      },
+      "entity_7": {
+        "attributes": {
+          "description": "The finalized field name and value for carrying client-terminal information in downstream audit services (Cerberus, image-center), replacing the originally proposed \"terminal\" field."
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "description": "Mapping function that derives the terminal value from context for the gateway's upstream passthrough. Deliberately duplicated across the cerberus and imagecenter packages as an anti-abstraction: each upstream gets its own implementation and its own json tag, so when either service finalizes or renames its field, only that service's two edit points change rather than forcing mutual compromise. Both implementations return \"\" for unknown terminal rather than falling back to web, deferring strictness defaults to the downstream service. The imagecenter copy requires importing liblibai.com/libtv/types/enums, which its import block does not yet include. With cerberus/image-center now confirmed on the final name `source`, this function's outbound mapping can be pointed at `source` instead of the provisional field.\n当前决定各上游映射保持独立：Cerberus/image-center出站改source，community数美链路仍terminal；用户暂缓community改名，只需其单个映射函数即可日后调整。"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "description": "Request provenance field: which terminal issued the current request at this moment; carried per-call rather than persisted. Implemented in libtv as enums.Terminal (string enum) with explicit unknown state, sourced from a ctx value written by SetLogMW and read via ctxutil.GetTerminal / TerminalFromContext. For the image-center integration, terminal rides in the wire JSON gained by flattening the embedded imageCheckPayload wrapper rather than in idl/community.thrift, since it is gateway-derived and must not become a client-supplied input parameter. Unknown terminal yields an empty string, dropped entirely from the JSON body by the omitempty tag — verified by test asserting require.NotContains(raw, \"terminal\") for values \"\" and \"ios\", so downstream cannot interpret an empty string as a real value. One of three orthogonal concepts alongside owner-type (account identity) and CreateSource (creation-time terminal attribution). Rides ClientForwardParam into sd-server, already parsed from clientForward for telemetry dimensions, and survives async generation via context.WithoutCancel. Populated from an unforgeable X-Client-Terminal header hard-written by the libtv-m gateway in copyRequestHeaders, so anything via the gateway is necessarily app. Per-request, gateway-hard-written, unforgeable, never persisted — distinct from CreateSource which is client-supplied (forgeable) and stored for data attribution/list filtering.\n\n[UPDATE] In sd-server's Cerberus-facing review call sites, the planned implementation is to thread terminal along the same route as bizType and userUuid within the existing audit-context bundle, filling it at both SubmitAuditReq construction points — buildSubmitReq (async lib path) and the inline builder in callCerberusSync (sync path).\n\n[UPDATE] Internal naming is now a locked decision after the upstream field-name finalization: enums.Terminal, the ctx key, the X-Client-Terminal header, and VAR_TERMINAL plus ClientForwardParam.terminal all keep their names; only the outward wire representation changed. An exception is the community (数美 text audit) field name, still undecided and still sending terminal.\nT-0129当前定稿：cerberus/image-center出站字段source: app；community数美链路仍terminal，用户要求暂缓统一。此前旧摘要出现的scene为历史拟名，不是此时最终出站字段。"
+        },
+        "summary": "T-0129 当前明确三条审核链路的字段差异：cerberus和image-center出站端标识已经定稿为 source: app，libtv提交4b3ec6a4f、sd-server提交f6fc2b651；community数美文本审核仍发送 terminal，用户决定先记录、后续有需要再改，仅须调整它独立的 terminalValue 映射。不能把community也写成已改source，也不能把早期拟名scene当最终wire字段。TERMINAL在内部仍指请求当下的客户端来源，区别于持久化、可由客户端影响的CreateSource；libtv-m网关写入X-Client-Terminal，经上下文/ClientForwardParam传递，未知值为空且JSON omitempty不发送。sd-server异步buildSubmitReq和同步callCerberusSync都需要同一端标识。旧旧资料的scene字段名记录已被此次source定稿取代。"
+      },
+      "entity_2": {
+        "attributes": {
+          "description": "行内组件扩展标签之一（与 cite, latex, img, button, time 并列），属于飞书文档 lark-doc XML 格式的资源块；仅 img, source, whiteboard, sheet, chat_card 支持资源块复制。在 sd-server 多账户可行性分析报告中，source 是 SdGenerate 实体当前已存储的字段之一（与 userId、bizType 并列），但不包含 teamId/accountType 等账户维度信息。在 GenerateServiceImpl.getProcessingTaskCountByStrategyKey 方法中，相比已有的 getParallelProcessTaskForDaysAgo 方法，新方法去除了 generateType、source、startIdForParallel 等特定过滤条件。\n\n[UPDATE] In T-0129, `source` is the finalized wire name for the terminal/origin field: sd-server ImageCheckReq.terminal serializes as `source` via @JsonProperty. The change surface was confined to json tags, one @JsonProperty, two auditContent keys, and comments — call sites, ctx propagation, middleware, and the enums package were untouched because prior layers never touched them.\nT-0129本次确认cerberus/image-center线上的字段名source: app已定稿；community数美文本审核仍用terminal，暂缓改名。"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "path": null,
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "path": null,
+          "project_id": null
+        },
+        "summary": null
+      },
+      "entity_5": {
+        "attributes": {
+          "path": "/Users/mac/work-ai/libtv-m",
+          "repo": "libtv-m"
+        },
+        "summary": null
+      }
+    }
+  ]
+}

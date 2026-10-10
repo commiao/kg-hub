@@ -1,0 +1,71 @@
+{
+  "sample_sid": "520a110c2c64e78f",
+  "batches": [
+    {
+      "entity_0": {
+        "attributes": {
+          "severity": null,
+          "status": "open PR"
+        },
+        "summary": null
+      },
+      "entity_1": {
+        "attributes": {
+          "org": "commiao"
+        },
+        "summary": null
+      },
+      "entity_2": {
+        "attributes": {
+          "severity": null,
+          "status": "open"
+        },
+        "summary": null
+      },
+      "entity_3": {
+        "attributes": {
+          "category": "PR tracking MCP status tool",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_4": {
+        "attributes": {
+          "category": "CLI",
+          "version": null
+        },
+        "summary": "当前在 commiao/fleet-ops 的 Claude Code 会话中，gh pr create 创建 PR #13 后自动绑定同一会话；mcp__ccd_pr__get_status(session_id=self) 返回 bound=true，无需额外调用 bind_pr。PR #13 为 open、非draft，base=main，head=claude/workspace-claude-fleet-ops-migration-784449，mergeable=MERGEABLE、mergeStateStatus=CLEAN；checks.available=true 但 passing/failing/pending 均为0，表示此提交没有配置CI检查，不能当成已通过；实际质量门是本地测试；当前观测仅确认推送前运行过339项，未给出这次运行全绿的证据。merge queue未启用，监控自动修复/回评论/合并/归档均关闭。gh 是GitHub CLI；旧2026-09-29另一上下文曾记录commiao token失效，这不能推断本次会话的鉴权状态。gh 成功调用API也不等于验证Git远端；在fork工作树中应显式指定--repo以免解析到上游。"
+      },
+      "entity_5": {
+        "attributes": {
+          "category": "AI coding assistant",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_6": {
+        "attributes": {
+          "category": "PR tracking MCP binding tool",
+          "version": null
+        },
+        "summary": null
+      },
+      "entity_7": {
+        "attributes": {
+          "path": "/Users/mac/work-ai/fleet-ops/.claude/worktrees/workspace-claude-fleet-ops-migration-784449",
+          "repo": "commiao/fleet-ops"
+        },
+        "summary": null
+      }
+    },
+    {
+      "entity_0": {
+        "attributes": {
+          "category": "CI/CD",
+          "version": null
+        },
+        "summary": null
+      }
+    }
+  ]
+}
