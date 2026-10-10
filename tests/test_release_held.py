@@ -90,8 +90,14 @@ class ResetKeysTests(unittest.TestCase):
 
     def test_dry_run_deletes_nothing(self):
         got = asyncio.run(H.reset_keys(self.plan(), self.driver, limit=10, apply=False))
-        self.assertEqual(got, [1, 3])
+        self.assertEqual(got, [1])                    # 3 正在执行：试跑与执行判据一致
         self.assertEqual(self.driver.deletes, [])
+
+    def test_dry_run_rechecks_the_server_not_the_plan(self):
+        # 2026-10-10: a dry run counted 114 keys an earlier batch had deleted.
+        items = self.plan()
+        del self.driver.keys[(SD.format(1), "s1")]
+        self.assertEqual(asyncio.run(H.reset_keys(items, self.driver, limit=10, apply=False)), [])
 
     def test_apply_only_resets_unpaid_idle_claims(self):
         got = asyncio.run(H.reset_keys(self.plan(), self.driver, limit=10, apply=True))
