@@ -36,8 +36,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-# Settled with no result: never reached the gateway, or a definitive failure.
-SETTLED_WITHOUT_RESULT = {"absent", "failed"}
+# Settled with no result: never reached the gateway, a definitive failure, or
+# an answer the caller rejected (paid, but unusable -- nothing to reuse).
+SETTLED_WITHOUT_RESULT = {"absent", "failed", "rejected"}
 RESET, RESUME, UNKNOWN, ALL_COMPLETED = "reset", "resume", "unknown_outcome", "all_completed"
 
 

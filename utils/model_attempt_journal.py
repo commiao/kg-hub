@@ -236,6 +236,31 @@ class ModelAttemptJournal:
             if changed.rowcount != 1:
                 raise RuntimeError("model attempt intent vanished before response persistence")
 
+    def reject_result(self, source_description: str, source_obs_id: str,
+                      step_id: str, request_digest: str) -> bool:
+        """The answer this step would replay failed the caller's schema: stop
+        replaying it.
+
+        A paid answer that misses a required field used to be replayed by every
+        retry of the task, failing identically forever without a new model call
+        (obs 8762, 11459 on 2026-10-09/10). Rejects exactly the row ``prepare``
+        replays (newest completed for this exact request); it stays as evidence
+        of the paid call, and the next retry asks the model again.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT idempotency_key FROM model_attempts
+                WHERE source_description = ? AND source_obs_id = ?
+                  AND step_id = ? AND request_digest = ?
+                  AND phase = 'completed' AND result_json IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1""",
+                (source_description, source_obs_id, step_id, request_digest)).fetchone()
+            if row is None:
+                return False
+            db.execute("UPDATE model_attempts SET phase = 'rejected', updated_at = ? "
+                       "WHERE idempotency_key = ?", (_now(), row[0]))
+            return True
+
     def start_http(self, key: str) -> None:
         """Durably mark the SDK HTTP-call boundary before invoking the SDK."""
         with self._connect() as db:
@@ -686,6 +711,11 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
         step = row["step_id"]
         phase = row["phase"]
         started = row["provider_call_started"]
+        if phase == "rejected":
+            # A paid answer the caller could not use: one failed model call.
+            failed_by_step[step] = failed_by_step.get(step, 0) + 1
+            failed_http_identities.add(str(row.get("idempotency_key") or f"{step}:rejected"))
+            continue
         if row.get("result_json"):
             # The exact model response is durable even if a later gateway
             # status refresh changed the phase. Business graph completion is

@@ -465,6 +465,38 @@ def repair_structured_envelopes(response: Any, tools: Any = None) -> None:
             "[envelope_repair] skipped (non-fatal)", exc_info=True)
 
 
+# Where the last model answer of one Graphiti call came from, so a caller that
+# rejects the answer (schema validation) can stop the journal replaying it.
+_result_sink: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "kg_hub_model_result_sink", default=None)
+
+
+@contextmanager
+def capture_model_result():
+    sink: dict = {}
+    token = _result_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _result_sink.reset(token)
+
+
+def _note_model_result(journal, task, step_id: str, request_digest: str) -> None:
+    sink = _result_sink.get()
+    if sink is not None and journal is not None and task and step_id:
+        sink.update(journal=journal, task=task, step_id=step_id,
+                    request_digest=request_digest)
+
+
+async def reject_model_result(sink: dict) -> bool:
+    """Mark the captured answer unusable; True when a journal row changed."""
+    journal = sink.get("journal")
+    if journal is None:
+        return False
+    return await asyncio.to_thread(journal.reject_result, sink["task"][0], sink["task"][1],
+                                   sink["step_id"], sink["request_digest"])
+
+
 @contextmanager
 def model_operation(namespace: str, operation_id: str):
     """Bind paid substeps to a durable business operation identity.
@@ -739,6 +771,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     repair_structured_envelopes(result, kwargs.get("tools"))
                     if resume is not None:
                         resume["cached_pending"].discard(step_id)
+                    _note_model_result(journal, task, step_id, request_digest)
                     future.set_result(result)
                     return result
                 prepared = True
@@ -772,6 +805,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             note_offscript_if_missing_tool_use(kwargs, result)
             if journal and prepared:
                 await asyncio.to_thread(journal.complete, key, result.model_dump_json())
+                _note_model_result(journal, task, step_id, request_digest)
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
