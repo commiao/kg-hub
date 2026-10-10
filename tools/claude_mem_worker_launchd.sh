@@ -20,6 +20,20 @@ set -eu
 
 log() { echo "[launcher] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
+# 隔离采集启用后，当前一代 worker 归 com.claude-mem.capture-next 管（它有自己的
+# KeepAlive），这里永不接管。2026-10-10 查实：切换后 ~/.claude-mem/settings.json
+# 的端口与数据目录都指向当前一代（37721、~/.claude-mem-next），而本脚本只认插件
+# cache 的 bundle。那份 worker 一退，这里每 5s 查一次端口，比 capture-next 的 10s
+# 节流先到，于是没打补丁的 cache bundle 会直接写当前一代库，capture-next 反倒卡在
+# 等端口。判据与旧单源同步脚本让位用的是同一个启用标记。不退出：退出会被 KeepAlive
+# 每 10s 重拉；标记撤掉（回滚到旧一代）后恢复原来的兜底语义。
+DUAL_MARKER="$HOME/.kg-hub/state/claude-mem-dual-active.json"
+if [ -f "$DUAL_MARKER" ]; then
+  log "隔离采集已启用（${DUAL_MARKER}），当前一代由 com.claude-mem.capture-next 负责，本作业不接管"
+  while [ -f "$DUAL_MARKER" ]; do sleep "${CLAUDE_MEM_DEFER_POLL_S:-60}"; done
+  log "隔离采集标记已撤除，恢复兜底接管"
+fi
+
 # 单例端口以 settings.json 为准，别在这里再抄一份常量。
 PORT=$(/usr/bin/python3 -c "
 import json
