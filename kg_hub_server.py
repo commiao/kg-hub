@@ -104,7 +104,7 @@ from utils.model_attempt_journal import (
     query_gateway_attempt_status, summarize_attempts,
 )
 from utils.reconciliation_mailbox import BUSINESS_KEY, MailboxStore
-from utils.reconciliation_worker import run_mailbox_cycle, _task_report_data
+from utils.reconciliation_worker import RefreshSchedule, run_mailbox_cycle, _task_report_data
 from utils.graphiti_episode_checkpoint import add_episode_with_context_checkpoint
 
 # provenance 合法值(IngestBody.provenance 覆写 + 待办补标入图共用)
@@ -2382,6 +2382,7 @@ async def _reconciliation_mailbox_loop() -> None:
         "reconciliation-mailbox.sqlite3"))
     await _recover_interrupted_manual_resumes(store, journal)
     sent_versions: dict[str, int] = {}
+    refresh_schedule = RefreshSchedule()
     while True:
         try:
             await _recover_interrupted_manual_resumes(store, journal)
@@ -2404,6 +2405,7 @@ async def _reconciliation_mailbox_loop() -> None:
                 sent_versions=sent_versions,
                 enqueue_manual_resume=enqueue_manual_resume,
                 dispatch_manual_resume=dispatch_manual_resume,
+                schedule=refresh_schedule,
             )
         except asyncio.CancelledError:
             raise

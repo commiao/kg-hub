@@ -7,6 +7,7 @@ checked its business result and explicitly authorized recovery.
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 import json
 import os
@@ -693,16 +694,27 @@ class AttemptStatusPacer:
     """
     FIRST_DELAY = 10.0
     MAX_DELAY = 300.0
+    # Process-wide ceiling. Per-attempt pacing alone still allowed ~1000
+    # reads/min once thousands of tasks were tracked (2026-10-10); the level
+    # before that was ~55/min. A skipped read keeps the journal's last answer.
+    MAX_READS_PER_MINUTE = 60
 
     def __init__(self, clock=time.monotonic):
         self.clock = clock
         self._state: dict[str, tuple[float, float, tuple]] = {}
+        self._reads: deque[float] = deque()
 
     def due(self, key: str) -> bool:
+        now = self.clock()
+        while self._reads and now - self._reads[0] >= 60.0:
+            self._reads.popleft()
+        if len(self._reads) >= self.MAX_READS_PER_MINUTE:
+            return False
         state = self._state.get(key)
-        return state is None or self.clock() >= state[0]
+        return state is None or now >= state[0]
 
     def observed(self, key: str, status: dict) -> float:
+        self._reads.append(self.clock())
         # Only the fields the journal keeps; anything else in the response
         # (timestamps, diagnostics) must not count as "changed".
         answer = tuple(status.get(field) for field in
