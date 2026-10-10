@@ -207,7 +207,7 @@ class ReadDependencies:
             if self._flush_task is None:
                 self._flush_task = asyncio.create_task(self._persist_pending())
             # A read never reaches Graphiti or a paid model before its durable
-            # dependency. Concurrent reads share one FULL synchronous commit.
+            # dependency. Concurrent reads share one journal commit.
             await asyncio.shield(self._flush_task)
         return result
 

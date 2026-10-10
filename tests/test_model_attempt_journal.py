@@ -516,5 +516,29 @@ class AttemptStatusPacerTests(unittest.TestCase):
         self.assertTrue(self.pacer.due("other"))
 
 
+class JournalSynchronousTests(unittest.TestCase):
+    """2026-10-11 user decision (T-0234): model-attempts.sqlite3 runs at NORMAL."""
+
+    def test_every_connection_to_model_attempts_uses_normal(self):
+        from utils import journal_prune
+        from utils.graphiti_stage_adapter import StageArtifactStore
+        from utils.model_attempt_journal import JOURNAL_SYNCHRONOUS
+        self.assertEqual(JOURNAL_SYNCHRONOUS, "NORMAL")
+        normal = 1   # PRAGMA synchronous: 0 OFF, 1 NORMAL, 2 FULL
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model-attempts.sqlite3"
+            journal = ModelAttemptJournal(path)
+            with journal._connect() as db:
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], normal)
+            with StageArtifactStore(path)._connect() as db:
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], normal)
+            db = journal_prune._connect(path)
+            try:
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], normal)
+                self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            finally:
+                db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

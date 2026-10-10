@@ -88,7 +88,9 @@ def journal_tasks(db, names: set[str]) -> set[tuple[str, str]]:
 def _connect(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path, timeout=15, isolation_level=None)
     db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=FULL")
+    # Same database and level as utils.model_attempt_journal.JOURNAL_SYNCHRONOUS
+    # (literal here: this file also runs as a plain script).
+    db.execute("PRAGMA synchronous=NORMAL")
     return db
 
 

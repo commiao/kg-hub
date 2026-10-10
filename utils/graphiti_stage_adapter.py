@@ -20,6 +20,8 @@ from contextlib import closing, contextmanager
 from datetime import date, datetime
 from enum import Enum
 
+from utils.model_attempt_journal import JOURNAL_SYNCHRONOUS
+
 
 def _encoded(value: object) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -74,7 +76,7 @@ class StageArtifactStore:
         db = sqlite3.connect(self.path, timeout=15)
         try:
             db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=FULL")
+            db.execute(f"PRAGMA synchronous={JOURNAL_SYNCHRONOUS}")
             with db:
                 yield db
         finally:
