@@ -107,7 +107,11 @@ class MailboxStore:
             if row:
                 old = json.loads(row[3])
                 old.pop("version", None)
-                version = row[2] if old == data else row[2] + 1
+                if old == data:
+                    # 2026-10-10: every cycle re-prepared ~7400 unchanged reports,
+                    # each a FULL-sync upsert. Unchanged is not a write.
+                    return {**data, "version": row[2]}
+                version = row[2] + 1
             else:
                 version = 0
             data["version"] = version

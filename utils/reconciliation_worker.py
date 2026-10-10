@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 
 from utils.model_attempt_journal import summarize_attempts
 from utils.reconciliation_mailbox import (
@@ -174,19 +175,64 @@ def prepare_task_report(store: MailboxStore, journal, row: dict,
         reason=data["reason"])
 
 
+ACTIVE_REPORT_STATES = frozenset({"queued", "running", "reconciliation", "retry_waiting"})
+
+
+class RefreshSchedule:
+    """Which tracked tasks to re-check this cycle: the head of a due-time queue.
+
+    2026-10-10: every ~10s cycle re-checked all 7382 tracked tasks (graph
+    queries, journal reads and gateway attempt-status for each). It only looked
+    bounded because each check also paid a FULL-sync journal write; once that
+    write went away the loop ran flat out (~1000 attempt-status/min, 67% CPU).
+    Same shape as the gateway's own reconcile_due: earliest due first, at most
+    MAX_CHECKS per cycle, an unchanged report doubles its wait up to MAX_DELAY,
+    a changed one (new version) resets it. New tasks are due at once.
+    """
+    FIRST_DELAY = 10.0
+    MAX_DELAY = 600.0
+    MAX_CHECKS = 20
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self._state: dict[str, tuple[float, float, object]] = {}
+
+    def pick(self, reports: list[dict]) -> list[dict]:
+        now = self.clock()
+        active = {r["task_id"]: r for r in reports if r.get("state") in ACTIVE_REPORT_STATES}
+        for task_id in set(self._state) - set(active):
+            del self._state[task_id]
+        due = [(self._state.get(task_id, (0.0,))[0], task_id)
+               for task_id in active if now >= self._state.get(task_id, (0.0,))[0]]
+        return [active[task_id] for _, task_id in sorted(due)[:self.MAX_CHECKS]]
+
+    def observed(self, task_id: str, version: object) -> float:
+        """``version=None`` means the check failed: back off, keep the last version."""
+        previous = self._state.get(task_id)
+        changed = previous is None or (version is not None and version != previous[2])
+        delay = self.FIRST_DELAY if changed else min(previous[1]*2, self.MAX_DELAY)
+        kept = version if version is not None else (previous[2] if previous else None)
+        self._state[task_id] = (self.clock()+delay, delay, kept)
+        return delay
+
+
 async def refresh_tracked_reports(*, store: MailboxStore, journal,
                                   check_task, deadline_seconds: float,
-                                  manual_resume_available: bool = False) -> list[dict]:
+                                  manual_resume_available: bool = False,
+                                  schedule: RefreshSchedule | None = None) -> list[dict]:
     """Refresh durable nonterminal mailbox identities from authoritative state.
 
     A human reconcile command can move an IngestedKey out of the original
     needs_reconciliation/failed query. Keep polling the task identities already
     in the mailbox until they have a verified business terminal state.
+    Without ``schedule`` every active task is checked each call.
     """
-    active_states = {"queued", "running", "reconciliation", "retry_waiting"}
     refreshed = []
-    for prior in await asyncio.to_thread(store.all_reports):
-        if prior.get("state") not in active_states:
+    priors = await asyncio.to_thread(store.all_reports)
+    if schedule is not None:
+        priors = schedule.pick(priors)
+    for prior in priors:
+        if prior.get("state") not in ACTIVE_REPORT_STATES:
             continue
         identity = await asyncio.to_thread(store.lookup_task, prior["task_id"])
         if identity is None:
@@ -197,16 +243,23 @@ async def refresh_tracked_reports(*, store: MailboxStore, journal,
         except Exception:
             # A temporary graph/journal read error cannot be translated into a
             # business failure or overwrite the last known report.
+            if schedule is not None:
+                schedule.observed(prior["task_id"], None)
             continue
         if (result.get("status") != "ok"
                 or not isinstance(result.get("task"), dict)
                 or not isinstance(result.get("business_result_persisted"), bool)):
+            if schedule is not None:
+                schedule.observed(prior["task_id"], None)
             continue
-        refreshed.append(await asyncio.to_thread(
+        report = await asyncio.to_thread(
             prepare_task_report, store, journal, result["task"],
             deadline_seconds=deadline_seconds,
             business_result_persisted=result["business_result_persisted"],
-            manual_resume_available=manual_resume_available))
+            manual_resume_available=manual_resume_available)
+        if schedule is not None:
+            schedule.observed(prior["task_id"], report.get("version"))
+        refreshed.append(report)
     return refreshed
 
 
@@ -274,14 +327,25 @@ async def run_mailbox_cycle(*, driver, store: MailboxStore, journal, check_task,
                             base_url: str, token: str, deadline_seconds: float,
                             sent_versions: dict[str, int],
                             enqueue_manual_resume=None,
-                            dispatch_manual_resume=None) -> None:
+                            dispatch_manual_resume=None,
+                            schedule: RefreshSchedule | None = None) -> None:
     rows, _, _ = await driver.execute_query(
         "MATCH (k:IngestedKey) "
         "WHERE k.status IN ['needs_reconciliation', 'error', 'failed'] "
         "RETURN k.source_description AS source_description, "
         "k.source_obs_id AS source_obs_id, k.status AS status, "
         "k.error_kind AS error_kind")
+    tracked = set()
+    if schedule is not None:
+        # Already-tracked active tasks are refreshed by the scheduled check
+        # below, which reads the same graph row plus the business result. Here
+        # we only admit new ones; re-preparing all of them each cycle is what
+        # made the loop a full scan.
+        tracked = {r["task_id"] for r in await asyncio.to_thread(store.all_reports)
+                   if r.get("state") in ACTIVE_REPORT_STATES}
     for row in rows:
+        if tracked and task_uuid(row["source_description"], row["source_obs_id"]) in tracked:
+            continue
         await asyncio.to_thread(
             prepare_task_report, store, journal, row,
             deadline_seconds=deadline_seconds,
@@ -289,7 +353,8 @@ async def run_mailbox_cycle(*, driver, store: MailboxStore, journal, check_task,
     await refresh_tracked_reports(
         store=store, journal=journal, check_task=check_task,
         deadline_seconds=deadline_seconds,
-        manual_resume_available=enqueue_manual_resume is not None)
+        manual_resume_available=enqueue_manual_resume is not None,
+        schedule=schedule)
     for report in await asyncio.to_thread(store.all_reports):
         if sent_versions.get(report["task_id"]) == report["version"]:
             continue

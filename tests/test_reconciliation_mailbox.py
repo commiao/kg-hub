@@ -1,13 +1,16 @@
 """Business task mapping and mailbox command dedup survive process restarts."""
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from utils.reconciliation_mailbox import MailboxStore, task_uuid, ZERO_STEP
+from utils import reconciliation_worker
 from utils.reconciliation_worker import (
-    prepare_task_report, process_command, refresh_tracked_reports,
+    RefreshSchedule, prepare_task_report, process_command, refresh_tracked_reports,
+    run_mailbox_cycle,
 )
 
 
@@ -391,6 +394,140 @@ class MailboxCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(updated["reason"], "manual_retry_queued")
             self.assertEqual(store.command_result(command["command_id"])["result_state"],
                              "queued")
+
+
+def _running(source, obs):
+    return {"status": "ok", "business_result_persisted": False, "task": {
+        "source_description": source, "source_obs_id": obs,
+        "status": "running", "error_kind": None}}
+
+
+class QueueHeadRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-10: every cycle re-checked all 7382 tracked tasks."""
+
+    def setUp(self):
+        self.now = [0.0]
+        self.schedule = RefreshSchedule(clock=lambda: self.now[0])
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name) / "mailbox.sqlite3"
+        self.store = MailboxStore(self.path)
+
+    def track(self, n):
+        for i in range(n):
+            self.store.prepare_report("source", f"id-{i}", step_id=ZERO_STEP,
+                                      state="running", failed_attempts=0,
+                                      retryable=False, reason="business_task_running")
+
+    async def refresh(self, check):
+        return await refresh_tracked_reports(store=self.store, journal=None,
+                                             check_task=check, deadline_seconds=180,
+                                             schedule=self.schedule)
+
+    def test_unchanged_report_is_not_written(self):
+        fields = dict(step_id=ZERO_STEP, state="running", failed_attempts=0,
+                      retryable=False, reason="business_task_running")
+        self.store.prepare_report("source", "id-1", **fields)
+        watcher = sqlite3.connect(self.path)
+        self.addCleanup(watcher.close)
+        version = lambda: watcher.execute("PRAGMA data_version").fetchone()[0]
+        before = version()
+        self.assertEqual(self.store.prepare_report("source", "id-1", **fields)["version"], 0)
+        self.assertEqual(version(), before)
+        self.assertEqual(self.store.prepare_report(
+            "source", "id-1", **{**fields, "state": "failed"})["version"], 1)
+        self.assertNotEqual(version(), before)
+
+    async def test_only_the_queue_head_is_checked_each_cycle(self):
+        self.track(25)
+        check = AsyncMock(side_effect=lambda sd, sid, **_: _running(sd, sid))
+        await self.refresh(check)
+        self.assertEqual(check.await_count, RefreshSchedule.MAX_CHECKS)
+        await self.refresh(check)            # the 5 never checked are now the head
+        self.assertEqual(check.await_count, 25)
+        await self.refresh(check)            # nothing due yet
+        self.assertEqual(check.await_count, 25)
+        self.now[0] = 10
+        await self.refresh(check)
+        self.assertEqual(check.await_count, 45)
+
+    async def test_new_task_jumps_ahead_of_backed_off_ones(self):
+        self.track(20)
+        check = AsyncMock(side_effect=lambda sd, sid, **_: _running(sd, sid))
+        for at in (0, 10, 30):                # unchanged reports: waits 10, 20, 40
+            self.now[0] = at
+            await self.refresh(check)
+        self.store.prepare_report("source", "new", step_id=ZERO_STEP, state="running",
+                                  failed_attempts=0, retryable=False,
+                                  reason="business_task_running")
+        check.reset_mock()
+        self.now[0] = 31
+        await self.refresh(check)
+        self.assertEqual([c.args[1] for c in check.await_args_list], ["new"])
+
+    def test_backoff_doubles_to_ceiling_resets_on_change_and_failures_back_off(self):
+        delays = [self.schedule.observed("t", 3) for _ in range(8)]
+        self.assertEqual(delays, [10, 20, 40, 80, 160, 320, 600, 600])
+        self.assertEqual(self.schedule.observed("t", 4), 10)
+        self.assertEqual(self.schedule.observed("t", None), 20)
+        self.assertEqual(self.schedule.observed("t", 4), 40)   # failure kept version 4
+
+    def test_earliest_due_comes_first_when_more_than_a_cycle_is_due(self):
+        reports = [{"task_id": f"t{i:02d}", "state": "reconciliation"} for i in range(25)]
+        for r in reports[:20]:
+            self.schedule.observed(r["task_id"], 1)       # due at 10
+        self.now[0] = 10                                  # t20..t24 were due at 0
+        picked = [r["task_id"] for r in self.schedule.pick(reports)]
+        self.assertEqual(len(picked), RefreshSchedule.MAX_CHECKS)
+        self.assertEqual(picked[:5], ["t20", "t21", "t22", "t23", "t24"])
+
+    def test_terminal_and_vanished_tasks_are_dropped(self):
+        self.schedule.observed("gone", 1)
+        picked = self.schedule.pick([{"task_id": "a", "state": "reconciliation"},
+                                     {"task_id": "b", "state": "succeeded"}])
+        self.assertEqual([r["task_id"] for r in picked], ["a"])
+        self.assertNotIn("gone", self.schedule._state)
+
+    async def test_cycle_admits_only_untracked_rows(self):
+        self.track(2)
+        new_row = {"source_description": "source", "source_obs_id": "fresh",
+                   "status": "failed", "error_kind": "reconciliation_model_step_missing"}
+        tracked_row = {"source_description": "source", "source_obs_id": "id-0",
+                       "status": "needs_reconciliation", "error_kind": None}
+        driver = Mock(execute_query=AsyncMock(return_value=([tracked_row, new_row], None, None)))
+        check = AsyncMock(side_effect=lambda sd, sid, **_: _running(sd, sid))
+        seen = []
+        real = reconciliation_worker.prepare_task_report
+
+        def spy(store, journal, row, **kw):
+            seen.append(row["source_obs_id"])
+            return real(store, journal, row, **kw)
+
+        with patch.object(reconciliation_worker, "prepare_task_report", spy), \
+             patch.object(reconciliation_worker, "mailbox_post",
+                          return_value={"command": None}):
+            await run_mailbox_cycle(driver=driver, store=self.store, journal=None,
+                                    check_task=check, base_url="http://gw", token="t",
+                                    deadline_seconds=180, sent_versions={},
+                                    schedule=self.schedule)
+        # graph pass admits only "fresh"; the scheduled pass refreshes id-0, id-1
+        self.assertEqual(seen[0], "fresh")
+        self.assertEqual(sorted(seen[1:]), ["id-0", "id-1"])
+        self.assertEqual(self.store.read_report(task_uuid("source", "fresh"))["state"],
+                         "unrecoverable")
+
+
+class AttemptStatusCeilingTests(unittest.TestCase):
+    def test_reads_per_minute_are_capped_process_wide(self):
+        from utils.model_attempt_journal import AttemptStatusPacer
+        now = [0.0]
+        pacer = AttemptStatusPacer(clock=lambda: now[0])
+        for i in range(AttemptStatusPacer.MAX_READS_PER_MINUTE):
+            self.assertTrue(pacer.due(f"k{i}"))
+            pacer.observed(f"k{i}", {"phase": "unknown"})
+        self.assertFalse(pacer.due("another"))
+        now[0] = 60
+        self.assertTrue(pacer.due("another"))
 
 
 if __name__ == "__main__":
