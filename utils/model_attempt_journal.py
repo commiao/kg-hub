@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 import hashlib
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
@@ -56,6 +57,12 @@ class ModelAttemptJournal:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
+            if "queue_owned" not in columns:
+                db.execute("ALTER TABLE model_attempts ADD COLUMN queue_owned INTEGER NOT NULL DEFAULT 0")
+            db.execute("""CREATE TABLE IF NOT EXISTS queue_business_receipts (
+                idempotency_key TEXT PRIMARY KEY, business_key TEXT NOT NULL,
+                receipt TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)""")
             # Existing NAS journals predate the local HTTP-start marker.
             columns = {row[1] for row in db.execute("PRAGMA table_info(model_attempts)")}
             if "http_started_at" not in columns:
@@ -139,12 +146,12 @@ class ModelAttemptJournal:
 
     def prepare(self, *, key: str, business_key: str, source_description: str,
                 source_obs_id: str, step_id: str, request_digest: str,
-                stage: str | None = None) -> str | None:
+                stage: str | None = None, queue_owned: bool = False) -> str | None:
         """Commit exact identity before HTTP; return a prior complete response."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT phase, provider_call_started, step_id, request_digest, result_json, stage "
+                "SELECT phase, provider_call_started, step_id, request_digest, result_json, stage, queue_owned "
                 "FROM model_attempts WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if row and row[2:4] != (step_id, request_digest):
@@ -163,6 +170,10 @@ class ModelAttemptJournal:
             if completed:
                 return completed[0]
             if row:
+                if queue_owned and row[6]:
+                    # Resume only this exact durable queue identity. This does
+                    # not authorize a new paid attempt or legacy SDK replay.
+                    return row[4] if row[0] == 'completed' else None
                 if row[0] == "completed" and row[4]:
                     return row[4]
                 if row[0] == "preflight" and row[1] == 0:
@@ -178,11 +189,44 @@ class ModelAttemptJournal:
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, stage, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at, queue_owned)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)""",
                  (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, stage, now, now))
+                 step_id, request_digest, stage, now, now, int(queue_owned)))
         return None
+
+    def queue_business_receipts(self, sd: str, sid: str, reference: str, state: str = "completed") -> None:
+        """Call only after business completion/failure has been verified."""
+        if state not in {"completed", "failed"}:
+            raise ValueError("invalid business receipt state")
+        with self._connect() as db:
+            receipt = json.dumps({'state': state, 'reference': reference}, sort_keys=True)
+            db.execute("""INSERT OR IGNORE INTO queue_business_receipts
+                (idempotency_key,business_key,receipt)
+                SELECT idempotency_key,business_key,? FROM model_attempts
+                WHERE source_description=? AND source_obs_id=? AND queue_owned=1
+                AND (phase='failed' OR (phase='completed' AND result_json IS NOT NULL))""", (receipt, sd, sid))
+
+    def missing_queue_receipt_tasks(self, after=("", ""), limit=50):
+        with self._connect() as db:
+            return db.execute("""SELECT DISTINCT a.source_description,a.source_obs_id
+                FROM model_attempts a LEFT JOIN queue_business_receipts r
+                ON r.idempotency_key=a.idempotency_key
+                WHERE a.queue_owned=1 AND a.phase='completed' AND a.result_json IS NOT NULL
+                AND r.idempotency_key IS NULL
+                AND (a.source_description,a.source_obs_id)>(?,?)
+                ORDER BY a.source_description,a.source_obs_id LIMIT ?""", (*after,limit)).fetchall()
+
+    def pending_queue_receipts(self):
+        with self._connect() as db:
+            return [{'idempotency_key': key, 'business_key': business, 'receipt': json.loads(receipt)}
+                    for key, business, receipt in db.execute(
+                        'SELECT idempotency_key,business_key,receipt FROM queue_business_receipts '
+                        'WHERE acknowledged=0 LIMIT 50')]
+
+    def acknowledge_queue_receipt(self, key):
+        with self._connect() as db:
+            db.execute('UPDATE queue_business_receipts SET acknowledged=1 WHERE idempotency_key=?', (key,))
 
     def complete(self, key: str, result_json: str) -> None:
         """The client received a model response; business completion is separate."""
@@ -192,6 +236,31 @@ class ModelAttemptJournal:
                 WHERE idempotency_key = ?""", (result_json, _now(), key))
             if changed.rowcount != 1:
                 raise RuntimeError("model attempt intent vanished before response persistence")
+
+    def reject_result(self, source_description: str, source_obs_id: str,
+                      step_id: str, request_digest: str) -> bool:
+        """The answer this step would replay failed the caller's schema: stop
+        replaying it.
+
+        A paid answer that misses a required field used to be replayed by every
+        retry of the task, failing identically forever without a new model call
+        (obs 8762, 11459 on 2026-10-09/10). Rejects exactly the row ``prepare``
+        replays (newest completed for this exact request); it stays as evidence
+        of the paid call, and the next retry asks the model again.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT idempotency_key FROM model_attempts
+                WHERE source_description = ? AND source_obs_id = ?
+                  AND step_id = ? AND request_digest = ?
+                  AND phase = 'completed' AND result_json IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1""",
+                (source_description, source_obs_id, step_id, request_digest)).fetchone()
+            if row is None:
+                return False
+            db.execute("UPDATE model_attempts SET phase = 'rejected', updated_at = ? "
+                       "WHERE idempotency_key = ?", (_now(), row[0]))
+            return True
 
     def start_http(self, key: str) -> None:
         """Durably mark the SDK HTTP-call boundary before invoking the SDK."""
@@ -214,17 +283,22 @@ class ModelAttemptJournal:
             started = None
         identity = status.get("identity")
         http_status = status.get("http_status")
+        values = (phase, None if started is None else int(started),
+                  identity if isinstance(identity, str) else None,
+                  http_status if isinstance(http_status, int) else None)
         with self._connect() as db:
-            db.execute("""UPDATE model_attempts SET phase = ?,
-                provider_call_started = ?, gateway_identity = ?,
-                gateway_http_status = ?, updated_at = ?
-                WHERE idempotency_key = ?""",
-                (phase, None if started is None else int(started),
-                 identity if isinstance(identity, str) else None,
-                 http_status if isinstance(http_status, int) else None,
-                 _now(), key))
-            row = db.execute("SELECT step_id FROM model_attempts WHERE idempotency_key = ?",
-                             (key,)).fetchone()
+            row = db.execute("""SELECT step_id, phase, provider_call_started,
+                gateway_identity, gateway_http_status
+                FROM model_attempts WHERE idempotency_key = ?""", (key,)).fetchone()
+            # 2026-10-10: the reconciliation loop re-read the same unresolved
+            # status every ~10s and rewrote it each time -- one FULL-sync write
+            # transaction per stuck attempt on the NAS spinning disk. An
+            # unchanged status is not new evidence, so it is not a write.
+            if row and tuple(row[1:]) != values:
+                db.execute("""UPDATE model_attempts SET phase = ?,
+                    provider_call_started = ?, gateway_identity = ?,
+                    gateway_http_status = ?, updated_at = ?
+                    WHERE idempotency_key = ?""", (*values, _now(), key))
         return NeedsReconciliation(row[0] if row else "unknown", phase, started)
 
     def find_task(self, source_description: str, source_obs_id: str) -> list[dict]:
@@ -293,7 +367,9 @@ class ModelAttemptJournal:
         """Settle one whole worker run; sibling HTTP failures cannot double count."""
         from utils.reconciliation_mailbox import task_uuid
 
-        if state not in {"succeeded", "failed", "uncertain", "unrecoverable"}:
+        # deferred: refused before any model result (provider 429, quota). It
+        # settles the run without spending one of the task's three attempts.
+        if state not in {"succeeded", "failed", "uncertain", "unrecoverable", "deferred"}:
             raise ValueError("invalid task execution state")
         task_id = task_uuid(source_description, source_obs_id)
         with self._connect() as db:
@@ -532,7 +608,8 @@ class ModelAttemptJournal:
     def claim_retry(self, grant_id: str, *, source_description: str,
                     source_obs_id: str, step_id: str, request_digest: str,
                     business_key: str, base_key: str, deadline_seconds: float,
-                    stage: str | None = None, execution_id: str | None = None) -> str:
+                    stage: str | None = None, execution_id: str | None = None,
+                    queue_owned: bool = False) -> str:
         """Consume a grant and reserve a fresh exact-call identity atomically."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -578,10 +655,10 @@ class ModelAttemptJournal:
             now = _now()
             db.execute("""INSERT INTO model_attempts
                 (idempotency_key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, phase, stage, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)""",
+                 step_id, request_digest, phase, stage, created_at, updated_at, queue_owned)
+                 VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?)""",
                 (key, business_key, source_description, source_obs_id,
-                 step_id, request_digest, stage, now, now))
+                 step_id, request_digest, stage, now, now, int(queue_owned)))
             changed = db.execute("""UPDATE model_retry_grants SET state = 'consumed',
                 consumed_at = ? WHERE grant_id = ? AND state = 'granted'""",
                 (now, grant_id))
@@ -602,6 +679,41 @@ def query_gateway_attempt_status(base_url: str, token: str, business_key: str,
     if not isinstance(value, dict) or value.get("version") != 1:
         raise RuntimeError("invalid gateway attempt-status response")
     return value
+
+
+class AttemptStatusPacer:
+    """Per-attempt pacing for reconciliation reads of gateway attempt-status.
+
+    2026-10-10: the reconciliation loop asked the gateway about every unresolved
+    attempt of every tracked task each ~10s (77 stuck tasks, ~108 reads/min),
+    though the answer had not changed for a day. Unchanged answers now double the
+    wait up to MAX_DELAY; any change resets it. MAX_DELAY matches the gateway's
+    own reconciliation recheck ceiling (credvault RECONCILE_MAX_DELAY), so a
+    late outcome is still seen within one gateway recheck period.
+    """
+    FIRST_DELAY = 10.0
+    MAX_DELAY = 300.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self._state: dict[str, tuple[float, float, tuple]] = {}
+
+    def due(self, key: str) -> bool:
+        state = self._state.get(key)
+        return state is None or self.clock() >= state[0]
+
+    def observed(self, key: str, status: dict) -> float:
+        # Only the fields the journal keeps; anything else in the response
+        # (timestamps, diagnostics) must not count as "changed".
+        answer = tuple(status.get(field) for field in
+                       ("phase", "provider_call_started", "identity", "http_status"))
+        previous = self._state.get(key)
+        if previous is None or previous[2] != answer:
+            delay = self.FIRST_DELAY
+        else:
+            delay = min(previous[1]*2, self.MAX_DELAY)
+        self._state[key] = (self.clock()+delay, delay, answer)
+        return delay
 
 
 _journals: dict[Path, ModelAttemptJournal] = {}
@@ -640,6 +752,11 @@ def summarize_attempts(rows: list[dict], *, deadline_seconds: float,
         step = row["step_id"]
         phase = row["phase"]
         started = row["provider_call_started"]
+        if phase == "rejected":
+            # A paid answer the caller could not use: one failed model call.
+            failed_by_step[step] = failed_by_step.get(step, 0) + 1
+            failed_http_identities.add(str(row.get("idempotency_key") or f"{step}:rejected"))
+            continue
         if row.get("result_json"):
             # The exact model response is durable even if a later gateway
             # status refresh changed the phase. Business graph completion is

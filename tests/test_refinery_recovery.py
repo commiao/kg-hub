@@ -90,5 +90,37 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(asyncio.run(R.poll_until_done("s", "1")), kind)
 
 
+class BackoffPersistenceTests(unittest.TestCase):
+    """重启后冷却仍在、指数退避接着走（2026-10-08：重启 5 分钟内 100+ 次 409）。"""
+
+    def roundtrip(self, backoff, *, cycle, saved_at, loaded_at):
+        dumped = recovery.dump_backoff(backoff, cycle=cycle, interval=90, now=saved_at)
+        return recovery.load_backoff(dumped, cycle=0, interval=90, now=loaded_at)
+
+    def test_cooling_survives_restart(self):
+        # 第 40 轮记下「第 4 次 409，等 8 轮」；重启后过了 1 轮的时间
+        loaded = self.roundtrip({7: [4, 48]}, cycle=40, saved_at=1000, loaded_at=1090)
+        self.assertEqual(loaded[7][0], 4)
+        for first_cycles in range(1, 8):          # 新进程第 1..7 轮仍在冷却
+            self.assertTrue(recovery.cooling(loaded[7], first_cycles))
+        self.assertFalse(recovery.cooling(loaded[7], 8))
+
+    def test_expired_entry_keeps_count_for_next_409(self):
+        loaded = self.roundtrip({7: [4, 48]}, cycle=40, saved_at=1000, loaded_at=5000)
+        self.assertFalse(recovery.cooling(loaded[7], 1))
+        self.assertEqual(loaded[7][0], 4)         # 下一次 409 记第 5 次，退避 16 轮
+
+    def test_wall_clock_rate_limit_entry_is_kept(self):
+        loaded = self.roundtrip({9: [1, 50, 1300.0]}, cycle=40, saved_at=1000, loaded_at=1010)
+        self.assertTrue(recovery.cooling(loaded[9], 1))
+        self.assertTrue(recovery.cooling(loaded[9], 4))
+        self.assertFalse(recovery.cooling(loaded[9], 5))
+
+    def test_entries_older_than_error_key_lifetime_are_dropped(self):
+        old = recovery.dump_backoff({7: [9, 41]}, cycle=40, interval=90, now=1000)
+        later = 1000 + recovery.BACKOFF_RETENTION_SECONDS + 200
+        self.assertEqual(recovery.load_backoff(old, cycle=0, interval=90, now=later), {})
+
+
 if __name__ == "__main__":
     unittest.main()

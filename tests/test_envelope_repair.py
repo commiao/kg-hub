@@ -275,7 +275,8 @@ class VisibilityTests(unittest.TestCase):
     def test_the_fetch_happens_before_every_gate(self):
         """窗口外 refinery 不干活,但 ingester / task-hub 桥仍在写,修正照样发生。"""
         src = (ROOT / "kg_refinery.py").read_text("utf-8")
-        body = src.split("while True:\n        cycle += 1", 1)[1][:600]
+        # 循环开头还有放回 held 的请求处理(也在门控之前),窗口留足。
+        body = src.split("while True:\n        cycle += 1", 1)[1][:1500]
         fetch = body.index("refresh_envelope_repairs()")
         self.assertLess(fetch, body.index("breakers.is_tripped"),
                         "取数排在门控之后,窗口外就看不到那些修正")

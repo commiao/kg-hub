@@ -144,6 +144,11 @@ def _copy_for_read(source: Path, into: Path, attempt: int = 0) -> Path:
     return target
 
 
+def _discard_copies(staging: Path) -> None:
+    for leftover in staging.glob("witness-*"):
+        leftover.unlink(missing_ok=True)
+
+
 class TornSnapshot(RuntimeError):
     """副本落在活库的一次写事务中间，读不出完整数据。"""
 
@@ -182,6 +187,7 @@ def _open_consistent_copy(witness: Path, staging: Path, *,
             copy = _copy_for_read(witness, staging, attempt)
             database = sqlite3.connect(f"file:{copy}?mode=ro", uri=True, timeout=10)
         except (OSError, sqlite3.Error) as exc:
+            _discard_copies(staging)
             last = exc
             continue
         try:
@@ -195,6 +201,8 @@ def _open_consistent_copy(witness: Path, staging: Path, *,
                 raise TornSnapshot("见证库副本缺 witness_meta / cost_policy_ceiling")
         except (TornSnapshot, sqlite3.Error) as exc:
             database.close()
+            # 撕裂的副本当场删掉：/tmp 是 tmpfs，留着 6 份就是 6 倍见证库的内存。
+            _discard_copies(staging)
             last = exc
             continue
         return database, meta, ceiling

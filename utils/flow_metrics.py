@@ -23,7 +23,7 @@ _lock = threading.Lock()
 _db_lock = threading.Lock()
 _write_error: str | None = None
 _read_error: str | None = None
-_RETENTION_S = 72 * 3600
+_RETENTION_S = 30 * 86400
 _COLUMNS = ("at", "conflict", "lock_wait_s", "commit_s", "validate_skipped",
             "prevalidated_conflict")
 _COMMIT_FIELDS = ("lock_wait_avg", "lock_wait_p90", "commit_avg", "commit_p50",

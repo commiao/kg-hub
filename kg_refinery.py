@@ -48,6 +48,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import refinery_window
 import urllib.error
 import urllib.request
@@ -58,6 +59,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils import refinery_recovery as recovery  # noqa: E402
+from utils import release_request  # noqa: E402
 
 import breakers  # noqa: E402
 from utils.ingest_budget import ingest_ceiling_sec  # noqa: E402
@@ -414,9 +416,10 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
     line = lines.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
     line.setdefault("result_counts", {})
     line.setdefault("filter_counts", {})
+    line.setdefault("deferred_counts", {})
     for t in _BUDGET_TALLIES:
         line[t] = int(line.get(t, 0)) + int(stats.get(t, 0) or 0)
-    for bucket in ("result_counts", "filter_counts"):
+    for bucket in ("result_counts", "filter_counts", "deferred_counts"):
         for name, n in (stats.get(bucket) or {}).items():
             line[bucket][name] = int(line[bucket].get(name, 0)) + int(n)
     # 小时桶:看板要画的是逐小时柱状图,只有当日合计画不出"什么时候烧的"。
@@ -427,6 +430,11 @@ def note_budget(kind: str, stats: dict) -> dict[str, object]:
     hline = bucket.setdefault(kind, {t: 0 for t in _BUDGET_TALLIES})
     for t in _BUDGET_TALLIES:
         hline[t] = int(hline.get(t, 0)) + int(stats.get(t, 0) or 0)
+    # 推迟原因也进小时桶：看板的推迟占比按近 24h 小时桶算，原因必须取同一批桶，
+    # 否则「占比」是 24h、「原因」是当日账，两个数说的不是同一批推迟。
+    reasons = hline.setdefault("deferred_counts", {})
+    for name, n in (stats.get("deferred_counts") or {}).items():
+        reasons[name] = int(reasons.get(name, 0)) + int(n)
     for name in sorted(_budget_hourly)[:-BUDGET_HOURS]:
         _budget_hourly.pop(name, None)
 
@@ -677,6 +685,17 @@ def _http(method: str, url: str, body: dict | None = None, timeout: int = 30,
 # 正常干活时记一次假 timeout,下一轮重推撞上自己刚建的键,换来 409 和指数退避。
 POLL_MAX_WAIT_S = int(ingest_ceiling_sec())
 
+# Last time a poll saw kg-hub report that the gateway is holding its model
+# calls for a provider rate limit (credvault #67). Those tasks wait it out;
+# meanwhile no batch sends anything new.
+PROVIDER_WAIT_FRESH_S = 120
+_provider_wait_seen = [0.0]
+
+
+def provider_waiting(now: float | None = None) -> bool:
+    return ((time.time() if now is None else now) - _provider_wait_seen[0]
+            < PROVIDER_WAIT_FRESH_S)
+
 
 async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) -> str:
     import urllib.parse
@@ -705,11 +724,17 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
                     return kind
             if st in ("ok", "skipped", "error", "needs_reconciliation"):
                 return st
+        held = code == 200 and st == "pending" and bool(d.get("provider_wait"))
+        if held:
+            _provider_wait_seen[0] = time.time()
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
         delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
         step += 1
         await asyncio.sleep(delay)
-        waited += delay
+        # 网关因供应商限流把作业留在队列里:它迟早会执行并计费,先放弃只会让结果
+        # 没人收、下一轮重推撞 409。限流多久不由我们定,所以这段时间不计入上限。
+        if not held:
+            waited += delay
     return "timeout"
 
 
@@ -853,6 +878,24 @@ async def heartbeat_loop() -> None:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
+async def queue_sample_loop(wm: dict) -> None:
+    """Keep sampling through gate pauses; never trigger ingestion or model calls."""
+    from utils import refinery_queues
+    process = uuid.uuid4().hex
+    while True:
+        # Freeze sets on the event loop before handing them to the I/O thread.
+        snapshot = {key: set(wm.get(key, ())) for key in
+                    ("ingested", "rejected", "failed", "held")}
+        snapshot["boundary_id"] = wm.get("boundary_id")
+        try:
+            await asyncio.to_thread(refinery_queues.sample, DB_PATH,
+                                    STATE_DIR / "queue-remaining.sqlite3",
+                                    snapshot, process, time.time())
+        except Exception:
+            log.exception("[queue-sample] failed (non-fatal)")
+        await asyncio.sleep(refinery_queues.INTERVAL)
+
+
 # ---------- 主循环 ----------
 
 async def process_batch(rows: list[dict], wm: dict, cfg: dict,
@@ -877,12 +920,18 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
     # 仅有 deferred 总数无法判断卡在本地过滤、幂等键、网络还是服务端，运维会
     # 被迫猜测；这两个小计让下一轮状态直接说明哪一层作出了决定。
     stats = {"ingested": 0, "rejected": 0, "deferred": 0, "backoff_skipped": 0,
-             "filter_counts": {}, "result_counts": {}}
+             "filter_counts": {}, "result_counts": {}, "deferred_counts": {}}
     wm.setdefault("held", set())
 
     def count(bucket: str, label: str) -> None:
         values = stats[bucket]
         values[label] = values.get(label, 0) + 1
+
+    def defer(label: str) -> None:
+        # result_counts 记的是每条的全部结果（含 ok、冷却跳过）；deferred_counts 只记
+        # 计入 deferred 的那些，二者之和恒等于 deferred —— 看板的「推迟原因」读它。
+        stats["deferred"] += 1
+        count("deferred_counts", label or "unknown")
 
     to_ingest: list[dict] = []
     for obs in rows:
@@ -932,6 +981,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 
     def stopped() -> bool:
         return (halt["stop"] or bool(quota_pause and quota_pause.get("reason"))
+                or provider_waiting()
                 or (can_submit is not None and not can_submit()))
 
     def settle(obs: dict, st: str) -> None:
@@ -942,6 +992,8 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             stats["ingested"] += 1
             decided.pop(oid, None)
             backoff.pop(oid, None)   # 成功即清退避,恢复后立刻全速
+            if quota_pause is not None:
+                recovery.note_success(quota_pause)
             log.info("[%s] obs-%d → %s", kind, oid, st)
         elif st == "409":
             # 指数退避:n 次连续 409 → 等 2^(n-1) 轮再试(上限 BACKOFF_MAX_CYCLES)。
@@ -949,7 +1001,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             n = (backoff.get(oid, [0, 0])[0]) + 1
             wait = min(2 ** (n - 1), BACKOFF_MAX_CYCLES)
             backoff[oid] = [n, cycle + wait]
-            stats["deferred"] += 1
+            defer(st)
             # 只在前 3 次打 warning,之后降 debug —— 日志量本身也是故障放大器
             (log.warning if n <= 3 else log.debug)(
                 "[%s] obs-%d → 409(第 %d 次,退避 %d 轮≈%dmin)",
@@ -958,7 +1010,7 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
             # A partially persisted business result requires an operator. Keep
             # the original observation out of the automatic submission loop.
             wm["held"].add(oid)
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → 预拆结果未完成,暂停自动提交并等待人工核实", kind, oid)
         elif st in recovery.PAUSING_FAILURES:
             # The error key can remain for an hour. Cool down this observation,
@@ -972,11 +1024,11 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
                     quota_delay=QUOTA_PAUSE_CYCLES * INTERVAL)
             stats["quota_paused" if st in {"quota", "daily_quota"} else
                   "rate_limited" if st == "rate_limited" else "upstream_error"] = 1
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → %s; observation cooling, queue awaits readiness",
                         kind, oid, st)
         else:  # error/timeout/net → 不记水印,下轮重试
-            stats["deferred"] += 1
+            defer(st)
             log.warning("[%s] obs-%d → %s(下轮重试)", kind, oid, st)
         save_watermark(wm)
         if on_progress is not None:
@@ -990,12 +1042,12 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
 
         async def run(obs: dict) -> None:
             if stopped():
-                stats["deferred"] += 1      # 没发出去,下轮重试
+                defer("halted")             # 没发出去,下轮重试
                 count("result_counts", "halted")
                 return
             async with gate:
                 if stopped():
-                    stats["deferred"] += 1
+                    defer("halted")
                     count("result_counts", "halted")
                     return
                 st = await ingest_via_api(obs, kind)
@@ -1107,10 +1159,21 @@ async def main() -> int:
         save_watermark(wm)
         log.info("[boundary] 首轮启动,boundary_id=%d(≤此为积压,夜间窗口烧)", wm["boundary_id"])
 
+    _queue_sample_task = asyncio.create_task(queue_sample_loop(wm))
+
     decided: dict[int, bool] = {}  # 进程内决策缓存
     decision_day = datetime.now(tz=CST).date()
     first_seen_at: dict[int, datetime] = {}  # created_at 无效时的最长等待起点
     backoff: dict[int, list[int]] = {}   # obs_id → [连续409次数, 下次可试的 cycle]
+    backoff_path = STATE_DIR / "backoff.json"
+    try:
+        backoff.update(recovery.load_backoff(
+            json.loads(backoff_path.read_text()) if backoff_path.exists() else {},
+            cycle=0, interval=INTERVAL))
+    except (OSError, ValueError, TypeError) as exc:
+        # 读不到只损失冷却信息（多试几次 409），不影响入图正确性。
+        log.warning("[backoff] 退避记录不可读，按空表启动：%s", exc)
+    saved_backoff = {"text": None}
     recovery_path = STATE_DIR / "recovery.json"
     try:
         quota_pause = json.loads(recovery_path.read_text()) if recovery_path.exists() else {}
@@ -1127,6 +1190,13 @@ async def main() -> int:
         tmp = recovery_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(quota_pause))
         os.replace(tmp, recovery_path)
+        text = json.dumps(recovery.dump_backoff(backoff, cycle=cycle, interval=INTERVAL),
+                          sort_keys=True)
+        if text != saved_backoff["text"]:
+            tmp = backoff_path.with_suffix(".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, backoff_path)
+            saved_backoff["text"] = text
 
     def can_submit():
         return in_backlog_window() and not breakers.is_tripped(BREAKER_KEY)[0]
@@ -1139,6 +1209,11 @@ async def main() -> int:
             # 放在所有门控之前:窗口外 refinery 不干活,但 ingester / task-hub 桥
             # 仍在往服务端写,外壳修正照样会发生。门控之后取就看不到那些。
             refresh_envelope_repairs()
+            # 运维放回 held:在断路器之前处理,断开期间也能放回(恢复时直接接着跑)。
+            # 改的是本进程内存里的水印,不用再停容器(2026-10-10 一天停了五次)。
+            released = release_request.apply(STATE_DIR, wm, save_watermark)
+            if released is not None:
+                log.warning("[release_request] %s", json.dumps(released, ensure_ascii=False))
             # —— 人工断路器:排在所有门控最前面 ——
             # 这是**停流**,不是拒绝。开关一关本轮一条都不选、一条都不提交,所以
             # 既不产生请求也不产生错误——不会出现"关了开关却一直撞墙报错、把
@@ -1198,7 +1273,8 @@ async def main() -> int:
                     # No model request is used as a health check. A real durable
                     # terminal-write failure must remain paused until repaired.
                     code, health = await asyncio.to_thread(
-                        _http, "GET", f"{KG_HUB_URL}/api/model-readiness", None, 8)
+                        _http, "GET", f"{KG_HUB_URL}/api/model-readiness", None,
+                        recovery.READINESS_PROXY_TIMEOUT)
                     recovery.probe_result(quota_pause,
                                           code == 200 and health.get("status") == "ok")
                     save_recovery()
@@ -1226,6 +1302,7 @@ async def main() -> int:
                     **cycle_budget_fields(),
                     backoff_pending=len(backoff),
                     **recovery.status_fields(quota_pause),
+                    provider_wait=provider_waiting(),
                     breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
@@ -1265,9 +1342,10 @@ async def main() -> int:
             async def consume(kind, row):
                 nonlocal backlog_remaining
                 oid = row["id"]
+                update, finish = ledger.run(kind, oid)
                 def progress(stats):
                     nonlocal backlog_remaining
-                    delta = ledger.update(kind, oid, stats)
+                    delta = update(stats)
                     budget = note_budget(kind, delta)
                     # Held tasks are excluded from the runnable queue but never
                     # counted as successful graph ingestion.
@@ -1275,10 +1353,13 @@ async def main() -> int:
                     backlog_remaining = sum(r["id"] not in terminal_now for r in initial_backlog)
                     snapshot(backlog_processed=totals["backlog"], live_processed=totals["live"],
                              backlog_remaining=backlog_remaining, budget_today=budget)
-                stats = await process_batch(
-                    [row], wm, cfg, None, decided, backoff, cycle, kind,
-                    quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
-                progress(stats)
+                try:
+                    stats = await process_batch(
+                        [row], wm, cfg, None, decided, backoff, cycle, kind,
+                        quota_pause=quota_pause, can_submit=can_submit, on_progress=progress)
+                    progress(stats)
+                finally:
+                    finish()
 
             def advance_cursor():
                 nonlocal cursor

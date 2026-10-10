@@ -134,6 +134,24 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertEqual(live["deferred"], 6)
         self.assertEqual(live["result_counts"], {"halted": 6, "409": 4})
 
+    def test_deferred_reasons_land_in_the_same_hourly_bucket_as_the_tally(self):
+        out = refinery.note_budget("backlog", {"deferred": 3, "ingested": 2,
+                                               "result_counts": {"ok": 2, "409": 3},
+                                               "deferred_counts": {"409": 3}})
+        hour = out["hourly"][max(out["hourly"])]["backlog"]
+        self.assertEqual(hour["deferred"], 3)
+        self.assertEqual(hour["deferred_counts"], {"409": 3})
+        self.assertEqual(out["lines"]["backlog"]["deferred_counts"], {"409": 3})
+
+    def test_topology_lists_only_deferred_reasons(self):
+        out = refinery.note_budget("live", {"ingested": 5, "deferred": 1,
+                                            "result_counts": {"ok": 5, "timeout": 1},
+                                            "deferred_counts": {"timeout": 1}})
+        lines, _ = topology.budget_detail({"budget_today": out}, None)
+        reason = next(l for l in lines if "推迟原因" in l)
+        self.assertIn("timeout 1", reason)
+        self.assertNotIn("ok", reason)
+
     def test_lines_are_kept_apart(self):
         refinery.note_budget("live", {"ingested": 10, "rejected": 1})
         out = refinery.note_budget("backlog", {"ingested": 2})
@@ -182,6 +200,36 @@ class BudgetTelemetryTests(unittest.TestCase):
         self.assertEqual(ledger.totals["backlog"]["ingested"], 1)
         self.assertIn("note_budget(kind, delta)", SOURCE)
         self.assertNotIn('note_budget("backlog", s_back)', SOURCE)
+
+    def test_same_observation_processed_twice_in_one_cycle(self):
+        # 2026-10-08 线上：409 推迟 → 冷却后同一轮内再处理并入图，账本报
+        # "progress counter regressed"，整个调度池停止取任务直到槽位排空。
+        from utils.refinery_scheduler import ProgressLedger
+        ledger = ProgressLedger()
+        update, finish = ledger.run("live", 40719)
+        update({"deferred": 1, "result_counts": {"409": 1}})
+        finish()
+        update, finish = ledger.run("live", 40719)
+        delta = update({"ingested": 1, "result_counts": {"ok": 1}})
+        self.assertEqual(delta["ingested"], 1)
+        totals = ledger.totals["live"]
+        self.assertEqual((totals["deferred"], totals["ingested"]), (1, 1))
+        self.assertEqual(totals["result_counts"], {"409": 1, "ok": 1})
+        finish()
+        self.assertEqual(ledger.partials, {})
+
+    def test_one_run_still_rejects_regression_and_dedupes(self):
+        from utils.refinery_scheduler import ProgressLedger
+        ledger = ProgressLedger()
+        update, _ = ledger.run("live", 7)
+        update({"ingested": 1})
+        self.assertEqual(update({"ingested": 1})["ingested"], 0)
+        with self.assertRaisesRegex(ValueError, "regressed"):
+            update({"ingested": 0})
+
+    def test_consume_records_progress_per_run(self):
+        self.assertIn("update, finish = ledger.run(kind, oid)", SOURCE)
+        self.assertNotIn("ledger.update(kind, oid, stats)", SOURCE)
 
 
 class PerCycleFreshnessTests(unittest.TestCase):

@@ -135,12 +135,56 @@ class BottleneckTests(unittest.TestCase):
         flow = build(status=st)
         self.assertIn("近 24h 积压零消化", titles(flow))
 
+    def test_each_bottleneck_says_when_its_evidence_starts(self):
+        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(10, 1, deferred=2)})
+        keys = {"by_status": {}, "pending": 0, "pending_oldest_s": None,
+                "errors_24h": {"model_outcome_unknown": 250}, "duration_p50": None,
+                "duration_p90": None, "duration_samples": 0}
+        earliest = (NOW - timedelta(hours=3)).timestamp()
+        flow = build(status=st, keys=keys,
+                     timing={"samples": 50, "wait_share": 0.82, "parallel": True,
+                             "wait_p50": 188.6, "extract_p50": 22.2,
+                             "earliest_at": earliest})
+        since = {b["title"]: b["since_beijing"] for b in flow["bottlenecks"]}
+        # 进程内耗时样本：从窗口里最早一条样本起
+        self.assertEqual(since["并发槽位排队是主要耗时"], "2026-09-28 09:30")
+        # 小时桶只留了 10 小时，起点是最早那个桶，不是假装的 24 小时前
+        self.assertEqual(since["推迟/重试占比高"], "2026-09-28 03:00")
+        self.assertEqual(since["近 24h 抽取失败偏多"], "2026-09-27 12:30")
+
+    def test_calls_per_observation_starts_at_the_utc_day_boundary(self):
+        flow = build(status=status(), gateway_node={
+            "state": "green", "metrics": {"keys": {"kg_hub.entity_extract": {"today": 1180}}}},
+            graph_daily=[{"bucket": "2026-09-28", "lane": "积压线", "count": 100}])
+        item = next(b for b in flow["bottlenecks"] if b["title"] == "每条观测模型调用次数高")
+        self.assertEqual(item["since_beijing"], "2026-09-28 08:00")
+
+    def test_snapshot_bottlenecks_have_no_start_time(self):
+        flow = build(status=status(heartbeat_at=None))
+        self.assertIsNone(flow["primary"]["since"])
+
     def test_high_deferred_share_names_its_reasons(self):
-        st = status(budget_today={"day": "2026-09-28", "hourly": hourly(24, 1, deferred=2),
-                                  "lines": {"backlog": {"result_counts": {"409": 30, "upstream_error": 5}}}})
+        hours = hourly(24, 1, deferred=2)
+        for i, key in enumerate(sorted(hours)):
+            hours[key]["backlog"]["deferred_counts"] = {"timeout": 2} if i % 3 == 0 else {"409": 2}
+        # 当日账的 result_counts 含 ok，且窗口不同：不得出现在证据里
+        st = status(budget_today={"day": "2026-09-28", "hourly": hours,
+                                  "lines": {"backlog": {"result_counts": {"ok": 999, "409": 30}}}})
         flow = build(status=st)
         item = next(b for b in flow["bottlenecks"] if b["title"] == "推迟/重试占比高")
-        self.assertIn("409 30", item["evidence"])
+        self.assertIn("推迟 48 次", item["evidence"])
+        self.assertIn("409 32、timeout 16", item["evidence"])
+        self.assertNotIn("ok", item["evidence"])
+
+    def test_deferred_reasons_ignore_hours_outside_the_share_window(self):
+        hours = hourly(24, 1, deferred=2)
+        stale = (NOW - timedelta(hours=30)).strftime("%Y-%m-%dT%H")
+        hours[stale] = {"backlog": {"ingested": 0, "rejected": 0, "deferred": 50,
+                                    "deferred_counts": {"halted": 50}}}
+        digest = F.backlog_digest(status(budget_today={"day": "2026-09-28", "hourly": hours}),
+                                  None, NOW)
+        self.assertNotIn("halted", digest["deferred_reasons"])
+        self.assertEqual(digest["last24"]["backlog_deferred"], 48)
 
     def test_red_capture_stage_is_reported_without_blaming_the_backlog(self):
         snap = {"_host": "mac", "nodes": [{"id": "worker", "layer": "worker",
@@ -251,6 +295,23 @@ class StageTests(unittest.TestCase):
                                            "metrics": {"queue_depth": 42}}]}
         self.assertEqual(F.probe_stages([snap])["claude_mem"]["sub"], "内存队列 42")
 
+    def test_migrated_host_uses_current_worker_not_retired_probe(self):
+        snap = {"_host": "mac", "nodes": [
+            {"id": "worker", "state": "red", "detail": "old :37701 unavailable"},
+            {"id": "sqlite", "state": "amber", "detail": "old database stale"}],
+            "claude_mem_queue": {"current": [{"worker": "current", "at": NOW.timestamp(),
+                "depth": 0, "pid": "29149", "held": 0, "error": None}]}}
+        stage = F.probe_stages([snap], NOW)["claude_mem"]
+        self.assertEqual(stage["state"], "green")
+        self.assertNotIn("old", stage["detail"])
+        current = snap["claude_mem_queue"]["current"][0]
+        current.update(depth=None, error="队列接口不可用")
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "red")
+        current.update(depth=0, error=None, at=NOW.timestamp()-1201)
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "grey")
+        current.update(at=NOW.timestamp(), held_error="待核验账本不可读")
+        self.assertEqual(F.probe_stages([snap], NOW)["claude_mem"]["state"], "amber")
+
 
 class DiagramTests(unittest.TestCase):
     def test_topology_marks_the_choke_and_escapes_labels(self):
@@ -288,7 +349,7 @@ class RenderTests(unittest.TestCase):
     def test_page_embeds_data_without_breaking_out_of_script(self):
         flow = build(status=status(last_error="</script><img src=x>"))
         with patch.object(F, "collect_flow", AsyncMock(return_value=flow)):
-            response = asyncio.run(F.dashboard_flow(None))
+            response = asyncio.run(F.dashboard_flow(__import__("starlette.requests", fromlist=["Request"]).Request({"type":"http","query_string":b""})))
         html = response.body.decode()
         self.assertNotIn("</script><img", html)
         payload = html.split("const D=", 1)[1].split(";\nconst $", 1)[0]
@@ -297,7 +358,7 @@ class RenderTests(unittest.TestCase):
     def test_json_endpoint_returns_the_same_structure(self):
         flow = build()
         with patch.object(F, "collect_flow", AsyncMock(return_value=flow)):
-            response = asyncio.run(F.dashboard_flow_json(None))
+            response = asyncio.run(F.dashboard_flow_json(__import__("starlette.requests", fromlist=["Request"]).Request({"type":"http","query_string":b""})))
         self.assertEqual(json.loads(response.body)["generated_at"], flow["generated_at"])
 
     def test_beijing_labels_keep_utc_source_buckets_and_cross_midnight(self):
@@ -323,12 +384,244 @@ class RenderTests(unittest.TestCase):
         html = F._HTML
         self.assertIn("row.hour_beijing", html)
         self.assertIn("r.hour_beijing+' 北京时间'", html)
-        self.assertIn("r.day_beijing_start.slice(5)", html)
+        self.assertIn("r.label.slice(5)", html)
         self.assertIn("D.generated_at_beijing", html)
         self.assertIn("data-backlog-chart", html)
 
 
+class TimeRangeTests(unittest.TestCase):
+    def test_beijing_midnight_and_yesterday_are_half_open(self):
+        now = datetime(2026, 10, 7, 0, 30, tzinfo=timezone.utc)
+        today = F.time_range("today", now)
+        yesterday = F.time_range("yesterday", now)
+        self.assertEqual(today["start"], "2026-10-06T16:00:00+00:00")
+        self.assertEqual(yesterday["start"], "2026-10-05T16:00:00+00:00")
+        self.assertEqual(yesterday["end"], today["start"])
+        for key, hours in {"month":720,"week":168,"day":24,"6h":6,"3h":3,"1h":1}.items():
+            w = F.time_range(key, now)
+            self.assertEqual((F._parse_ts(w["end"])-F._parse_ts(w["start"])).total_seconds(), hours*3600)
+
+    def test_selected_partial_hour_filters_events_and_inflight_denominator(self):
+        start = NOW - timedelta(hours=1)
+        commits = [{"at":(start-timedelta(seconds=1)).timestamp(), "conflict":False,
+                    "lock_wait_s":900,"commit_s":900,"prevalidated_conflict":False,"validate_skipped":False},
+                   {"at":start.timestamp(),"conflict":False,"lock_wait_s":2,"commit_s":4,
+                    "prevalidated_conflict":False,"validate_skipped":False}]
+        rows = F.key_metric_trends(now=NOW, window_start=start, commits=commits,
+            attempts=[((start-timedelta(minutes=5)).isoformat(), (start+timedelta(minutes=15)).isoformat(), "completed"),
+                      (NOW.isoformat(), NOW.isoformat(), "completed")], outcomes=[])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sum(r["model_calls"] for r in rows), 0)
+        self.assertEqual(rows[0]["model_inflight_avg"], .5)
+        self.assertEqual(rows[0]["commit_p50"], 4)
+
+    def test_yesterday_has_24_hours_without_today_bucket(self):
+        w=F.time_range("yesterday", NOW)
+        rows=F.key_metric_trends(now=F._parse_ts(w["end"]),window_start=F._parse_ts(w["start"]),
+                                commits=[],attempts=None,outcomes=None)
+        self.assertEqual(len(rows),24)
+        self.assertEqual(F._beijing_hour(rows[0]["hour"]),"2026-09-27 00:00")
+        self.assertEqual(F._beijing_hour(rows[-1]["hour"]),"2026-09-27 23:00")
+        self.assertTrue(all(r["model_calls"] is None for r in rows))
+
+    def test_default_and_invalid_range_endpoints(self):
+        from starlette.requests import Request
+        with patch.object(F,"collect_flow",AsyncMock(return_value={})) as collect:
+            asyncio.run(F.dashboard_flow_json(Request({"type":"http","query_string":b""})))
+            collect.assert_awaited_once_with("today")
+        with patch.object(F,"collect_flow",AsyncMock()) as collect:
+            r=asyncio.run(F.dashboard_flow_json(Request({"type":"http","query_string":b"range=bad"})))
+            self.assertEqual(r.status_code,400)
+            collect.assert_not_awaited()
+
+    def test_queries_bound_both_ends(self):
+        driver=type("Driver",(),{"execute_query":AsyncMock(return_value=([],None,None))})()
+        start=NOW-timedelta(hours=1)
+        asyncio.run(F._hourly_outcomes(driver,NOW,start))
+        args,kw=driver.execute_query.call_args
+        self.assertIn("k.updated_at < $until",args[0])
+        self.assertEqual(kw,{"since":start.isoformat(),"until":NOW.isoformat()})
+        asyncio.run(F._graph_period(driver,100,start,NOW))
+        self.assertEqual(driver.execute_query.call_args.kwargs["until"],NOW.isoformat())
+
+    def test_all_presets_render_with_one_axis_and_preserve_url(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript smoke test")
+        for key in F.RANGE_LABELS:
+            w=F.time_range(key,NOW)
+            rows=F.key_metric_trends(now=F._parse_ts(w["end"]),window_start=F._parse_ts(w["start"]),
+                                    commits=[],attempts=[],outcomes=[])
+            data=build(key_trends=rows)
+            data.update(time_range=w,range_options=F.RANGE_LABELS,
+                        period=F.selected_period({},w,NOW,rows,[],[]))
+            script=F._HTML.split("<script>")[1].split("</script>")[0].replace("__DATA__",json.dumps(data))
+            harness = """const elements={};
+const element=()=>({innerHTML:'',textContent:'',dataset:{},classList:{toggle(){}},append(){},addEventListener(){}});
+const document={getElementById:id=>elements[id]??=(element()),createElement:element,querySelectorAll:()=>[]};
+const window={};
+"""
+            script += """
+if(!elements['time-ranges'].innerHTML.includes('href="?range='+range.key+'" aria-current="true"'))throw Error('selection');
+if((elements['time-ranges'].innerHTML.match(/<a /g)||[]).length!==8)throw Error('options');
+if(!elements.keytrends.innerHTML.includes(axisLabel(chartStart)))throw Error('axis start');
+if(!elements.keytrends.innerHTML.includes(axisLabel(chartEnd)))throw Error('axis end');
+"""
+            result=subprocess.run(["node","-e",harness+script],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_rate_chart_outlier_neither_flattens_the_axis_nor_overprints_ticks(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript")
+        script=F._HTML.split("<script>")[1]
+        helpers=script[script.index("function chartRange"):script.index("function backlogChart")]
+        # 2026-10-08: one -129876/h sample among normal 0–60/h rates.
+        check = """
+const spec={zeroBaseline:true,robust:true,series:[['净消化速度','live_rate']]};
+// Max ~270/h puts the padded top at ≈13248, 8px above zero — the label clash seen.
+const values=Array.from({length:200},(_,i)=>i%3*30).concat([-129876.4,270]);
+const {low,top}=chartRange(values,spec);
+if(!(low<0&&low>-1000&&top>=60&&top<1000))throw Error('range '+low+' '+top);
+const y=v=>9+92*(1-(Math.min(top,Math.max(low,v))-low)/(top-low));
+const ticks=chartTicks(low,top,spec,y);
+if(y(-129876.4)-y(0)<5)throw Error('pinned outlier drawn on the zero line');
+if(!ticks.includes(0))throw Error('zero tick');
+for(let i=1;i<ticks.length;i++)if(Math.abs(y(ticks[i])-y(ticks[i-1]))<12)throw Error('overlap '+ticks);
+const raw=chartRange(values,{...spec,robust:false});
+if(raw.low!==-129876.4)throw Error('non-robust charts keep full range');
+const t=chartTicks(raw.low,raw.top,spec,v=>9+92*(1-(v-raw.low)/(raw.top-raw.low)));
+if(Math.round(raw.top)!==13285||t.length!==2||!t.includes(0)||!t.includes(Math.round(raw.low)))throw Error('crowded top tick dropped '+t);
+// An all-zero rate (backlog drained) gives a 0–1.1 axis: no label may repeat,
+// and each label must sit where its own value is.
+const flat=chartRange(Array(30).fill(0),spec),fy=v=>9+92*(1-(v-flat.low)/(flat.top-flat.low));
+const ft=chartTicks(flat.low,flat.top,spec,fy);
+if(ft.join()!=='0,1')throw Error('flat axis ticks '+ft);
+const few=chartRange([0,30,-5000],spec);
+if(few.low!==-5000)throw Error('too few samples to call an outlier');
+"""
+        result=subprocess.run(["node","-e",helpers+check],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_refinery_partial_leading_hour_is_not_counted(self):
+        w=F.time_range("1h",NOW)
+        st=status(budget_today={"hourly":{"2026-09-28T03":{"backlog":{"ingested":99}},
+                                          "2026-09-28T04":{"backlog":{"ingested":2}}}})
+        period=F.selected_period(st,w,NOW,[],[],None)
+        self.assertEqual(period["backlog"]["ingested"],2)
+        self.assertEqual(period["coverage_h"],.5)
+
+
+def queue_rows(days: int, step: int = 120) -> list[dict]:
+    """Two-minute queue samples ending at NOW, like refinery_queue_trends emits."""
+    start = NOW.timestamp() - days * 86400
+    rows = []
+    for i in range(int(days * 86400 // step)):
+        at = datetime.fromtimestamp(start + i * step, timezone.utc)
+        rows.append({"at": at.isoformat(), "label": F._beijing_time(at), "process": "p1",
+                     "boundary": 13295, "live": 9000 - i % 50, "backlog": 4,
+                     "live_held": 2800, "backlog_held": 927, "live_total": 30000,
+                     "backlog_total": 13280, "live_rate": float(i % 7), "live_burst": None,
+                     "backlog_rate": 0.0, "backlog_burst": None})
+    return rows
+
+
+class ScopeSeriesTests(unittest.TestCase):
+    """2026-10-10: 6h 页面内联了 30 天队列采样（2.1MB），DERP 中转下打不开。"""
+
+    def scoped(self, key: str, rows: list[dict], history=(), hosts=()) -> dict:
+        w = F.time_range(key, NOW)
+        data = {"refinery_queue_trends": {"rows": rows, "latest": rows[-1] if rows else None,
+                                          "stale": False},
+                "backlog_remaining_history": list(history),
+                "claude_mem_trends": [dict(h) for h in hosts]}
+        F.scope_series(data, F._parse_ts(w["start"]), F._parse_ts(w["end"]))
+        return data
+
+    def test_short_range_keeps_only_its_own_samples_untouched(self):
+        rows = queue_rows(30)
+        data = self.scoped("6h", rows)
+        q = data["refinery_queue_trends"]
+        self.assertEqual(q["bucket_seconds"], 0)
+        self.assertEqual(len(q["rows"]), 6 * 30)
+        self.assertEqual(q["rows"], rows[-180:])
+        self.assertEqual(q["first_at"], rows[0]["at"])
+        self.assertIs(q["latest"], rows[-1])
+        self.assertLess(len(json.dumps(data, ensure_ascii=False).encode()), 100_000)
+
+    def test_long_range_fits_the_chart_without_losing_speed_or_refills(self):
+        rows = queue_rows(30)
+        rows[-5]["live_burst"], rows[-4]["live_burst"] = 300, 250
+        data = self.scoped("month", rows)
+        q = data["refinery_queue_trends"]
+        self.assertEqual(q["bucket_seconds"], 3600)
+        self.assertLessEqual(len(q["rows"]), F.MAX_CHART_POINTS + 1)
+        last = q["rows"][-1]
+        # The bucket keeps its last level, averages rates, and sums refills.
+        bucket = [r for r in rows
+                  if int(F._parse_ts(r["at"]).timestamp()) // 3600 == int(F._parse_ts(last["at"]).timestamp()) // 3600]
+        self.assertEqual(last["live"], bucket[-1]["live"])
+        self.assertEqual(last["live_rate"],
+                         round(sum(r["live_rate"] for r in bucket) / len(bucket), 1))
+        self.assertEqual(sum(r["live_burst"] or 0 for r in q["rows"]), 550)
+        self.assertLess(len(json.dumps(data, ensure_ascii=False).encode()), 400_000)
+
+    def test_thinning_never_merges_across_restart_or_boundary(self):
+        rows = queue_rows(1, step=600)[:6]
+        for r in rows[3:]:
+            r["process"] = "p2"
+        thinned = F.thin_rows(rows, 86400, rates=("live_rate",))
+        self.assertEqual([r["process"] for r in thinned], ["p1", "p2"])
+
+    def test_legacy_backlog_snapshots_only_before_the_first_real_sample(self):
+        rows = queue_rows(1)[-60:]                      # real samples: last 2h only
+        history = [{"at": (NOW - timedelta(minutes=m)).isoformat(), "remaining": m,
+                    "boundary_id": "13295"} for m in range(0, 600, 2)]
+        data = self.scoped("6h", rows, history=history)
+        first = F._parse_ts(rows[0]["at"])
+        spliced = data["backlog_remaining_history"]
+        self.assertTrue(spliced)
+        self.assertTrue(all(NOW - timedelta(hours=6) <= F._parse_ts(r["at"]) < first
+                            for r in spliced))
+
+    def test_claude_mem_worker_rows_follow_the_range(self):
+        host = {"host": "mac-office", "rows": [{"at": (NOW - timedelta(hours=h)).isoformat()}
+                                               for h in range(720, 0, -1)]}
+        data = self.scoped("day", [], hosts=[host])
+        self.assertEqual(len(data["claude_mem_trends"][0]["rows"]), 24)
+        self.assertEqual(data["refinery_queue_trends"]["rows"], [])
+        self.assertIsNone(data["refinery_queue_trends"]["first_at"])
+
+    def test_thinned_month_still_draws_lines_not_scattered_dots(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript")
+        w = F.time_range("month", NOW)
+        data = build()
+        data.update(time_range=w, range_options=F.RANGE_LABELS,
+                    period=F.selected_period({}, w, NOW, [], [], None),
+                    refinery_queue_trends={"rows": queue_rows(30), "latest": None, "stale": True})
+        F.scope_series(data, F._parse_ts(w["start"]), F._parse_ts(w["end"]))
+        script = F._HTML.split("<script>")[1].split("</script>")[0].replace("__DATA__", json.dumps(data))
+        harness = """const elements={};
+const element=()=>({innerHTML:'',textContent:'',dataset:{},classList:{toggle(){}},append(){},addEventListener(){}});
+const document={getElementById:id=>elements[id]??=(element()),createElement:element,querySelectorAll:()=>[]};
+const window={};
+"""
+        check = """
+const live=elements.backlogtrends.innerHTML.split('<div class=trend>')[1];
+if((live.match(/<polyline/g)||[]).length!==2)throw Error('expected one line per series');
+if(live.includes('<circle'))throw Error('hour-apart samples broken into dots');
+"""
+        result = subprocess.run(["node", "-e", harness + script + check], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class WiringTests(unittest.TestCase):
+    def test_dashboards_are_gzipped(self):
+        middleware = SERVER.split("app = Starlette(", 1)[1].split("middleware=", 1)[1]
+        self.assertTrue(middleware.lstrip("[ ").startswith("Middleware(GZipMiddleware"))
+
     def test_routes_and_portal_entry_are_registered(self):
         self.assertIn('Route("/dashboard/flow", dashboard_flow', SERVER)
         self.assertIn('Route("/dashboard/flow.json", dashboard_flow_json', SERVER)

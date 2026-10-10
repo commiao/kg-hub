@@ -114,7 +114,8 @@ def budget_detail(status: dict, calls_today: int | None) -> tuple[list[str], dic
         dfr = int(v.get("deferred") or 0)
         share = f" · 占终态 {(ing + rej) * 100 // terminal}%" if terminal else ""
         out.append(f"  {name}: 入图 {ing}、拒 {rej}、推迟 {dfr}{share}")
-        rc = v.get("result_counts") or {}
+        # result_counts 含 ok 与冷却跳过，不是推迟原因；deferred_counts 之和才等于推迟数。
+        rc = v.get("deferred_counts") or {}
         if rc:
             out.append("      推迟原因:" + "、".join(
                 f"{k} {n}" for k, n in sorted(rc.items(), key=lambda kv: -kv[1])))

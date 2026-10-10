@@ -107,5 +107,72 @@ class VersionDiscoveryTests(unittest.TestCase):
         self.assertEqual(found[1].split()[0], "0" * 24)
 
 
+class IsolatedCaptureDeferTests(unittest.TestCase):
+    """隔离采集启用后，旧作业不许拿 cache bundle 接管当前一代的端口与库。
+
+    整个脚本在假 HOME 里真跑：bun 是只写哨兵文件的假程序，端口取一个没人监听的，
+    所以「端口空着」这个接管条件是成立的 —— 不接管只能归因于启用标记。"""
+
+    def setUp(self):
+        import socket
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        install(self.home, "13.32.0")
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        (self.home / ".claude-mem").mkdir()
+        (self.home / ".claude-mem/settings.json").write_text(
+            json.dumps({"CLAUDE_MEM_WORKER_PORT": port}), "utf-8")
+        bun = self.home / ".bun/bin/bun"
+        bun.parent.mkdir(parents=True)
+        bun.write_text(f'#!/bin/sh\necho "$@" > "{self.home}/bun-started"\n', "utf-8")
+        bun.chmod(0o755)
+        self.marker = self.home / ".kg-hub/state/claude-mem-dual-active.json"
+        self.marker.parent.mkdir(parents=True)
+        self.started = self.home / "bun-started"
+
+    def launch(self):
+        # UTF-8 locale：裸展开紧跟中文只在这里炸（准则 31），空 locale 测不出来。
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", "LC_ALL": "en_US.UTF-8",
+               "CLAUDE_MEM_DEFER_POLL_S": "0.1"}
+        proc = subprocess.Popen(["/bin/sh", str(SCRIPT)], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+    def wait_for(self, predicate, seconds=5.0):
+        import time
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_marker_present_never_takes_over_a_free_port(self):
+        self.marker.write_text('{"generation":"next"}', "utf-8")
+        proc = self.launch()
+        self.assertFalse(self.wait_for(self.started.exists, 1.5), "启用标记在场仍拉起了 cache bundle")
+        self.assertIsNone(proc.poll(), "不接管时必须原地待机，退出会被 KeepAlive 每 10s 重拉")
+        proc.kill()
+        self.assertIn("本作业不接管", proc.communicate()[0])
+
+    def test_marker_withdrawn_restores_takeover(self):
+        self.marker.write_text('{"generation":"next"}', "utf-8")
+        proc = self.launch()
+        self.assertFalse(self.wait_for(self.started.exists, 0.5))
+        self.marker.unlink()
+        self.assertTrue(self.wait_for(self.started.exists), "标记撤掉后没有恢复兜底接管")
+        self.assertIn("13.32.0/scripts/worker-service.cjs", self.started.read_text("utf-8"))
+        proc.wait(timeout=5)
+
+    def test_without_marker_takes_over_as_before(self):
+        self.launch().wait(timeout=5)
+        self.assertTrue(self.started.exists(), "没有启用标记时原来的兜底接管被弄丢了")
+
+
 if __name__ == "__main__":
     unittest.main()

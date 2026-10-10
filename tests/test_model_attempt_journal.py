@@ -460,5 +460,61 @@ class ClientJournalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(row["http_started_at"])
 
 
+class UnchangedGatewayStatusTests(unittest.TestCase):
+    """2026-10-10: an unchanged status re-read every ~10s was rewritten every time."""
+
+    def test_unchanged_status_is_not_written_and_a_change_is(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "attempts.sqlite3"
+            journal = ModelAttemptJournal(path)
+            journal.prepare(**fields())
+            status = {"phase": "unknown", "provider_call_started": None,
+                      "identity": "gw-1", "http_status": 503, "checked_at": "t1"}
+            journal.update_gateway_status("key-1", status)
+            watcher = sqlite3.connect(path)
+            self.addCleanup(watcher.close)
+            version = lambda: watcher.execute("PRAGMA data_version").fetchone()[0]
+            before, updated = version(), journal.find_task("source", "id-1")[0]["updated_at"]
+            again = journal.update_gateway_status("key-1", {**status, "checked_at": "t2"})
+            self.assertEqual((again.step_id, again.phase, again.provider_call_started),
+                             ("step-1", "unknown", None))
+            self.assertEqual(version(), before)
+            self.assertEqual(journal.find_task("source", "id-1")[0]["updated_at"], updated)
+            journal.update_gateway_status("key-1", {**status, "phase": "failed"})
+            self.assertNotEqual(version(), before)
+            self.assertEqual(journal.find_task("source", "id-1")[0]["phase"], "failed")
+
+    def test_unknown_key_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = ModelAttemptJournal(Path(temp) / "attempts.sqlite3")
+            result = journal.update_gateway_status("missing", {"phase": "failed"})
+            self.assertEqual(result.step_id, "unknown")
+
+
+class AttemptStatusPacerTests(unittest.TestCase):
+    def setUp(self):
+        from utils.model_attempt_journal import AttemptStatusPacer
+        self.now = [0.0]
+        self.pacer = AttemptStatusPacer(clock=lambda: self.now[0])
+
+    def test_unchanged_answers_double_up_to_the_gateway_recheck_ceiling(self):
+        answer = {"phase": "unknown", "provider_call_started": None, "checked_at": 1}
+        delays = []
+        for i in range(8):
+            self.assertTrue(self.pacer.due("k"))
+            delays.append(self.pacer.observed("k", {**answer, "checked_at": i}))
+            self.assertFalse(self.pacer.due("k"))
+            self.now[0] += delays[-1]
+        self.assertEqual(delays, [10, 20, 40, 80, 160, 300, 300, 300])
+
+    def test_a_changed_answer_resets_and_keys_are_independent(self):
+        self.pacer.observed("k", {"phase": "unknown"})
+        self.now[0] += 10
+        self.pacer.observed("k", {"phase": "unknown"})
+        self.now[0] += 20
+        self.assertEqual(self.pacer.observed("k", {"phase": "failed"}), 10)
+        self.assertTrue(self.pacer.due("other"))
+
+
 if __name__ == "__main__":
     unittest.main()

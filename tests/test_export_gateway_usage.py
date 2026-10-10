@@ -170,6 +170,37 @@ class ExportContractTests(unittest.TestCase):
             self.assertIn("kg_hub.entity_extract", payload["ceilings"])
             self.assertIs(E._open_consistent_copy, E_delay)
 
+    def test_torn_copies_are_discarded_before_the_next_attempt(self):
+        # /tmp 是 tmpfs（2026-10-10）：撕裂副本留到本轮结束，就是 6 倍见证库的内存。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            witness = root / "w.sqlite3"
+            make_witness(witness)
+            staging = root / "staging"
+            staging.mkdir()
+            real = E._copy_for_read
+            seen = []
+
+            def flaky(source, into, attempt):
+                seen.append(sorted(p.name for p in into.iterdir()))
+                target = real(source, into, attempt)
+                if attempt < 2:
+                    target.write_bytes(b"SQLite format 3\x00" + b"\x00" * 200)
+                return target
+
+            with mock.patch.object(E, "_copy_for_read", flaky), \
+                 mock.patch.object(E.time, "sleep"):
+                database, _, _ = E._open_consistent_copy(witness, staging)
+            database.close()
+            self.assertEqual(seen, [[], [], []])
+            self.assertEqual(sorted(p.name for p in staging.iterdir()), ["witness-2.sqlite3"])
+
+    def test_watchdog_stages_witness_copies_in_memory(self):
+        # 2026-10-10 实测：副本落盘时 watchdog 容器 4.5 小时写了 22.8GB。
+        compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text("utf-8")
+        block = compose.split("\n  watchdog:\n", 1)[1].split("\n  # ", 1)[0]
+        self.assertRegex(block, r"\n    tmpfs:\n      - /tmp:size=\d+m")
+
 
 if __name__ == "__main__":
     unittest.main()

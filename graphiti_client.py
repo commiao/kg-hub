@@ -15,6 +15,7 @@ lock (Phase 1 → Phase 2 requires concurrent ingest + MCP read).
 
 import asyncio
 from contextlib import nullcontext
+import logging
 import os
 import threading
 import typing
@@ -42,10 +43,11 @@ from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.client import ModelSize
 from graphiti_core.prompts.models import Message
 from model_gateway_client import (
-    create_gateway_client, gateway_model, gateway_token, model_stage,
+    capture_model_result, create_gateway_client, gateway_model, gateway_token,
+    model_stage, reject_model_result,
 )
 from utils.graphiti_stage_names import graphiti_model_stage
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 # --- Perf fix (task #7): make EDGE dedup vector-only ---------------------------
 # resolve_extracted_edges() runs EDGE_HYBRID_SEARCH_RRF (bm25 fulltext + cosine
@@ -126,7 +128,7 @@ class SingleAttemptAnthropicClient(AnthropicClient):
             max_tokens = self.max_tokens
         stage = graphiti_model_stage(prompt_name)
         stage_scope = model_stage(stage) if stage else nullcontext()
-        with stage_scope:
+        with stage_scope, capture_model_result() as source:
             response, input_tokens, output_tokens = await self._generate_response(
                 messages, response_model, max_tokens, model_size
             )
@@ -134,7 +136,16 @@ class SingleAttemptAnthropicClient(AnthropicClient):
         if response_model is not None:
             # Validation errors intentionally propagate.  In particular, never
             # append a corrective prompt and make another paid request.
-            return response_model(**response).model_dump()
+            try:
+                return response_model(**response).model_dump()
+            except ValidationError:
+                # This exact answer can never pass: stop the journal replaying
+                # it, so the task's next (separate) retry asks the model again.
+                if await reject_model_result(source):
+                    logging.getLogger("kg_hub.gateway").warning(
+                        "[model_result:rejected] stage=%s model=%s; the next retry re-asks",
+                        stage, response_model.__name__)
+                raise
         return response
 
 

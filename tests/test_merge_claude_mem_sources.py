@@ -80,4 +80,27 @@ class MergeSourcesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'rolled back'):
             m.merge(self.config,self.out)
 
+    def test_appended_source_columns_are_not_copied(self):
+        m.merge(self.config,self.out,True)
+        with sqlite3.connect(self.new) as db:
+            db.execute('ALTER TABLE sdk_sessions ADD COLUMN cwd TEXT')
+            db.execute('ALTER TABLE observations ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1')
+            db.execute('INSERT INTO sdk_sessions VALUES(2,"s2","memory2","/repo")')
+            db.execute('INSERT INTO observations VALUES(2,"memory2","after upgrade",3)')
+        self.assertEqual(m.merge(self.config,self.out), {'legacy':0,'next':1})
+        self.assertEqual(self.rows('SELECT text FROM observations ORDER BY id'), [('first',),('first',),('after upgrade',)])
+        self.assertEqual(self.rows("SELECT name FROM pragma_table_info('observations')"), [('id',),('memory_session_id',),('text',)])
+        self.assertEqual(self.rows("SELECT name FROM pragma_table_info('sdk_sessions')"), [('id',),('content_session_id',),('memory_session_id',)])
+
+    def test_missing_or_retyped_aggregate_column_fails_closed(self):
+        m.merge(self.config,self.out,True)
+        with sqlite3.connect(self.new) as db:
+            db.executescript('ALTER TABLE observations DROP COLUMN text; ALTER TABLE observations ADD COLUMN text INTEGER;')
+        with self.assertRaisesRegex(ValueError,'schema mismatch: observations'):
+            m.merge(self.config,self.out)
+        with sqlite3.connect(self.new) as db:
+            db.execute('ALTER TABLE observations DROP COLUMN text')
+        with self.assertRaisesRegex(ValueError,'schema mismatch: observations'):
+            m.merge(self.config,self.out)
+
 if __name__=='__main__': unittest.main()

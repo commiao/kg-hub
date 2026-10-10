@@ -251,8 +251,13 @@ def is_local_admission_rejection(exc: BaseException) -> bool:
         return False
     body = getattr(exc, "body", None)
     error = body.get("error") if isinstance(body, dict) else None
-    return (isinstance(error, dict)
-            and error.get("code") == "cost_limit_exceeded"
+    if not isinstance(error, dict):
+        return False
+    # The gateway's unified result mapping (credvault #68) states it directly;
+    # the localized message check stays only for gateways that predate it.
+    if "disposition" in error:
+        return error.get("disposition") == "retry" and error.get("same_key") is True
+    return (error.get("code") == "cost_limit_exceeded"
             and error.get("message") in _ADMISSION_REJECTION_MESSAGES)
 
 
@@ -460,6 +465,38 @@ def repair_structured_envelopes(response: Any, tools: Any = None) -> None:
             "[envelope_repair] skipped (non-fatal)", exc_info=True)
 
 
+# Where the last model answer of one Graphiti call came from, so a caller that
+# rejects the answer (schema validation) can stop the journal replaying it.
+_result_sink: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "kg_hub_model_result_sink", default=None)
+
+
+@contextmanager
+def capture_model_result():
+    sink: dict = {}
+    token = _result_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _result_sink.reset(token)
+
+
+def _note_model_result(journal, task, step_id: str, request_digest: str) -> None:
+    sink = _result_sink.get()
+    if sink is not None and journal is not None and task and step_id:
+        sink.update(journal=journal, task=task, step_id=step_id,
+                    request_digest=request_digest)
+
+
+async def reject_model_result(sink: dict) -> bool:
+    """Mark the captured answer unusable; True when a journal row changed."""
+    journal = sink.get("journal")
+    if journal is None:
+        return False
+    return await asyncio.to_thread(journal.reject_result, sink["task"][0], sink["task"][1],
+                                   sink["step_id"], sink["request_digest"])
+
+
 @contextmanager
 def model_operation(namespace: str, operation_id: str):
     """Bind paid substeps to a durable business operation identity.
@@ -601,7 +638,7 @@ def gateway_token() -> str:
 
 
 def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
-                                     thinking_disabled: bool = True) -> Any:
+                                     thinking_disabled: bool = True, queue_transport=None) -> Any:
     """Inject a durable operation-derived key and optional local throttle.
 
     The SDK client is always constructed with ``max_retries=0``.  Therefore the
@@ -695,7 +732,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                         request_digest=request_digest,
                         business_key=str(kwargs.get("model") or gateway_model()),
                         base_key=key, deadline_seconds=MIN_CLIENT_TIMEOUT_SEC,
-                        stage=_model_stage.get(), execution_id=resume.get("execution_id"))
+                        stage=_model_stage.get(), execution_id=resume.get("execution_id"),
+                        queue_owned=queue_transport is not None)
                     headers["Idempotency-Key"] = key
                     resume["consumed"] = True
                     reserved_by_grant = True
@@ -712,7 +750,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
         inflight[key] = future
         prepared = False
         try:
-            if min_interval > 0:
+            if min_interval > 0 and queue_transport is None:
                 async with throttle_lock:
                     wait = min_interval - (time.monotonic() - last_call["at"])
                     if wait > 0:
@@ -723,7 +761,7 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     key=key, business_key=str(kwargs.get("model") or gateway_model()),
                     source_description=task[0], source_obs_id=task[1],
                     step_id=step_id, request_digest=request_digest,
-                    stage=_model_stage.get(),
+                    stage=_model_stage.get(), queue_owned=queue_transport is not None,
                 )
                 if cached_result is not None:
                     from anthropic.types import Message
@@ -733,12 +771,13 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     repair_structured_envelopes(result, kwargs.get("tools"))
                     if resume is not None:
                         resume["cached_pending"].discard(step_id)
+                    _note_model_result(journal, task, step_id, request_digest)
                     future.set_result(result)
                     return result
                 prepared = True
             elif reserved_by_grant:
                 prepared = True
-            if journal and prepared:
+            if journal and prepared and queue_transport is None:
                 # Commit the local HTTP-start boundary before entering the SDK.
                 # A crash/timeout after this point is one failed business
                 # model attempt once the maximum timeout expires, even when
@@ -747,7 +786,17 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             wire_token = (_wire_attempt.set((key, step_id))
                           if journal and task else None)
             try:
-                result = await _create_with_admission_retry(original_create, args, kwargs)
+                if queue_transport is not None:
+                    if args:
+                        raise RuntimeError('queue transport requires named parameters')
+                    async def record_wire(digest):
+                        if journal and task:
+                            await asyncio.to_thread(journal.record_gateway_step,
+                                *task, key, digest, digest,
+                                mailbox_step_id=resume.get("gateway_step_id") if reserved_by_grant else None)
+                    result = await queue_transport(key, kwargs, task, record_wire)
+                else:
+                    result = await _create_with_admission_retry(original_create, args, kwargs)
             finally:
                 if wire_token is not None:
                     _wire_attempt.reset(wire_token)
@@ -756,12 +805,22 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
             note_offscript_if_missing_tool_use(kwargs, result)
             if journal and prepared:
                 await asyncio.to_thread(journal.complete, key, result.model_dump_json())
+                _note_model_result(journal, task, step_id, request_digest)
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
             raise
         except Exception as exc:
-            if journal and prepared:
+            from utils.gateway_queue import QueueOutcomeError, QueueRetryWithNewKey
+            if journal and prepared and isinstance(exc, QueueRetryWithNewKey):
+                # A settled failure with no model result (provider 429/5xx
+                # answer, queue expiry, cancelled before running): the gateway
+                # says retry under a new key. Record it as "no model call" (the
+                # same accounting as a pre-provider refusal), not reconciliation.
+                await asyncio.to_thread(journal.update_gateway_status, key, {
+                    "phase": "failed", "provider_call_started": False,
+                    "http_status": exc.status_code})
+            elif journal and prepared and (queue_transport is None or isinstance(exc, QueueOutcomeError)):
                 try:
                     status = await asyncio.to_thread(
                         query_gateway_attempt_status, gateway_base_url(), gateway_token(),
@@ -769,6 +828,8 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                     )
                 except Exception:
                     status = {"phase": "unknown", "provider_call_started": None}
+                if isinstance(exc, QueueOutcomeError) and exc.job['state'] == 'failed':
+                    status = {**status, 'phase': 'failed'}
                 reconciliation = await asyncio.to_thread(journal.update_gateway_status, key, status)
                 if reconciliation.provider_call_started is not False:
                     exc = reconciliation
@@ -833,6 +894,13 @@ def create_gateway_client(*, timeout: float | None = None, min_interval: float =
         timeout=timeout,
         http_client=wire_client,
     )
+    async def queued_transport(key, kwargs, task, record_wire):
+        from utils.gateway_queue import execute_queued, request_body
+        return await execute_queued(base_url, auth_token, key, request_body(kwargs),
+            task_ids=[task_uuid(*task)] if task else None,
+            scenario=kwargs['extra_headers'].get('X-Model-Gateway-Scenario', 'unclassified'),
+            before_submit=record_wire)
     return install_gateway_request_contract(
-        client, min_interval=min_interval, thinking_disabled=thinking_disabled
+        client, min_interval=min_interval, thinking_disabled=thinking_disabled,
+        queue_transport=queued_transport,
     )

@@ -39,8 +39,10 @@ def judge(lag, backlog_age_s, stamp_age_s=None, sync_runs=0):
         @staticmethod
         def stat():
             return type("S", (), {"st_mtime": time.time() - (stamp_age_s or 0)})()
-    orig_stamp, orig_log = P.SYNC_STAMP, P.SYNC_LOG
+    orig_stamp, orig_log, orig_marker = P.SYNC_STAMP, P.SYNC_LOG, P.DUAL_MARKER
     P.SYNC_STAMP = _Stamp
+    # 单源判据：本机若真有双源标记，不能让它混进来。
+    P.DUAL_MARKER = Path("/nonexistent/claude-mem-dual-active.json")
     # 同步器在积压窗口内"真正执行了几次"是第四轮判据的核心维度：
     # 墙钟时长在可休眠设备上不代表机会次数（笔记本睡着时任务根本不触发）。
     if sync_runs:
@@ -57,7 +59,7 @@ def judge(lag, backlog_age_s, stamp_age_s=None, sync_runs=0):
         return P.probe_sync(local_max, "dummy-host")["state"]
     finally:
         P.sh, P.sqlite3.connect = orig_sh, orig_connect
-        P.SYNC_STAMP, P.SYNC_LOG = orig_stamp, orig_log
+        P.SYNC_STAMP, P.SYNC_LOG, P.DUAL_MARKER = orig_stamp, orig_log, orig_marker
 
 
 CASES = [
@@ -75,6 +77,8 @@ CASES = [
     (41,  66*M,   66*M,   P.AMBER, "★同样积压 66 分钟，但同步器只跑了 1 次(机器在睡) → 不告警", 1),
     (41,  66*M,   66*M,   P.AMBER, "★同样积压 66 分钟，同步器一次都没轮到 → 不告警", 0),
     (10,  None,   50*M,   P.AMBER, "算不出等待时长(库读不到) → 留意但不告警，不猜"),
+    # ↓ 2026-10-08：双源切换后探针一直拿冻结的旧库比 NAS，落差 -9205 照样绿。
+    (-9205, None, 10*M,   P.RED,   "★负落差：比错了库，判据失效必须出声"),
 ]
 ok = fail = 0
 for case in CASES:
@@ -85,5 +89,81 @@ for case in CASES:
     ok, fail = (ok + 1, fail) if got == want else (ok, fail + 1)
     ba = "—" if bage is None else f"{bage//60}分"
     print(f"  {mark} 落差{lag:>4} / 积压{ba:>4} / 同步器跑{runs}次 → {got:<5} (期望 {want:<5}) {why}")
+
+
+# ── 双源采集：真实 SQLite 临时库，判据走 probe_sync 真实路径 ──────────────
+import json, sqlite3, tempfile
+
+
+def dual_judge(*, unmerged_age_s, aggregate_ahead=0, log_lines=(), break_aggregate=False):
+    """legacy + next 两个源并入聚合库；next 在游标之后还有未合并的行。"""
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        now_ms = time.time() * 1000.0
+        dbs = {}
+        for name in ("legacy", "next", "aggregate"):
+            dbs[name] = root / f"{name}.db"
+            con = sqlite3.connect(dbs[name])
+            con.execute("CREATE TABLE observations (id INTEGER PRIMARY KEY, created_at_epoch INTEGER)")
+            con.commit(); con.close()
+        def add(name, ids, age_s):
+            con = sqlite3.connect(dbs[name])
+            con.executemany("INSERT INTO observations VALUES (?,?)",
+                            [(i, now_ms - age_s * 1000.0) for i in ids])
+            con.commit(); con.close()
+        add("legacy", range(1, 11), 86400)
+        add("next", range(1, 6), 86400)
+        add("aggregate", range(1, 16 + aggregate_ahead), 3600)
+        if unmerged_age_s is not None:
+            add("next", range(6, 9), unmerged_age_s)
+        con = sqlite3.connect(dbs["aggregate"])
+        con.execute("CREATE TABLE source_cursor (name TEXT, last_id INTEGER)")
+        con.executemany("INSERT INTO source_cursor VALUES (?,?)", [("legacy", 10), ("next", 5)])
+        con.commit(); con.close()
+        if break_aggregate:
+            dbs["aggregate"].write_bytes(b"not a database")
+        config = root / "sources.json"
+        config.write_text(json.dumps({"sources": [
+            {"name": "legacy", "path": str(dbs["legacy"])},
+            {"name": "next", "path": str(dbs["next"])}]}))
+        marker = root / "dual-active.json"
+        marker.write_text(json.dumps({"source_config": str(config)}))
+        log = root / "sync.out.log"
+        log.write_text("\n".join(log_lines))
+        saved = (P.DUAL_MARKER, P.AGGREGATE_DB, P.SYNC_LOG, P.SYNC_STAMP, P.sh)
+        P.DUAL_MARKER, P.AGGREGATE_DB, P.SYNC_LOG = marker, dbs["aggregate"], log
+        P.SYNC_STAMP = root / "missing.stamp"
+        P.sh = lambda *a, **k: ("ok@@15", None)       # NAS 与聚合库同步到 15
+        try:
+            return P.probe_sync(None, "dummy-host")
+        finally:
+            P.DUAL_MARKER, P.AGGREGATE_DB, P.SYNC_LOG, P.SYNC_STAMP, P.sh = saved
+
+
+def lines(n, text, age_s):
+    base = time.time() - age_s + 60
+    return [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base + i * 60)) + " " + text
+            for i in range(n)]
+
+
+FENCED = "skip: legacy-only sync fenced by dual capture activation"
+FAILED = "FAIL 双源合并失败（原因见 claude-mem-sync.err.log）"
+DUAL_CASES = [
+    (dict(unmerged_age_s=None), P.GREEN, "两源都已并入、聚合库与 NAS 一致 → 健康"),
+    (dict(unmerged_age_s=3 * 3600, log_lines=lines(4, FAILED, 3 * 3600)), P.RED,
+     "★10-03 实况：合并连续失败，聚合库=NAS，但源里有 3 条等了 3 小时"),
+    (dict(unmerged_age_s=3 * 3600, log_lines=lines(9, FENCED, 3 * 3600)), P.AMBER,
+     "★同样卡 3 小时，日志里只有被隔离的旧作业行 → 不算同步机会，不告警"),
+    (dict(unmerged_age_s=4 * 60), P.GREEN, "新观测刚产生、尚未到合并周期 → 健康"),
+    (dict(unmerged_age_s=None, aggregate_ahead=2, log_lines=lines(5, "推送失败", 3600)),
+     P.RED, "聚合库领先 NAS 且同步器跑了 5 次 → 推送卡住"),
+    (dict(unmerged_age_s=None, break_aggregate=True), P.RED, "聚合库读不到 → 判据失去比对对象"),
+]
+for kwargs, want, why in DUAL_CASES:
+    node = dual_judge(**kwargs)
+    got = node["state"]
+    mark = "✅" if got == want else "❌"
+    ok, fail = (ok + 1, fail) if got == want else (ok, fail + 1)
+    print(f"  {mark} 双源 → {got:<5} (期望 {want:<5}) {why}｜{node.get('detail', '')[:90]}")
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

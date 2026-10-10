@@ -15,6 +15,33 @@ from utils.graphiti_stage_adapter import StageArtifactStore, inspect_started_gra
 _current = ContextVar("ingest_workflow", default=None)
 log = logging.getLogger("kg_hub.ingest_workflow")
 
+PLAN_OPERATION = "business-task"
+
+
+def plan_operation(epoch):
+    """Each attempt owns its plan; a retry gets a new epoch and must not collide.
+
+    Plans used to share one key per observation while the digest included the
+    epoch, so every retry hit "graphiti stage input drift" and fell back to
+    extracting inside the global writer lock (2026-10-08: 367 of 381 tasks).
+    """
+    return PLAN_OPERATION if epoch is None else f"{PLAN_OPERATION}@{epoch}"
+
+
+def locate_plan(store, sd, sid, epoch):
+    """Return (operation, digest, plan) of this attempt's plan, or None."""
+    operation = plan_operation(epoch)
+    located = store.locate(sd, sid, operation, "task_plan")
+    if located is not None:
+        return (operation, *located)
+    if operation == PLAN_OPERATION:
+        return None
+    # Plans written before per-attempt keys still count for their own epoch.
+    legacy = store.locate(sd, sid, PLAN_OPERATION, "task_plan")
+    if legacy is not None and legacy[1].get("epoch") == epoch:
+        return (PLAN_OPERATION, *legacy)
+    return None
+
 
 def current_workflow():
     return _current.get()
@@ -47,8 +74,13 @@ def open_workflow(body, reference_time, epoch, route, journal_factory):
         digest = stable_operation_id(
             body.name, body.episode_body, body.source_description,
             body.source_obs_id, reference_time.isoformat(), epoch, route)
+        operation = plan_operation(epoch)
+        located = locate_plan(store, body.source_description, body.source_obs_id, epoch)
+        if located is not None:
+            # A drifted input for the same attempt still fails closed below.
+            operation = located[0]
         plan = store.save_or_load(
-            body.source_description, body.source_obs_id, "business-task", digest,
+            body.source_description, body.source_obs_id, operation, digest,
             "task_plan", {
                 "name": body.name, "source_description": body.source_description,
                 "source_obs_id": body.source_obs_id, "epoch": epoch, "route": route,
@@ -56,7 +88,8 @@ def open_workflow(body, reference_time, epoch, route, journal_factory):
                 "reference_time": reference_time.isoformat(),
                 "parent_uuid": str(uuid.uuid4()) if route in {"split", "catalog"} else None,
             })
-        workflow = {"store": store, "plan": plan, "digest": digest}
+        workflow = {"store": store, "plan": plan, "digest": digest,
+                    "operation": operation}
     except Exception:
         if manual_resume_stage() is not None:
             raise
@@ -70,7 +103,7 @@ def split_observations(new_value=None, *, step_ids=()):
         return new_value
     plan = workflow["plan"]
     saved = workflow["store"].save_or_load(
-        plan["source_description"], plan["source_obs_id"], "business-task",
+        plan["source_description"], plan["source_obs_id"], workflow["operation"],
         workflow["digest"], "split_observations",
         {"observations": new_value, "model_step_ids": sorted(step_ids)}
         if new_value is not None else None)
@@ -91,10 +124,11 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
         return None
     store = await asyncio.to_thread(StageArtifactStore, journal.path)
     sd, sid = row.get("source_description"), row.get("source_obs_id")
-    located = await asyncio.to_thread(store.locate, sd, sid, "business-task", "task_plan")
+    epoch = row.get("execution_epoch") or row.get("created_at")
+    located = await asyncio.to_thread(locate_plan, store, sd, sid, epoch)
     if located is None:
         return None
-    digest, plan = located
+    operation, digest, plan = located
     parent = plan.get("parent_uuid")
     operations = []
     if parent:
@@ -110,7 +144,7 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
         row["episode_uuid"] = parent
     if plan["route"] == "split":
         observations = await asyncio.to_thread(
-            store.save_or_load, sd, sid, "business-task", digest, "split_observations")
+            store.save_or_load, sd, sid, operation, digest, "split_observations")
         if not observations:
             return False
         for index, obs in enumerate(observations["observations"], 1):
@@ -121,7 +155,7 @@ async def verify_task_plan(driver, journal, row, *, observation_body):
     elif plan["route"] == "episode":
         # The exact operation ID is recorded before its first Graphiti call.
         link = await asyncio.to_thread(
-            store.save_or_load, sd, sid, "business-task", digest, "episode_operation")
+            store.save_or_load, sd, sid, operation, digest, "episode_operation")
         if not link:
             return False
         operations.append(link["operation_id"])

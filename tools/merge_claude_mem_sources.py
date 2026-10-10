@@ -22,8 +22,21 @@ def ro(path):
 def cols(db, table):
     return [r['name'] for r in db.execute('PRAGMA table_info(' + table + ')')]
 
-def insert(db, table, row):
-    names = list(row)
+def check_schema(db, reader, table):
+    """The aggregate schema is the NAS consumer contract and never changes here.
+
+    A source may append columns (claude-mem 13.32 added sdk_sessions.cwd and
+    observations.occurrence_count among others); they are not copied, so the
+    NAS replica keeps applying incremental deltas. A missing or retyped
+    aggregate column still fails closed.
+    """
+    types = {r['name']: r['type'] for r in reader.execute('PRAGMA table_info(' + table + ')')}
+    for r in db.execute('PRAGMA table_info(' + table + ')'):
+        if types.get(r['name']) != r['type']:
+            raise ValueError('schema mismatch: ' + table)
+
+def insert(db, table, row, keep):
+    names = [n for n in row if n in keep]
     sql = 'INSERT INTO ' + table + ' (' + ','.join('"' + n + '"' for n in names) + ') VALUES (' + ','.join('?' for _ in names) + ')'
     return db.execute(sql, [row[n] for n in names]).lastrowid
 
@@ -65,11 +78,11 @@ def merge(config, output, initialize=False):
                 db.execute('INSERT INTO source_cursor VALUES (?,?,?,?,?)', (source['name'], ordinal, str(Path(source['path']).resolve()), source.get('after_id', 0), source.get('after_id', 0)))
         if {r[0] for r in db.execute('SELECT name FROM source_cursor')} != {s['name'] for s in sources}:
             raise ValueError('source set changed')
+        keep = {table: set(cols(db, table)) for table in TABLES}
         counts = {}
         for index, (source, reader) in enumerate(zip(sources, readers)):
             for table in TABLES:
-                if cols(db, table) != cols(reader, table):
-                    raise ValueError('schema mismatch: ' + table)
+                check_schema(db, reader, table)
             name = source['name']
             cursor = db.execute('SELECT * FROM source_cursor WHERE name=?', (name,)).fetchone()
             if (cursor['ordinal'], cursor['path'], cursor['baseline']) != (index, str(Path(source['path']).resolve()), source.get('after_id', 0)):
@@ -95,13 +108,13 @@ def merge(config, output, initialize=False):
                         if index != 0:
                             sr['content_session_id'] = name + ':' + sr['content_session_id']
                         sr['memory_session_id'] = memory
-                        new_sid = insert(db, 'sdk_sessions', sr)
+                        new_sid = insert(db, 'sdk_sessions', sr, keep['sdk_sessions'])
                         db.execute('INSERT INTO source_session_map VALUES (?,?,?)', (name, old_sid, new_sid))
                 local_id = row.pop('id')
                 if initialize and index == 0:
                     row['id'] = local_id
                 row['memory_session_id'] = memory
-                aggregate_id = insert(db, 'observations', row)
+                aggregate_id = insert(db, 'observations', row, keep['observations'])
                 db.execute('INSERT INTO source_observation_map VALUES (?,?,?)', (name, local_id, aggregate_id))
                 counts[name] += 1
             db.execute('UPDATE source_cursor SET last_id=? WHERE name=?', (high, name))

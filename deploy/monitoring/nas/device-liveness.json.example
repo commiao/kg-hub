@@ -1,7 +1,7 @@
 {
-  "capture_probe_hosts": ["MacBook-Pro-4"],
+  "capture_probe_hosts": ["mac-office"],
   "capture_device_aliases": {
-    "MacBook-Pro-4": ["MacBook Pro (3)", "mac-office"]
+    "mac-office": ["MacBook Pro (3)", "MacBook-Pro-4"]
   },
   "capture_stale_after_min": 30,
   "device_liveness_path": "/device-liveness/tailscale-status.json",

@@ -295,6 +295,33 @@ def check_queue() -> tuple[dict | None, str]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def apply_held_checks(stats: dict, cfg: dict, anomalies: dict, details: dict) -> None:
+    """待核验增长与自动断路两条告警;判据只读 /api/queue_stats。"""
+    # ── 结果未知的任务在堆积(2026-10-10 补的盲区)────────────────
+    # 一次模型调用发出去却拿不到答复,任务进待核验,那次调用可能已经计费。
+    # 10-10 上午供应商约 15 秒空闲断开,每小时约 24 次这样的调用持续了几个
+    # 小时,零告警——是用户看用量图自己发现的。总量里有几千条历史存量,
+    # 看不出「正在变坏」,所以按最近一小时的增量报。
+    held_gate = int(cfg.get("held_growth_per_hour", 5))
+    held_1h = stats.get("needs_reconciliation_last_1h")
+    if held_gate > 0 and isinstance(held_1h, int) and held_1h >= held_gate:
+        anomalies["held_growth"] = True
+        details["held_growth"] = (
+            f"⚠️ 最近 1 小时 {held_1h} 条任务结果未知、进了待核验(阈值 {held_gate}),"
+            "每条都可能白付了一次模型调用。查网关日志里的 ConnectionReset /"
+            " DeadlineExceeded / reconciliation;必要时在拓扑页断开 refinery")
+    details["held_growth:clear"] = "最近 1 小时进待核验的任务已回落到阈值以下"
+    # 自动断路由服务端的 held 激增保护打开(utils/held_surge.py)。人工断开的
+    # 操作员自己知道,不重复报;自动断开必须让人知道,恢复也要人来做。
+    brk = stats.get("model_breaker") or {}
+    if brk.get("tripped") and str(brk.get("by") or "").startswith("auto:"):
+        anomalies["model_breaker_auto"] = True
+        details["model_breaker_auto"] = (
+            f"⛔ kg_hub 模型调用已自动断开:{brk.get('reason') or '(无原因)'}"
+            " → 查明原因后在 /dashboard/topology 恢复")
+    details["model_breaker_auto:clear"] = "kg_hub 模型调用的自动断路已解除"
+
+
 def check_search_probe() -> tuple[str, float, str]:
     """Timed probe of /api/search — exercises the FalkorDB query path.
 
@@ -754,6 +781,8 @@ def main() -> int:
         "capture_probe_stale": False,
         "capture_monitor_unhealthy": False,
         "extraction_failing": False,
+        "held_growth": False,
+        "model_breaker_auto": False,
     }
     details: dict[str, str] = {}
 
@@ -833,6 +862,7 @@ def main() -> int:
                     new_anomalies["capsule_stale"] = _hold_or_release(
                         "capsule_stale", bool(prev_anomalies.get("capsule_stale")),
                         streak, details, "胶囊账龄")
+            apply_held_checks(stats, cfg, new_anomalies, details)
             if isinstance(oldest_age, (int, float)) and oldest_age > STUCK_SECONDS:
                 new_anomalies["stuck_jobs"] = True
                 details["stuck_jobs"] = (

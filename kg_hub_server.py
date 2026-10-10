@@ -56,6 +56,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.routing import Route
@@ -81,6 +82,11 @@ from utils import ingest_budget  # noqa: E402
 from utils import ingest_timing  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
+from utils.gateway_queue import provider_wait  # noqa: E402
+import breakers  # noqa: E402
+from utils.held_surge import HeldSurgeGuard, trip_if_surging  # noqa: E402
+
+_HELD_SURGE = HeldSurgeGuard()
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
 from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
@@ -94,8 +100,8 @@ from model_gateway_client import (  # noqa: E402
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
     offscript_total, stable_operation_id)
 from utils.model_attempt_journal import (
-    NeedsReconciliation, journal_from_backup_env, query_gateway_attempt_status,
-    summarize_attempts,
+    AttemptStatusPacer, NeedsReconciliation, journal_from_backup_env,
+    query_gateway_attempt_status, summarize_attempts,
 )
 from utils.reconciliation_mailbox import BUSINESS_KEY, MailboxStore
 from utils.reconciliation_worker import run_mailbox_cycle, _task_report_data
@@ -447,7 +453,11 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
         code = error.get("code") if isinstance(error, dict) else None
         if code in {"daily_quota_exhausted", "package_quota_exhausted"}:
             return "daily_quota_exhausted"
-        if code in {"rate_limit_exceeded", "concurrency_limit_exceeded"}:
+        # provider_rate_limited: the provider answered 429 (a queue job's
+        # failed/provider_error/429, or credvault #67 holding the route). The
+        # body does not say quota vs. rate; both end the same way here.
+        if code in {"rate_limit_exceeded", "concurrency_limit_exceeded",
+                    "provider_rate_limited"}:
             return "rate_limited"
         return "quota_exhausted"
     # Some Anthropic SDK versions expose a 429 as RateLimitError without a
@@ -476,6 +486,9 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
     # 所以这里改判据:不再问「它说了什么」,而是问「它回了几」。状态码是协议里定死的,
     # 不跟着文案漂(准则 22)。5xx 一律归上游,重试节奏由 1h 清理接管。
     status = getattr(exc, "status_code", None)
+    if status is None:
+        # Queue HTTP calls use httpx, whose status lives on the response.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int) and 500 <= status <= 599:
         # 与 gateway_unavailable 分开:那个是「够不着网关」,这个是「网关活着并回了
         # 一个 5xx」。两者的运维动作不同——把后者报成前者,值班的第一反应会是去重启
@@ -540,6 +553,26 @@ async def update_ingested_key_status(
                 sid=source_obs_id)
         except Exception:  # noqa: BLE001 — 清不掉不影响入图本身
             logger.warning("[ingest] 隔离记录清理失败 sid=%s(非致命)", source_obs_id)
+    # 结果未知(可能已计费)成批出现 = 上游出了问题:自动断开 kg_hub 这一路。
+    # 判定只在这里做一次,三条入图路径都经过本函数。
+    if status == "needs_reconciliation" and error_kind == "model_outcome_unknown":
+        try:
+            tripped = trip_if_surging(_HELD_SURGE, breakers, "kg_hub.entity_extract")
+            if tripped:
+                logger.error("[breaker:auto] kg_hub.entity_extract 已自动断开:%s",
+                             tripped["reason"])
+        except Exception:  # noqa: BLE001 — 保护失灵不能拖垮状态落库
+            logger.exception("[breaker:auto] held surge guard failed (non-fatal)")
+
+
+def _model_breaker_view() -> dict:
+    try:
+        state = breakers.read_state()
+        entry = dict(state["breakers"].get("kg_hub.entity_extract") or {})
+        entry["corrupt"] = bool(state.get("corrupt"))
+        return entry
+    except Exception as exc:  # noqa: BLE001 — 读不到就如实报,不让 stats 整体失败
+        return {"error": type(exc).__name__}
 
 
 async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
@@ -702,8 +735,9 @@ async def health(request: Request) -> JSONResponse:
 async def model_readiness(request: Request) -> JSONResponse:
     """Authenticated, no-charge availability probe for refinery recovery."""
     import httpx
+    from utils.refinery_recovery import GATEWAY_READINESS_TIMEOUT
     try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=GATEWAY_READINESS_TIMEOUT, follow_redirects=False) as client:
             response = await client.get(f"{gateway_base_url()}/health/ready")
             ready = response.status_code == 200 and response.json().get("status") == "ok"
     except Exception:  # no upstream content or credentials in the response
@@ -1003,7 +1037,7 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
         if workflow["plan"]["route"] == "episode":
             await asyncio.to_thread(
                 workflow["store"].save_or_load,
-                task_sd, task_sid, "business-task", workflow["digest"],
+                task_sd, task_sid, workflow["operation"], workflow["digest"],
                 "episode_operation", {"operation_id": operation_id})
         return await add_episode_with_stage_checkpoint(
             graphiti, store=workflow["store"], task_sd=task_sd, task_sid=task_sid,
@@ -1069,9 +1103,15 @@ async def _predigest_extract(graphiti, body: IngestBody, ref_time: datetime,
         return True
     except Exception as exc:  # noqa: BLE001
         logger.exception("[ingest:predigest_llm_failed] name=%s", body.name)
+        # Nothing is written to the graph before the split, so a refusal that
+        # says nothing about this observation is an ordinary retryable error.
+        from utils.task_execution import REFUSED_BEFORE_RESULT
+        refused = classify_extract_error(exc) in REFUSED_BEFORE_RESULT
         await update_ingested_key_status(
-            graphiti, sd, sid, "needs_reconciliation",
-            error_kind="predigest_model_failed", error_message=str(exc))
+            graphiti, sd, sid, "error" if refused else "needs_reconciliation",
+            error_kind=(classify_extract_error(exc) if refused
+                        else "predigest_model_failed"),
+            error_message=str(exc))
         return True
     if not obs_list:
         await update_ingested_key_status(
@@ -1689,6 +1729,9 @@ async def ingest_status(request: Request) -> JSONResponse:
         "error_kind": row.get("error_kind"),
         "predigest_children": row.get("predigest_children"),
         "failed_children": row.get("failed_children"),
+        # Still pending because the gateway holds our model calls for a
+        # provider rate limit: the refinery keeps waiting and sends nothing new.
+        "provider_wait": (provider_wait() if row.get("status") == "pending" else None),
     })
 
 
@@ -1821,6 +1864,10 @@ async def _persisted_business_result(driver, row: dict) -> bool:
                for i in range(1, expected + 1))
 
 
+# One per process: pacing is advisory and safe to forget on restart.
+_attempt_status_pacer = AttemptStatusPacer()
+
+
 async def ingest_reconciliation_check(request: Request) -> JSONResponse:
     """Read model/graph evidence and settle only a proven business outcome."""
     try:
@@ -1865,10 +1912,14 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
             # A malformed durable identity cannot be queried at the gateway.
             # Its explicit failed-list classification happens below.
             continue
+        if not _attempt_status_pacer.due(attempt["idempotency_key"]):
+            # The journal already holds the last answer; it is the evidence.
+            continue
         try:
             evidence = await asyncio.to_thread(
                 query_gateway_attempt_status, gateway_base_url(), gateway_token(),
                 attempt["business_key"], attempt["idempotency_key"])
+            _attempt_status_pacer.observed(attempt["idempotency_key"], evidence)
             await asyncio.to_thread(
                 journal.update_gateway_status, attempt["idempotency_key"], evidence)
         except Exception:
@@ -1913,13 +1964,17 @@ async def ingest_reconciliation_check(request: Request) -> JSONResponse:
                                         reason="business_result_persisted")
             elif (row.get("status") not in {"pending", "running"}
                   and row.get("worker_state") != "running"):
+                from utils.task_execution import REFUSED_BEFORE_RESULT
                 execution_state = ("uncertain" if summary["in_flight"]
                                    or summary["unknown_without_http_evidence"]
+                                   else "deferred" if row.get("status") == "error"
+                                   and row.get("error_kind") in REFUSED_BEFORE_RESULT
                                    else "failed")
                 await asyncio.to_thread(
                     journal.finish_task_execution,
                     sd, sid, execution_id, state=execution_state,
                     reason=("model_call_outcome_unknown" if execution_state == "uncertain"
+                            else "refused_before_result" if execution_state == "deferred"
                             else "business_result_missing"))
         except RuntimeError:
             # A settled execution is immutable; the exact graph receipt may
@@ -2072,7 +2127,9 @@ async def _enqueue_manual_resume(command: dict, task: dict, report: dict,
                 else "manual_retry_running"}
 
     from utils.graphiti_stage_adapter import StageArtifactStore
-    plan = StageArtifactStore(journal.path).locate(sd, sid, "business-task", "task_plan")
+    from utils.ingest_workflow import locate_plan
+    plan = locate_plan(StageArtifactStore(journal.path), sd, sid,
+                       task.get("execution_epoch") or task.get("created_at"))
     if plan is None:
         changed, _, _ = await driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
@@ -2413,6 +2470,7 @@ async def queue_stats(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
     pending = ok = errored = failed = needs_reconciliation = 0
+    needs_reconciliation_last_1h = 0
     reconciliation_samples: list[dict] = []
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
@@ -2448,6 +2506,11 @@ async def queue_stats(request: Request) -> JSONResponse:
                 pass
         elif s == "needs_reconciliation":
             needs_reconciliation += 1
+            try:
+                if updated and datetime.fromisoformat(updated.replace("Z", "+00:00")) > last_hour:
+                    needs_reconciliation_last_1h += 1
+            except Exception:
+                pass
             if len(reconciliation_samples) < 20:
                 reconciliation_samples.append({
                     "source_description": r.get("sd"),
@@ -2474,6 +2537,9 @@ async def queue_stats(request: Request) -> JSONResponse:
         "errored_total": errored,
         "failed_total": failed,
         "needs_reconciliation": needs_reconciliation,
+        # watchdog 按增速报警:总量里有大量历史存量,看总数看不出「正在变坏」。
+        "needs_reconciliation_last_1h": needs_reconciliation_last_1h,
+        "model_breaker": _model_breaker_view(),
         "reconciliation_samples": reconciliation_samples,
         "ok_last_1h": ok_last_1h,
         "errored_last_1h": errored_last_1h,
@@ -5534,9 +5600,27 @@ async def _application_lifespan(app):
     from utils.loop_block_probe import start_probe, stop_probe
     start_probe()
     await _start_reconciliation_mailbox()
+    from utils.gateway_queue import receipt_loop
+    receipt_task = None
     try:
+        if INGEST_BACKUP_PATH:
+            async def verify_queue_business_result(sd, sid):
+                from utils.task_execution import read_task
+                driver = get_status_driver()
+                row = await read_task(driver, sd, sid)
+                if row and await _persisted_business_result(driver, row):
+                    return 'neo4j:ingest:' + str(row.get('episode_uuid') or row.get('created_by_request'))
+                return None
+            receipt_task = asyncio.create_task(receipt_loop(journal_from_backup_env,
+                gateway_base_url(), gateway_token(), verify_result=verify_queue_business_result), name='model-queue-business-receipts')
         yield
     finally:
+        if receipt_task is not None:
+            receipt_task.cancel()
+            try:
+                await receipt_task
+            except asyncio.CancelledError:
+                pass
         await _stop_reconciliation_mailbox()
         await stop_probe()
 
@@ -5600,7 +5684,10 @@ app = Starlette(
         Route("/api/node_neighbors", node_neighbors, methods=["GET"]),
         Route("/api/path_between", path_between, methods=["GET"]),
     ],
-    middleware=[Middleware(BearerAuthMiddleware)],
+    # 看板把数据内联进 HTML，走 Tailscale DERP 中转时每秒只有十几 KB；
+    # Starlette 的 GZip 自动跳过 text/event-stream，不影响流式响应。
+    middleware=[Middleware(GZipMiddleware, minimum_size=1024),
+                Middleware(BearerAuthMiddleware)],
 )
 
 

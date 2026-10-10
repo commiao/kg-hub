@@ -47,6 +47,13 @@ CM_HEALTH = "http://localhost:37701/api/health"
 SYNC_STAMP = HOME / ".kg-hub" / "state" / "claude-mem-synced.obsid"
 SYNC_LOG = HOME / ".kg-hub" / "logs" / "claude-mem-sync.out.log"
 NAS_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
+# 双源采集（2026-09-28 起）：同步发布的是聚合库，不是旧 worker 的库。
+# 此前同步判据一直拿冻结的旧库比 NAS，落差恒为负、恒为绿；10-03 起合并
+# 每轮失败、NAS 冻结 5 天，没有任何告警。
+DUAL_MARKER = HOME / ".kg-hub" / "state" / "claude-mem-dual-active.json"
+AGGREGATE_DB = HOME / ".kg-hub" / "state" / "claude-mem-aggregate.db"
+# 旧单源作业在双源启用后每轮只写这一行就退出，它不是同步机会。
+LEGACY_FENCED = "legacy-only sync fenced"
 
 # 状态枚举。green=健康 / amber=空闲但不算故障 / red=故障 / grey=未配置或不适用
 GREEN, AMBER, RED, GREY = "green", "amber", "red", "grey"
@@ -211,9 +218,10 @@ def probe_tools() -> tuple[list[dict], dict]:
     seen: dict[str, dict] = {}
     stats: dict[str, tuple[int, float | None]] = {}
 
-    if CM_DB.exists():
+    db = active_capture_db()
+    if db.exists():
         try:
-            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=8)
             for src, obs, last_ms in con.execute("""
                 SELECT s.platform_source AS src,
                        COUNT(o.id)       AS obs,
@@ -694,17 +702,18 @@ def probe_worker() -> dict:
 
 def probe_sqlite() -> tuple[dict, int | None]:
     """SQLite 层：WAL 模式下主库 mtime 会骗人，所以三个都量。"""
-    if not CM_DB.exists():
+    db = active_capture_db()
+    if not db.exists():
         return ({"id": "sqlite", "layer": "storage", "label": "SQLite",
-                 "state": RED, "detail": "claude-mem.db 不存在"}, None)
-    wal = CM_DB.with_name(CM_DB.name + "-wal")
+                 "state": RED, "detail": f"{db} 不存在"}, None)
+    wal = db.with_name(db.name + "-wal")
     now = time.time()
-    main_idle = now - CM_DB.stat().st_mtime
+    main_idle = now - db.stat().st_mtime
     wal_idle = (now - wal.stat().st_mtime) if wal.exists() else None
     wal_mb = (wal.stat().st_size / 1048576) if wal.exists() else 0.0
     max_id, mode = None, "?"
     try:
-        con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=8)
         mode = con.execute("PRAGMA journal_mode;").fetchone()[0]
         max_id = con.execute("SELECT MAX(id) FROM observations;").fetchone()[0]
         con.close()
@@ -714,7 +723,7 @@ def probe_sqlite() -> tuple[dict, int | None]:
     # 真正的新鲜度看 WAL（WAL 模式下），不看主库
     eff_idle = wal_idle if (mode == "wal" and wal_idle is not None) else main_idle
     state = GREEN if eff_idle < TOOL_FRESH_S else AMBER
-    detail = (f"journal_mode={mode}｜MAX(obs.id)={max_id}｜"
+    detail = (f"{db.parent.name}/{db.name}｜journal_mode={mode}｜MAX(obs.id)={max_id}｜"
               f"WAL {wal_mb:.1f}MB 更新于 {human_idle(wal_idle)}前｜"
               f"主库 mtime {human_idle(main_idle)}前")
     if mode == "wal" and wal_idle is not None and main_idle - wal_idle > 3600:
@@ -723,6 +732,59 @@ def probe_sqlite() -> tuple[dict, int | None]:
              "state": state, "idle_seconds": int(eff_idle), "idle_human": human_idle(eff_idle),
              "metrics": {"max_obs_id": max_id, "wal_mb": round(wal_mb, 1), "journal_mode": mode},
              "detail": detail}, max_id)
+
+
+def active_capture_db() -> Path:
+    """当前一代采集写入的库。双源启用后旧库不再增长，读它会把工具判成久未使用。
+
+    新一代库从旧库克隆了完整历史（见 claude-mem-sources.json 的 after_id），
+    所以单读它就能得到各工具的完整统计。读不到配置时退回旧库。
+    """
+    if not DUAL_MARKER.exists():
+        return CM_DB
+    try:
+        marker = json.loads(DUAL_MARKER.read_text())
+        sources = json.loads(Path(marker["source_config"]).read_text())["sources"]
+        return Path(sources[-1]["path"])
+    except Exception:  # noqa: BLE001 - 同步节点会单独把读不到配置判红
+        return CM_DB
+
+
+def dual_capture_state() -> dict | None:
+    """双源启用时，返回聚合库水位和各源尚未并入聚合库的行。未启用返回 None。
+
+    合并这一步卡住时聚合库不再增长、NAS 与它保持一致，只看「聚合库 vs NAS」
+    同样是绿的 —— 所以未合并的源行必须单独算进积压。
+    """
+    if not DUAL_MARKER.exists():
+        return None
+    state = {"aggregate_max": None, "unmerged": 0, "unmerged_oldest": None, "error": None}
+    try:
+        marker = json.loads(DUAL_MARKER.read_text())
+        sources = json.loads(Path(marker["source_config"]).read_text())["sources"]
+        con = sqlite3.connect(f"file:{AGGREGATE_DB}?mode=ro", uri=True, timeout=8)
+        try:
+            state["aggregate_max"] = con.execute(
+                "SELECT MAX(id) FROM observations;").fetchone()[0]
+            cursors = dict(con.execute("SELECT name, last_id FROM source_cursor;").fetchall())
+        finally:
+            con.close()
+        for source in sources:
+            src = sqlite3.connect(f"file:{source['path']}?mode=ro", uri=True, timeout=8)
+            try:
+                count, oldest = src.execute(
+                    "SELECT COUNT(*), MIN(created_at_epoch) FROM observations WHERE id > ?;",
+                    (cursors[source["name"]],)).fetchone()
+            finally:
+                src.close()
+            state["unmerged"] += count or 0
+            oldest = _epoch_seconds(oldest)
+            if oldest is not None and (state["unmerged_oldest"] is None
+                                       or oldest < state["unmerged_oldest"]):
+                state["unmerged_oldest"] = oldest
+    except Exception as e:  # noqa: BLE001
+        state["error"] = f"{type(e).__name__}: {e}"[:120]
+    return state
 
 
 def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
@@ -736,6 +798,8 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         """
         runs = 0
         for line in reversed(lines):
+            if dual is not None and LEGACY_FENCED in line:
+                continue           # 被隔离的旧作业每轮都写一行，但它不搬数据
             stamp = line[:19]
             try:
                 moment = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
@@ -746,12 +810,18 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
             runs += 1
         return runs
 
+    dual = dual_capture_state()
+    ref_db = CM_DB
+    if dual is not None:
+        local_max, ref_db = dual["aggregate_max"], AGGREGATE_DB
     last_line = ""
     sync_lines: list[str] = []
     if SYNC_LOG.exists():
         try:
             sync_lines = SYNC_LOG.read_text(errors="replace").splitlines()
-            last_line = sync_lines[-1] if sync_lines else ""
+            active = [l for l in sync_lines
+                      if dual is None or LEGACY_FENCED not in l]
+            last_line = active[-1] if active else ""
         except Exception:  # noqa: BLE001
             pass
     stamp_age = None
@@ -792,6 +862,12 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
                           f"｜ingester 正在读一个坏库，需重传全量（见 T-0033）")
         return node
 
+    if dual is not None and dual["error"]:
+        # 双源已启用却读不到源或聚合库：判据失去比对对象，必须出声。
+        node["state"] = RED
+        node["detail"] = f"读不到双源采集的源库/聚合库（{dual['error']}），无法判断同步是否在走"
+        return node
+
     if nas_max is None:
         # 走到这里说明 ssh 本身没通（或输出格式不对）—— 传输层抖动，暂态。
         node["state"] = AMBER
@@ -799,6 +875,16 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
         return node
 
     lag = (local_max or 0) - nas_max
+    unmerged = dual["unmerged"] if dual is not None else 0
+    node["metrics"]["unmerged_rows"] = unmerged if dual is not None else None
+    if lag < 0:
+        # NAS 不可能比它的来源多：负落差说明比错了库，判据已经失效。
+        node["metrics"]["lag_rows"] = lag
+        node["state"] = RED
+        node["detail"] = (f"落差为负（本机 {local_max} / NAS {nas_max}）：探针比对的不是"
+                          f"同步实际发布的库，无法判断同步是否在走")
+        return node
+    lag += unmerged
     node["metrics"]["lag_rows"] = lag
     node["metrics"]["since_last_sync_s"] = int(stamp_age) if stamp_age else None
 
@@ -807,19 +893,19 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
     backlog_age = None
     if lag > 0:
         try:
-            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
-            row = con.execute(
-                "SELECT MIN(created_at_epoch) FROM observations WHERE id > ?;",
-                (nas_max,)).fetchone()
-            con.close()
-            if row and row[0]:
-                # created_at_epoch 是**毫秒**(claude-mem 用 JS 时间戳)。按秒算会
-                # 得到 -1.78e12 这种负数，被 max(0,..) 夹成 0 → 看起来"刚积压"，
-                # 永远绿灯 —— 又一个"命令成功但语义错"的静默失效。
-                ep = float(row[0])
-                if ep > 1e11:
-                    ep /= 1000.0
-                backlog_age = max(0.0, time.time() - ep)
+            oldest = None
+            if (local_max or 0) > nas_max:
+                con = sqlite3.connect(f"file:{ref_db}?mode=ro", uri=True, timeout=8)
+                row = con.execute(
+                    "SELECT MIN(created_at_epoch) FROM observations WHERE id > ?;",
+                    (nas_max,)).fetchone()
+                con.close()
+                oldest = _epoch_seconds(row[0]) if row else None
+            if dual is not None and dual["unmerged_oldest"] is not None:
+                oldest = (dual["unmerged_oldest"] if oldest is None
+                          else min(oldest, dual["unmerged_oldest"]))
+            if oldest is not None:
+                backlog_age = max(0.0, time.time() - oldest)
         except Exception:  # noqa: BLE001
             backlog_age = None
         # 注意:算不到时**不要**退回 stamp_age —— 那正是本轮要消除的假红来源
@@ -850,7 +936,8 @@ def probe_sync(local_max: int | None, nas_host: str | None) -> dict:
 
     node["idle_seconds"] = int(stamp_age) if stamp_age else None
     node["idle_human"] = human_idle(stamp_age)
-    node["detail"] = (f"落差 {lag} 条（本机 {local_max} / NAS {nas_max}）｜"
+    node["detail"] = (f"落差 {lag} 条（本机 {local_max} / NAS {nas_max}"
+                      + (f"，另有 {unmerged} 条未并入聚合库" if unmerged else "") + "）｜"
                       + (f"积压最久 {human_idle(backlog_age)}｜" if backlog_age else "")
                       + f"上次成功同步 {human_idle(stamp_age)}前｜最后日志：{last_line[-48:]}")
     if runs_since is not None:
