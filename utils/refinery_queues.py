@@ -31,6 +31,12 @@ def sample(source: Path, history: Path, wm: dict, process: str, at: float) -> No
                 counts[kind + "_held"] += 1
             elif oid not in terminal:
                 counts[kind] += 1
+        # Creation-time hourly counts over the whole retention window, recounted
+        # every sample so a delayed Mac→NAS sync back-fills the hours it belongs to.
+        created = db.execute(
+            "SELECT created_at_epoch / 3600000, count(*) FROM observations "
+            "WHERE created_at_epoch >= ? AND created_at_epoch < ? GROUP BY 1",
+            (int(at - RETENTION) // 3600 * 3600000, int(at + 3600) * 1000)).fetchall()
     history.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(history, timeout=2)) as db, db:
         db.execute("CREATE TABLE IF NOT EXISTS samples (at REAL PRIMARY KEY, "
@@ -45,6 +51,16 @@ def sample(source: Path, history: Path, wm: dict, process: str, at: float) -> No
                    f"VALUES ({','.join('?' * len(_COLUMNS))})",
                    (at, process, boundary, *(counts[c] for c in _COLUMNS[3:])))
         db.execute("DELETE FROM samples WHERE at < ?", (at - RETENTION,))
+        db.execute("CREATE TABLE IF NOT EXISTS created_hourly ("
+                   "hour INTEGER PRIMARY KEY, count INTEGER NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS created_meta ("
+                   "id INTEGER PRIMARY KEY CHECK (id = 1), sampled_at REAL NOT NULL, "
+                   "first_hour INTEGER NOT NULL)")
+        first_hour = int(at - RETENTION) // 3600
+        # The recount covers the whole window; anything older ages out.
+        db.execute("DELETE FROM created_hourly")
+        db.executemany("INSERT INTO created_hourly VALUES (?, ?)", created)
+        db.execute("INSERT OR REPLACE INTO created_meta VALUES (1, ?, ?)", (at, first_hour))
 
 
 def read(history: Path, now: float) -> list[dict]:
@@ -70,3 +86,21 @@ def read(history: Path, now: float) -> list[dict]:
                     (previous[kind] - row[kind]) * 3600 / (row["at"] - previous["at"]), 1)
         previous = row
     return rows
+
+
+def read_created(history: Path) -> dict | None:
+    """Hourly new-observation counts by claude-mem creation time (UTC epoch hours).
+
+    Hours inside [first_hour, sampled_at] without a row are a real zero; None
+    means the sampler has never written this table."""
+    if not history.exists():
+        return None
+    with closing(sqlite3.connect(f"file:{history}?mode=ro", uri=True, timeout=2)) as db:
+        try:
+            meta = db.execute("SELECT sampled_at, first_hour FROM created_meta").fetchone()
+            rows = db.execute("SELECT hour, count FROM created_hourly").fetchall()
+        except sqlite3.OperationalError:
+            return None
+    if not meta:
+        return None
+    return {"sampled_at": meta[0], "first_hour": meta[1], "hours": dict(rows)}

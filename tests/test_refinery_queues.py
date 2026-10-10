@@ -21,8 +21,9 @@ class QueueTests(unittest.TestCase):
         self.source = Path(self.tmp.name) / "source.db"
         self.history = Path(self.tmp.name) / "queue-remaining.sqlite3"
         with closing(sqlite3.connect(self.source)) as db, db:
-            db.execute("CREATE TABLE observations (id INTEGER PRIMARY KEY)")
-            db.executemany("INSERT INTO observations VALUES (?)", [(x,) for x in (1, 4, 9, 11, 50, 99)])
+            db.execute("CREATE TABLE observations (id INTEGER PRIMARY KEY, "
+                       "created_at_epoch INTEGER NOT NULL DEFAULT 0)")
+            db.executemany("INSERT INTO observations (id) VALUES (?)", [(x,) for x in (1, 4, 9, 11, 50, 99)])
         self.wm = dict(boundary_id=10, live_cursor=50, ingested={1, 11}, rejected=set(),
                        held={9}, failed=set())
         self.now = 1790946000
@@ -40,7 +41,7 @@ class QueueTests(unittest.TestCase):
         self.sample()
         self.wm["ingested"].add(50)
         with closing(sqlite3.connect(self.source)) as db, db:
-            db.executemany("INSERT INTO observations VALUES (?)", [(110,), (120,)])
+            db.executemany("INSERT INTO observations (id) VALUES (?)", [(110,), (120,)])
         self.sample(self.now + 120)
         row = Q.read(self.history, self.now + 120)[-1]
         self.assertEqual(row["live"], 3)
@@ -53,11 +54,11 @@ class QueueTests(unittest.TestCase):
     def test_delayed_sync_landing_at_once_is_a_burst_not_a_rate(self):
         self.sample()
         with closing(sqlite3.connect(self.source)) as db, db:
-            db.executemany("INSERT INTO observations VALUES (?)",
+            db.executemany("INSERT INTO observations (id) VALUES (?)",
                            [(x,) for x in range(1000, 1000 + Q.BURST_ROWS)])
         self.sample(self.now + 120)
         with closing(sqlite3.connect(self.source)) as db, db:
-            db.execute("INSERT INTO observations VALUES (5000)")
+            db.execute("INSERT INTO observations (id) VALUES (5000)")
         self.sample(self.now + 240)
         burst, after = Q.read(self.history, self.now + 240)[1:]
         self.assertEqual(burst["live"], 2 + Q.BURST_ROWS)
@@ -125,6 +126,46 @@ class QueueTests(unittest.TestCase):
         data = F.claude_mem_trends([dict(claude_mem_queue=dict(history=points, sampled_at=self.now+240))],
                                  datetime.fromtimestamp(self.now+240, timezone.utc))[0]
         self.assertIsNone(data["rows"][-1]["current_rate"])
+
+    def test_created_counts_by_creation_hour_and_backfill_delayed_sync(self):
+        hour = int(self.now) // 3600
+        def add(oid, h, offset=10):
+            with closing(sqlite3.connect(self.source)) as db, db:
+                db.execute("INSERT INTO observations VALUES (?, ?)", (oid, h * 3600000 + offset))
+        add(200, hour - 1)
+        add(201, hour - 1, 999)
+        add(202, hour)
+        add(203, hour - Q.RETENTION // 3600 - 2)  # outside retention
+        self.sample()
+        self.assertEqual(Q.read_created(self.history)["hours"], {hour - 1: 2, hour: 1})
+        # A delayed sync lands a row created three hours ago: it fills that hour.
+        add(204, hour - 3)
+        self.sample(self.now + 120)
+        data = Q.read_created(self.history)
+        self.assertEqual(data["hours"], {hour - 3: 1, hour - 1: 2, hour: 1})
+        self.assertEqual(data["sampled_at"], self.now + 120)
+        self.assertIsNone(Q.read_created(self.history.with_name("missing")))
+
+    def test_dashboard_buckets_unknown_vs_zero(self):
+        hour = int(self.now) // 3600
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.executemany("INSERT INTO observations VALUES (?, ?)",
+                           [(300, (hour - 1) * 3600000 + 10), (301, (hour - 1) * 3600000 + 20)])
+        self.sample()
+        now = datetime.fromtimestamp(self.now, timezone.utc)
+        start = datetime.fromtimestamp((hour - 3) * 3600, timezone.utc)
+        out = F.claude_mem_created(self.history, start, now, now)
+        self.assertEqual([r["count"] for r in out["rows"]], [0, 0, 2])
+        self.assertEqual((out["total"], out["granularity"], out["stale"]), (2, "hour", False))
+        # After the last sample the hour is unknown, not zero.
+        later = datetime.fromtimestamp((hour + 2) * 3600 + 5, timezone.utc)
+        out = F.claude_mem_created(self.history, start, later, later)
+        self.assertEqual([r["count"] for r in out["rows"]][-2:], [None, None])
+        self.assertTrue(out["stale"])
+        week = F.claude_mem_created(self.history, now - F.timedelta(days=7), now, now)
+        self.assertEqual(week["granularity"], "day")
+        self.assertEqual(week["total"], 2)
+        self.assertEqual(F.claude_mem_created(self.history.with_name("x"), start, now, now)["total"], None)
 
 
 if __name__ == "__main__":
