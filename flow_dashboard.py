@@ -614,6 +614,35 @@ def refinery_queue_trends(path: Path, now: datetime) -> dict:
             "stale": latest is None or (now - _parse_ts(latest["at"])).total_seconds() > 600}
 
 
+def claude_mem_created(path: Path, start: datetime, end: datetime,
+                       now: datetime) -> dict:
+    """所选范围内 claude-mem 每个时间桶的新增观测（按 claude-mem 创建时间）。
+
+    计数由 refinery 采样时从 NAS 副本整窗重算；采样覆盖之外的小时为未知，
+    覆盖之内无记录的小时是真实的 0。超过 2 天按北京时间自然日分桶。"""
+    from utils import refinery_queues
+    data = refinery_queues.read_created(path)
+    daily = end - start > timedelta(days=2)
+    buckets: dict[str, dict] = {}
+    for hour in range(int(start.timestamp()) // 3600, math.ceil(end.timestamp() / 3600)):
+        at = datetime.fromtimestamp(hour * 3600, timezone.utc)
+        label = _beijing_hour(_hour_key(at))
+        label = label[:10] if daily else label
+        bucket = buckets.setdefault(label, {"at": at.isoformat(), "label": label,
+                                            "count": None, "partial": False})
+        if data and data["first_hour"] <= hour and hour * 3600 <= data["sampled_at"]:
+            bucket["count"] = (bucket["count"] or 0) + data["hours"].get(hour, 0)
+        else:
+            bucket["partial"] = True
+    rows = list(buckets.values())
+    known = [r["count"] for r in rows if r["count"] is not None]
+    sampled = datetime.fromtimestamp(data["sampled_at"], timezone.utc) if data else None
+    return {"rows": rows, "total": sum(known) if known else None,
+            "granularity": "day" if daily else "hour",
+            "sampled_at_beijing": _beijing_time(sampled) if sampled else None,
+            "stale": sampled is None or (now - sampled).total_seconds() > 600}
+
+
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
     """同一 UTC 日：网关 kg-hub 调用次数 ÷ 图内当日新增 Episode。
 
@@ -1248,6 +1277,13 @@ async def collect_flow(range_key: str = "today") -> dict:
     except Exception as exc:
         graph_period = None
         data["source_errors"].append(f"区间入图量不可读：{type(exc).__name__}")
+    try:
+        data["claude_mem_created"] = await asyncio.to_thread(
+            claude_mem_created, REFINERY_STATUS_PATH.with_name("queue-remaining.sqlite3"),
+            start, end, now)
+    except (OSError, sqlite3.Error) as exc:
+        data["claude_mem_created"] = None
+        data["source_errors"].append(f"claude-mem 新增量不可读：{type(exc).__name__}")
     data["time_range"] = window
     data["range_options"] = RANGE_LABELS
     data["period"] = selected_period(status, window, now, trends, commits, graph_period)
@@ -1341,6 +1377,10 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=cards id=cmcards></div>
 <div class=note>队列剩余趋势：所选时间范围，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。数量持平不能说明 worker 是否在正常处理。</div>
 <div class=trend-grid id=cmtrends></div>
+<h3 style="font-size:14px;margin:1rem 0 .3rem">claude-mem · 新增观测</h3>
+<div class=cards id=cmcreatedcards></div>
+<div class=note id=cmcreatednote></div>
+<div id=cmcreated></div>
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
@@ -1441,6 +1481,24 @@ function stack(target,rows,label,parts){const box=$(target);
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
 stack('daily',(Pd.graph||[]).slice().reverse(),r=>r.label.slice(5),[
  ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
+
+const CC=D.claude_mem_created;
+if(!CC){$('cmcreated').innerHTML='<div class=note>暂无数据：refinery 尚未写入新增计数</div>'}
+else{
+ const unit=CC.granularity==='day'?'天':'小时';
+ const known=CC.rows.filter(r=>r.count!==null);
+ const peak=known.reduce((m,r)=>r.count>m.count?r:m,known[0]||{count:null,label:'—'});
+ $('cmcreatedcards').innerHTML=renderCards([
+  [range.label+' · 新增观测',fmt(CC.total),'按 claude-mem 创建时间 · '+known.length+'/'+CC.rows.length+' 个'+unit+'有数'],
+  ['每'+unit+'平均',known.length?Math.round(CC.total/known.length*10)/10:'—','只计有数的时间桶'],
+  ['峰值'+unit,fmt(peak.count),peak.label+' 北京时间'],
+ ]);
+ $('cmcreatednote').textContent='每个'+unit+'内 claude-mem 新产生的观测条数（北京时间分桶，超过2天按自然日）。NAS 副本按创建时间整窗重算，Mac→NAS 同步延迟的观测会补回所属时间桶，最近 15–30 分钟的数可能偏低。采样 '+(CC.sampled_at_beijing||'未知')+(CC.stale?' · 数据过期':'')+'；— 表示该桶不在采样覆盖内（缺测，不是 0），* 表示仅部分覆盖。';
+ stack('cmcreated',CC.rows.slice().reverse(),r=>r.label.slice(5)+(r.partial&&r.count!==null?'*':''),[
+  ['新增',r=>r.count,'#D97706']]);
+ // stack() 把缺测画成 0，这里改回 —
+ CC.rows.slice().reverse().forEach((r,i)=>{if(r.count===null){const c=$('cmcreated').children[i]?.querySelector('.c');if(c)c.textContent='新增 —'}});
+}
 
 const processingData=[
  {title:'backlog 处理去向（每小时，非净速度）',unit:' 条',rows:(Pd.hourly||[]).map(r=>({
