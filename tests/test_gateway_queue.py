@@ -38,7 +38,9 @@ class QueueClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(QueueOutcomeError if state=='reconciliation' else TimeoutError):
                 await execute_queued('http://model-gateway:39000','token','k',BODY,
                     transport=httpx.MockTransport(handle),wait_seconds=0)
-            self.assertEqual(seen,['/v1/queue/submit'])
+            # Giving up asks the gateway to withdraw the job; it never resubmits.
+            self.assertEqual(seen,['/v1/queue/submit'] if state=='reconciliation'
+                             else ['/v1/queue/submit','/v1/queue/cancel'])
 
     def test_extra_body_and_transport_parameters(self):
         body=request_body({**BODY,'extra_headers':{'Authorization':'secret'},

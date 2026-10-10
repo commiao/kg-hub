@@ -251,8 +251,13 @@ def is_local_admission_rejection(exc: BaseException) -> bool:
         return False
     body = getattr(exc, "body", None)
     error = body.get("error") if isinstance(body, dict) else None
-    return (isinstance(error, dict)
-            and error.get("code") == "cost_limit_exceeded"
+    if not isinstance(error, dict):
+        return False
+    # The gateway's unified result mapping (credvault #68) states it directly;
+    # the localized message check stays only for gateways that predate it.
+    if "disposition" in error:
+        return error.get("disposition") == "retry" and error.get("same_key") is True
+    return (error.get("code") == "cost_limit_exceeded"
             and error.get("message") in _ADMISSION_REJECTION_MESSAGES)
 
 
@@ -772,14 +777,15 @@ def install_gateway_request_contract(client: Any, *, min_interval: float = 0.0,
                 future.cancel()
             raise
         except Exception as exc:
-            from utils.gateway_queue import QueueOutcomeError, QueueProviderRefused
-            if journal and prepared and isinstance(exc, QueueProviderRefused):
-                # The provider's 429 is a settled outcome: no answer, no charge.
-                # Record it as "no model call" (the same accounting as a
-                # pre-provider refusal) instead of asking reconciliation.
+            from utils.gateway_queue import QueueOutcomeError, QueueRetryWithNewKey
+            if journal and prepared and isinstance(exc, QueueRetryWithNewKey):
+                # A settled failure with no model result (provider 429/5xx
+                # answer, queue expiry, cancelled before running): the gateway
+                # says retry under a new key. Record it as "no model call" (the
+                # same accounting as a pre-provider refusal), not reconciliation.
                 await asyncio.to_thread(journal.update_gateway_status, key, {
                     "phase": "failed", "provider_call_started": False,
-                    "http_status": 429})
+                    "http_status": exc.status_code})
             elif journal and prepared and (queue_transport is None or isinstance(exc, QueueOutcomeError)):
                 try:
                     status = await asyncio.to_thread(
