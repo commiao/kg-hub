@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 import time
+from urllib.error import HTTPError
 
 from utils.model_attempt_journal import summarize_attempts
 from utils.reconciliation_mailbox import (
@@ -21,6 +22,13 @@ log = logging.getLogger("kg_hub.reconciliation")
 REPLAYABLE_GRAPHITI_STAGES = frozenset({
     "node_extraction", "node_resolution", "edge_phase", "attribute_phase", "predigest_split",
 })
+
+
+def _error_detail(exc: HTTPError) -> str:
+    try:
+        return exc.read(300).decode("utf-8", "replace").replace("\n", " ")
+    except Exception:
+        return ""
 
 
 def _reason(value: object, fallback: str = "business_state_unknown") -> str:
@@ -358,7 +366,18 @@ async def run_mailbox_cycle(*, driver, store: MailboxStore, journal, check_task,
     for report in await asyncio.to_thread(store.all_reports):
         if sent_versions.get(report["task_id"]) == report["version"]:
             continue
-        await asyncio.to_thread(mailbox_post, base_url, token, "report", report)
+        try:
+            await asyncio.to_thread(mailbox_post, base_url, token, "report", report)
+        except HTTPError as exc:
+            if not 400 <= exc.code < 500:
+                raise
+            # The gateway refused this exact version (2026-10-11: one "stale
+            # task report" 400 aborted every cycle -- the reports after it and
+            # the human-command claim never ran -- and logged a full traceback
+            # every ~12s). Resending the same version cannot succeed; a new
+            # version is sent again.
+            log.warning("[mailbox:report_rejected] task=%s version=%s http=%s detail=%s",
+                        report["task_id"], report["version"], exc.code, _error_detail(exc))
         sent_versions[report["task_id"]] = report["version"]
     response = await asyncio.to_thread(mailbox_post, base_url, token,
                                        "claim", {"business_key": BUSINESS_KEY})
