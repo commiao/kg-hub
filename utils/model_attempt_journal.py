@@ -25,6 +25,15 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Every connection to model-attempts.sqlite3 (this journal, the stage artifact
+# store, journal_prune) uses this. 2026-10-11, user decision (T-0234): NORMAL.
+# In WAL mode NORMAL is still atomic and still durable across a process crash;
+# only an OS crash or power loss can roll back the last commits before the next
+# checkpoint. FULL paid one fsync per commit on the NAS spinning disk
+# (0.6-1.9s measured), in the event loop and in every disk-write queue.
+JOURNAL_SYNCHRONOUS = "NORMAL"
+
+
 class NeedsReconciliation(RuntimeError):
     """A model request has no usable local result; automatic replay is unsafe."""
 
@@ -139,7 +148,7 @@ class ModelAttemptJournal:
         db = sqlite3.connect(self.path, timeout=15)
         try:
             db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=FULL")
+            db.execute(f"PRAGMA synchronous={JOURNAL_SYNCHRONOUS}")
             with db:
                 yield db
         finally:
