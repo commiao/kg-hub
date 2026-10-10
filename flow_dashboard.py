@@ -614,6 +614,69 @@ def refinery_queue_trends(path: Path, now: datetime) -> dict:
             "stale": latest is None or (now - _parse_ts(latest["at"])).total_seconds() > 600}
 
 
+# 页面只画所选区间，但曾把 30 天、每 2 分钟一条的队列采样整份内联，6h 页面也有
+# 2.1MB，走 DERP 中转时打不开（2026-10-10）。趋势图宽 398px，再多的点也分不出。
+MAX_CHART_POINTS = 720
+
+
+def chart_bucket_seconds(start: datetime, end: datetime) -> int:
+    """Downsampling bucket for 2-minute series; 0 while the range already fits."""
+    from utils import refinery_queues
+    width = int((end - start).total_seconds()) // MAX_CHART_POINTS
+    return width if width > refinery_queues.INTERVAL else 0
+
+
+def _in_window(rows: list[dict], start: datetime, end: datetime) -> list[dict]:
+    # Same half-open window as the page's inRange(), so its filter becomes a no-op.
+    return [r for r in rows if (at := _parse_ts(r.get("at"))) and start <= at < end]
+
+
+def thin_rows(rows: list[dict], bucket: int, rates: tuple[str, ...] = (),
+              bursts: tuple[str, ...] = ()) -> list[dict]:
+    """Keep the last sample per bucket and segment (process/boundary).
+
+    Rates average their bucket and burst refills add up, so a thinned chart still
+    reads the real speed and still marks every delayed sync."""
+    if not bucket:
+        return rows
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (int(_parse_ts(row["at"]).timestamp()) // bucket,
+               row.get("process"), row.get("boundary", row.get("boundary_id")))
+        groups.setdefault(key, []).append(row)
+    thinned = []
+    for group in groups.values():
+        row = dict(group[-1])
+        for field in rates:
+            values = [r[field] for r in group if r.get(field) is not None]
+            row[field] = round(sum(values) / len(values), 1) if values else None
+        for field in bursts:
+            values = [r[field] for r in group if r.get(field) is not None]
+            row[field] = sum(values) if values else None
+        thinned.append(row)
+    return thinned
+
+
+def scope_series(data: dict, start: datetime, end: datetime) -> None:
+    """Cut the inlined trend series down to what the selected range draws."""
+    bucket = chart_bucket_seconds(start, end)
+    queues = data.get("refinery_queue_trends") or {}
+    rows = queues.get("rows") or []
+    # The page splices legacy backlog snapshots in only before the first real
+    # queue sample ever taken, not the first one inside the range.
+    first_at = rows[0]["at"] if rows else None
+    queues.update(first_at=first_at, bucket_seconds=bucket,
+                  rows=thin_rows(_in_window(rows, start, end), bucket,
+                                 rates=("live_rate", "backlog_rate"),
+                                 bursts=("live_burst", "backlog_burst")))
+    first = _parse_ts(first_at) if first_at else None
+    history = [r for r in _in_window(data.get("backlog_remaining_history") or [], start, end)
+               if first is None or _parse_ts(r["at"]) < first]
+    data["backlog_remaining_history"] = thin_rows(history, bucket)
+    for host in data.get("claude_mem_trends") or []:
+        host["rows"] = _in_window(host.get("rows") or [], start, end)
+
+
 def claude_mem_created(path: Path, start: datetime, end: datetime,
                        now: datetime) -> dict:
     """所选范围内 claude-mem 每个时间桶的新增观测（按 claude-mem 创建时间）。
@@ -1271,6 +1334,7 @@ async def collect_flow(range_key: str = "today") -> dict:
                       active=active_extractions(), graph_daily=graph_daily, now=now,
                       source_errors=errors, key_trends=trends,
                       remaining_history=remaining_history, queue_trends=queue_trends)
+    scope_series(data, start, end)
     try:
         graph_period = (await _graph_period(driver, status["boundary_id"], start, end)
                         if status.get("boundary_id") is not None else None)
@@ -1515,14 +1579,14 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
 ['live','backlog'].forEach(k=>{
  let rows=kgQueues.rows||[];
  if(k==='backlog'){
-   const first=rows.length?Date.parse(rows[0].at):Infinity;
+   const first=kgQueues.first_at?Date.parse(kgQueues.first_at):Infinity;
    rows=(D.backlog_remaining_history||[]).filter(r=>Date.parse(r.at)<first).map(r=>({
      at:r.at,label:r.at_beijing,backlog:r.remaining,boundary:r.boundary_id,process:'legacy-snapshot'})).concat(rows);
  }
  const color=k==='live'?'#378ADD':'#8250C4';
- backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',gapMinutes:10,continuity:true,rows:filterRows(rows),
+ backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',gapMinutes:10,bucketSeconds:kgQueues.bucket_seconds,continuity:true,rows:filterRows(rows),
    burst:k+'_burst',series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
- backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,continuity:true,zeroBaseline:true,robust:true,
+ backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,bucketSeconds:kgQueues.bucket_seconds,continuity:true,zeroBaseline:true,robust:true,
    rows:filterRows(kgQueues.rows),burst:k+'_burst',
    series:[['净消化速度',k+'_rate',color]]});
 });
@@ -1571,7 +1635,7 @@ function backlogChart(spec,index){
  const curves=spec.series.map(s=>{
    const pieces=[];let part=[];
    rows.forEach((r,i)=>{
-     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>(spec.gapMinutes||90)*60000
+     const previous=rows[i-1],gap=previous&&(Date.parse(r.at)-Date.parse(previous.at)>Math.max((spec.gapMinutes||90)*60000,(spec.bucketSeconds||0)*2500)
        ||(spec.continuity&&(r.boundary!==previous.boundary||r.process!==previous.process)));
      if(gap&&part.length){pieces.push(part);part=[]}
      if(Number.isFinite(r[s[1]]))part.push(backlogX(spec,r.at).toFixed(1)+','+y(r[s[1]]).toFixed(1));

@@ -56,6 +56,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.routing import Route
@@ -5683,7 +5684,10 @@ app = Starlette(
         Route("/api/node_neighbors", node_neighbors, methods=["GET"]),
         Route("/api/path_between", path_between, methods=["GET"]),
     ],
-    middleware=[Middleware(BearerAuthMiddleware)],
+    # 看板把数据内联进 HTML，走 Tailscale DERP 中转时每秒只有十几 KB；
+    # Starlette 的 GZip 自动跳过 text/event-stream，不影响流式响应。
+    middleware=[Middleware(GZipMiddleware, minimum_size=1024),
+                Middleware(BearerAuthMiddleware)],
 )
 
 

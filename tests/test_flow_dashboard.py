@@ -512,7 +512,116 @@ if(few.low!==-5000)throw Error('too few samples to call an outlier');
         self.assertEqual(period["coverage_h"],.5)
 
 
+def queue_rows(days: int, step: int = 120) -> list[dict]:
+    """Two-minute queue samples ending at NOW, like refinery_queue_trends emits."""
+    start = NOW.timestamp() - days * 86400
+    rows = []
+    for i in range(int(days * 86400 // step)):
+        at = datetime.fromtimestamp(start + i * step, timezone.utc)
+        rows.append({"at": at.isoformat(), "label": F._beijing_time(at), "process": "p1",
+                     "boundary": 13295, "live": 9000 - i % 50, "backlog": 4,
+                     "live_held": 2800, "backlog_held": 927, "live_total": 30000,
+                     "backlog_total": 13280, "live_rate": float(i % 7), "live_burst": None,
+                     "backlog_rate": 0.0, "backlog_burst": None})
+    return rows
+
+
+class ScopeSeriesTests(unittest.TestCase):
+    """2026-10-10: 6h 页面内联了 30 天队列采样（2.1MB），DERP 中转下打不开。"""
+
+    def scoped(self, key: str, rows: list[dict], history=(), hosts=()) -> dict:
+        w = F.time_range(key, NOW)
+        data = {"refinery_queue_trends": {"rows": rows, "latest": rows[-1] if rows else None,
+                                          "stale": False},
+                "backlog_remaining_history": list(history),
+                "claude_mem_trends": [dict(h) for h in hosts]}
+        F.scope_series(data, F._parse_ts(w["start"]), F._parse_ts(w["end"]))
+        return data
+
+    def test_short_range_keeps_only_its_own_samples_untouched(self):
+        rows = queue_rows(30)
+        data = self.scoped("6h", rows)
+        q = data["refinery_queue_trends"]
+        self.assertEqual(q["bucket_seconds"], 0)
+        self.assertEqual(len(q["rows"]), 6 * 30)
+        self.assertEqual(q["rows"], rows[-180:])
+        self.assertEqual(q["first_at"], rows[0]["at"])
+        self.assertIs(q["latest"], rows[-1])
+        self.assertLess(len(json.dumps(data, ensure_ascii=False).encode()), 100_000)
+
+    def test_long_range_fits_the_chart_without_losing_speed_or_refills(self):
+        rows = queue_rows(30)
+        rows[-5]["live_burst"], rows[-4]["live_burst"] = 300, 250
+        data = self.scoped("month", rows)
+        q = data["refinery_queue_trends"]
+        self.assertEqual(q["bucket_seconds"], 3600)
+        self.assertLessEqual(len(q["rows"]), F.MAX_CHART_POINTS + 1)
+        last = q["rows"][-1]
+        # The bucket keeps its last level, averages rates, and sums refills.
+        bucket = [r for r in rows
+                  if int(F._parse_ts(r["at"]).timestamp()) // 3600 == int(F._parse_ts(last["at"]).timestamp()) // 3600]
+        self.assertEqual(last["live"], bucket[-1]["live"])
+        self.assertEqual(last["live_rate"],
+                         round(sum(r["live_rate"] for r in bucket) / len(bucket), 1))
+        self.assertEqual(sum(r["live_burst"] or 0 for r in q["rows"]), 550)
+        self.assertLess(len(json.dumps(data, ensure_ascii=False).encode()), 400_000)
+
+    def test_thinning_never_merges_across_restart_or_boundary(self):
+        rows = queue_rows(1, step=600)[:6]
+        for r in rows[3:]:
+            r["process"] = "p2"
+        thinned = F.thin_rows(rows, 86400, rates=("live_rate",))
+        self.assertEqual([r["process"] for r in thinned], ["p1", "p2"])
+
+    def test_legacy_backlog_snapshots_only_before_the_first_real_sample(self):
+        rows = queue_rows(1)[-60:]                      # real samples: last 2h only
+        history = [{"at": (NOW - timedelta(minutes=m)).isoformat(), "remaining": m,
+                    "boundary_id": "13295"} for m in range(0, 600, 2)]
+        data = self.scoped("6h", rows, history=history)
+        first = F._parse_ts(rows[0]["at"])
+        spliced = data["backlog_remaining_history"]
+        self.assertTrue(spliced)
+        self.assertTrue(all(NOW - timedelta(hours=6) <= F._parse_ts(r["at"]) < first
+                            for r in spliced))
+
+    def test_claude_mem_worker_rows_follow_the_range(self):
+        host = {"host": "mac-office", "rows": [{"at": (NOW - timedelta(hours=h)).isoformat()}
+                                               for h in range(720, 0, -1)]}
+        data = self.scoped("day", [], hosts=[host])
+        self.assertEqual(len(data["claude_mem_trends"][0]["rows"]), 24)
+        self.assertEqual(data["refinery_queue_trends"]["rows"], [])
+        self.assertIsNone(data["refinery_queue_trends"]["first_at"])
+
+    def test_thinned_month_still_draws_lines_not_scattered_dots(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript")
+        w = F.time_range("month", NOW)
+        data = build()
+        data.update(time_range=w, range_options=F.RANGE_LABELS,
+                    period=F.selected_period({}, w, NOW, [], [], None),
+                    refinery_queue_trends={"rows": queue_rows(30), "latest": None, "stale": True})
+        F.scope_series(data, F._parse_ts(w["start"]), F._parse_ts(w["end"]))
+        script = F._HTML.split("<script>")[1].split("</script>")[0].replace("__DATA__", json.dumps(data))
+        harness = """const elements={};
+const element=()=>({innerHTML:'',textContent:'',dataset:{},classList:{toggle(){}},append(){},addEventListener(){}});
+const document={getElementById:id=>elements[id]??=(element()),createElement:element,querySelectorAll:()=>[]};
+const window={};
+"""
+        check = """
+const live=elements.backlogtrends.innerHTML.split('<div class=trend>')[1];
+if((live.match(/<polyline/g)||[]).length!==2)throw Error('expected one line per series');
+if(live.includes('<circle'))throw Error('hour-apart samples broken into dots');
+"""
+        result = subprocess.run(["node", "-e", harness + script + check], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class WiringTests(unittest.TestCase):
+    def test_dashboards_are_gzipped(self):
+        middleware = SERVER.split("app = Starlette(", 1)[1].split("middleware=", 1)[1]
+        self.assertTrue(middleware.lstrip("[ ").startswith("Middleware(GZipMiddleware"))
+
     def test_routes_and_portal_entry_are_registered(self):
         self.assertIn('Route("/dashboard/flow", dashboard_flow', SERVER)
         self.assertIn('Route("/dashboard/flow.json", dashboard_flow_json', SERVER)
