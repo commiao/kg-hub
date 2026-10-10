@@ -207,6 +207,11 @@ services:
       # 盘温预警:DSM 61°C 强制关机且无任何通知(8/16 因此停机 24h 无人知)。
       # 59°C 就喊人,给"及时开机/加风扇"留反应时间。
       - KG_HUB_DISK_TEMP_WARN=${KG_HUB_DISK_TEMP_WARN:-59}
+    # 用量导出每轮把见证库整份复制到 /tmp 再自检（单次成功率约 40%，平均 2.5 份），
+    # 2026-10-10 实测见证库 111MB：容器 4.5 小时落盘 22.8GB，约 1.4MB/s 压在 NAS 机械盘上。
+    # 副本只是读一次就删的中间产物，放内存即可；上限按见证库 + WAL 的数倍留余量。
+    tmpfs:
+      - /tmp:size=768m,mode=1777
     volumes:
       - /run/synostorage/disks:/disktemp:ro   # 盘温直读(免 sudo)
       # 用量导出:只读回滚见证 + 写快照给门户「模型用量与成本」卡。
