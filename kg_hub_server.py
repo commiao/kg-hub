@@ -82,6 +82,10 @@ from utils import ingest_timing  # noqa: E402
 from utils.writer_lock import async_writer_lock, WriterLockBusy  # noqa: E402
 from utils.wait_for_dependencies import wait_for_falkordb  # noqa: E402
 from utils.gateway_queue import provider_wait  # noqa: E402
+import breakers  # noqa: E402
+from utils.held_surge import HeldSurgeGuard, trip_if_surging  # noqa: E402
+
+_HELD_SURGE = HeldSurgeGuard()
 from utils.provenance import classify_provenance, has_recognizable_source  # noqa: E402
 from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
@@ -548,6 +552,26 @@ async def update_ingested_key_status(
                 sid=source_obs_id)
         except Exception:  # noqa: BLE001 — 清不掉不影响入图本身
             logger.warning("[ingest] 隔离记录清理失败 sid=%s(非致命)", source_obs_id)
+    # 结果未知(可能已计费)成批出现 = 上游出了问题:自动断开 kg_hub 这一路。
+    # 判定只在这里做一次,三条入图路径都经过本函数。
+    if status == "needs_reconciliation" and error_kind == "model_outcome_unknown":
+        try:
+            tripped = trip_if_surging(_HELD_SURGE, breakers, "kg_hub.entity_extract")
+            if tripped:
+                logger.error("[breaker:auto] kg_hub.entity_extract 已自动断开:%s",
+                             tripped["reason"])
+        except Exception:  # noqa: BLE001 — 保护失灵不能拖垮状态落库
+            logger.exception("[breaker:auto] held surge guard failed (non-fatal)")
+
+
+def _model_breaker_view() -> dict:
+    try:
+        state = breakers.read_state()
+        entry = dict(state["breakers"].get("kg_hub.entity_extract") or {})
+        entry["corrupt"] = bool(state.get("corrupt"))
+        return entry
+    except Exception as exc:  # noqa: BLE001 — 读不到就如实报,不让 stats 整体失败
+        return {"error": type(exc).__name__}
 
 
 async def lookup_status_by_uuid(graphiti, episode_uuid: str) -> dict | None:
@@ -2437,6 +2461,7 @@ async def queue_stats(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
     pending = ok = errored = failed = needs_reconciliation = 0
+    needs_reconciliation_last_1h = 0
     reconciliation_samples: list[dict] = []
     oldest_pending: str | None = None
     last_hour = datetime.now(tz=timezone.utc) - timedelta(hours=1)
@@ -2472,6 +2497,11 @@ async def queue_stats(request: Request) -> JSONResponse:
                 pass
         elif s == "needs_reconciliation":
             needs_reconciliation += 1
+            try:
+                if updated and datetime.fromisoformat(updated.replace("Z", "+00:00")) > last_hour:
+                    needs_reconciliation_last_1h += 1
+            except Exception:
+                pass
             if len(reconciliation_samples) < 20:
                 reconciliation_samples.append({
                     "source_description": r.get("sd"),
@@ -2498,6 +2528,9 @@ async def queue_stats(request: Request) -> JSONResponse:
         "errored_total": errored,
         "failed_total": failed,
         "needs_reconciliation": needs_reconciliation,
+        # watchdog 按增速报警:总量里有大量历史存量,看总数看不出「正在变坏」。
+        "needs_reconciliation_last_1h": needs_reconciliation_last_1h,
+        "model_breaker": _model_breaker_view(),
         "reconciliation_samples": reconciliation_samples,
         "ok_last_1h": ok_last_1h,
         "errored_last_1h": errored_last_1h,

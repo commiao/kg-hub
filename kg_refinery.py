@@ -59,6 +59,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils import refinery_recovery as recovery  # noqa: E402
+from utils import release_request  # noqa: E402
 
 import breakers  # noqa: E402
 from utils.ingest_budget import ingest_ceiling_sec  # noqa: E402
@@ -1208,6 +1209,11 @@ async def main() -> int:
             # 放在所有门控之前:窗口外 refinery 不干活,但 ingester / task-hub 桥
             # 仍在往服务端写,外壳修正照样会发生。门控之后取就看不到那些。
             refresh_envelope_repairs()
+            # 运维放回 held:在断路器之前处理,断开期间也能放回(恢复时直接接着跑)。
+            # 改的是本进程内存里的水印,不用再停容器(2026-10-10 一天停了五次)。
+            released = release_request.apply(STATE_DIR, wm, save_watermark)
+            if released is not None:
+                log.warning("[release_request] %s", json.dumps(released, ensure_ascii=False))
             # —— 人工断路器:排在所有门控最前面 ——
             # 这是**停流**,不是拒绝。开关一关本轮一条都不选、一条都不提交,所以
             # 既不产生请求也不产生错误——不会出现"关了开关却一直撞墙报错、把

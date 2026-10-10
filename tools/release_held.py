@@ -15,9 +15,14 @@ Three steps, run in this order:
   reset-keys  inside kg-hub-server; dry run unless --apply. Re-reads the journal
               per task and deletes the IngestedKey only while it is still
               needs_reconciliation with no worker attached.
-  unhold      on the NAS host **with kg-hub-refinery stopped** (it keeps the
-              watermark in memory and would overwrite the edit). Removes reset
-              observations from ``held``; server-confirmed ones go to ``ingested``.
+  request-unhold
+              on the NAS host, refinery running: drops a release request into
+              the refinery state directory; the refinery applies it to its own
+              in-memory watermark at the next cycle and writes a receipt.
+              Removes reset observations from ``held``; server-confirmed ones
+              go to ``ingested``.
+  unhold      the same edit made directly, only **with kg-hub-refinery stopped**
+              (it keeps the watermark in memory and would overwrite the edit).
 
 Observations with successful calls are left for the manual resume path, which
 reuses the paid results; this tool never touches them.
@@ -107,6 +112,11 @@ async def reset_keys(items: list[dict], driver, *, limit: int, apply: bool,
         rows = journal_rows(db, item["oid"])
         if classify([r[0] for r in rows]) != RESET or {(r[1], r[2]) for r in rows} != {(item["sd"], item["sid"])}:
             continue                        # the journal moved since the plan: skip, never guess
+        # The plan's server status goes stale: on 2026-10-10 a dry run counted
+        # 114 observations whose keys an earlier batch had already deleted.
+        status = await key_status(driver, item["sd"], item["sid"])
+        if not status or status["status"] != "needs_reconciliation" or status["worker_state"] is not None:
+            continue
         if not apply:
             done.append(item["oid"])
             continue
@@ -132,6 +142,32 @@ def unhold(watermark: Path, release: list[int], ingested: list[int]) -> dict:
     return {"released": len(release), "marked_ingested": len(ingested), "held_left": len(wm["held"])}
 
 
+def request_unhold(state_dir: Path, release: list[int], ingested: list[int], *,
+                   wait: float, poll: float = 2.0) -> dict:
+    """Ask the running refinery to release; wait for its receipt."""
+    import time
+    from datetime import datetime, timezone
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from utils import release_request
+    path = state_dir / release_request.REQUEST_NAME
+    if path.exists():
+        raise SystemExit(f"a release request is still pending: {path}")
+    request_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid()}"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"version": 1, "id": request_id,
+                               "release": sorted(set(release) - set(ingested)),
+                               "ingested": sorted(set(ingested))}))
+    os.replace(tmp, path)
+    receipt = release_request.receipt_path(state_dir, request_id)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if receipt.exists():
+            return json.loads(receipt.read_text())
+        time.sleep(poll)
+    return {"id": request_id, "pending": True,
+            "hint": "the refinery applies requests at the start of each cycle; check the receipt later"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -141,11 +177,18 @@ def main() -> int:
     r.add_argument("--above", type=int, default=0, help="only oids greater than this (refinery boundary = live line)")
     u = sub.add_parser("unhold"); u.add_argument("--watermark", type=Path, required=True)
     u.add_argument("--released", type=Path, required=True); u.add_argument("--plan", type=Path, required=True)
+    q = sub.add_parser("request-unhold"); q.add_argument("--state-dir", type=Path, required=True)
+    q.add_argument("--released", type=Path, required=True); q.add_argument("--plan", type=Path, required=True)
+    q.add_argument("--wait", type=float, default=300, help="seconds to wait for the refinery's receipt")
     args = parser.parse_args()
-    if args.cmd == "unhold":
+    if args.cmd in {"unhold", "request-unhold"}:
         items = json.loads(args.plan.read_text())
         confirmed = [i["oid"] for i in items if i["server"] == "ok"]
-        print(json.dumps(unhold(args.watermark, json.loads(args.released.read_text()), confirmed)))
+        released = json.loads(args.released.read_text())
+        if args.cmd == "unhold":
+            print(json.dumps(unhold(args.watermark, released, confirmed)))
+        else:
+            print(json.dumps(request_unhold(args.state_dir, released, confirmed, wait=args.wait)))
         return 0
 
     import asyncio
