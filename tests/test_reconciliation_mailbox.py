@@ -517,6 +517,63 @@ class QueueHeadRefreshTests(unittest.IsolatedAsyncioTestCase):
                          "unrecoverable")
 
 
+class ReportPushIsolationTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-11: one rejected report aborted every cycle before the claim."""
+
+    async def run_cycle(self, store, post, sent):
+        driver = Mock(execute_query=AsyncMock(return_value=([], None, None)))
+        with patch.object(reconciliation_worker, "mailbox_post", side_effect=post):
+            await run_mailbox_cycle(driver=driver, store=store, journal=None,
+                                    check_task=AsyncMock(), base_url="http://gw",
+                                    token="t", deadline_seconds=180, sent_versions=sent,
+                                    schedule=RefreshSchedule())
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = MailboxStore(Path(temp.name) / "mailbox.sqlite3")
+        for obs in ("a", "bad", "c"):
+            self.store.prepare_report("source", obs, step_id=ZERO_STEP, state="succeeded",
+                                      failed_attempts=0, retryable=False,
+                                      reason="business_result_persisted")
+        self.bad = task_uuid("source", "bad")
+
+    async def test_rejected_report_does_not_block_others_or_the_claim(self):
+        import io
+        from urllib.error import HTTPError
+        calls = []
+
+        def post(url, token, action, payload):
+            calls.append((action, payload.get("task_id")))
+            if action == "report" and payload["task_id"] == self.bad:
+                raise HTTPError(url, 400, "Bad Request", {},
+                                io.BytesIO(b'{"error":{"message":"stale task report"}}'))
+            return {"command": None}
+
+        sent = {}
+        with self.assertLogs("kg_hub.reconciliation", "WARNING") as logs:
+            await self.run_cycle(self.store, post, sent)
+        reports = [t for a, t in calls if a == "report"]
+        self.assertEqual(len(reports), 3)
+        self.assertIn(("claim", None), calls)
+        self.assertIn("stale task report", logs.output[0])
+        calls.clear()
+        await self.run_cycle(self.store, post, sent)     # same version: not resent
+        self.assertEqual(calls, [("claim", None)])
+
+    async def test_server_errors_still_fail_the_cycle(self):
+        import io
+        from urllib.error import HTTPError
+
+        def post(url, token, action, payload):
+            raise HTTPError(url, 503, "Unavailable", {}, io.BytesIO(b""))
+
+        sent = {}
+        with self.assertRaises(HTTPError):
+            await self.run_cycle(self.store, post, sent)
+        self.assertEqual(sent, {})
+
+
 class AttemptStatusCeilingTests(unittest.TestCase):
     def test_reads_per_minute_are_capped_process_wide(self):
         from utils.model_attempt_journal import AttemptStatusPacer
