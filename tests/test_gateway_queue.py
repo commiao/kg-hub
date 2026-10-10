@@ -297,4 +297,92 @@ class LifespanReceiptWiringTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     verify.assert_not_awaited()
 
+class ReceiptAckDispositionTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-10: ack 409 with disposition=failed was retried every 10s for 13h."""
+    RECEIPT = {'state':'completed','reference':'neo4j:ingest:1'}
+
+    def setUp(self):
+        from utils.gateway_queue import ReceiptBackoff
+        self.now = [0.0]
+        self.backoff = ReceiptBackoff(clock=lambda: self.now[0])
+        self.acked = []
+        test = self
+        class Journal:
+            def pending_queue_receipts(self):
+                return [{'idempotency_key':k,'business_key':BODY['model'],'receipt':test.RECEIPT}
+                        for k in ('k1',) if k not in test.acked]
+            def acknowledge_queue_receipt(self, key): test.acked.append(key)
+        self.journal = Journal()
+        self.requests = []
+
+    async def run_pass(self, respond):
+        import logging
+        from utils.gateway_queue import acknowledge_receipts
+        async def handle(req):
+            self.requests.append(json.loads(req.content))
+            return respond(req)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            with self.assertLogs('kg_hub.queue_receipts', 'WARNING') as logs:
+                logging.getLogger('kg_hub.queue_receipts').warning('marker')
+                done = await acknowledge_receipts(client, self.journal, 'http://gw', 't',
+                                                  self.backoff, logging.getLogger('kg_hub.queue_receipts'))
+        return done, [r for r in logs.records if r.getMessage() != 'marker']
+
+    async def test_failed_disposition_parks_the_receipt_without_traceback(self):
+        conflict = lambda req: httpx.Response(409, json={'error':{'code':'idempotency_conflict',
+            'message':'model request has not reached a known terminal state','disposition':'failed'}})
+        done, records = await self.run_pass(conflict)
+        self.assertEqual((done, len(self.requests)), ([], 1))
+        self.assertEqual(len(records), 1)
+        self.assertIn('[receipt:parked]', records[0].getMessage())
+        self.assertIsNone(records[0].exc_info)
+        self.now[0] = 10**6
+        done, records = await self.run_pass(conflict)
+        self.assertEqual((len(self.requests), records), (1, []))
+
+    async def test_other_errors_back_off_per_receipt_and_double(self):
+        down = lambda req: httpx.Response(503, text='restarting')
+        await self.run_pass(down)
+        self.now[0] = 9.9
+        await self.run_pass(down)
+        self.assertEqual(len(self.requests), 1)
+        self.now[0] = 10.0
+        _, records = await self.run_pass(down)
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn('next_in=20s', records[0].getMessage())
+
+    async def test_retry_after_seconds_is_honoured(self):
+        paused = lambda req: httpx.Response(503, json={'error':{'code':'provider_paused',
+            'disposition':'paused','retry_after_seconds':120}})
+        _, records = await self.run_pass(paused)
+        self.assertIn('next_in=120s', records[0].getMessage())
+        self.now[0] = 119
+        await self.run_pass(paused)
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_transport_error_backs_off(self):
+        def boom(req): raise httpx.ConnectError('refused', request=req)
+        _, records = await self.run_pass(boom)
+        self.assertIn('reason=ConnectError', records[0].getMessage())
+        await self.run_pass(boom)
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_success_acknowledges_and_clears_backoff(self):
+        await self.run_pass(lambda req: httpx.Response(503))
+        self.now[0] = 10
+        ok = lambda req: httpx.Response(200, json={'version':1,'job':{'request_key':'k1',
+            'business_key':BODY['model'],'business_receipt':self.RECEIPT}})
+        done, _ = await self.run_pass(ok)
+        self.assertEqual((done, self.acked), (['k1'], ['k1']))
+        self.assertFalse(self.backoff.failed_before('k1'))
+
+    async def test_identity_mismatch_logs_traceback_once(self):
+        wrong = lambda req: httpx.Response(200, json={'version':1,'job':{'request_key':'other'}})
+        _, first = await self.run_pass(wrong)
+        self.assertIsNotNone(first[0].exc_info)
+        self.now[0] = 10
+        _, second = await self.run_pass(wrong)
+        self.assertIsNone(second[0].exc_info)
+        self.assertEqual(self.acked, [])
+
 if __name__ == '__main__': unittest.main()

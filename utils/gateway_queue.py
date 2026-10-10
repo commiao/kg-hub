@@ -290,34 +290,121 @@ async def recover_business_receipts(journal, verify_result, cursor=("", "")):
     return tuple(rows[-1]) if rows else ("", "")
 
 
-async def receipt_loop(journal_factory, base_url, token, *, interval=10, verify_result=None):
+class ReceiptBackoff:
+    """Per-receipt pacing for /v1/queue/ack, decided by the gateway's disposition.
+
+    2026-10-10: four receipts whose gateway jobs sat in ``reconciliation`` were
+    re-acknowledged every 10s for 13 hours (6424 tracebacks). The gateway had
+    answered 409 with ``disposition=failed`` -- do not retry this request -- but
+    the loop never read it. ``failed`` now parks the receipt for the life of the
+    process (one retry after a restart); anything else backs off per receipt.
+    """
+    FIRST_DELAY = 10.0
+    MAX_DELAY = 3600.0
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self._next: dict[str, float] = {}
+        self._delay: dict[str, float] = {}
+        self.parked: set[str] = set()
+
+    def due(self, key):
+        return key not in self.parked and self.clock() >= self._next.get(key, 0.0)
+
+    def failed_before(self, key):
+        return key in self._delay or key in self.parked
+
+    def defer(self, key, retry_after=None):
+        delay = min(max(self._delay.get(key, 0.0)*2, self.FIRST_DELAY), self.MAX_DELAY)
+        self._delay[key] = delay
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            delay = max(delay, float(retry_after))
+        self._next[key] = self.clock()+delay
+        return delay
+
+    def park(self, key):
+        self.parked.add(key)
+
+    def clear(self, key):
+        self._next.pop(key, None)
+        self._delay.pop(key, None)
+        self.parked.discard(key)
+
+
+def _ack_error(response):
+    try:
+        error = response.json().get('error')
+    except ValueError:
+        return {}
+    return error if isinstance(error, dict) else {}
+
+
+async def acknowledge_receipts(client, journal, base_url, token, backoff, log):
+    """One pass over pending receipts that are due; returns keys acknowledged."""
+    import httpx
+    acknowledged = []
+    for payload in await asyncio.to_thread(journal.pending_queue_receipts):
+        key = payload['idempotency_key']
+        if not backoff.due(key):
+            continue
+        try:
+            response = await client.post(base_url+'/v1/queue/ack',
+                headers={'Authorization':'Bearer '+token}, json=payload)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            log.warning('[receipt:retry] key=%s reason=%s next_in=%.0fs',
+                        key[:16], type(exc).__name__, backoff.defer(key))
+            continue
+        if response.status_code >= 400:
+            error = _ack_error(response)
+            if error.get('disposition') == 'failed':
+                backoff.park(key)
+                log.warning('[receipt:parked] key=%s http=%s code=%s message=%s; '
+                            'not retried until restart', key[:16], response.status_code,
+                            error.get('code'), error.get('message'))
+            else:
+                log.warning('[receipt:retry] key=%s http=%s disposition=%s code=%s next_in=%.0fs',
+                            key[:16], response.status_code, error.get('disposition'),
+                            error.get('code'), backoff.defer(key, error.get('retry_after_seconds')))
+            continue
+        try:
+            job = response.json().get('job', {})
+            if (job.get('request_key') != key
+                    or job.get('business_key') != payload['business_key']
+                    or job.get('business_receipt') != payload['receipt']):
+                raise RuntimeError('business acknowledgement identity mismatch')
+            await asyncio.to_thread(journal.acknowledge_queue_receipt, key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Traceback once per receipt; repeats stay one line.
+            if backoff.failed_before(key):
+                log.warning('[receipt:retry] key=%s reason=unexpected next_in=%.0fs',
+                            key[:16], backoff.defer(key))
+            else:
+                backoff.defer(key)
+                log.exception('business receipt remains queued: %s', key)
+            continue
+        backoff.clear(key)
+        acknowledged.append(key)
+    return acknowledged
+
+
+async def receipt_loop(journal_factory, base_url, token, *, interval=10, verify_result=None,
+                       transport=None, backoff=None):
     """Retry only durable business acknowledgements, never a model invocation."""
     import logging
     import httpx
     log = logging.getLogger('kg_hub.queue_receipts')
+    backoff = backoff or ReceiptBackoff()
     cursor = ('', '')
-    async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+    async with httpx.AsyncClient(timeout=5, follow_redirects=False, transport=transport) as client:
         while True:
             try:
                 journal = await asyncio.to_thread(journal_factory)
                 if journal:
                     if verify_result is not None:
                         cursor = await recover_business_receipts(journal, verify_result, cursor)
-                    for payload in await asyncio.to_thread(journal.pending_queue_receipts):
-                        try:
-                            response = await client.post(base_url+'/v1/queue/ack',
-                                headers={'Authorization':'Bearer '+token}, json=payload)
-                            response.raise_for_status()
-                            job = response.json().get('job', {})
-                            if (job.get('request_key') != payload['idempotency_key']
-                                    or job.get('business_key') != payload['business_key']
-                                    or job.get('business_receipt') != payload['receipt']):
-                                raise RuntimeError('business acknowledgement identity mismatch')
-                            await asyncio.to_thread(journal.acknowledge_queue_receipt, payload['idempotency_key'])
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            log.exception('business receipt remains queued: %s', payload['idempotency_key'])
+                    await acknowledge_receipts(client, journal, base_url, token, backoff, log)
             except asyncio.CancelledError:
                 raise
             except Exception:
