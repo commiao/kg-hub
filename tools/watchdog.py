@@ -204,24 +204,36 @@ def deliver_alerts(state, anomalies, details, blocker_ids):
     pending = dict(state.get("pending_alerts", {}))
     old_ids = set(state.get("capture_blocker_ids", []))
     new_ids = old_ids if blocker_ids is None else set(blocker_ids)
+    # 「新阻塞点」要和**本次故障期间已报过的**比，不能只和上一轮比：一个阻塞点
+    # 闪掉一轮再回来，和上一轮比就成了「新」，同一故障里反复重报。2026-10-09
+    # 实测 capture_blocked 一天连报 10 次而不解除；10-10 04:16 与 04:18 阻塞点
+    # 完全相同，只因 refinery 中间消失过一轮，就报了两次。
+    # 故障解除（capture_blocked 为假）时清空，下一次故障从零记起。
+    # 旧状态没有这个键时以上一轮集合起步，与旧行为衔接，升级当轮不会多报。
+    alerted = set(state.get("capture_blocker_alerted", old_ids))
+    if not anomalies.get("capture_blocked"):
+        alerted = set()
     for kind, bad in anomalies.items():
         changed = bad != bool(previous.get(kind, False))
-        added = kind == "capture_blocked" and bad and bool(new_ids - old_ids)
+        added = kind == "capture_blocked" and bad and bool(new_ids - alerted)
         if changed or added:
             pending[kind] = {
                 "severity": "fire" if bad else "clear",
                 "message": details.get(kind, "anomaly detected") if bad else
                            details.get(f"{kind}:clear", "resolved"),
             }
+    if anomalies.get("capture_blocked"):
+        alerted |= new_ids
     # Checkpoint BEFORE any network call: a crash can duplicate, never lose, it.
     checkpoint = dict(state, anomalies=anomalies, pending_alerts=pending,
-                      capture_blocker_ids=sorted(new_ids))
+                      capture_blocker_ids=sorted(new_ids),
+                      capture_blocker_alerted=sorted(alerted))
     save_state(checkpoint)
     for kind, event in list(pending.items()):
         if emit_alert(event["severity"], kind, event["message"]) is True:
             del pending[kind]
             save_state(dict(checkpoint, pending_alerts=pending))
-    return pending, sorted(new_ids)
+    return pending, sorted(new_ids), sorted(alerted)
 
 
 DISKTEMP_DIR = Path(os.environ.get("KG_HUB_DISKTEMP_DIR", "/disktemp"))
@@ -954,13 +966,16 @@ def main() -> int:
         check_model_gateway_consumer_contract(), new_anomalies, details,
     )
 
-    pending, blocker_ids = deliver_alerts(
+    pending, blocker_ids, blocker_alerted = deliver_alerts(
         state, new_anomalies, details,
         decision.blocker_ids if decision.blocked is not None else None)
+    # 这里是整份重写：deliver_alerts 存进 checkpoint 的键，不在这张清单上就会被
+    # 冲掉。capture_blocker_alerted 漏掉的话，下一轮又退回「只和上一轮比」。
     save_state({
         "anomalies": new_anomalies,
         "pending_alerts": pending,
         "capture_blocker_ids": blocker_ids,
+        "capture_blocker_alerted": blocker_alerted,
         "counters": new_counters,
         "last_run": now_iso(),
         "last_stats": stats,
