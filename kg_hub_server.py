@@ -5603,6 +5603,12 @@ async def _application_lifespan(app):
     start_probe()
     await _start_reconciliation_mailbox()
     from utils.gateway_queue import receipt_loop
+    from utils import sqlite_anchor
+    if INGEST_BACKUP_PATH:
+        # T-0234: keep -wal/-shm of the two hot WAL databases from being
+        # deleted and recreated on every open/close (see utils/sqlite_anchor).
+        await asyncio.to_thread(sqlite_anchor.hold_backup_databases,
+                                INGEST_BACKUP_PATH, journal_from_backup_env)
     receipt_task = None
     try:
         if INGEST_BACKUP_PATH:
@@ -5625,6 +5631,7 @@ async def _application_lifespan(app):
                 pass
         await _stop_reconciliation_mailbox()
         await stop_probe()
+        sqlite_anchor.release_all()
 
 
 app = Starlette(
