@@ -141,6 +141,8 @@ class DeploymentTests(unittest.TestCase):
     def test_compose_is_locked_down_and_mounts_only_what_it_needs(self):
         svc = self.service()
         self.assertTrue(svc["read_only"])
+        # 账本目录在容器里是 1027 的 0700；去掉 capability 的 root 写不了（首次发布实测）
+        self.assertEqual(svc["user"], "${KG_HUB_JOURNAL_PRUNE_USER:-1027:100}")
         self.assertEqual(svc["cap_drop"], ["ALL"])
         self.assertIn("no-new-privileges:true", svc["security_opt"])
         root = "${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}"

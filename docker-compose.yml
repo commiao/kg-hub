@@ -366,6 +366,10 @@ services:
     image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
     container_name: kg-hub-journal-prune
     restart: unless-stopped
+    # 以账本目录属主运行：容器里看不到 Synology ACL，ingest-backup 显示为 1027 的 0700；
+    # cap_drop ALL 的 root 进不去 journal-prune 状态目录（2026-10-12 首次发布实测）。
+    # <数据根>/journal-prune 须预先存在且属 1027:100——Synology docker 不会自动创建绑定源。
+    user: "${KG_HUB_JOURNAL_PRUNE_USER:-1027:100}"
     read_only: true
     cap_drop:
       - ALL
