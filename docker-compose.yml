@@ -357,7 +357,7 @@ services:
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/breakers:/breakers:ro
     command: ["sh", "-c", "sleep 40; python -m kg_refinery"]
 
-  # T-0213: 每晚北京时间 23:05 清理 model-attempts.sqlite3（保留 7 天，用户 2026-10-11
+  # T-0213: 每晚低峰窗口（北京 23:05–06:00，窗口内启动则补跑当晚）清理 model-attempts.sqlite3（保留 7 天，用户 2026-10-11
   # 批准）。调度、IO 看护与停止都在 tools/nightly_prune.py；它只跑 journal_prune，
   # 而 journal_prune 设计为服务在线时运行（小批事务、批间停顿）。release.sh 重建本容器时
   # SIGTERM 会先停掉在跑的清理（每批一个事务，停在一半安全）。
@@ -384,6 +384,7 @@ services:
       - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
       - KG_HUB_PRUNE_DIR=/journal-prune
       - KG_HUB_PRUNE_AT=23:05
+      - KG_HUB_PRUNE_UNTIL=06:00
       - KG_HUB_PRUNE_RETENTION_DAYS=7
       - KG_HUB_PRUNE_MAX_SECONDS=3600
       - KG_HUB_PRUNE_IO_LIMIT=4
