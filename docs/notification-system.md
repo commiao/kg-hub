@@ -69,7 +69,7 @@ python3 ~/.claude/skills/feishu-notify/scripts/send.py "kg-hub 重建完成" --w
 
 NAS compose 里的 `kg-hub-watchdog` 容器,每 ~90s 跑 `tools/watchdog.py`,**边沿触发**推飞书。检查项:
 - `server_down` —— `/health` 不通
-- `falkordb_slow` —— 探针 `/api/search` > 阈值(CPU 跑飞/查询堆积前兆)
+- `falkordb_slow` —— 探针 `/api/search` 连续 2 轮 > 8s(`falkordb_slow_rounds` / `falkordb_slow_sec` 可热改);测的是 server 全链路,平时约 2.5s,常见原因是 FalkorDB 大批量写入
 - `falkordb_unreachable` —— 搜索报错
 - `queue_backlog` / `stuck_jobs` / `recent_errors` —— 摄入队列积压/卡死/近 1h 报错(含具体错误样本)
 

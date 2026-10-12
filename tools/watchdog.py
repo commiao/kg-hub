@@ -76,12 +76,21 @@ STUCK_SECONDS = int(os.environ.get("KG_HUB_STUCK_THRESHOLD_MIN", "30")) * 60
 # than this, FalkorDB is likely overloaded (the runaway-query / pegged-CPU failure
 # that started this whole effort). Tune via KG_HUB_FALKORDB_SLOW_SEC.
 SLOW_SECONDS = float(os.environ.get("KG_HUB_FALKORDB_SLOW_SEC", "8"))
+# 单轮超时不报，连续这么多轮都慢才报；一轮正常就立即解除。
+# 门槛取自真实分布(2026-10-12 复盘 NAS alerts.log 10-05 起的 180 对 FIRE/CLEAR):
+#   正常耗时稳定在 2.4~3.4s(连打 30 次实测),8s 阈值本身没问题;
+#   但 180 次里绝大多数只慢 1 轮(持续中位 1.7min,约等于一轮间隔)就自愈,
+#   高峰日(10-04/05/09)一天几十对 FIRE/CLEAR,看到了也没有可做的事。
+#   连续 2 轮 → 剩 16 次;3 轮 → 剩 1 次(会漏掉持续 5 分钟的变慢,太松)。
+# 这些毛刺与 FalkorDB 大批量写入同期(GRAPH.SLOWLOG 里 14~81s 的 MERGE),
+# 不是查询跑飞;真跑飞是持续性的,连续 2 轮照样抓得到。
+SLOW_CONSECUTIVE_ROUNDS = int(os.environ.get("KG_HUB_FALKORDB_SLOW_ROUNDS", "2"))
 
 # Hot-reloadable notification config: edit this JSON file (on a mounted volume) to
 # change webhook / thresholds / enable WITHOUT rebuilding the container — it is
 # re-read every watchdog cycle. Keys (all optional):
 #   {"enabled": true, "feishu_webhook": "...", "backlog_threshold": 20,
-#    "stuck_threshold_min": 30, "falkordb_slow_sec": 8}
+#    "stuck_threshold_min": 30, "falkordb_slow_sec": 8, "falkordb_slow_rounds": 2}
 NOTIFY_CONFIG_PATH = Path(
     os.environ.get("KG_HUB_NOTIFY_CONFIG", "/config/notify.json")
 )
@@ -354,7 +363,7 @@ def check_search_probe() -> tuple[str, float, str]:
         if r.status_code != 200:
             return "error", dt, f"HTTP {r.status_code}: {r.text[:150]}"
         if dt > SLOW_SECONDS:
-            return "slow", dt, f"search took {dt:.1f}s (> {SLOW_SECONDS:.0f}s) — FalkorDB may be overloaded"
+            return "slow", dt, f"search took {dt:.1f}s (> {SLOW_SECONDS:.0f}s)"
         return "ok", dt, f"{dt:.2f}s"
     except Exception as exc:
         return "error", 0.0, f"{type(exc).__name__}: {exc}"
@@ -746,10 +755,36 @@ def apply_capture_decision(decision: CaptureDecision, prev_anomalies: dict,
                 + "\n  ".join(decision.source_errors[:6]))
 
 
+def apply_search_probe(pstatus: str, plat: float, pmsg: str, prev_anomalies: dict,
+                       new_anomalies: dict, details: dict, prev_counters: dict,
+                       new_counters: dict) -> None:
+    """把 /api/search 探针结果落到 falkordb_unreachable / falkordb_slow。
+
+    falkordb_slow 去抖：连续 SLOW_CONSECUTIVE_ROUNDS 轮都慢才报；已在报警中则
+    慢一轮就继续保持；任何非 slow 的一轮清零计数并解除（解除不去抖）。
+    """
+    if pstatus == "error":
+        new_anomalies["falkordb_unreachable"] = True
+        details["falkordb_unreachable"] = pmsg
+    if pstatus != "slow":
+        new_counters["falkordb_slow_streak"] = 0
+        return
+    streak = int(prev_counters.get("falkordb_slow_streak", 0)) + 1
+    new_counters["falkordb_slow_streak"] = streak
+    if prev_anomalies.get("falkordb_slow") or streak >= SLOW_CONSECUTIVE_ROUNDS:
+        new_anomalies["falkordb_slow"] = True
+        # 探针测的是 server 全链路(向量化 + 检索 + 合并),不只是 FalkorDB。
+        details["falkordb_slow"] = (
+            f"kg-hub 搜索变慢：连续 {streak} 轮超过 {SLOW_SECONDS:.0f}s"
+            f"（本轮 {plat:.1f}s，平时约 2.5s）—— 常见原因是 FalkorDB 正在大批量写入；"
+            f"持续不退再查 GRAPH.SLOWLOG kg_hub 与 kg_hub_server 负载")
+
+
 def main() -> int:
     # Hot-read notification config (file on a mounted volume) — overrides env-derived
     # defaults each cycle, so rules change without a rebuild/recreate.
     global FEISHU_WEBHOOK, BACKLOG_THRESHOLD, STUCK_SECONDS, SLOW_SECONDS
+    global SLOW_CONSECUTIVE_ROUNDS
     cfg = load_notify_config()
     if cfg.get("enabled") is False:
         print("[watchdog] disabled via notify config")
@@ -762,6 +797,8 @@ def main() -> int:
         STUCK_SECONDS = int(cfg["stuck_threshold_min"]) * 60
     if "falkordb_slow_sec" in cfg:
         SLOW_SECONDS = float(cfg["falkordb_slow_sec"])
+    if "falkordb_slow_rounds" in cfg:
+        SLOW_CONSECUTIVE_ROUNDS = max(1, int(cfg["falkordb_slow_rounds"]))
 
     state = load_state()
     prev_anomalies = state.get("anomalies", {})
@@ -945,12 +982,10 @@ def main() -> int:
     # 2b. FalkorDB probe — timed /api/search (only if server alive)
     if alive:
         pstatus, plat, pmsg = check_search_probe()
-        if pstatus == "error":
-            new_anomalies["falkordb_unreachable"] = True
-            details["falkordb_unreachable"] = pmsg
-        elif pstatus == "slow":
-            new_anomalies["falkordb_slow"] = True
-            details["falkordb_slow"] = pmsg
+    else:
+        pstatus, plat, pmsg = "skip", 0.0, "server down"
+    apply_search_probe(pstatus, plat, pmsg, prev_anomalies, new_anomalies, details,
+                       prev_counters, new_counters)
 
     # 2c. Capture-chain judgment and stable blocker identities.
     decision = CaptureDecision(None, None)
