@@ -21,8 +21,17 @@ from tools import nightly_prune as N  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
-STUBBORN = [sys.executable, "-c",
-            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+
+
+def stubborn(ready: Path) -> list[str]:
+    """忽略 SIGTERM 的子进程；装好处理器后才写 ready 文件。
+
+    2026-10-13 镜像里实测：在慢盘的 NAS 上子进程还没执行到 signal.signal，看护的
+    SIGTERM 就到了，于是被 SIGTERM 杀掉（rc=-15），测不到 SIGKILL 那条路径。
+    """
+    return [sys.executable, "-c",
+            "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "open(sys.argv[1], 'w').close(); time.sleep(60)", str(ready)]
 
 
 def utc(*args):
@@ -107,8 +116,18 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(report["result"], "terminated")
 
     def test_a_child_ignoring_sigterm_is_killed_after_the_grace(self):
-        (self.control / "CANCEL").touch()
-        report = self.run_guarded(STUBBORN, grace=0.5)
+        import threading
+        ready = self.control / "ready"
+
+        def cancel_once_ready():                 # 子进程忽略 SIGTERM 之后才要求停
+            deadline = time.monotonic() + 30
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            (self.control / "CANCEL").touch()
+
+        threading.Thread(target=cancel_once_ready, daemon=True).start()
+        report = self.run_guarded(stubborn(ready), grace=0.5)
+        self.assertTrue(ready.exists(), "child never got to ignore SIGTERM")
         self.assertEqual(report["result"], "cancelled")
         self.assertEqual(report["rc"], -9)                       # SIGKILL
         self.assertLess(report["elapsed"], 10)
@@ -118,6 +137,97 @@ class GuardTests(unittest.TestCase):
         data = json.loads((self.control / "status.json").read_text())
         self.assertEqual(data["state"], "waiting")
         self.assertFalse((self.control / "status.json.tmp").exists())
+
+
+class CatchUpWindowTests(unittest.TestCase):
+    """2026-10-12：服务 23:59 上线，原逻辑把首次运行排到第二天 23:05。"""
+
+    def test_current_night_across_midnight(self):
+        # 北京 10-12 23:30 → 10-12 那一晚；10-13 03:00 仍属 10-12 那一晚
+        self.assertEqual(N.current_night(utc(2026, 10, 12, 15, 30)), "2026-10-12")
+        self.assertEqual(N.current_night(utc(2026, 10, 12, 19, 0)), "2026-10-12")
+        self.assertEqual(N.current_night(utc(2026, 10, 12, 15, 5)), "2026-10-12")   # 23:05 整
+        self.assertIsNone(N.current_night(utc(2026, 10, 12, 22, 0)))                # 06:00 整
+        self.assertIsNone(N.current_night(utc(2026, 10, 12, 4, 0)))                 # 12:00
+        self.assertIsNone(N.current_night(utc(2026, 10, 12, 15, 4)))                # 23:04
+
+    def test_a_same_day_window_works_too(self):
+        self.assertEqual(N.current_night(utc(2026, 10, 12, 18, 0), "01:00", "06:00"), "2026-10-13")
+        self.assertIsNone(N.current_night(utc(2026, 10, 12, 16, 30), "01:00", "06:00"))
+
+    def test_due_night_runs_each_night_once(self):
+        now = utc(2026, 10, 12, 16, 30)                                             # 00:30
+        self.assertEqual(N.due_night(now, None), "2026-10-12")
+        self.assertEqual(N.due_night(now, "2026-10-11"), "2026-10-12")
+        self.assertIsNone(N.due_night(now, "2026-10-12"))
+        self.assertIsNone(N.due_night(utc(2026, 10, 12, 4, 0), None))               # 白天
+
+    def test_last_night_is_read_back_from_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = Path(tmp)
+            self.assertIsNone(N.read_last_night(control))
+            N.write_status(control, state="waiting", last_night="2026-10-12")
+            self.assertEqual(N.read_last_night(control), "2026-10-12")
+            (control / "status.json").write_text("not json")
+            self.assertIsNone(N.read_last_night(control))
+
+
+class MainLoopTests(unittest.TestCase):
+    """用假时钟把主循环跑起来：窗口内启动补跑一次，跑过就等下一晚。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.control = Path(tmp.name)
+        self.runs = []
+
+    def run_main(self, now):
+        from unittest import mock
+        stop = N._Stop()
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        def fake_run(cmd, **kw):
+            self.runs.append(cmd)
+            return {"result": "done", "rc": 0, "seconds": 0.1}
+
+        def fake_sleep(seconds):
+            stop.requested = True                     # 进入等待即结束测试
+
+        with mock.patch.dict("os.environ", {"KG_HUB_PRUNE_DIR": str(self.control)}), \
+             mock.patch.object(N, "datetime", Clock), \
+             mock.patch.object(N, "_Stop", return_value=stop), \
+             mock.patch.object(N, "run_once", side_effect=fake_run), \
+             mock.patch.object(N.time, "sleep", side_effect=fake_sleep), \
+             mock.patch.object(N.signal, "signal"):
+            N.main()
+        return json.loads((self.control / "status.json").read_text())
+
+    def test_starting_inside_the_window_catches_up_once(self):
+        status = self.run_main(utc(2026, 10, 12, 16, 30))                          # 00:30
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(status["last_night"], "2026-10-12")
+        self.assertEqual(status["last"]["result"], "done")
+
+    def test_a_night_already_run_is_not_run_again_after_a_restart(self):
+        N.write_status(self.control, state="waiting", last_night="2026-10-12")
+        status = self.run_main(utc(2026, 10, 12, 18, 0))                           # 02:00
+        self.assertEqual(self.runs, [])
+        self.assertEqual(status["last_night"], "2026-10-12")
+
+    def test_starting_in_the_daytime_waits_for_the_window(self):
+        self.run_main(utc(2026, 10, 12, 4, 0))                                     # 12:00
+        self.assertEqual(self.runs, [])
+
+    def test_a_cancel_file_skips_the_night_and_counts_it(self):
+        (self.control / "CANCEL").touch()
+        status = self.run_main(utc(2026, 10, 12, 16, 30))
+        self.assertEqual(self.runs, [])
+        self.assertEqual(status["last_night"], "2026-10-12")
+        self.assertEqual(status["last"]["result"], "skipped")
 
 
 class DeploymentTests(unittest.TestCase):
@@ -131,6 +241,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue(svc["image"].startswith("kg-hub-server:${KG_HUB_IMAGE_TAG:?"))
         env = dict(item.split("=", 1) for item in svc["environment"])
         self.assertEqual(env["KG_HUB_PRUNE_AT"], "23:05")
+        self.assertEqual(env["KG_HUB_PRUNE_UNTIL"], "06:00")
         self.assertEqual(env["KG_HUB_PRUNE_RETENTION_DAYS"], "7")
         self.assertEqual(env["KG_HUB_INGEST_BACKUP_PATH"], "/backup/ingest-backup.jsonl")
         self.assertEqual(env["KG_HUB_FALKORDB_HOST"], "falkordb")

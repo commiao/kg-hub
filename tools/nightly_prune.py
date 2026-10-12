@@ -4,7 +4,10 @@
 为什么是容器：DSM 没有用户 crontab；2026-10-11/12 第一次清理靠宿主上 nohup 的
 一次性脚本（~/journal-stats/prune-night.sh），不在任何仓库里，也不会每晚再跑。
 
-每晚北京时间 KG_HUB_PRUNE_AT（默认 23:05）运行一次：
+每晚低峰窗口（北京时间 KG_HUB_PRUNE_AT 到次日 KG_HUB_PRUNE_UNTIL，默认 23:05–06:00）
+运行一次；窗口内任何时刻启动或醒来、当晚还没跑过，就立即补跑（2026-10-12：服务
+23:59 才上线，原逻辑把首次运行排到了第二天 23:05）。「当晚」按窗口开始那天的日期计，
+记在 status.json 的 last_night，容器重建后仍然有效；无论结果如何每晚只跑一次：
 
     python -m utils.journal_prune --apply --retention-days 7 --max-seconds 3600
 
@@ -47,6 +50,40 @@ def next_run(now: datetime, at: str = "23:05") -> datetime:
     if target <= local:
         target += timedelta(days=1)
     return target.astimezone(timezone.utc)
+
+
+def _clock(value: str) -> tuple[int, int]:
+    hour, minute = (int(x) for x in value.split(":"))
+    return hour, minute
+
+
+def current_night(now: datetime, at: str = "23:05", until: str = "06:00") -> str | None:
+    """now 落在哪一晚的低峰窗口里（窗口开始那天的北京日期），不在窗口内返回 None。"""
+    local = now.astimezone(BEIJING)
+    start = local.replace(hour=_clock(at)[0], minute=_clock(at)[1], second=0, microsecond=0)
+    end = local.replace(hour=_clock(until)[0], minute=_clock(until)[1], second=0, microsecond=0)
+    if start < end:                                   # 同一天内的窗口
+        return local.date().isoformat() if start <= local < end else None
+    if local >= start:                                # 跨零点：今晚的前半段
+        return local.date().isoformat()
+    if local < end:                                   # 跨零点：昨晚的后半段
+        return (local - timedelta(days=1)).date().isoformat()
+    return None
+
+
+def due_night(now: datetime, last_night: str | None, at: str = "23:05",
+              until: str = "06:00") -> str | None:
+    """现在要跑的那一晚；不在窗口内、或这一晚已经跑过则 None。"""
+    night = current_night(now, at, until)
+    return night if night is not None and night != last_night else None
+
+
+def read_last_night(control: Path) -> str | None:
+    try:
+        value = json.loads((control / "status.json").read_text("utf-8")).get("last_night")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def io_load(path: str | Path = "/proc/syno_loadavg") -> float | None:
@@ -133,6 +170,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     control = Path(os.environ.get("KG_HUB_PRUNE_DIR", "/journal-prune"))
     at = os.environ.get("KG_HUB_PRUNE_AT", "23:05")
+    until = os.environ.get("KG_HUB_PRUNE_UNTIL", "06:00")
     io_limit = float(os.environ.get("KG_HUB_PRUNE_IO_LIMIT", "4"))
     interval = float(os.environ.get("KG_HUB_PRUNE_IO_INTERVAL", "30"))
     cmd = command(os.environ.get("KG_HUB_PRUNE_RETENTION_DAYS", "7"),
@@ -141,27 +179,32 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     last = None
+    last_night = read_last_night(control)
     while not stop.requested:
-        due = next_run(datetime.now(timezone.utc), at)
-        write_status(control, state="waiting", next_run=due.isoformat(), last=last)
-        log.info("[prune] next run %s (Beijing %s)", due.isoformat(),
-                 due.astimezone(BEIJING).strftime("%F %H:%M"))
-        while not stop.requested and datetime.now(timezone.utc) < due:
-            time.sleep(min(20.0, max(0.1, (due - datetime.now(timezone.utc)).total_seconds())))
-        if stop.requested:
-            break
-        if (control / "CANCEL").exists():
-            last = {"result": "skipped", "reason": "CANCEL file",
-                    "at": datetime.now(timezone.utc).isoformat()}
-            log.warning("[prune] skipped tonight: CANCEL file present")
+        night = due_night(datetime.now(timezone.utc), last_night, at, until)
+        if night is None:
+            due = next_run(datetime.now(timezone.utc), at)
+            write_status(control, state="waiting", next_run=due.isoformat(),
+                         last=last, last_night=last_night)
+            log.info("[prune] next run %s (Beijing %s)", due.isoformat(),
+                     due.astimezone(BEIJING).strftime("%F %H:%M"))
+            while not stop.requested and datetime.now(timezone.utc) < due:
+                time.sleep(min(20.0, max(0.1, (due - datetime.now(timezone.utc)).total_seconds())))
             continue
-        write_status(control, state="running", next_run=due.isoformat(), last=last)
+        last_night = night                       # 每晚只做一次决定，不在窗口内反复重试
+        if (control / "CANCEL").exists():
+            last = {"result": "skipped", "reason": "CANCEL file", "night": night,
+                    "at": datetime.now(timezone.utc).isoformat()}
+            log.warning("[prune] skipped night %s: CANCEL file present", night)
+            write_status(control, state="waiting", last=last, last_night=last_night)
+            continue
+        write_status(control, state="running", night=night, last=last, last_night=last_night)
         last = {**run_once(cmd, control=control, io_limit=io_limit, stop=stop,
                            interval=interval),
-                "at": datetime.now(timezone.utc).isoformat()}
-    write_status(control, state="stopped", last=last)
+                "night": night, "at": datetime.now(timezone.utc).isoformat()}
+        write_status(control, state="waiting", last=last, last_night=last_night)
+    write_status(control, state="stopped", last=last, last_night=last_night)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
