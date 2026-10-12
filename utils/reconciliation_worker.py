@@ -204,6 +204,9 @@ class RefreshSchedule:
     def __init__(self, clock=time.monotonic):
         self.clock = clock
         self._state: dict[str, tuple[float, float, object]] = {}
+        # Untracked graph rows (terminal reports such as unrecoverable/failed,
+        # or not reported yet): due, delay, report version, graph fingerprint.
+        self._admitted: dict[str, tuple[float, float, object, object]] = {}
 
     def pick(self, reports: list[dict]) -> list[dict]:
         now = self.clock()
@@ -213,6 +216,24 @@ class RefreshSchedule:
         due = [(self._state.get(task_id, (0.0,))[0], task_id)
                for task_id in active if now >= self._state.get(task_id, (0.0,))[0]]
         return [active[task_id] for _, task_id in sorted(due)[:self.MAX_CHECKS]]
+
+    def admission_due(self, task_id: str, fingerprint: object) -> bool:
+        """An untracked graph row is re-prepared when new, when its graph row
+        changed, or when its backoff elapsed -- not on every cycle (T-0246)."""
+        held = self._admitted.get(task_id)
+        return held is None or held[3] != fingerprint or self.clock() >= held[0]
+
+    def admitted(self, task_id: str, fingerprint: object, version: object) -> float:
+        previous = self._admitted.get(task_id)
+        changed = (previous is None or previous[3] != fingerprint
+                   or version != previous[2])
+        delay = self.FIRST_DELAY if changed else min(previous[1]*2, self.MAX_DELAY)
+        self._admitted[task_id] = (self.clock()+delay, delay, version, fingerprint)
+        return delay
+
+    def forget_admissions_except(self, task_ids: set[str]) -> None:
+        for task_id in set(self._admitted) - task_ids:
+            del self._admitted[task_id]
 
     def observed(self, task_id: str, version: object) -> float:
         """``version=None`` means the check failed: back off, keep the last version."""
@@ -351,13 +372,28 @@ async def run_mailbox_cycle(*, driver, store: MailboxStore, journal, check_task,
         # made the loop a full scan.
         tracked = {r["task_id"] for r in await asyncio.to_thread(store.all_reports)
                    if r.get("state") in ACTIVE_REPORT_STATES}
+    # 2026-10-12 (T-0246): the rows not tracked here -- terminal reports such
+    # as unrecoverable/failed -- were re-prepared every 10s cycle, ~5 database
+    # opens each, ~300 opens a cycle for reports that never change. They now
+    # back off like tracked tasks; a changed graph row is prepared at once.
+    seen_rows: set[str] = set()
     for row in rows:
-        if tracked and task_uuid(row["source_description"], row["source_obs_id"]) in tracked:
+        task_id = task_uuid(row["source_description"], row["source_obs_id"])
+        if tracked and task_id in tracked:
             continue
-        await asyncio.to_thread(
+        fingerprint = repr(sorted(row.items()))
+        if schedule is not None:
+            seen_rows.add(task_id)
+            if not schedule.admission_due(task_id, fingerprint):
+                continue
+        report = await asyncio.to_thread(
             prepare_task_report, store, journal, row,
             deadline_seconds=deadline_seconds,
             manual_resume_available=enqueue_manual_resume is not None)
+        if schedule is not None:
+            schedule.admitted(task_id, fingerprint, report.get("version"))
+    if schedule is not None:
+        schedule.forget_admissions_except(seen_rows)
     await refresh_tracked_reports(
         store=store, journal=journal, check_task=check_task,
         deadline_seconds=deadline_seconds,

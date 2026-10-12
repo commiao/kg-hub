@@ -587,5 +587,80 @@ class AttemptStatusCeilingTests(unittest.TestCase):
         self.assertTrue(pacer.due("another"))
 
 
+class UntrackedRowBackoffTests(unittest.IsolatedAsyncioTestCase):
+    """2026-10-12 (T-0246): terminal rows were re-prepared every 10s cycle."""
+
+    def setUp(self):
+        self.now = [0.0]
+        self.schedule = RefreshSchedule(clock=lambda: self.now[0])
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = MailboxStore(Path(temp.name) / "mailbox.sqlite3")
+        self.rows = [{"source_description": "source", "source_obs_id": f"dead-{i}",
+                      "status": "failed", "error_kind": "reconciliation_model_step_missing"}
+                     for i in range(3)]
+        self.prepared = []
+
+    async def cycle(self, schedule="default"):
+        driver = Mock(execute_query=AsyncMock(return_value=(list(self.rows), None, None)))
+        real = reconciliation_worker.prepare_task_report
+
+        def spy(store, journal, row, **kw):
+            self.prepared.append(row["source_obs_id"])
+            return real(store, journal, row, **kw)
+
+        with patch.object(reconciliation_worker, "prepare_task_report", spy), \
+             patch.object(reconciliation_worker, "mailbox_post",
+                          return_value={"command": None}):
+            await run_mailbox_cycle(driver=driver, store=self.store, journal=None,
+                                    check_task=AsyncMock(), base_url="http://gw",
+                                    token="fixture", deadline_seconds=180, sent_versions={},
+                                    schedule=self.schedule if schedule == "default" else schedule)
+
+    async def test_unchanged_terminal_rows_back_off_instead_of_every_cycle(self):
+        await self.cycle()
+        self.assertEqual(len(self.prepared), 3)              # new rows: at once
+        for _ in range(5):
+            await self.cycle()                               # same clock: nothing due
+        self.assertEqual(len(self.prepared), 3)
+        self.now[0] = 10
+        await self.cycle()
+        self.assertEqual(len(self.prepared), 6)              # first backoff elapsed
+        self.now[0] = 25
+        await self.cycle()
+        self.assertEqual(len(self.prepared), 6)              # next wait is 20s
+        self.now[0] = 30
+        await self.cycle()
+        self.assertEqual(len(self.prepared), 9)
+
+    async def test_backoff_reaches_the_ceiling(self):
+        delays = [self.schedule.admitted("t", "row", 0) for _ in range(9)]
+        self.assertEqual(delays, [10, 20, 40, 80, 160, 320, 600, 600, 600])
+
+    async def test_a_changed_graph_row_is_prepared_at_once(self):
+        await self.cycle()
+        self.rows[1] = {**self.rows[1], "status": "needs_reconciliation", "error_kind": None}
+        await self.cycle()
+        self.assertEqual(self.prepared[3:], ["dead-1"])
+
+    async def test_a_new_row_is_prepared_at_once(self):
+        await self.cycle()
+        self.rows.append({"source_description": "source", "source_obs_id": "fresh",
+                          "status": "failed", "error_kind": "reconciliation_model_step_missing"})
+        await self.cycle()
+        self.assertEqual(self.prepared[3:], ["fresh"])
+
+    async def test_vanished_rows_are_forgotten(self):
+        await self.cycle()
+        self.rows = self.rows[:1]
+        await self.cycle()
+        self.assertEqual(set(self.schedule._admitted), {task_uuid("source", "dead-0")})
+
+    async def test_without_a_schedule_every_row_is_prepared_every_cycle(self):
+        await self.cycle(schedule=None)
+        await self.cycle(schedule=None)
+        self.assertEqual(len(self.prepared), 6)
+
+
 if __name__ == "__main__":
     unittest.main()
