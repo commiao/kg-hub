@@ -9,7 +9,7 @@
 VPS(oc-vps-aliyun-us, 常开)         NAS(home-nas-syno, 常开)
   check.sh ──监控──▶ kg-hub@NAS         watchdog(容器) ── kg-hub 内部(server/falkordb/队列)
   check.sh ──监控──▶ openclaw@本机        nas_probe(容器) ──监控──▶ openclaw@VPS(公网IP)
-  progress.sh ── 摄入增量播报              ingester(容器) ── 一次性重建(已完成)
+  progress.sh ── 摄入增量播报              ingester(容器) ── 只同步 canonical 文档入图(每 10 分钟)
   daily-summary.sh ── 每日心跳
         ▲ 互盯:VPS↔NAS,任一整体挂,另一台飞书报
 Mac: mcp_server.py ── 用 kg-hub 连不上时飞书预警(L3,客户端视角)
