@@ -12,6 +12,9 @@
 所以这里**先复制文件、再读副本**：与活库零锁交互，代价是快照可能撕裂——对报表
 可以接受，且读不出来就跳过本轮、不写坏文件。
 
+见证库切到 WAL 之后（T-0234 阶段 3）改为直接只读打开活库：WAL 读者不挡写者，复制
+那层保护不再必要。判断看文件头，DELETE 模式仍走复制，见 `_open_direct`。
+
 网关自己的 `runtime/state/usage/*.json` 不能用：它只有**当天**计数和一个分钟
 滑窗，没有历史，做不出月/日/时曲线。
 
@@ -171,6 +174,55 @@ def _rows(database: sqlite3.Connection, sql: str, *,
         return []
 
 
+def _self_check(database: sqlite3.Connection) -> tuple[list[tuple], list[tuple]]:
+    meta = _rows(database, "SELECT deployment_id FROM witness_meta LIMIT 1",
+                 required=True)
+    ceiling = _rows(
+        database,
+        "SELECT business_key,daily_requests,requests_per_minute "
+        "FROM cost_policy_ceiling", required=True)
+    if not meta or not ceiling:
+        raise TornSnapshot("见证库缺 witness_meta / cost_policy_ceiling")
+    return meta, ceiling
+
+
+def _is_wal(witness: Path) -> bool:
+    """文件头第 18、19 字节（读/写格式版本）为 2 即 WAL；只读 100 字节，不经 SQLite。"""
+    try:
+        with open(witness, "rb") as handle:
+            header = handle.read(100)
+    except OSError:
+        return False
+    return (len(header) == 100 and header[:16] == b"SQLite format 3\x00"
+            and header[18] == 2 and header[19] == 2)
+
+
+def _open_direct(witness: Path):
+    """WAL 下直接只读打开活库，不复制（T-0234 阶段 3）。
+
+    WAL 的读者不拿会挡写者的锁：读的是某一刻的一致快照，网关照常写见证，所以 DELETE
+    模式下那条「绝不碰活库」的理由在这里不成立。复制反而每轮把整个见证库写一遍 tmpfs。
+    - 网关在跑：它的锚连接让 -wal/-shm 常驻，mode=ro 在只读挂载上也能读到 -wal 里的提交。
+    - 网关停了：最后一个连接已 checkpoint 并删掉 sidecar，没有写者，immutable=1 安全。
+    两条都不通（例如 -wal 还在而 -shm 不在）返回 None，由调用方退回复制。
+    """
+    candidates = [f"file:{witness}?mode=ro"]
+    if not witness.with_name(witness.name + "-wal").exists():
+        candidates.append(f"file:{witness}?mode=ro&immutable=1")
+    for uri in candidates:
+        try:
+            database = sqlite3.connect(uri, uri=True, timeout=2)
+        except sqlite3.Error:
+            continue
+        try:
+            meta, ceiling = _self_check(database)
+        except (TornSnapshot, sqlite3.Error):
+            database.close()
+            continue
+        return database, meta, ceiling
+    return None
+
+
 def _open_consistent_copy(witness: Path, staging: Path, *,
                           attempts: int = 6, delay_s: float = 0.7):
     """反复「复制→自检」直到拿到一份自洽副本；始终不碰活库的锁。
@@ -191,14 +243,7 @@ def _open_consistent_copy(witness: Path, staging: Path, *,
             last = exc
             continue
         try:
-            meta = _rows(database, "SELECT deployment_id FROM witness_meta LIMIT 1",
-                         required=True)
-            ceiling = _rows(
-                database,
-                "SELECT business_key,daily_requests,requests_per_minute "
-                "FROM cost_policy_ceiling", required=True)
-            if not meta or not ceiling:
-                raise TornSnapshot("见证库副本缺 witness_meta / cost_policy_ceiling")
+            meta, ceiling = _self_check(database)
         except (TornSnapshot, sqlite3.Error) as exc:
             database.close()
             # 撕裂的副本当场删掉：/tmp 是 tmpfs，留着 6 份就是 6 倍见证库的内存。
@@ -212,8 +257,11 @@ def _open_consistent_copy(witness: Path, staging: Path, *,
 def collect(witness: Path, *, gateway_url: str | None = None) -> dict:
     now = datetime.now(tz=timezone.utc)
     with tempfile.TemporaryDirectory() as staging:
-        database, deployment, ceiling_raw = _open_consistent_copy(
-            witness, Path(staging))
+        # DELETE 模式继续复制：那里读者的共享锁会挡住网关写见证（T-0046）。
+        opened = _open_direct(witness) if _is_wal(witness) else None
+        if opened is None:
+            opened = _open_consistent_copy(witness, Path(staging))
+        database, deployment, ceiling_raw = opened
         try:
             daily_raw = _rows(
                 database,

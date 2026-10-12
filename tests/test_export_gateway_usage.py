@@ -202,5 +202,136 @@ class ExportContractTests(unittest.TestCase):
         self.assertRegex(block, r"\n    tmpfs:\n      - /tmp:size=\d+m")
 
 
+def make_wal_witness(path: Path) -> sqlite3.Connection:
+    """像网关那样：WAL + 一条常驻连接（锚），之后的写都留在 -wal 里未 checkpoint。"""
+    make_witness(path)
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("INSERT INTO daily_counts VALUES ('2026-09-08','kg_hub.entity_extract',7)")
+    writer.commit()
+    return writer
+
+
+class DirectWalReadTests(unittest.TestCase):
+    """T-0234 阶段 3：见证库为 WAL 时直接只读打开，不再每轮复制整库到 tmpfs。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "witness"
+        self.root.mkdir()
+        self.witness = self.root / "rollback-witness.sqlite3"
+
+    def read_only_mount(self, directory=None):
+        # watchdog 以 :ro 挂载见证目录：既不能建 -shm，也不能写任何文件。
+        directory = directory or self.root
+        directory.chmod(0o555)
+        self.addCleanup(directory.chmod, 0o755)
+        try:                                   # root 无视权限位，模拟不出只读挂载
+            (directory / ".probe").touch()
+        except OSError:
+            return
+        (directory / ".probe").unlink()
+        self.skipTest("chmod 不能让目录只读（以 root 运行？）")
+
+    def no_copy(self):
+        return mock.patch.object(E, "_copy_for_read",
+                                 side_effect=AssertionError("WAL 见证库不该被复制"))
+
+    def counts(self, payload):
+        return {r["day"]: r["count"] for r in payload["daily"]}
+
+    def test_running_gateway_is_read_in_place_including_uncheckpointed_commits(self):
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        self.assertTrue(Path(str(self.witness) + "-wal").stat().st_size > 0)
+        self.read_only_mount()
+        with self.no_copy(), mock.patch.object(E, "DAILY_DAYS", 100000):
+            payload = E.collect(self.witness)
+        self.assertEqual(self.counts(payload)["2026-09-08"], 7)
+
+    def test_reader_does_not_block_the_gateway_writing_its_witness(self):
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        database, _, _ = E._open_direct(self.witness)
+        try:
+            database.execute("BEGIN")
+            database.execute("SELECT count(*) FROM daily_counts").fetchone()
+            writer.execute("INSERT INTO daily_counts VALUES ('2026-09-09','k',1)")
+            writer.commit()                                   # DELETE 模式下这里会 busy
+        finally:
+            database.close()
+
+    def test_stopped_gateway_is_read_immutably_without_sidecars(self):
+        writer = make_wal_witness(self.witness)
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer.close()
+        for suffix in ("-wal", "-shm"):                      # Linux 最后关闭时会删掉
+            Path(str(self.witness) + suffix).unlink(missing_ok=True)
+        self.read_only_mount()
+        with self.no_copy(), mock.patch.object(E, "DAILY_DAYS", 100000):
+            payload = E.collect(self.witness)
+        self.assertEqual(self.counts(payload)["2026-09-08"], 7)
+
+    def test_delete_mode_witness_is_still_copied(self):
+        make_witness(self.witness)
+        self.assertFalse(E._is_wal(self.witness))
+        real = E._copy_for_read
+        with mock.patch.object(E, "_copy_for_read", side_effect=real) as copy:
+            E.collect(self.witness)
+        self.assertEqual(copy.call_count, 1)
+
+    def test_wal_witness_that_cannot_be_opened_directly_falls_back_to_copy(self):
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        real = E._copy_for_read
+        with mock.patch.object(E, "_open_direct", return_value=None), \
+             mock.patch.object(E, "_copy_for_read", side_effect=real) as copy:
+            payload = E.collect(self.witness)
+        self.assertEqual(copy.call_count, 1)
+        self.assertIn("kg_hub.entity_extract", payload["ceilings"])
+
+    def test_leftover_wal_is_never_read_immutably(self):
+        # immutable=1 会无视 -wal：-wal 里还有提交时那样读到的是旧数据，宁可复制。
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        crashed = self.root / "crashed"
+        crashed.mkdir()
+        target = crashed / self.witness.name
+        for suffix in ("", "-wal"):                          # 有 -wal、无 -shm
+            target.with_name(target.name + suffix).write_bytes(
+                Path(str(self.witness) + suffix).read_bytes())
+        self.read_only_mount(crashed)
+        self.assertIsNone(E._open_direct(target))
+
+    def test_direct_read_that_fails_self_check_falls_back_to_copy(self):
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        real_check, real_copy = E._self_check, E._copy_for_read
+        verdicts = iter([E.TornSnapshot("direct"), None])
+
+        def check_once_torn(database):
+            verdict = next(verdicts, None)
+            if verdict:
+                raise verdict
+            return real_check(database)
+
+        with mock.patch.object(E, "_self_check", side_effect=check_once_torn), \
+             mock.patch.object(E, "_copy_for_read", side_effect=real_copy) as copy:
+            payload = E.collect(self.witness)
+        self.assertGreaterEqual(copy.call_count, 1)
+        self.assertIn("kg_hub.entity_extract", payload["ceilings"])
+
+    def test_wal_detection_reads_the_header_not_the_name(self):
+        writer = make_wal_witness(self.witness)
+        self.addCleanup(writer.close)
+        self.assertTrue(E._is_wal(self.witness))
+        bogus = self.root / "torn.sqlite3"
+        bogus.write_bytes(b"SQLite format 3\x00" + b"\x00" * 200)
+        self.assertFalse(E._is_wal(bogus))
+        self.assertFalse(E._is_wal(self.root / "missing.sqlite3"))
+
+
 if __name__ == "__main__":
     unittest.main()
