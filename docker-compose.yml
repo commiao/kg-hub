@@ -23,7 +23,13 @@ services:
     container_name: kg-hub-falkordb
     restart: unless-stopped
     environment:
-      - FALKORDB_ARGS=TIMEOUT_MAX 60000 TIMEOUT_DEFAULT 30000 --requirepass ${FALKORDB_PASSWORD} --appendonly yes --appendfsync everysec
+      # T-0244: AOF (everysec) is the durability and the restart source. Redis' default
+      # RDB rules ("3600 1 300 100 60 10000") rewrote the whole 456MB dump.rdb every
+      # ~8 minutes under normal ingest (185 saves on 2026-10-09, ~1MB/s average,
+      # written by a forked child that per-container accounting never sees). One
+      # RDB a day stays as a fallback independent of AOF; tools/backup_graph.sh and
+      # MIGRATION.md take their own SAVE first. run.sh word-splits FALKORDB_ARGS.
+      - FALKORDB_ARGS=TIMEOUT_MAX 60000 TIMEOUT_DEFAULT 30000 --requirepass ${FALKORDB_PASSWORD} --appendonly yes --appendfsync everysec --save 86400 1
       - BROWSER=1
       # Needed INSIDE the container so the healthcheck's redis-cli -a "$FALKORDB_PASSWORD" works.
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
