@@ -42,7 +42,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 COMPOSE_BASE="docker-compose.yml"
 COMPOSE_GATEWAY_OVERRIDE="deploy/model-gateway-network.override.yml"
 # 共用同一个镜像的全部服务。falkordb 不在其中：它是数据面，发布不碰它。
-SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery}"
+SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery journal_prune}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
 [ "${KG_HUB_SSH_ALLOW_PROXYJUMP:-0}" = 1 ] || SSH_OPTS+=(-o ProxyJump=none)
 
