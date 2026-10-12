@@ -39,12 +39,19 @@ class SlowProbeDebounce(unittest.TestCase):
         self.assertFalse(anomalies['falkordb_slow'])
         self.assertEqual(counters['falkordb_slow_streak'], 0)
 
-    def test_error_reports_unreachable_and_resets_streak(self):
+    def test_error_reports_unreachable_and_keeps_streak(self):
+        # 探针报错 = 本轮快慢不可判：不触发、不清零，也不打断连续计数。
         anomalies, details, counters = self._apply(('error', 0.0, 'HTTP 500: x'), prev_streak=1)
         self.assertTrue(anomalies['falkordb_unreachable'])
         self.assertEqual(details['falkordb_unreachable'], 'HTTP 500: x')
         self.assertFalse(anomalies['falkordb_slow'])
-        self.assertEqual(counters['falkordb_slow_streak'], 0)
+        self.assertEqual(counters['falkordb_slow_streak'], 1)
+
+    def test_unjudgeable_round_holds_a_firing_alert(self):
+        for probe in (('error', 0.0, 'x'), ('skip', 0.0, 'server down')):
+            anomalies, _, counters = self._apply(probe, prev_bad=True, prev_streak=3)
+            self.assertTrue(anomalies['falkordb_slow'], probe)
+            self.assertEqual(counters['falkordb_slow_unknown'], 1)
 
     def test_rounds_one_restores_single_round_behaviour(self):
         with patch.object(W, 'SLOW_CONSECUTIVE_ROUNDS', 1):

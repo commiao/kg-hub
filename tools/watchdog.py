@@ -684,11 +684,19 @@ STATS_ANOMALY_KINDS: tuple[tuple[str, str], ...] = (
     ("capsule_stale", "OpenClaw 胶囊管线"),
     ("recent_errors", "近 1h 新增入图错误"),
     ("extraction_failing", "抽取失败存量"),
+    # 2026-10-12 补:这两条同样只读 /api/queue_stats,却漏在清单外。当晚两次发布
+    # 重启 server,断路一直开着,它们仍各发了一对「resolved → 再 FIRE」。
+    ("held_growth", "待核验增长"),
+    ("model_breaker_auto", "模型调用自动断路"),
 )
+STATS_SOURCE_HINT = "server_down（/api/queue_stats 取不到数）"
+# 未纳入三态的判据要么不依赖 server(盘温、网关、采集链路另有一套),要么已单独
+# 处理:refinery_stalled(判决取自 /api/topology/latest)、falkordb_slow(探针)。
 
 
 def _hold_or_release(kind: str, prev_bad: bool, streak: int, details: dict,
-                     what: str) -> bool:
+                     what: str,
+                     see: str = "capture_monitor_unhealthy / capture_probe_stale") -> bool:
     """unknown 轮的沿用/释放决策。返回本轮该不该继续判 bad。"""
     if not prev_bad:
         return False
@@ -699,8 +707,7 @@ def _hold_or_release(kind: str, prev_bad: bool, streak: int, details: dict,
     # 停止沿用。CLEAR 文案必须说明这不是"已修复"，否则就是又一个撒谎的信号。
     details[f"{kind}:clear"] = (
         f"连续 {streak} 轮无法判定，停止沿用未经验证的结论 —— "
-        f"**这不等于故障已修复**；证据源本身的问题见 capture_monitor_unhealthy / "
-        f"capture_probe_stale")
+        f"**这不等于故障已修复**；证据源本身的问题见 {see}")
     return False
 
 
@@ -761,11 +768,22 @@ def apply_search_probe(pstatus: str, plat: float, pmsg: str, prev_anomalies: dic
     """把 /api/search 探针结果落到 falkordb_unreachable / falkordb_slow。
 
     falkordb_slow 去抖：连续 SLOW_CONSECUTIVE_ROUNDS 轮都慢才报；已在报警中则
-    慢一轮就继续保持；任何非 slow 的一轮清零计数并解除（解除不去抖）。
+    慢一轮就继续保持；探针正常的一轮清零计数并解除（解除不去抖）。
+    探针报错或没跑（server 不可达）= 本轮快慢不可判：沿用上一轮、计数不动，
+    而不是落回 False 发假 CLEAR。
     """
     if pstatus == "error":
         new_anomalies["falkordb_unreachable"] = True
         details["falkordb_unreachable"] = pmsg
+    if pstatus in ("error", "skip"):
+        new_counters["falkordb_slow_streak"] = int(prev_counters.get("falkordb_slow_streak", 0))
+        unknown = int(prev_counters.get("falkordb_slow_unknown", 0)) + 1
+        new_counters["falkordb_slow_unknown"] = unknown
+        new_anomalies["falkordb_slow"] = _hold_or_release(
+            "falkordb_slow", bool(prev_anomalies.get("falkordb_slow")),
+            unknown, details, "搜索耗时", "server_down / falkordb_unreachable")
+        return
+    new_counters["falkordb_slow_unknown"] = 0
     if pstatus != "slow":
         new_counters["falkordb_slow_streak"] = 0
         return
@@ -856,6 +874,17 @@ def main() -> int:
             f"⏸ refinery 在工作窗口内停工：{gates}{extra}"
             f"｜积压 {backlog if backlog is not None else '?'} 条不再下降"
             "｜看 /dashboard/refinery")
+    # 取不到判决(server 重启/不可达)≠ 恢复:沿用上一轮,有轮数上限。
+    # server 可达时判决总在(窗口外也是 halted=False),None 只意味着读不到。
+    if halt is None:
+        streak = int(prev_counters.get("refinery_stalled_unknown", 0)) + 1
+        new_counters["refinery_stalled_unknown"] = streak
+        new_anomalies["refinery_stalled"] = _hold_or_release(
+            "refinery_stalled", bool(prev_anomalies.get("refinery_stalled")),
+            streak, details, "refinery 停工判决",
+            "server_down（/api/topology/latest 取不到判决）")
+    else:
+        new_counters["refinery_stalled_unknown"] = 0
 
     hottest, temp_msg = check_disk_temp()
     if hottest is not None and hottest >= DISK_TEMP_WARN:
@@ -910,7 +939,7 @@ def main() -> int:
                     new_counters["capsule_stale_unknown"] = streak
                     new_anomalies["capsule_stale"] = _hold_or_release(
                         "capsule_stale", bool(prev_anomalies.get("capsule_stale")),
-                        streak, details, "胶囊账龄")
+                        streak, details, "胶囊账龄", STATS_SOURCE_HINT)
             apply_held_checks(stats, cfg, new_anomalies, details)
             if isinstance(oldest_age, (int, float)) and oldest_age > STUCK_SECONDS:
                 new_anomalies["stuck_jobs"] = True
@@ -977,7 +1006,7 @@ def main() -> int:
             new_counters[f"{_kind}_unknown"] = streak
             new_anomalies[_kind] = _hold_or_release(
                 _kind, bool(prev_anomalies.get(_kind, False)),
-                streak, details, _what)
+                streak, details, _what, STATS_SOURCE_HINT)
 
     # 2b. FalkorDB probe — timed /api/search (only if server alive)
     if alive:
