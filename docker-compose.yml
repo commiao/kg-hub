@@ -38,9 +38,13 @@ services:
       - "127.0.0.1:3001:3000"   # FalkorDB browser UI, NAS-local only
     volumes:
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/falkordb:/var/lib/falkordb/data
+    # T-0245: every health probe makes dockerd rewrite this container's config.v2.json
+    # with fsync+rename on /volume1 (btrfs), a whole transaction commit of a few MB.
+    # At 10s this was the largest periodic writer on volume1. Nothing acts on
+    # "unhealthy" at runtime; dependents only wait for the first healthy probe.
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$FALKORDB_PASSWORD\" --no-auth-warning PING | grep -q PONG"]
-      interval: 10s
+      interval: 60s
       timeout: 3s
       retries: 6
       start_period: 20s

@@ -1,4 +1,5 @@
-"""T-0244: FalkorDB keeps AOF (everysec) and writes at most one RDB a day."""
+"""T-0244: FalkorDB keeps AOF (everysec) and writes at most one RDB a day.
+T-0245: its health probe runs once a minute, not every 10 seconds."""
 from __future__ import annotations
 
 import re
@@ -8,9 +9,13 @@ from pathlib import Path
 COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
 
 
-def falkordb_args() -> list[str]:
+def falkordb_block() -> str:
     text = COMPOSE.read_text("utf-8")
-    block = text.split("\n  falkordb:\n", 1)[1].split("\n\n", 1)[0]
+    return text.split("\n  falkordb:\n", 1)[1].split("\n\n", 1)[0]
+
+
+def falkordb_args() -> list[str]:
+    block = falkordb_block()
     line = re.search(r"- FALKORDB_ARGS=(.*)", block).group(1)
     return line.split()          # run.sh word-splits ${FALKORDB_ARGS}
 
@@ -33,6 +38,11 @@ class FalkorDBPersistenceTests(unittest.TestCase):
 
     def test_at_most_one_rdb_snapshot_a_day(self):
         self.assertEqual(self.option("--save"), ["86400", "1"])
+
+    def test_health_probe_runs_once_a_minute(self):
+        healthcheck = falkordb_block().split("    healthcheck:\n", 1)[1]
+        self.assertRegex(healthcheck, r"(?m)^      interval: 60s$")
+        self.assertRegex(healthcheck, r"(?m)^      test: .*PING")
 
 
 if __name__ == "__main__":
