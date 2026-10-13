@@ -39,7 +39,7 @@ def run_rounds(rounds):
              patch.object(W, 'check_model_gateway_consumer_contract', return_value='ok'), \
              patch.object(W, 'check_capture_chain', return_value=W.CaptureDecision(None, None)), \
              patch.object(W, 'emit_alert',
-                          side_effect=lambda sev, kind, msg: fired.append((sev, kind, msg)) or True):
+                          side_effect=lambda sev, kind, msg, **_: fired.append((sev, kind, msg)) or True):
             W.main()
         state = saves[-1]
     return [(sev, kind, msg) for sev, kind, msg in fired if kind in WATCHED]
