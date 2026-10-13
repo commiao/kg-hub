@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 
@@ -53,7 +54,8 @@ def _run(failure_epoch_s: float, observation_epoch_s: float):
         P.CM_LOG_DIR, P.CM_DB = log_dir, db
         P.http_json = lambda *a, **k: (_health(), None)
         try:
-            return P.probe_worker()
+            with patch.object(P, "DUAL_MARKER", Path("/nonexistent/dual-active.json")):
+                return P.probe_worker()
         finally:
             P.CM_LOG_DIR, P.CM_DB, P.http_json = old_log_dir, old_db, old_http
 
@@ -91,7 +93,8 @@ def _run_lines(log_lines, observation_epoch_s, *, health=None):
         P.CM_LOG_DIR, P.CM_DB = log_dir, db
         P.http_json = lambda *a, **k: (health or _health(), None)
         try:
-            return P.probe_worker()
+            with patch.object(P, "DUAL_MARKER", Path("/nonexistent/dual-active.json")):
+                return P.probe_worker()
         finally:
             P.CM_LOG_DIR, P.CM_DB, P.http_json = old
 
@@ -293,7 +296,9 @@ def test_health_unreachable_still_red():
     old = P.http_json
     P.http_json = lambda *a, **k: (None, "URLError")
     try:
-        node = P.probe_worker()
+        with patch.object(P, "CM_DB", Path("/nonexistent/legacy/claude-mem.db")), \
+             patch.object(P, "DUAL_MARKER", Path("/nonexistent/dual-active.json")):
+            node = P.probe_worker()
     finally:
         P.http_json = old
     assert node["state"] == P.RED
