@@ -43,7 +43,6 @@ HOME = Path.home()
 CM_DB = HOME / ".claude-mem" / "claude-mem.db"
 CM_ENV = HOME / ".claude-mem" / ".env"
 CM_LOG_DIR = HOME / ".claude-mem" / "logs"
-CM_HEALTH = "http://localhost:37701/api/health"
 SYNC_STAMP = HOME / ".kg-hub" / "state" / "claude-mem-synced.obsid"
 SYNC_LOG = HOME / ".kg-hub" / "logs" / "claude-mem-sync.out.log"
 NAS_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
@@ -185,7 +184,9 @@ def _http_json_once(url: str, timeout: float = 5.0, token: str | None = None,
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Infrastructure probes must reach the actual local/Tailnet service, not a system proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
             body = resp.read().decode(errors="replace")
         return (json.loads(body) if body.strip() else {}), None
     except urllib.error.HTTPError as e:
@@ -576,7 +577,41 @@ def _log_epoch(line: str) -> float | None:
     return None
 
 
-def _worker_generation_diagnostics() -> dict:
+def _worker_runtime() -> tuple[str, Path, Path]:
+    """Resolve health and generation evidence from the same capture instance.
+
+    An activated generation must have readable settings; never probe an old
+    worker when its current configuration is missing or inconsistent.
+    """
+    db, logs = CM_DB, CM_LOG_DIR
+    activated = DUAL_MARKER.exists()
+    if activated:
+        marker = json.loads(DUAL_MARKER.read_text())
+        sources = json.loads(Path(marker["source_config"]).read_text())["sources"]
+        db = Path(sources[-1]["path"])
+        if not db.is_absolute():
+            raise ValueError("absolute capture database required")
+        logs = db.parent / "logs"
+    settings_path = db.parent / "settings.json"
+    if not activated and not settings_path.exists():
+        settings = {}
+    else:
+        settings = json.loads(settings_path.read_text())
+    if not isinstance(settings, dict):
+        raise ValueError("worker settings must be an object")
+    raw_port = settings["CLAUDE_MEM_WORKER_PORT"] if activated else settings.get("CLAUDE_MEM_WORKER_PORT", 37701)
+    if isinstance(raw_port, bool) or not isinstance(raw_port, (str, int)):
+        raise ValueError("invalid worker port")
+    port = int(raw_port)
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid worker port")
+    if "CLAUDE_MEM_DATA_DIR" in settings:
+        if Path(settings["CLAUDE_MEM_DATA_DIR"]).resolve() != db.parent.resolve():
+            raise ValueError("worker data directory mismatch")
+    return f"http://127.0.0.1:{port}/api/health", db, logs
+
+
+def _worker_generation_diagnostics(db: Path | None = None, log_dir: Path | None = None) -> dict:
     """把“进程活着”和“素材真的变成了 observation”拆成两个独立信号。
 
     `/api/health=ok` 只证明 worker HTTP 进程存在。真正要回答的是：**送进去的批次
@@ -586,10 +621,12 @@ def _worker_generation_diagnostics() -> dict:
     空闲免疫：没有流量就没有丢弃，`discards_since_observation` 恒为 0，不会因为
     “夜里没人干活所以没有新 observation”而误判——那正是此前三轮误报的病根。
     """
+    db = CM_DB if db is None else db
+    log_dir = CM_LOG_DIR if log_dir is None else log_dir
     observation_epoch = None
-    if CM_DB.exists():
+    if db.exists():
         try:
-            con = sqlite3.connect(f"file:{CM_DB}?mode=ro", uri=True, timeout=8)
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=8)
             row = con.execute("SELECT MAX(created_at_epoch) FROM observations").fetchone()
             con.close()
             observation_epoch = _epoch_seconds(row[0] if row else None)
@@ -600,7 +637,7 @@ def _worker_generation_diagnostics() -> dict:
     discards = 0
     failure_hint = None
     try:
-        logs = sorted(CM_LOG_DIR.glob("claude-mem-*.log"),
+        logs = sorted(log_dir.glob("claude-mem-*.log"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         logs = []
@@ -664,12 +701,18 @@ def _worker_generation_diagnostics() -> dict:
 
 def probe_worker() -> dict:
     """claude-mem worker：HTTP 存活与 observation 产出链路都必须健康。"""
-    data, err = http_json(CM_HEALTH, timeout=4, retries=2)
+    try:
+        health, db, log_dir = _worker_runtime()
+    except Exception as exc:  # configuration errors must not expose settings values
+        return {"id": "worker", "layer": "worker", "label": "claude-mem",
+                "state": RED, "detail": f"当前采集 worker 配置不可读（{type(exc).__name__}）"}
+    port = health.split(":")[-1].split("/")[0]
+    data, err = http_json(health, timeout=4, retries=2)
     if err or not data:
         return {"id": "worker", "layer": "worker", "label": "claude-mem",
-                "state": RED, "detail": f"health 不可达（{err or 'empty'}）@ :37701"}
+                "state": RED, "detail": f"health 不可达（{err or 'empty'}）@ :{port}"}
     up = int(data.get("uptime") or 0)
-    diag = _worker_generation_diagnostics()
+    diag = _worker_generation_diagnostics(db, log_dir)
     metrics = {"pid": data.get("pid"), "uptime_s": up,
                "queue_depth": diag["queue_depth"],
                "discards_since_observation": diag["discards_since_observation"]}
