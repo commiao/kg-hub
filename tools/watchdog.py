@@ -299,6 +299,14 @@ def check_health() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+# /api/queue_stats 要全表扫 IngestedKey:平时 1.8~2.1s(2026-10-13 连测 8 次)。
+# 原超时 10s 在 refinery 窗口高负载时不够:10-13 01:05–01:12、01:24–01:30 两段
+# server /health 每轮 200,queue_stats 却每轮超时、server 侧连一条完成记录都没有;
+# 同刻搜索探针(平时 2.5s)涨到十几秒仍能返回。超时只决定 watchdog 等不等得到,
+# 不增加 server 负担(请求照样在算),所以放宽到 30s。
+QUEUE_STATS_TIMEOUT = float(os.environ.get("KG_HUB_QUEUE_STATS_TIMEOUT_SEC", "30"))
+
+
 def check_queue() -> tuple[dict | None, str]:
     """Returns (stats_dict, message)."""
     if not KG_HUB_TOKEN:
@@ -307,7 +315,7 @@ def check_queue() -> tuple[dict | None, str]:
         r = httpx.get(
             f"{KG_HUB_URL}/api/queue_stats",
             headers={"Authorization": f"Bearer {KG_HUB_TOKEN}"},
-            timeout=10.0,
+            timeout=QUEUE_STATS_TIMEOUT,
         )
         if r.status_code == 200:
             return r.json(), "ok"
@@ -690,19 +698,26 @@ STATS_ANOMALY_KINDS: tuple[tuple[str, str], ...] = (
     ("model_breaker_auto", "模型调用自动断路"),
 )
 STATS_SOURCE_HINT = "server_down（/api/queue_stats 取不到数）"
+# server 活着、只是取数失败(高负载超时)时的沿用上限。3 轮是为 server 宕机设计的:
+# 那时 server_down 会接手报警,早点释放没有信息损失。活着却取不到数时没有别的告警
+# 接手,10-13 凌晨两段各卡 4 轮,刚好越过 3 轮,于是报了两对「释放 → 1~2 分钟后
+# 再 FIRE」。10 轮约 17~20 分钟,覆盖负载尖峰;更久仍取不到才释放并写明原因。
+STATS_SLOW_HOLD_ROUNDS = int(os.environ.get("KG_HUB_STATS_SLOW_HOLD", "10"))
 # 未纳入三态的判据要么不依赖 server(盘温、网关、采集链路另有一套),要么已单独
 # 处理:refinery_stalled(判决取自 /api/topology/latest)、falkordb_slow(探针)。
 
 
 def _hold_or_release(kind: str, prev_bad: bool, streak: int, details: dict,
                      what: str,
-                     see: str = "capture_monitor_unhealthy / capture_probe_stale") -> bool:
+                     see: str = "capture_monitor_unhealthy / capture_probe_stale",
+                     limit: int | None = None) -> bool:
     """unknown 轮的沿用/释放决策。返回本轮该不该继续判 bad。"""
     if not prev_bad:
         return False
-    if streak <= CAPTURE_UNKNOWN_HOLD_ROUNDS:
+    limit = CAPTURE_UNKNOWN_HOLD_ROUNDS if limit is None else limit
+    if streak <= limit:
         details[kind] = (f"{what}本轮不可判，沿用上一轮状态"
-                         f"（第 {streak}/{CAPTURE_UNKNOWN_HOLD_ROUNDS} 轮）")
+                         f"（第 {streak}/{limit} 轮）")
         return True
     # 停止沿用。CLEAR 文案必须说明这不是"已修复"，否则就是又一个撒谎的信号。
     details[f"{kind}:clear"] = (
@@ -899,8 +914,12 @@ def main() -> int:
 
     # 2. queue stats (only meaningful if server alive)
     stats = None
+    qmsg = "server down"
     if alive:
         stats, qmsg = check_queue()
+        if not stats:
+            # 原先丢弃这条原因,事后只能翻 server 访问日志反推是超时。
+            print(f"[watchdog] queue_stats unavailable: {qmsg}")
         if stats:
             pending = int(stats.get("pending", 0))
             oldest_age = stats.get("oldest_pending_age_seconds")
@@ -1001,12 +1020,18 @@ def main() -> int:
         for _kind, _what in STATS_ANOMALY_KINDS:
             new_counters.setdefault(f"{_kind}_unknown", 0)
     else:
+        # server 活着只是取数失败:放宽上限,释放文案写明真实原因(见 STATS_SLOW_HOLD_ROUNDS)。
+        if alive:
+            stats_see = f"server 存活但 /api/queue_stats 取数失败（{qmsg[:120]}）"
+            stats_limit = STATS_SLOW_HOLD_ROUNDS
+        else:
+            stats_see, stats_limit = STATS_SOURCE_HINT, None
         for _kind, _what in STATS_ANOMALY_KINDS:
             streak = int(prev_counters.get(f"{_kind}_unknown", 0)) + 1
             new_counters[f"{_kind}_unknown"] = streak
             new_anomalies[_kind] = _hold_or_release(
                 _kind, bool(prev_anomalies.get(_kind, False)),
-                streak, details, _what, STATS_SOURCE_HINT)
+                streak, details, _what, stats_see, stats_limit)
 
     # 2b. FalkorDB probe — timed /api/search (only if server alive)
     if alive:
