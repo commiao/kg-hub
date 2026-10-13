@@ -185,11 +185,19 @@ def send_macos_notification(title: str, message: str) -> bool:
         return False
 
 
-def emit_alert(severity: str, kind: str, message: str) -> bool:
-    """severity: 'fire' (BAD-state-entered) or 'clear' (BAD-state-resolved)."""
+def emit_alert(severity: str, kind: str, message: str, attempt: int = 1) -> bool:
+    """severity: 'fire' (BAD-state-entered) or 'clear' (BAD-state-resolved).
+
+    alerts.log 记的是**状态变化**,不是发送次数。日志先于发送写(崩溃时宁可多不可少),
+    所以投递失败、下一轮重发时,原来会再写一行一模一样的 [FIRE]/[CLEAR] —— 看上去
+    就是同一条告警报了两次。2026-10-13 复盘:全量日志里这类「重复」都相隔一轮、文案
+    相同,集中在凌晨 02:00 飞书不可达的那几分钟;09-15 起约 20 小时投递全失败,一条
+    告警重写了 771 次。故重发单独打标,失败另记一行,统计 [FIRE]/[CLEAR] 才是真边沿。
+    """
     emoji = "🔴" if severity == "fire" else "✅"
     title = f"{emoji} kg-hub {kind}"
-    line = f"[{severity.upper()}] {kind}: {message}"
+    tag = severity.upper() if attempt <= 1 else f"{severity.upper()}·重发#{attempt}"
+    line = f"[{tag}] {kind}: {message}"
     write_alert_log(line)
     body = f"{title}\n{message}"
     # A local fallback must not acknowledge an undelivered Feishu alert.
@@ -200,6 +208,9 @@ def emit_alert(severity: str, kind: str, message: str) -> bool:
         delivered = send_macos_notification(title, message)
         sent_via = "macos" if delivered else "pending"
     print(f"{title} | {message} (via {sent_via})")
+    if not delivered:
+        channel = "飞书" if FEISHU_WEBHOOK else "macOS 通知"
+        write_alert_log(f"[PENDING] {kind}: {channel}未送达（第 {attempt} 次），下一轮重发")
     return delivered
 
 
@@ -230,6 +241,7 @@ def deliver_alerts(state, anomalies, details, blocker_ids):
                 "severity": "fire" if bad else "clear",
                 "message": details.get(kind, "anomaly detected") if bad else
                            details.get(f"{kind}:clear", "resolved"),
+                "attempts": 0,
             }
     if anomalies.get("capture_blocked"):
         alerted |= new_ids
@@ -239,9 +251,14 @@ def deliver_alerts(state, anomalies, details, blocker_ids):
                       capture_blocker_alerted=sorted(alerted))
     save_state(checkpoint)
     for kind, event in list(pending.items()):
-        if emit_alert(event["severity"], kind, event["message"]) is True:
+        # 本轮新建的条目 attempts=0；升级前留下的旧条目没有这个键，但它们一定
+        # 已经发过至少一次，按 1 计，免得升级当轮把重发记成新边沿。
+        attempt = int(event.get("attempts", 1)) + 1
+        if emit_alert(event["severity"], kind, event["message"], attempt=attempt) is True:
             del pending[kind]
-            save_state(dict(checkpoint, pending_alerts=pending))
+        else:
+            pending[kind] = dict(event, attempts=attempt)
+        save_state(dict(checkpoint, pending_alerts=pending))
     return pending, sorted(new_ids), sorted(alerted)
 
 

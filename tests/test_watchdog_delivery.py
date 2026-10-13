@@ -39,7 +39,7 @@ class Delivery(unittest.TestCase):
         state = {'anomalies': {'capture_blocked': True}, 'pending_alerts': {'capture_blocked': {'severity': 'fire', 'message': 'old'}}}
         with patch.object(W, 'save_state'), patch.object(W, 'emit_alert', return_value=True) as emit:
             W.deliver_alerts(state, {'capture_blocked': False}, {}, [])
-            emit.assert_called_once_with('clear', 'capture_blocked', 'resolved')
+            emit.assert_called_once_with('clear', 'capture_blocked', 'resolved', attempt=1)
 
 
     # ── 阻塞点闪烁不算「新」(2026-10-12)───────────────────────────
@@ -124,7 +124,7 @@ class Delivery(unittest.TestCase):
                  patch.object(W, 'check_model_gateway_consumer_contract', return_value='ok'), \
                  patch.object(W, 'check_capture_chain', return_value=decision), \
                  patch.object(W, 'emit_alert',
-                              side_effect=lambda sev, kind, msg: fired.append((sev, kind)) or True):
+                              side_effect=lambda sev, kind, msg, **_: fired.append((sev, kind)) or True):
                 W.main()
             state = saves[-1]   # 文件被每次 save 整体覆盖：下一轮读到的是最后一次
         self.assertEqual([f for f in fired if f[1] == 'capture_blocked'],

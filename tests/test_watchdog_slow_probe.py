@@ -84,7 +84,7 @@ class SlowProbeThroughMain(unittest.TestCase):
                  patch.object(W, 'check_capture_chain',
                               return_value=W.CaptureDecision(None, None)), \
                  patch.object(W, 'emit_alert',
-                              side_effect=lambda sev, kind, msg: fired.append((sev, kind)) or True):
+                              side_effect=lambda sev, kind, msg, **_: fired.append((sev, kind)) or True):
                 W.main()
             state = saves[-1]
         return [f for f in fired if f[1] == 'falkordb_slow']
