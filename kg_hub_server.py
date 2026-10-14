@@ -3836,7 +3836,10 @@ var kws=Object.keys(D.rankings);document.getElementById('kw').innerHTML=kws.map(
 Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(b){b.onclick=function(){Array.prototype.forEach.call(document.querySelectorAll('#kw button'),function(x){x.setAttribute('aria-pressed','false')});b.setAttribute('aria-pressed','true');rank(b.dataset.k);};});
 rank(kws[0]);</script></body></html>"""
 
-_DASH_KWS = ["kg-hub", "workspace_claudeCode", "sd-server"]
+# 模拟 PUSH hook 在几个典型目录下推导出的关键词（tools/kg_push_hook.py
+# derive_project_keywords：目录名 + 上级目录名）。仓库迁到 ~/work-ai 后，
+# ~/work-ai/kg-hub 推导出的是 kg-hub、work-ai，不再有 workspace_claudeCode。
+_DASH_KWS = ["kg-hub", "work-ai", "sd-server"]
 
 
 async def dashboard_capsules(request: Request) -> HTMLResponse:
@@ -4196,8 +4199,44 @@ function bars(el,arr,key,label,color){var mx=Math.max.apply(null,arr.map(functio
 document.getElementById(el).innerHTML=arr.length?arr.map(function(x){return '<div class=row><span class=nm>'+label(x)+'</span><div class=bar><i style="width:'+Math.round(x[key]/mx*100)+'%;background:'+color+'"></i></div><span class=n>'+x[key]+'</span></div>';}).join(''):'<div class=empty>暂无（尚无上报）</div>';}
 bars('contrib',D.contrib,'count',function(x){return x.tool},'#1D9E75');
 bars('usage',D.usage,'n',function(x){return x.tool+(x.last?' <span class=ts>'+x.last+'</span>':'')},'#378ADD');
-document.getElementById('note').textContent='每 60s 刷新 · 贡献按 project=workspace_<工具> 归属，真实项目目录归"工具未知" · 使用=PUSH hook 注入上报（检索取用已计入全图 usage，但此处按工具拆分仍只覆盖 hook）';
+document.getElementById('note').textContent='每 60s 刷新 · 贡献先按 project=workspace_<工具> 目录、再按 claude-mem 的 platform 归属，两者都没有归"工具未知" · 使用=PUSH hook 注入上报（检索取用已计入全图 usage，但此处按工具拆分仍只覆盖 hook）';
 </script></body></html>"""
+
+
+# 工具贡献归属。source_description 形如
+#   claude-mem obs id=1 project=<p> type=<t> platform=<claude|codex|cursor|qoder|_default>
+# 以前只认 project=workspace_<工具>：那只在会话开在 ~/workspace_<工具> 根目录时成立，
+# 仓库迁到 ~/work-ai 后 project 成了仓库名，新数据几乎全落进「工具未知」
+# （2026-10-14：最新 2000 条里约 1443 条）。规则：
+#   1. project=workspace_<工具> → 该工具（目录明确；claude-mem 曾把 Cursor/Qoder
+#      会话硬编码成 platform=claude，两者冲突时以目录为准）
+#   2. 否则 platform=<工具> → 该工具
+#   3. 都没有（platform 为 _default 或早期记录无 platform）→ 工具未知
+_TOOL_NAMES = {"claudeCode": "Claude Code", "claude": "Claude Code", "codex": "Codex",
+               "cursor": "Cursor", "qoder": "Qoder"}
+_TOOL_ORDER = ["Claude Code", "Codex", "Cursor", "Qoder", "工具未知"]
+_TOOL_CONTRIB_QUERY = (
+    "MATCH (n:Episodic) WHERE n.source_description CONTAINS 'claude-mem obs' "
+    "WITH split(split(n.source_description, ' project=')[1], ' ')[0] AS proj, "
+    "CASE WHEN n.source_description CONTAINS ' platform=' "
+    "THEN split(split(n.source_description, ' platform=')[1], ' ')[0] ELSE '' END AS plat "
+    "WITH CASE WHEN proj STARTS WITH 'workspace_' THEN proj ELSE '' END AS ws, plat "
+    "RETURN ws, plat, count(*) AS c")
+
+
+def tool_of(project_dir: str, platform: str) -> str:
+    if project_dir.startswith("workspace_"):
+        name = _TOOL_NAMES.get(project_dir[len("workspace_"):])
+        if name:
+            return name
+    return _TOOL_NAMES.get(platform, "工具未知")
+
+
+def tool_contributions(rows) -> list[dict]:
+    counts = dict.fromkeys(_TOOL_ORDER, 0)
+    for r in rows:
+        counts[tool_of(r.get("ws") or "", r.get("plat") or "")] += int(r.get("c") or 0)
+    return [{"tool": t, "count": counts[t]} for t in _TOOL_ORDER]
 
 
 async def dashboard_tools(request: Request) -> HTMLResponse:
@@ -4206,23 +4245,9 @@ async def dashboard_tools(request: Request) -> HTMLResponse:
     def esc(t):
         return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    async def cnt(cy, **p):
-        rows, _, _ = await driver.execute_query(cy, **p)
-        return int(rows[0].get("c") or 0) if rows else 0
-
-    TOOLS = [("Claude Code", "project=workspace_claudeCode "),
-             ("Codex", "project=workspace_codex "),
-             ("Cursor", "project=workspace_cursor "),
-             ("Qoder", "project=workspace_qoder ")]
     try:
-        cm_total = await cnt("MATCH (n:Episodic) WHERE n.source_description CONTAINS 'claude-mem obs' "
-                             "RETURN count(n) AS c")
-        contrib, known = [], 0
-        for name, pat in TOOLS:
-            c = await cnt("MATCH (n:Episodic) WHERE n.source_description CONTAINS $p RETURN count(n) AS c", p=pat)
-            known += c
-            contrib.append({"tool": name, "count": c})
-        contrib.append({"tool": "工具未知", "count": max(cm_total - known, 0)})
+        rows, _, _ = await driver.execute_query(_TOOL_CONTRIB_QUERY)
+        contrib = tool_contributions(rows)
         rows, _, _ = await driver.execute_query(
             "MATCH (t:ToolStat) RETURN t.tool AS tool, coalesce(t.injections,0) AS n, t.last_at AS last "
             "ORDER BY n DESC")
