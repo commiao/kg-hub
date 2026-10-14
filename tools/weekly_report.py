@@ -1,7 +1,11 @@
 """
 kg-hub weekly report — orchestrator.
 
-Runs via launchd weekly (Sun 09:00 local). Generates two artifacts:
+Runs weekly (Sun 09:00 Beijing) inside the NAS weekly_report container, driven by
+tools/weekly_report_scheduler.py (T-0269). It used to be a Mac launchd job; after the
+2026-09-20 switch to release artifacts it could no longer find its interpreter, and the
+Mac never had the FalkorDB credentials or the refinery decisions log anyway — the last
+report before the move is dated 2026-08-23. Generates:
   1. ~/.kg-hub/reports/quality-baseline-YYYY-MM-DD.md   (KG composition snapshot)
   2. ~/.kg-hub/reports/decisions-7d-YYYY-MM-DD.md       (filter decisions over 7d)
 
@@ -41,7 +45,9 @@ except Exception:
 from utils.wait_for_dependencies import wait_for_port  # noqa: E402
 
 KG_HUB_ROOT = Path(__file__).resolve().parent.parent
-PYTHON = KG_HUB_ROOT / "spike-graphiti" / ".venv" / "bin" / "python"
+# 子报告用跑本脚本的同一个解释器。原先写死 <代码根>/spike-graphiti/.venv —— 那是开发
+# 工作树的布局，发布产物和 NAS 镜像里都没有，9/27 起每周 FATAL「python not found」。
+PYTHON = Path(os.environ.get("KG_HUB_PYTHON") or sys.executable)
 REPORT_DIR = Path.home() / ".kg-hub" / "reports"
 
 

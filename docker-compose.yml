@@ -405,3 +405,46 @@ services:
         mode: "non-blocking"
         max-buffer-size: "1m"
     command: ["python", "-m", "tools.nightly_prune"]
+
+  # T-0269: 每周日北京时间 09:00 跑 kg-hub 周报（quality_audit / decisions_summary /
+  # kg_eval / usage_ranking），报告写到 <数据根>/reports。原先是 Mac launchd 作业，但数据和
+  # 凭据都在 NAS：Mac 端从 2026-08-23 之后再没产出过一份报告。调度见 tools/weekly_report_scheduler.py。
+  # <数据根>/reports 由 release.sh 预先创建——Synology docker 不会自动创建绑定源。
+  weekly_report:
+    image: kg-hub-server:${KG_HUB_IMAGE_TAG:?必须由 deploy/nas/release.sh 按 git commit 设定；不接受 latest}
+    container_name: kg-hub-weekly-report
+    restart: unless-stopped
+    depends_on:
+      - falkordb
+      - kg_hub_server
+    environment:
+      - KG_HUB_URL=http://kg_hub_server:8080
+      - KG_HUB_API_TOKEN=${KG_HUB_API_TOKEN}
+      - KG_HUB_FALKORDB_HOST=falkordb
+      - KG_HUB_FALKORDB_PORT=6379
+      - KG_HUB_FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
+      - KG_HUB_FALKORDB_DATABASE=kg_hub
+      - KG_HUB_DECISIONS_LOG=/refinery-state/ingest_decisions.jsonl
+      - EMBEDDING_DIM=384
+      - FASTEMBED_CACHE_PATH=/models
+      - FASTEMBED_LOCAL_FILES_ONLY=true
+      - HF_HUB_OFFLINE=1
+      - KG_HUB_REPORT_AT=09:00
+      - KG_HUB_REPORT_WEEKDAY=6
+    volumes:
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/reports:/root/.kg-hub/reports
+      # 以下只读：周报只看不写。claude-mem.db 是 refinery 消费的那份 NAS 副本
+      # （quality_audit 按 ~/.claude-mem/claude-mem.db 找它）；决策日志由 refinery 写。
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/claude-mem:/root/.claude-mem:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/refinery-state:/refinery-state:ro
+      - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/models:/models:ro
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "2"
+        mode: "non-blocking"
+        max-buffer-size: "1m"
+    command: ["python", "-m", "tools.weekly_report_scheduler"]

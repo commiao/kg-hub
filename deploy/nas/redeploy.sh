@@ -146,6 +146,7 @@ ssh "${SSH_OPTS[@]}" "$NAS" "
       device_liveness) container='kg-hub-device-liveness' ;;
       kg_hub_server) container='kg-hub-server' ;;
       journal_prune) container='kg-hub-journal-prune' ;;
+      weekly_report) container='kg-hub-weekly-report' ;;
       *) container=\"kg-hub-\$service\" ;;
     esac
     # 不用 compose ps：NAS 上该插件会被历史残留客户端锁住；raw docker ps 不受影响。
@@ -230,7 +231,7 @@ ssh "${SSH_OPTS[@]}" "$NAS" "
   # watchdog 必须最后启动，避免它在 server 重建窗口发出部署诱发的 server_down。
   cleanup_ghosts
   trap 'status=\$?; rollback_staged || true; cleanup_ghosts || true; start_created || true; exit \$status' EXIT
-  for service in device_liveness ingester refinery kg_hub_server journal_prune watchdog; do
+  for service in device_liveness ingester refinery kg_hub_server journal_prune weekly_report watchdog; do
     recreate_service \"\$service\"
   done
   cleanup_ghosts

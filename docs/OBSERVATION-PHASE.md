@@ -49,12 +49,14 @@ cd ~/workspace_claudeCode/kg-hub
 
 ### Passive cadence
 
-`com.kg-hub.weekly-report` (Sundays 09:00 local) automatically writes:
-- `~/.kg-hub/reports/quality-baseline-YYYY-MM-DD.md` — KG composition snapshot
-- `~/.kg-hub/reports/decisions-7d-YYYY-MM-DD.md` — last-week decisions + verdict
-- `~/.kg-hub/reports/INDEX.md` — rolling pointer
+The NAS `weekly_report` container (Sundays 09:00 Beijing; moved off the Mac launchd job
+on 2026-10-14, T-0269) automatically writes to `<kg-hub data root>/reports/`:
+- `quality-baseline-YYYY-MM-DD.md` — KG composition snapshot
+- `decisions-7d-YYYY-MM-DD.md` — last-week decisions + verdict (from the refinery's
+  `refinery-state/ingest_decisions.jsonl`)
+- `INDEX.md` — rolling pointer; `.scheduler-status.json` — last run / next run
 
-Logs at `~/.kg-hub/logs/weekly-report.{out,err}.log`.
+Logs: `docker logs kg-hub-weekly-report`.
 
 ## What to look for each week
 
@@ -122,8 +124,8 @@ dry-run output already shows exactly what would be removed.
 
 | Path | Written by | Purpose |
 |---|---|---|
-| `data/.ingest_decisions.jsonl` | every ingester run | per-obs decision record |
+| `<data root>/refinery-state/ingest_decisions.jsonl` (NAS) | every refinery run | per-obs decision record |
 | `data/.ingested.claude_mem.json` | ingester | watermark + (when not shadow) rejected list |
-| `~/.kg-hub/reports/` | weekly_report cron | dated markdown reports |
+| `<data root>/reports/` (NAS) | weekly_report container | dated markdown reports |
 | `~/.kg-hub/logs/claude-mem-ingest.{out,err}.log` | launchd | 15-min ingester runs |
-| `~/.kg-hub/logs/weekly-report.{out,err}.log` | launchd | Sunday 09:00 reports |
+| `docker logs kg-hub-weekly-report` (NAS) | weekly_report container | Sunday 09:00 reports |
