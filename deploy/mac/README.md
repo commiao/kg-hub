@@ -80,10 +80,10 @@ deploy/mac/install.sh com.kg-hub.capsule-watch   # 只装指定的
 
 ```
 # fleet-ops/bin/mac-release.py —— 从主干 commit 落一份不可变产物，原子切 current
-python3 ~/workspace_claudeCode/fleet-ops/bin/mac-release.py kg-hub \
-    --repo ~/workspace_claudeCode/kg-hub
-python3 ~/workspace_claudeCode/fleet-ops/bin/mac-release.py kg-hub \
-    --repo ~/workspace_claudeCode/kg-hub --check    # current 对应哪个 commit
+python3 ~/work-ai/fleet-ops/bin/mac-release.py kg-hub \
+    --repo ~/work-ai/kg-hub
+python3 ~/work-ai/fleet-ops/bin/mac-release.py kg-hub \
+    --repo ~/work-ai/kg-hub --check    # current 对应哪个 commit
 ```
 
 2026-09-20 之前，这 8 个作业的 plist 直接指向开发工作树 —— 于是"改完即生效"，
