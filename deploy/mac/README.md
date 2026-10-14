@@ -15,7 +15,7 @@
 后果：这台 Mac 挂了要凭记忆重建；改调度没有历史也没人 review；另一个 actor 不
 知道你动过。
 
-## 7 个服务
+## 6 个服务
 
 | Label | 频率 | 干什么 | 挂了会怎样 |
 |---|---|---|---|
@@ -24,10 +24,14 @@
 | `claude-mem-dual-ingest`（在 `optional/`） | 15 分钟 | 合并新旧两代 claude-mem 库，同步到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |
-| `weekly-report` | 周日 9:00 | 周报 | 少一封周报 |
 | `com.claude-mem.worker` | 常驻 | claude-mem 采集 worker 的**兜底看门人** | 见下 |
 
-前三个是链路的一部分，中间三个是报表，最后一个见下。
+前三个是链路的一部分，中间两个是报表，最后一个见下。
+
+周报 `weekly-report` 已于 2026-10-14 迁到 NAS（compose 服务 `weekly_report`，T-0269）：
+数据和凭据都在 NAS，Mac 端从 2026-08-23 之后再没产出过一份报告。已装在 Mac 上的旧作业
+要手工卸掉：`launchctl bootout gui/$UID/com.kg-hub.weekly-report`，再删
+`~/Library/LaunchAgents/com.kg-hub.weekly-report.plist`（install.sh 不会替你卸）。
 
 旧的单源同步 `claude-mem-ingest` 已于 2026-10-08 退役：双源启用后它每轮只写一行
 「已隔离」就退出，而它那行日志曾把探针「同步器跑了几次」的计数撑满。同步作业现在
@@ -65,7 +69,7 @@
 ```
 deploy/mac/install.sh          # 渲染并安装全部（会重载服务）
 deploy/mac/install.sh --check  # 只比对不改动 —— 发现有人手改了 plist
-deploy/mac/install.sh com.kg-hub.weekly-report   # 只装指定的
+deploy/mac/install.sh com.kg-hub.capsule-watch   # 只装指定的
 ```
 
 **改调度的正确姿势**：改 `agents/` 里的模板 → 走分支 → 合主干 → 跑 `install.sh`。

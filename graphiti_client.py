@@ -40,7 +40,7 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client import LLMConfig
 from graphiti_core.llm_client.anthropic_client import AnthropicClient
-from graphiti_core.llm_client.client import ModelSize
+from graphiti_core.llm_client.client import LLMClient, ModelSize
 from graphiti_core.prompts.models import Message
 from model_gateway_client import (
     capture_model_result, create_gateway_client, gateway_model, gateway_token,
@@ -203,6 +203,21 @@ class FastembedEmbedder(EmbedderClient):
         return await asyncio.to_thread(self._embed_sync, list(input_data_list))
 
 
+class SearchOnlyLLM(LLMClient):
+    """只读用途（如 tools/kg_eval 的检索评测）用的占位模型客户端。
+
+    检索路径（Graphiti.search / 全文）不调模型，但 build_llm() 需要网关凭据。只读工具不该
+    为了「构造得出来」就拿到能发起付费调用的凭据（T-0269：周报容器不接网关）。任何一次
+    生成都直接报错，保证零调用。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(config=None, cache=False)
+
+    async def _generate_response(self, *args, **kwargs):
+        raise RuntimeError("SearchOnlyLLM: 只读 Graphiti 不允许调用模型")
+
+
 class NoOpCrossEncoder(CrossEncoderClient):
     """Pass-through reranker; replace with BGERerankerClient when search quality matters."""
 
@@ -228,6 +243,7 @@ def _drop_falkordb_graph(database: str) -> None:
 async def build_graphiti(
     fresh: bool = False,
     database: str = FALKORDB_DATABASE,
+    llm_client: LLMClient | None = None,
 ) -> Graphiti:
     """
     Build a Graphiti instance backed by FalkorDB.
@@ -248,7 +264,7 @@ async def build_graphiti(
     )
     g = Graphiti(
         graph_driver=driver,
-        llm_client=build_llm(),
+        llm_client=llm_client if llm_client is not None else build_llm(),
         embedder=FastembedEmbedder(),
         cross_encoder=NoOpCrossEncoder(),
         # Keep business extraction serialized; gateway applies the signed ceiling.

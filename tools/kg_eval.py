@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml  # noqa: E402
 
-from graphiti_client import build_graphiti  # noqa: E402
+from graphiti_client import SearchOnlyLLM, build_graphiti  # noqa: E402
 
 EVAL_PATH = Path(__file__).resolve().parent.parent / "tests" / "kg_eval.yaml"
 REPORT_DIR = Path.home() / ".kg-hub" / "reports"
@@ -171,7 +171,8 @@ async def main_async(args) -> int:
         return 1
 
     print(f"[eval] loading graphiti (FastEmbed model warm-up may take ~10s)...", file=sys.stderr)
-    g = await build_graphiti(fresh=False)
+    # 只检索、不调模型：不需要也不该拿网关凭据（T-0269，周报容器不接网关）。
+    g = await build_graphiti(fresh=False, llm_client=SearchOnlyLLM())
     print(f"[eval] running {len(questions)} questions...", file=sys.stderr)
 
     results = []

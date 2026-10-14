@@ -42,7 +42,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 COMPOSE_BASE="docker-compose.yml"
 COMPOSE_GATEWAY_OVERRIDE="deploy/model-gateway-network.override.yml"
 # 共用同一个镜像的全部服务。falkordb 不在其中：它是数据面，发布不碰它。
-SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery journal_prune}"
+SERVICES="${KG_HUB_SERVICES:-kg_hub_server device_liveness watchdog ingester refinery journal_prune weekly_report}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20)
 [ "${KG_HUB_SSH_ALLOW_PROXYJUMP:-0}" = 1 ] || SSH_OPTS+=(-o ProxyJump=none)
 
@@ -577,6 +577,9 @@ fi
 
 # ---- 4. 新卷 + 构建不可变镜像 ---------------------------------------------
 on_nas "mkdir -p '$DATA/breakers' && chmod 700 '$DATA/breakers'"
+# weekly_report 的输出目录。Synology docker 不会自动创建绑定源，缺了它新容器根本起不来
+# （journal_prune 首次发布就栽在这上面，2026-10-12）。
+on_nas "mkdir -p '$DATA/reports'"
 
 if [ "$mode" = release ]; then
   say "[3/6] 构建 kg-hub-server:${SHA}（不动 latest）"

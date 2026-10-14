@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -30,7 +31,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-DECISIONS_LOG = Path(__file__).resolve().parent.parent / "data" / ".ingest_decisions.jsonl"
+# 决策日志现在由 NAS 上的 refinery 写进它的状态目录（kg_refinery.DECISIONS_LOG，格式同为
+# utils.ingest_filter.log_decision）；周报容器只读挂载那个目录，用 KG_HUB_DECISIONS_LOG 指过去。
+DECISIONS_LOG = Path(os.environ.get("KG_HUB_DECISIONS_LOG")
+                     or Path(__file__).resolve().parent.parent / "data" / ".ingest_decisions.jsonl")
 REPORT_DIR = Path.home() / ".kg-hub" / "reports"
 
 
