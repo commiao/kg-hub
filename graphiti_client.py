@@ -64,7 +64,14 @@ from utils.batched_node_attributes import extract_attributes_from_nodes as _batc
 from utils.batched_edge_timestamps import install as _install_timestamp_batch  # noqa: E402
 from utils.batched_edge_dedupe import install as _install_dedupe_batch  # noqa: E402
 from utils.indexed_edge_search import install as _install_indexed_edge_search  # noqa: E402
+from utils.edge_invalidation_shadow import install as _install_invalidation_shadow  # noqa: E402
+from utils.falkordb_episode_window import install as _install_episode_window  # noqa: E402
 
+# 抽取上下文「前 10 条 episode」按 reference_time 过滤（T-0285）。
+_install_episode_window()
+# graphiti 的矛盾判定默认只记日志、不让边失效（T-0285）。必须先于两个合批补丁安装：
+# 它们会替换下层拿到的模型客户端，装在它们外面就看不到去重答案。
+_install_invalidation_shadow(os.environ.get("KG_HUB_EDGE_INVALIDATION", "shadow"))
 _install_timestamp_batch(int(os.environ.get("KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT", "0")))
 # Installed second so its widened per-edge gather also lets the timestamp batch
 # see every edge of an episode; both use the same episode hash buckets.
@@ -107,8 +114,8 @@ EDGE_VEC_ONLY_SEARCH.edge_config.search_methods = [
 
 # 治理退休（T-0281）：背书 episode 全部 archived 的边不再召回，与 /api/search 的 agg()
 # 同一规则（查不到背书的边保留）。只认 archived，不按 expired_at/invalid_at 过滤：
-# 2026-10-14 实测 22% 的边被 graphiti 判为失效，且成簇（一条概述类 episode 入图就
-# 失效上千条），抽样多数仍成立；硬过滤会把 FalkorDB 这类正确答案挤出 top-10。
+# 2026-10-14 实测 22% 的边被 graphiti 判为失效，抽样多数仍成立；硬过滤会把 FalkorDB
+# 这类正确答案挤出 top-10。成因与入图侧止血见 utils/edge_invalidation_shadow.py。
 # 失效与否由 /api/search_semantic 原样带出 invalid_at/expired_at，交给使用方判断。
 RETIRED_HEADROOM = 10   # 多取几条抵扣被退休的，常见情况下仍只扫一次
 _RETIRED_ROUNDS = 3     # 不够再翻倍补取，最多扫三次

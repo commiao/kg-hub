@@ -157,6 +157,8 @@ services:
       - KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT=${KG_HUB_EDGE_TIMESTAMP_BATCH_PERCENT:-100}
       # 关系去重/失效原每条观测约 10.6 次外呼，合成至多 12 条一组的请求；对所有 episode 启用。
       - KG_HUB_EDGE_DEDUPE_BATCH_PERCENT=${KG_HUB_EDGE_DEDUPE_BATCH_PERCENT:-100}
+      # graphiti 的矛盾判定只记日志、不让边失效（T-0285）；upstream 恢复原行为。
+      - KG_HUB_EDGE_INVALIDATION=${KG_HUB_EDGE_INVALIDATION:-shadow}
       # 2.0 是线上实际在跑的值 —— 把模型调用速率相对 git 里的 4.0 翻了一倍。
       - KG_HUB_LLM_MIN_INTERVAL_SEC=${KG_HUB_LLM_MIN_INTERVAL_SEC:-2.0}
       # Phase B' 长文档预拆(REFINERY-DESIGN §3')。灰度开关:NAS .env 置 1 生效。
