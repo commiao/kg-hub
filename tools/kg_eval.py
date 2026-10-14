@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml  # noqa: E402
 
-from graphiti_client import SearchOnlyLLM, build_graphiti  # noqa: E402
+from graphiti_client import SearchOnlyLLM, build_graphiti, search_edges_semantic  # noqa: E402
 
 EVAL_PATH = Path(__file__).resolve().parent.parent / "tests" / "kg_eval.yaml"
 REPORT_DIR = Path.home() / ".kg-hub" / "reports"
@@ -74,22 +74,27 @@ async def run_question(g, item: dict, defaults: dict, verbose: bool) -> dict:
     n_eps = int(item.get("num_episode_results", defaults.get("num_episode_results", 5)))
 
     # 1. semantic edge search (kg_search path)
+    # 与 /api/search_semantic 同一个函数。不能用 g.search()：它带 bm25 全文腿，
+    # 在线上图上每次超时，异常被吞后 edges 恒为 0（T-0273）。
     edge_texts: list[str] = []
+    edge_error = ""
     try:
-        edges = await g.search(query=q, num_results=min(n_edges, 30))
+        edges = await search_edges_semantic(g, q, min(n_edges, 30))
         edge_texts = [(e.fact or "") for e in edges]
     except Exception as exc:  # noqa: BLE001
-        edge_texts = []
+        edge_error = f"{type(exc).__name__}: {exc}"[:200]
         if verbose:
-            print(f"    [warn] edge search failed: {type(exc).__name__}: {exc}")
+            print(f"    [warn] edge search failed: {edge_error}")
 
     # 2. episode fulltext (kg_episode_search path)
     ep_texts: list[str] = []
+    episode_error = ""
     try:
         ep_texts = await episode_fulltext(g, q, n_eps)
     except Exception as exc:  # noqa: BLE001
+        episode_error = f"{type(exc).__name__}: {exc}"[:200]
         if verbose:
-            print(f"    [warn] episode search failed: {type(exc).__name__}: {exc}")
+            print(f"    [warn] episode search failed: {episode_error}")
 
     haystack = " \n ".join(edge_texts + ep_texts).lower()
     matched = [k for k in keywords if k in haystack]
@@ -104,6 +109,8 @@ async def run_question(g, item: dict, defaults: dict, verbose: bool) -> dict:
         "passed": passed,
         "n_edges": len(edge_texts),
         "n_episodes": len(ep_texts),
+        "edge_error": edge_error,
+        "episode_error": episode_error,
         "top_edge": edge_texts[0][:120] if edge_texts else "",
     }
 
@@ -127,6 +134,12 @@ def render(results: list[dict], min_recall: float) -> str:
     p(f"- Passed: **{n_pass}**")
     p(f"- Failed: **{n - n_pass}**")
     p("")
+    # 检索报错与「检索到 0 条」必须分开报：前者说明召回率本身不可信（T-0273）。
+    errored = [r for r in results if r.get("edge_error") or r.get("episode_error")]
+    if errored:
+        p(f"> ⚠️ **{len(errored)}/{n} questions hit a search error** — recall above is not")
+        p("> trustworthy until the failing search path is fixed. See the ERR cells below.")
+        p("")
     p("## Per-question results")
     p("")
     p("| id | result | matched / needed | edges | eps | query |")
@@ -134,8 +147,19 @@ def render(results: list[dict], min_recall: float) -> str:
     for r in results:
         icon = "✓" if r["passed"] else "✗"
         mk = f"{len(r['matched'])}/{r['threshold']}"
-        p(f"| {r['id']} | {icon} | {mk} | {r['n_edges']} | {r['n_episodes']} | {r['q'][:48]} |")
+        n_e = "ERR" if r.get("edge_error") else r["n_edges"]
+        n_ep = "ERR" if r.get("episode_error") else r["n_episodes"]
+        p(f"| {r['id']} | {icon} | {mk} | {n_e} | {n_ep} | {r['q'][:48]} |")
     p("")
+    if errored:
+        p("## Search errors")
+        p("")
+        for r in errored:
+            if r.get("edge_error"):
+                p(f"- {r['id']} edges: `{r['edge_error']}`")
+            if r.get("episode_error"):
+                p(f"- {r['id']} episodes: `{r['episode_error']}`")
+        p("")
 
     fails = [r for r in results if not r["passed"]]
     if fails:
@@ -182,7 +206,11 @@ async def main_async(args) -> int:
         icon = "✓" if r["passed"] else "✗"
         print(f"  [{i}/{len(questions)}] {icon} {r['id']:24s} "
               f"matched={len(r['matched'])}/{r['threshold']} "
-              f"(edges={r['n_edges']}, eps={r['n_episodes']})", file=sys.stderr)
+              f"(edges={'ERR' if r['edge_error'] else r['n_edges']}, "
+              f"eps={'ERR' if r['episode_error'] else r['n_episodes']})", file=sys.stderr)
+        for leg in ("edge_error", "episode_error"):
+            if r[leg]:
+                print(f"        {leg}: {r[leg]}", file=sys.stderr)
         if args.verbose and r["matched"]:
             print(f"        keywords hit: {r['matched']}", file=sys.stderr)
 

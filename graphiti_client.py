@@ -89,6 +89,28 @@ if _cosine_methods:
     _vec_only.edge_config.search_methods = _cosine_methods
     _edge_ops.EDGE_HYBRID_SEARCH_RRF = _vec_only
 
+# --- 面向用户的语义边检索：唯一定义 ------------------------------------------------
+# MCP kg_search（/api/search_semantic）、/api/search 的语义腿、tools/kg_eval 都走这里。
+# Graphiti.search() 默认是 bm25 全文 + cosine：bm25 腿在 FalkorDB 上随边数变慢，
+# 约 16 万条 RELATES_TO 时每次都撞 30s 查询超时，整次检索抛异常（T-0273：kg_eval
+# 因此长期 edges=0）。从 recipes 模块取原件，与上面 dedup 补丁互不影响。
+from graphiti_core.search.search_config_recipes import (  # noqa: E402
+    EDGE_HYBRID_SEARCH_RRF as _EDGE_RRF_RECIPE,
+)
+
+EDGE_VEC_ONLY_SEARCH = _copy.deepcopy(_EDGE_RRF_RECIPE)
+EDGE_VEC_ONLY_SEARCH.edge_config.search_methods = [
+    m for m in EDGE_VEC_ONLY_SEARCH.edge_config.search_methods
+    if "cosine" in str(getattr(m, "value", m)).lower()
+] or EDGE_VEC_ONLY_SEARCH.edge_config.search_methods
+
+
+async def search_edges_semantic(g: "Graphiti", query: str, limit: int) -> list:
+    """仅 cosine 的语义边检索，返回 EntityEdge 列表（顺序即相关度排名）。"""
+    cfg = _copy.deepcopy(EDGE_VEC_ONLY_SEARCH)
+    cfg.limit = limit
+    return (await g._search(query=query, config=cfg)).edges
+
 
 # FalkorDB connection (Docker container `kg-hub-falkordb`). Reads from
 # kg-hub's project .env (loaded above) so we never hardcode the password.
