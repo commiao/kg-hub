@@ -149,7 +149,12 @@ async def kg_search(query: str, num_results: int = 10) -> list[dict[str, Any]]:
         num_results: How many edges to return (default 10, max 30).
 
     Returns:
-        List of {"fact", "source_node", "target_node", "valid_at"} dicts.
+        List of {"fact", "source_node_uuid", "target_node_uuid", "valid_at",
+        "invalid_at", "expired_at", "created_at"} dicts. Facts retired by
+        governance (all backing episodes archived) are never returned. A
+        non-null invalid_at means graphiti judged the fact superseded; that
+        judgement is often wrong, so such facts are kept — weigh them, don't
+        drop them blindly.
     """
     # /api/search_semantic = vector-only graphiti edge search (semantic recall,
     # no slow bm25 fulltext). Falls back to literal /api/search if it errors.
