@@ -39,7 +39,7 @@ kg-hub 把自己的报表/看板收拢成卡片，通过 `/portal_manifest` 交�
 运行:  Docker 容器 kg-hub-server（镜像 kg-hub-server:latest）
         Container Manager「项目」名 = kg-hub
         端口: 容器内 8080 → 宿主 127.0.0.1:17171 → 经 tailscale 暴露给 tailnet
-数据:  FalkorDB（同 NAS，只绑 127.0.0.1:6379，不对外）
+数据:  FalkorDB（同 NAS，绑 127.0.0.1:6379：不对局域网，但经 tailscale userspace 对 tailnet 可达，靠密码保护）
 ```
 
 - **本机仓库**：`/Users/mac/workspace_claudeCode/kg-hub`，git remote `git@github-commiao:commiao/kg-hub.git`，主分支 `main`。
@@ -140,7 +140,7 @@ curl -s "$KG_HUB_URL/dashboard/capsules" | grep -oE "canonical_total|rankings|�
 1. **改完代码不部署不生效**——源码 build 进镜像（§3、§6）。
 2. **compose project 必须 `-p kg-hub`**——否则 compose 不认现有容器，会新建并撞名报错。
 3. **NAS 整机有时 tailscale 抖动/查询偶慢**——`canonical_context` 这类重查询~4s，curl 给足超时（脚本已处理）。NAS 本身 always-on（别再误判"睡着"）。
-4. **FalkorDB 只在 NAS localhost**——本机连不上 6379；所有读必须经 server HTTP 或在 NAS 上。
+4. **FalkorDB 不要从本机直连**——6379 绑在 NAS 的 127.0.0.1，但 NAS 的 Tailscale 是 userspace 模式，tailnet 上其实连得到（会回 `NOAUTH`，要密码）。约定仍是：所有读必须经 server HTTP 或在 NAS 上跑，别在客户端放 FalkorDB 密码。
 5. **模板别用 f-string**——CSS/JS 的 `{}` 冲突；用 `__DATA__` 占位 + `.replace`。
 6. **别给 `/api/*` 去鉴权**——只放行 `/ /portal /dashboard*`。
 7. **深浅色**：页面用系统色 `Canvas`/`CanvasText`/`color-mix`；徽章用自带深字浅底固定色块（两模式都可读）。
