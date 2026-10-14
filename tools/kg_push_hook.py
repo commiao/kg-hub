@@ -57,7 +57,8 @@ except Exception:
     pass
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LOG_PATH = REPO_ROOT / "data" / ".push_hook.log"
+# 从发布产物运行时（tools/kg_push_hook.sh）由包装脚本指定日志位置：发布目录不可变。
+LOG_PATH = Path(os.environ.get("KG_HUB_PUSH_HOOK_LOG") or REPO_ROOT / "data" / ".push_hook.log")
 LOG_MAX_LINES = 200    # keep log small
 
 # kg-hub server (NAS). The hook talks HTTP only — read + usage_count bump both

@@ -10,7 +10,7 @@
     {
       "id": "kg-push",
       "label": "kg-hub PUSH",
-      "patterns": ["kg_push_hook.py"],
+      "patterns": ["kg_push_hook"],
       "purpose": "在会话开始或提交提示时注入 kg-hub canonical / 相关观察"
     },
     {

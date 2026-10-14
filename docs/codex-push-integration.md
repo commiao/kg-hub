@@ -55,7 +55,7 @@ Only useful for short-term experiments. Would add this entry to claude-mem's
 ```json
 {
   "type": "command",
-  "command": "/Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/work-ai/kg-hub/tools/kg_push_hook.py --format codex",
+  "command": "/bin/sh /Users/mac/.local/share/kg-hub/current/tools/kg_push_hook.sh --format codex",
   "timeout": 10
 }
 ```

@@ -94,7 +94,7 @@ def _action(command: str) -> str:
         return "version-check"
     if "worker-service" in command and re.search(r"\bstart\b", command):
         return "start"
-    if "kg_push_hook.py" in command:
+    if "kg_push_hook" in command:   # .py 直调或 .sh 包装
         return "push"
     if "session_context.py" in command or re.search(r"task-hub\.py\s+session-start", command):
         return "session-context"
