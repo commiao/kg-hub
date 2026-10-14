@@ -102,8 +102,8 @@ _MIN_KEYWORD_CHARS = 5
 def derive_project_keywords(cwd: str) -> list[str]:
     """Convert cwd to a set of keywords for fulltext search.
 
-    For /Users/mac/workspace_claudeCode/kg-hub →
-        ['kg-hub', 'workspace_claudeCode']
+    For /Users/mac/work-ai/kg-hub →
+        ['kg-hub', 'work-ai']
 
     For /Users/mac/workspace_codex/foo →
         ['foo', 'workspace_codex']

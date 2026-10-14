@@ -3,7 +3,7 @@
 > **维护者**：jingmiao@liblib.ai（Lovart）
 > **起始**：2026-05-14
 > **状态**：✅ 生产运行中（已迁至常开 NAS · 持续摄入 + 三层监控自治）
-> **父项目**：claude-mem（`/Users/mac/workspace_claudeCode/claude-mem`）
+> **父项目**：claude-mem（`/Users/mac/work-ai/claude-mem`）
 
 > ℹ️ **历史说明**：早期为绕过 FalkorDB 混合检索吞吐问题用过 `add_episode(skip_extraction=True)`
 > 的本地 patch，**现已移除**——根因已由「边去重改纯向量（cosine-only）」根治，canonical
@@ -171,7 +171,7 @@ ready 状态，绝不请求模型。
 - **原因**：fastembed 默认把嵌入模型缓存在 `/var/folders/sz/.../T/fastembed_cache/`，这是 macOS NSTemporaryDirectory，**系统会周期性清理**（典型 3 天）。模型一被清，kg_hub_server 的 Graphiti 单例就读不到 `.onnx`。
 - **临时修复**：用项目 venv 重下模型
   ```bash
-  /Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python -c "
+  /Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python -c "
   from huggingface_hub import hf_hub_download
   hf_hub_download(repo_id='qdrant/bge-small-en-v1.5-onnx-q', filename='model_optimized.onnx')
   "

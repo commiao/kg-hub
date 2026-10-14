@@ -82,7 +82,7 @@ docker exec kg-hub-falkordb redis-cli --no-auth-warning -a "$FALKORDB_PASSWORD" 
 docker stop kg-hub-falkordb
 # 整目录拷到 NAS(dump.rdb + appendonlydir)
 KG_HUB_DATA_ROOT=/volume2/4T/kg-hub-data
-rsync -av /Users/mac/workspace_claudeCode/kg-hub/data/falkordb/ \
+rsync -av /Users/mac/work-ai/kg-hub/data/falkordb/ \
   "<nas-tailscale>:$KG_HUB_DATA_ROOT/falkordb/"
 ```
 **在 NAS 上:** 确保拷入后,重启 falkordb 让其加载:

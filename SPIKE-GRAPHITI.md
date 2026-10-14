@@ -112,7 +112,7 @@ Cron ← FIXES_ISSUE_FOR ← 通知路由统一配置系统 (= capsule title)
 ## How to reproduce
 
 ```bash
-cd /Users/mac/workspace_claudeCode/kg-hub/spike-graphiti
+cd /Users/mac/work-ai/kg-hub/spike-graphiti
 source .venv/bin/activate
 python spike.py           # full ingest + query (~2 min, hits 百炼 5 times)
 python spike.py --reuse   # inspect existing kuzu_db (no LLM calls)

@@ -96,7 +96,7 @@ Send a message to the bot like "kg-hub 项目动机是什么". Verify the respon
 Run on the Mac:
 
 ```bash
-cd ~/workspace_claudeCode/kg-hub
+cd ~/work-ai/kg-hub
 ./spike-graphiti/.venv/bin/python -m tools.usage_ranking
 ```
 

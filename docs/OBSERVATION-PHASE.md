@@ -35,7 +35,7 @@ weekly report; no manual math needed.
 ### Active inspection (run any time)
 
 ```bash
-cd ~/workspace_claudeCode/kg-hub
+cd ~/work-ai/kg-hub
 
 # Last 24h of decisions
 ./spike-graphiti/.venv/bin/python -m tools.decisions_summary --window 24h
@@ -102,7 +102,7 @@ The flip:
 
 ```bash
 # Open the file, change one boolean
-$EDITOR ~/workspace_claudeCode/kg-hub/config/ingest_filter.json
+$EDITOR ~/work-ai/kg-hub/config/ingest_filter.json
 #   "shadow_mode": true   →   "shadow_mode": false
 ```
 

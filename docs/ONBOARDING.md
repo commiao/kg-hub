@@ -370,5 +370,5 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ## 维护者联系
 
-- 项目根：`/Users/mac/workspace_claudeCode/kg-hub/`
+- 项目根：`/Users/mac/work-ai/kg-hub/`
 - 维护者：jingmiao@liblib.ai

@@ -137,7 +137,7 @@ G4 不是收尾，是「新流量是否值得进入图」的独立决策。**摄
 2. 在根目录 `DESIGN.md`（注意：DESIGN.md 在仓库根，不在 `docs/`）抬头加一行指针：`认知资产化改造计划见 docs/LANDING-PLAN-cognitive-asset.md`。
 3. 提交（仅 docs，无需 redeploy）：
    ```bash
-   cd /Users/mac/workspace_claudeCode/kg-hub
+   cd /Users/mac/work-ai/kg-hub
    git add docs/LANDING-PLAN-cognitive-asset.md DESIGN.md
    git commit -m "docs: 认知资产化改造落地方案（采纳/拒绝存档）"
    git push
@@ -158,7 +158,7 @@ G4 不是收尾，是「新流量是否值得进入图」的独立决策。**摄
 
 **前置**：确认现状（应为空输出）：
 ```bash
-cd /Users/mac/workspace_claudeCode/kg-hub
+cd /Users/mac/work-ai/kg-hub
 grep -rn "experimental" . 2>/dev/null | grep -vE "tools/experimental/|__pycache__|\.git/|\.md" || echo "OK: no live reference"
 ```
 
