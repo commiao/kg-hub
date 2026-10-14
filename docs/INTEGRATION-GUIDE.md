@@ -79,8 +79,10 @@ KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
   ```json
   "hooks": { "SessionStart": [ { "matcher": "startup|resume", "hooks": [
     { "type":"command","timeout":10,
-      "command":"<venv>/bin/python /path/kg-hub/tools/kg_push_hook.py --format claude" } ] } ] }
+      "command":"/bin/sh ~/.local/share/kg-hub/current/tools/kg_push_hook.sh --format claude" } ] } ] }
   ```
+  走 `tools/kg_push_hook.sh` 包装：它加载 `~/.claude-mem/.env`（NAS 地址和 token），用发布产物和发布 venv 运行。
+  直接调 `kg_push_hook.py` 会拿不到 `KG_HUB_URL`，回落到已退役的 `127.0.0.1:8080`，静默注入为空。
 - **capture**:claude-mem 插件(`enabledPlugins: {"claude-mem@thedotmack": true}`);如长期没产 obs,跑 `npx claude-mem@latest install` 重建 runtime。
 
 ### 3.2 Cursor ✅
