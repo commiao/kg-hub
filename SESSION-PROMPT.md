@@ -15,14 +15,14 @@
 ```
 我正在启动一个新项目 kg-hub（个人 AI 中央知识图谱）。
 
-**项目位置**：`/Users/mac/workspace_claudeCode/kg-hub/`
+**项目位置**：`/Users/mac/work-ai/kg-hub/`
 
 **请你做的事**：
 1. 读完下面四份文档（按顺序）：
-   - `/Users/mac/workspace_claudeCode/kg-hub/README.md` — 项目入口
-   - `/Users/mac/workspace_claudeCode/kg-hub/DESIGN.md` — 已做的设计决策（**不要重新讨论已锁定的事**）
-   - `/Users/mac/workspace_claudeCode/kg-hub/ROADMAP.md` — 4 个 Phase 的任务清单
-   - `/Users/mac/workspace_claudeCode/claude-mem/HANDOVER.md`（父项目，扫一遍知道现状即可）
+   - `/Users/mac/work-ai/kg-hub/README.md` — 项目入口
+   - `/Users/mac/work-ai/kg-hub/DESIGN.md` — 已做的设计决策（**不要重新讨论已锁定的事**）
+   - `/Users/mac/work-ai/kg-hub/ROADMAP.md` — 4 个 Phase 的任务清单
+   - `/Users/mac/work-ai/claude-mem/HANDOVER.md`（父项目，扫一遍知道现状即可）
 
 2. 读完后回我一个**简短的确认**：
    - 项目目标一句话
@@ -88,14 +88,14 @@ inventory.json 看数据形态，再写 schema 映射脚本。
 
 ```bash
 # 看 OpenClaw 快照是否就位
-ls -la /Users/mac/workspace_claudeCode/kg-hub/data/openclaw-snapshot-2026-05-14/
+ls -la /Users/mac/work-ai/kg-hub/data/openclaw-snapshot-2026-05-14/
 
 # 看胶囊总数
-ls /Users/mac/workspace_claudeCode/kg-hub/data/openclaw-snapshot-2026-05-14/notes/capsules/*.md | wc -l
+ls /Users/mac/work-ai/kg-hub/data/openclaw-snapshot-2026-05-14/notes/capsules/*.md | wc -l
 
 # 看 capsule-metadata.json 结构
 jq 'to_entries | .[0]' \
-  /Users/mac/workspace_claudeCode/kg-hub/data/openclaw-snapshot-2026-05-14/capsule-metadata.json
+  /Users/mac/work-ai/kg-hub/data/openclaw-snapshot-2026-05-14/capsule-metadata.json
 
 # 看 claude-mem obs 备用（Phase 2 才用）
 sqlite3 ~/.claude-mem/claude-mem.db "SELECT COUNT(*) FROM observations;"
@@ -105,6 +105,6 @@ sqlite3 ~/.claude-mem/claude-mem.db "SELECT COUNT(*) FROM observations;"
 
 ## 提示：开新会话最佳实践
 
-- **开新 Claude Code 会话时**，先 `cd /Users/mac/workspace_claudeCode/kg-hub/` —— 让 Claude 自动把这个目录加入它的工作区，读文件更方便
+- **开新 Claude Code 会话时**，先 `cd /Users/mac/work-ai/kg-hub/` —— 让 Claude 自动把这个目录加入它的工作区，读文件更方便
 - **不要在 claude-mem 的对话里继续聊 kg-hub** —— 上下文越混越乱
 - **保留这个文件**：以后再开新会话还能用同一份 prompt

@@ -561,7 +561,7 @@ trade-off：
 
 **Phase 2 Production Smoke Test（2026-05-22 正式配置）**：
 
-详细记录：`/Users/mac/workspace_claudeCode/kg-hub/docs/muxcp-resolution-and-install.md`
+详细记录：`/Users/mac/work-ai/mcp-muxcp/docs/muxcp-resolution-and-install.md`（原在本仓库 docs/，已随 9539a3a 迁往 mcp-muxcp）
 
 | 路径 | 结果 | 证据 |
 |---|---|---|

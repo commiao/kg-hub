@@ -127,7 +127,7 @@ patch in this repo:
 ```bash
 cd <fresh clone of commiao/graphiti>
 git checkout -b feat/skip-extraction
-git am < ~/workspace_claudeCode/kg-hub/docs/upstream/graphiti-pr-0001-skip-extraction.patch
+git am < ~/work-ai/kg-hub/docs/upstream/graphiti-pr-0001-skip-extraction.patch
 git push fork feat/skip-extraction
 ```
 

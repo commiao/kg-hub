@@ -9,7 +9,7 @@
 
 > **架构已升级（2026-06-25）**：门户已拆成**独立服务 `report-portal`**。
 > 统一跨源入口 = **`http://100.123.208.32:17172/portal`**（独立容器；代码在
-> `/Users/mac/workspace_claudeCode/report-portal/`，见其 `README.md` +
+> `/Users/mac/work-ai/report-portal/`，见其 `README.md` +
 > `docs/MANIFEST-CONTRACT.md`）。门户只做聚合导航，各数据源自持并渲染自己的看板，
 > 只暴露一个 `/portal_manifest` 给门户抓取合并（"瘦门户 + manifest"模式）。
 >
@@ -42,7 +42,7 @@ kg-hub 把自己的报表/看板收拢成卡片，通过 `/portal_manifest` 交�
 数据:  FalkorDB（同 NAS，绑 127.0.0.1:6379：不对局域网，但经 tailscale userspace 对 tailnet 可达，靠密码保护）
 ```
 
-- **本机仓库**：`/Users/mac/workspace_claudeCode/kg-hub`，git remote `git@github-commiao:commiao/kg-hub.git`，主分支 `main`。
+- **本机仓库**：`/Users/mac/work-ai/kg-hub`，git remote `git@github-commiao:commiao/kg-hub.git`，主分支 `main`。
 - **访问门户**：tailnet 内任意设备浏览器开 `http://100.123.208.32:17171/portal`（无需 token）。
 - **SSH 到 NAS**：`ssh commiao@100.123.208.32`（key-based，走 tailscale；本机已配好，无需密码）。
 - **服务端配置**：owner-only 的 `deploy/nas/.env`，由

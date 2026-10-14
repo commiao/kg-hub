@@ -383,7 +383,7 @@ class EnforcementHonestyTests(unittest.TestCase):
 class ClaudeMemSideTests(unittest.TestCase):
     """claude-mem 那一路：断开不影响采集、不丢数据，恢复后从断点接着跑。"""
 
-    RELAY = Path("/Users/mac/workspace_claudeCode/credvault/session_forwarder.py")
+    RELAY = Path.home() / "work-ai" / "credvault" / "session_forwarder.py"
 
     def setUp(self):
         if not self.RELAY.exists():

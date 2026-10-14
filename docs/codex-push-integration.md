@@ -37,7 +37,7 @@ or falls back to env vars) and outputs Codex-compatible JSON
 
 [marketplaces.kg-hub-local]
 source_type = "local"
-source = "/Users/mac/workspace_claudeCode/kg-hub"
+source = "/Users/mac/work-ai/kg-hub"
 
 [plugins."kg-hub-push@kg-hub-local"]
 # (activation key — TBD based on Codex plugin docs)
@@ -55,7 +55,7 @@ Only useful for short-term experiments. Would add this entry to claude-mem's
 ```json
 {
   "type": "command",
-  "command": "/Users/mac/workspace_claudeCode/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/workspace_claudeCode/kg-hub/tools/kg_push_hook.py --format codex",
+  "command": "/Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python /Users/mac/work-ai/kg-hub/tools/kg_push_hook.py --format codex",
   "timeout": 10
 }
 ```
