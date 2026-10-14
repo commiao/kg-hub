@@ -167,6 +167,41 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(week["total"], 2)
         self.assertEqual(F.claude_mem_created(self.history.with_name("x"), start, now, now)["total"], None)
 
+    def test_graph_increments_align_by_bucket_and_keep_unknown_apart_from_zero(self):
+        hour = int(self.now) // 3600
+        now = datetime.fromtimestamp(self.now, timezone.utc)
+        start = datetime.fromtimestamp((hour - 3) * 3600, timezone.utc)
+        self.sample()
+        created = F.claude_mem_created(self.history, start, now, now)
+        labels = [r["label"] for r in created["rows"]]
+        # 真实 _graph_period 的形状：按北京时间标签分桶，只出现有 Episode 的桶。
+        graph = [{"hour": "x", "label": labels[1], "积压线": 4, "live 线": 2, "其他源": 9}]
+        F.merge_graph_increments(created, graph)
+        self.assertEqual([r["kg_ingested"] for r in created["rows"]], [0, 6, 0])
+        self.assertEqual((created["rows"][1]["kg_backlog"], created["rows"][1]["kg_live"]), (4, 2))
+        self.assertEqual(created["kg_total"], 6, "其他源不是 claude-mem 产出，不许算进入图")
+        # 图查询失败：整列未知，不能画成 0。
+        failed = F.claude_mem_created(self.history, start, now, now)
+        F.merge_graph_increments(failed, None)
+        self.assertEqual({r["kg_ingested"] for r in failed["rows"]}, {None})
+        self.assertIsNone(failed["kg_total"])
+        F.merge_graph_increments(None, graph)  # 新增计数不可读时不报错
+
+    def test_graph_buckets_use_the_same_labels_as_created_rows(self):
+        """两边分桶规则各写在一处，标签一旦不一致，对齐会静默全落空成 0。"""
+        import asyncio
+        hour = int(self.now) // 3600
+        now = datetime.fromtimestamp(self.now, timezone.utc)
+        for days in (1, 7):
+            start = now - F.timedelta(days=days)
+            created = F.claude_mem_created(self.history, start, now, now)
+            at = datetime.fromtimestamp((hour - 2) * 3600, timezone.utc)
+            class Driver:
+                async def execute_query(self, *a, **k):
+                    return ([{"hour": at.strftime("%Y-%m-%dT%H"), "lane": "live 线", "c": 3}], None, None)
+            graph = asyncio.run(F._graph_period(Driver(), 10, start, now))
+            self.assertIn(graph[0]["label"], {r["label"] for r in created["rows"]}, days)
+
 
 if __name__ == "__main__":
     unittest.main()
