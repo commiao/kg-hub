@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 
 log = logging.getLogger('kg_hub.gateway_queue')
@@ -159,6 +160,43 @@ async def _cancel(client, base_url, headers, business_key, key):
     return None
 
 
+async def _timed_submit(client, base_url, headers, payload, business_key, key, attempt):
+    """Measure each HTTP submit through response-body receipt, excluding recovery.
+
+    This is client elapsed time, including transport waits; it is separate from
+    server handler_ms. Never log URLs, tokens, request bodies or exception text.
+    Logging must not change success, failure, cancellation or retry decisions.
+    """
+    import httpx
+    started = time.monotonic()
+    outcome, status = 'error', None
+    try:
+        response = await client.post(base_url+'/v1/queue/submit', headers=headers, json=payload)
+        outcome, status = 'response', response.status_code
+        return response
+    except httpx.TimeoutException:
+        outcome = 'timeout'
+        raise
+    except httpx.TransportError:
+        outcome = 'transport_error'
+        raise
+    except asyncio.CancelledError:
+        outcome = 'cancelled'
+        raise
+    finally:
+        try:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            safe_business = (business_key if isinstance(business_key, str)
+                and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', business_key)
+                else 'invalid')
+            key_hash = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
+            log.info('[queue:submit_timing] business_key=%s key_hash=%s attempt=%d '
+                     'outcome=%s http_status=%s elapsed_ms=%.3f',
+                     safe_business, key_hash, attempt, outcome, status, elapsed_ms)
+        except Exception:
+            pass
+
+
 async def _submit(client, base_url, headers, payload, business_key, key, backoff):
     """Enqueue exactly once, recovering an ambiguous or refused submit.
 
@@ -171,7 +209,8 @@ async def _submit(client, base_url, headers, payload, business_key, key, backoff
     last = None
     for attempt in range(SUBMIT_ATTEMPTS):
         try:
-            response = await client.post(base_url+'/v1/queue/submit', headers=headers, json=payload)
+            response = await _timed_submit(client, base_url, headers, payload,
+                                          business_key, key, attempt + 1)
             response.raise_for_status()
             return response
         except (httpx.TimeoutException, httpx.TransportError) as exc:
