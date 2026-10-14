@@ -19,7 +19,8 @@
 | **capture** | 工具的工作 → claude-mem 生成 obs → 同步进图 | 各工具的 claude-mem 钩子/插件 |
 
 **③ 重活全在中央机本地,客户端只走一个可容忍的 HTTP 往返。**
-血泪教训:**别让客户端直连 FalkorDB(6379)**——迁移后它只绑中央机 localhost、不对 tailnet 暴露,且 tailscale relay 会抖动。读/写/排名一律走 server 的 HTTP API(`:17171`),server 在本地查 FalkorDB。
+血泪教训:**别让客户端直连 FalkorDB(6379)**——tailscale relay 会抖动,重查询跨网必超时,而且直连就得把 FalkorDB 密码分发到每台客户端。读/写/排名一律走 server 的 HTTP API(`:17171`),server 在本地查 FalkorDB。
+注意:6379 虽然只绑中央机 `127.0.0.1`,但**对 tailnet 是可达的**(只是要密码)——NAS 的 Tailscale 跑在 userspace 模式,tailnet 入站会被转到宿主 `127.0.0.1`,17171 正是靠这个机制对外服务。所以"绑 localhost"只挡局域网,不挡 tailnet;别把它当成网络隔离。
 
 ```
    各设备/工具 ──MCP(muxcp)/HTTP(:17171, Bearer)──▶ 中央 kg-hub(常开)
@@ -43,7 +44,7 @@
      -f docker-compose.yml -f deploy/model-gateway-network.override.yml \
      -p kg-hub up -d
    ```
-4. 装 Tailscale；**server 端口经 Tailscale 暴露**（本项目用 `127.0.0.1:17171→容器8080`，FalkorDB 6379 不对 tailnet 暴露）。
+4. 装 Tailscale；**server 端口经 Tailscale 暴露**（本项目用 `127.0.0.1:17171→容器8080`）。群晖 Tailscale 是 userspace 模式，宿主上**所有**绑 `127.0.0.1` 的端口都会对 tailnet 可达（含 FalkorDB 6379 和浏览器 UI 3001，靠密码保护）；要真正只开 17171，得在 Tailscale ACL 里限制端口。
 5. 验证：`curl http://<tailscale-ip>:17171/health` → `{"status":"ok"}`。
 
 > 完整部署、数据根和迁移细节见 `deploy/nas/MIGRATION.md`；日常重启用 `sh deploy/nas/redeploy.sh`。
@@ -122,7 +123,7 @@ KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
 
 **坑4:Mac→群晖 传文件 `subsystem request failed`。** 新版 `scp` 走 SFTP,群晖 sshd 默认没开 → 改 `cat | ssh "cat>tmp && mv -f tmp dst"` 管道。
 
-**坑5:客户端直连 FalkorDB 偶发超时。** falkordb 只绑中央机 localhost(6379 不对 tailnet 暴露)+ relay 抖动。**所有读/写/排名走 HTTP `:17171`**;MCP server 也已改纯 HTTP(不再 import graphiti/连 falkordb)。
+**坑5:客户端直连 FalkorDB 偶发超时。** relay 抖动 + 重查询跨网放大延迟(6379 对 tailnet 其实可达、只是要密码,原因见上文 userspace 说明;能连上不代表该直连)。**所有读/写/排名走 HTTP `:17171`**;MCP server 也已改纯 HTTP(不再 import graphiti/连 falkordb)。
 
 **坑6:claude-mem worker 空转烧 CPU(#2188)。** bun-runner 收空 stdin 会死循环。已用 `tools/claude_mem_guard.sh` + launchd 兜底(累计 CPU>120s 的 claude-mem hook 进程自动清+告警)。换设备记得也装这个守护。
 

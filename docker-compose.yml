@@ -34,8 +34,12 @@ services:
       # Needed INSIDE the container so the healthcheck's redis-cli -a "$FALKORDB_PASSWORD" works.
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD}
     ports:
-      - "127.0.0.1:6379:6379"   # NAS-local only — never exposed on the network
-      - "127.0.0.1:3001:3000"   # FalkorDB browser UI, NAS-local only
+      # Loopback bind keeps these off the LAN, but NOT off the tailnet: the NAS runs
+      # tailscaled with --tun=userspace-networking, which delivers inbound tailnet
+      # connections to 127.0.0.1 (same mechanism kg-hub-server relies on for 17171).
+      # Any tailnet device can reach both ports; requirepass is the only guard.
+      - "127.0.0.1:6379:6379"   # Redis protocol; tailnet-reachable, requires FALKORDB_PASSWORD
+      - "127.0.0.1:3001:3000"   # FalkorDB browser UI; tailnet-reachable, login = FalkorDB credentials
     volumes:
       - ${KG_HUB_DATA_ROOT:?set absolute kg-hub data root}/falkordb:/var/lib/falkordb/data
     # T-0245: every health probe makes dockerd rewrite this container's config.v2.json

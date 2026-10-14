@@ -34,7 +34,7 @@ kg-hub 与文章里的个人 Obsidian **不是同一物种**：文章是「一�
 
 ### 0.2 关键约束（不可违反）
 
-1. **FalkorDB 仅绑 NAS `127.0.0.1:6379`**，Mac 连不上；图谱读写脚本**必须在 NAS 上跑**（`ssh commiao@100.123.208.32`，key-based tailscale）。
+1. **FalkorDB 绑 NAS `127.0.0.1:6379`**（tailnet 经 Tailscale userspace 其实可达、需密码，但约定不从 Mac 直连）；图谱读写脚本**必须在 NAS 上跑**（`ssh commiao@100.123.208.32`，key-based tailscale）。
 2. **server 无任意 Cypher 写端点**（安全姿态）；任何图谱写操作只能通过 NAS 上跑的受控管理脚本，**不新增公网写端点**。
 3. **部署纪律**：改 `kg_hub_server.py` / 过滤器配置等运行时文件 → `git commit && push` → 同步到 NAS `/volume1/docker/kg-hub-src` → 用 `deploy/nas/redeploy.sh` → **校验 NAS sha == git HEAD**（PORTAL-HANDOFF 坑 #8）。该脚本固定使用 canonical env、root compose、model-gateway 私网 override 和 `-p kg-hub`。
 4. **docs 不随 redeploy 部署**（redeploy 只同步 server 文件）；纯文档改动无需 redeploy，也不会造成漂移。

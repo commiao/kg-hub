@@ -6,7 +6,7 @@
 
 ```
 群晖 NAS (always-on)
-  ├─ falkordb       :6379  仅绑 127.0.0.1(不对外)+ AOF + 查询超时
+  ├─ falkordb       :6379  绑 127.0.0.1(不对局域网;tailnet 可达,靠密码)+ AOF + 查询超时
   ├─ kg_hub_server  :17171  Bearer 鉴权,连 falkordb:6379(走容器内网/loopback)
   └─ 数据 ${KG_HUB_DATA_ROOT}/  + 群晖 Btrfs 快照
         ▲ 粗粒度 HTTP /api/ingest、/api/search,经 Tailscale
@@ -110,7 +110,7 @@ curl -s http://localhost:17171/health
 - 退役 Mac 本机的 falkordb 容器。
 
 ### 7. 安全
-- FalkorDB 6379 已 `127.0.0.1` 绑定,**不对外**。
+- FalkorDB 6379 / 浏览器 UI 3001 已 `127.0.0.1` 绑定,**只挡局域网,不挡 tailnet**:群晖 Tailscale 是 userspace 模式(`--tun=userspace-networking`),tailnet 入站一律转到宿主 `127.0.0.1`,与下面 17171 是同一机制。两者对整个 tailnet 可达,唯一防线是 `requirepass`;要只放行 17171,需在 Tailscale ACL 里按端口限制。
 - 对外端口 **17171**(容器内仍 8080)**只经 Tailscale 访问**:已 `127.0.0.1:17171` 绑定环回,Tailscale 用户态自动转发 `tailscale-ip:17171 → 127.0.0.1:17171`;**不要**在路由器做端口转发。
 - API token 与 FalkorDB 密码定期轮换。
 
