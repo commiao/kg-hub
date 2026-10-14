@@ -52,6 +52,15 @@ services:
       timeout: 3s
       retries: 6
       start_period: 20s
+    # Synology 的默认日志驱动 db 每行一次 SQLite 提交，NAS volume1（btrfs）上实测每行约
+    # 0.6–0.9MB 设备写入（T-0245，2026-10-13）。与其他 kg-hub 服务一致用 local。
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
 
   # Read the NAS Tailscale LocalAPI every minute and atomically publish a
   # validated snapshot. DSM on this host has no user crontab, so this dedicated

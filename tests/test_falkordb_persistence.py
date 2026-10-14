@@ -39,6 +39,11 @@ class FalkorDBPersistenceTests(unittest.TestCase):
     def test_at_most_one_rdb_snapshot_a_day(self):
         self.assertEqual(self.option("--save"), ["86400", "1"])
 
+    def test_logs_use_the_local_driver_not_synology_db(self):
+        logging = falkordb_block().split("    logging:\n", 1)[1]
+        self.assertRegex(logging, r"(?m)^      driver: local$")
+        self.assertRegex(logging, r'(?m)^        max-size: "\d+m"$')
+
     def test_health_probe_runs_once_a_minute(self):
         healthcheck = falkordb_block().split("    healthcheck:\n", 1)[1]
         self.assertRegex(healthcheck, r"(?m)^      interval: 60s$")
