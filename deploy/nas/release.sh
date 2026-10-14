@@ -748,6 +748,27 @@ discard_refinery_window_backup
 prune_orphans
 refresh_drift_verdict
 say "✅ 发布完成：kg-hub-server:${SHA}（上一个 $PREV 仍在盘上，可 --rollback）"
+apply_image_retention
+}
+
+# 发布成功后清旧镜像（2026-10-14）：nas_monitor 首次盘点 kg-hub-server 留着 138 个标签，
+# 整机 97% 的镜像空间可回收——本脚本只会 build，从不删。规则在 fleet-ops 的
+# lib/fleetops_retention.py（三个服务共用一份）：保留最新 KG_HUB_KEEP_IMAGES 个标签，
+# 永远不删容器在用的镜像和这次的 $SHA、回滚目标 $PREV；顺带清悬空镜像与 7 天前的构建缓存。
+# 放在「发布完成」之后、且失败不让发布失败：它是收尾家务，不是发布的一部分。
+apply_image_retention() {
+  [ "${DRY_RUN:-0}" != 1 ] || return 0
+  local lib="${FLEET_OPS_LIB:-$HOME/.local/share/fleet-ops/current/lib}"
+  if [ ! -f "$lib/fleetops_retention.py" ]; then
+    say "  ⚠ 没有清理旧镜像：找不到 $lib/fleetops_retention.py（fleet-ops 产物未安装）"
+    return 0
+  fi
+  set +e
+  python3 "$lib/fleetops_retention.py" images --ssh "$NAS" --docker "$DK" \
+    --repo kg-hub-server --keep "${KG_HUB_KEEP_IMAGES:-5}" \
+    --protect "kg-hub-server:$SHA" ${PREV:+--protect "kg-hub-server:$PREV"} \
+    --prune-dangling --builder-cache-hours 168 --apply 2>&1 | grep -v '^  删除 ' | sed 's/^/  /' >&2
+  set -e
 }
 
 # 发完顺手刷新漂移巡检的判决。
