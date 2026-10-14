@@ -70,6 +70,7 @@ from graphiti_client import (  # noqa: E402
     FALKORDB_HOST,
     FALKORDB_PORT,
     build_graphiti,
+    search_edges_semantic,
 )
 from schema import ENTITY_TYPES, EDGE_TYPES, EDGE_TYPE_MAP  # noqa: E402
 from topology import (  # noqa: E402
@@ -2580,10 +2581,8 @@ async def search(request: Request) -> JSONResponse:
     sem_ok = False
     try:
         g = await get_graphiti()
-        cfg = _copy_search.deepcopy(_EDGE_VEC_ONLY)
-        cfg.limit = pool
-        sres = await g._search(query=query, config=cfg)
-        for rank, e in enumerate(sres.edges):
+        sem_edges = await search_edges_semantic(g, query, pool)
+        for rank, e in enumerate(sem_edges):
             if not e.fact:
                 continue
             cand[e.fact] = {
@@ -2593,7 +2592,7 @@ async def search(request: Request) -> JSONResponse:
                 "valid_at": e.valid_at.isoformat() if e.valid_at else None,
                 "created_at": e.created_at.isoformat() if e.created_at else None,
                 "episodes": [],   # 统一在合并后按 fact 批量补,不依赖 EntityEdge.episodes
-                "sem": 1.0 - rank / max(len(sres.edges), 1),   # 排名转分
+                "sem": 1.0 - rank / max(len(sem_edges), 1),   # 排名转分
                 "exact": False,
             }
         sem_ok = True
@@ -3668,22 +3667,6 @@ async def path_between(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "paths": [r["names"] for r in rows if r.get("names")]})
 
 
-# Vector-only edge search config for /api/search_semantic. graphiti's user-facing
-# search defaults to bm25+cosine hybrid; the bm25 fulltext leg is the slow /
-# CPU-pegging path (see graphiti_client dedup note). Keep cosine_similarity only:
-# semantic recall without the slow fulltext leg.
-import copy as _copy_search  # noqa: E402
-from graphiti_core.search.search_config_recipes import (  # noqa: E402
-    EDGE_HYBRID_SEARCH_RRF as _EDGE_RRF_SRC,
-)
-
-_EDGE_VEC_ONLY = _copy_search.deepcopy(_EDGE_RRF_SRC)
-_cos_methods = [m for m in _EDGE_VEC_ONLY.edge_config.search_methods
-                if "cosine" in str(getattr(m, "value", m)).lower()]
-if _cos_methods:
-    _EDGE_VEC_ONLY.edge_config.search_methods = _cos_methods
-
-
 async def search_semantic(request: Request) -> JSONResponse:
     """GET /api/search_semantic?q=&num_results= — vector-only semantic edge search.
 
@@ -3701,9 +3684,7 @@ async def search_semantic(request: Request) -> JSONResponse:
         num = 10
     try:
         g = await get_graphiti()
-        cfg = _copy_search.deepcopy(_EDGE_VEC_ONLY)
-        cfg.limit = num
-        results = await g._search(query=q, config=cfg)
+        edges = await search_edges_semantic(g, q, num)
     except Exception as exc:  # noqa: BLE001
         logger.exception("[search_semantic] failed for q=%r", q)
         return JSONResponse(
@@ -3715,7 +3696,7 @@ async def search_semantic(request: Request) -> JSONResponse:
         "target_node_uuid": str(e.target_node_uuid),
         "valid_at": e.valid_at.isoformat() if e.valid_at else None,
         "created_at": e.created_at.isoformat() if e.created_at else None,
-    } for e in results.edges]
+    } for e in edges]
     # 检索即使用:bump 命中 fact 的背书 episode(MCP kg_search 的真实取用)。bump=0 关闭。
     do_bump = (request.query_params.get("bump", "1") or "").lower() not in ("0", "false", "no", "")
     facts = [o["fact"] for o in out if o.get("fact")]
