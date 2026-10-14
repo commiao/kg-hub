@@ -706,6 +706,28 @@ def claude_mem_created(path: Path, start: datetime, end: datetime,
             "stale": sampled is None or (now - sampled).total_seconds() > 600}
 
 
+def merge_graph_increments(created: dict | None, graph: list[dict] | None) -> None:
+    """把同一时间桶的 kg-hub 入图数并进 claude-mem 新增那一行，供同图对比。
+
+    两边按同一规则分桶（北京时间小时，超过 2 天按自然日），按标签对齐。
+    只计 claude-mem 来源（积压线 + live 线），其他源不是 claude-mem 产出的。
+    图查询失败时整列为 None（未知），查询成功而桶里没有 Episode 才是 0。"""
+    if not created:
+        return
+    by_label = {g["label"]: g for g in graph or []}
+    known = []
+    for row in created["rows"]:
+        if graph is None:
+            row.update(kg_ingested=None, kg_backlog=None, kg_live=None)
+            continue
+        g = by_label.get(row["label"], {})
+        row["kg_backlog"] = g.get("积压线", 0)
+        row["kg_live"] = g.get("live 线", 0)
+        row["kg_ingested"] = row["kg_backlog"] + row["kg_live"]
+        known.append(row["kg_ingested"])
+    created["kg_total"] = sum(known) if graph is not None else None
+
+
 def calls_per_observation(gateway_node: dict | None, digest: dict, now: datetime) -> float | None:
     """同一 UTC 日：网关 kg-hub 调用次数 ÷ 图内当日新增 Episode。
 
@@ -1348,6 +1370,7 @@ async def collect_flow(range_key: str = "today") -> dict:
     except (OSError, sqlite3.Error) as exc:
         data["claude_mem_created"] = None
         data["source_errors"].append(f"claude-mem 新增量不可读：{type(exc).__name__}")
+    merge_graph_increments(data["claude_mem_created"], graph_period)
     data["time_range"] = window
     data["range_options"] = RANGE_LABELS
     data["period"] = selected_period(status, window, now, trends, commits, graph_period)
@@ -1556,12 +1579,9 @@ else{
   [range.label+' · 新增观测',fmt(CC.total),'按 claude-mem 创建时间 · '+known.length+'/'+CC.rows.length+' 个'+unit+'有数'],
   ['每'+unit+'平均',known.length?Math.round(CC.total/known.length*10)/10:'—','只计有数的时间桶'],
   ['峰值'+unit,fmt(peak.count),peak.label+' 北京时间'],
+  ['同期 kg-hub 入图',fmt(CC.kg_total),'claude-mem 来源的 Episode（积压线 + live 线）'],
  ]);
- $('cmcreatednote').textContent='每个'+unit+'内 claude-mem 新产生的观测条数（北京时间分桶，超过2天按自然日）。NAS 副本按创建时间整窗重算，Mac→NAS 同步延迟的观测会补回所属时间桶，最近 15–30 分钟的数可能偏低。采样 '+(CC.sampled_at_beijing||'未知')+(CC.stale?' · 数据过期':'')+'；— 表示该桶不在采样覆盖内（缺测，不是 0），* 表示仅部分覆盖。';
- stack('cmcreated',CC.rows.slice().reverse(),r=>r.label.slice(5)+(r.partial&&r.count!==null?'*':''),[
-  ['新增',r=>r.count,'#D97706']]);
- // stack() 把缺测画成 0，这里改回 —
- CC.rows.slice().reverse().forEach((r,i)=>{if(r.count===null){const c=$('cmcreated').children[i]?.querySelector('.c');if(c)c.textContent='新增 —'}});
+ $('cmcreatednote').textContent='每个'+unit+'内 claude-mem 新产生的观测条数，与同一时间桶 kg-hub 入图的 claude-mem 来源 Episode 数对比（北京时间分桶，超过2天按自然日）。入图含积压线，处理的是更早产生的观测，所以入图高于新增不代表异常；入图持续低于新增，说明积压在增长。NAS 副本按创建时间整窗重算，Mac→NAS 同步延迟的观测会补回所属时间桶，最近 15–30 分钟的数可能偏低。采样 '+(CC.sampled_at_beijing||'未知')+(CC.stale?' · 数据过期':'')+'；曲线断开表示缺测，不是 0。';
 }
 
 const processingData=[
@@ -1598,6 +1618,12 @@ compressionHosts.forEach(h=>{
      series:[['剩余',key,color],['待核验',key+'_held','#E07A5F']]});
  });
 });
+const cmCreatedIndex=backlogData.length;
+if(CC)backlogData.push({title:'claude-mem 新增 vs kg-hub 入图（每'+(CC.granularity==='day'?'天':'小时')+'）',unit:' 条',
+  gapMinutes:CC.granularity==='day'?36*60:90,
+  rows:CC.rows.map(r=>({...r,label:r.label+' 北京时间'+(r.partial&&r.count!==null?' · 仅部分覆盖':'')})),
+  series:[['claude-mem 新增','count','#D97706'],['kg-hub 入图','kg_ingested','#1D9E75']],
+  extra:r=>Number.isFinite(r.kg_ingested)?['<span>入图其中 积压线 '+r.kg_backlog+' · live '+r.kg_live+'</span>']:[]});
 const backlogX=(spec,at)=>rangeX(at);
 // A single outlier (e.g. a delayed sync from before bursts were flagged) must not
 // flatten every normal point onto the zero line: robust charts scale to P2–P98
@@ -1662,13 +1688,16 @@ function backlogChart(spec,index){
   (clipped?'<span>'+clipped+' 个点超出坐标范围，贴边显示</span>':'')+'</div></div>';
 }
 $('backlogtrends').innerHTML=backlogData.slice(0,cmOffset).map(backlogChart).join('');
-$('cmtrends').innerHTML=backlogData.slice(cmOffset).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
+$('cmtrends').innerHTML=backlogData.slice(cmOffset,cmCreatedIndex).map((s,i)=>backlogChart(s,i+cmOffset)).join('');
+$('cmcreated').innerHTML=CC?'<div class=trend-grid style="grid-template-columns:1fr">'+backlogChart(backlogData[cmCreatedIndex],cmCreatedIndex)+'</div>'
+  :'<div class=note>暂无数据：refinery 尚未写入新增计数</div>';
 function showBacklogPoint(svg,index){
  const spec=backlogData[Number(svg.dataset.backlogChart)],r=spec.rows[index];if(!r)return;
  svg.dataset.pointIndex=index;
  const parts=spec.series.map(s=>'<span><i style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+s[2]+';margin-right:4px"></i>'+s[0]+' '+(Number.isFinite(r[s[1]])?r[s[1]]+spec.unit:'无样本')+'</span>');
  if(spec.burst&&Number.isFinite(r[spec.burst]))parts.push('<span>同步补灌 '+(r[spec.burst]>0?'+':'')+r[spec.burst]+' 条，不计入速度</span>');
  if(r.boundary!==undefined)parts.push('<span>boundary '+esc(r.boundary)+'</span>');
+ if(spec.extra)parts.push(...spec.extra(r));
  svg.parentElement.querySelector('[data-trend-readout]').innerHTML='<b>'+esc(r.label)+'</b>'+parts.join('');
  const line=svg.querySelector('[data-hover-line]'),x=backlogX(spec,r.at);
  line.setAttribute('x1',x);line.setAttribute('x2',x);line.style.display='';
