@@ -3695,6 +3695,9 @@ async def search_semantic(request: Request) -> JSONResponse:
         "source_node_uuid": str(e.source_node_uuid),
         "target_node_uuid": str(e.target_node_uuid),
         "valid_at": e.valid_at.isoformat() if e.valid_at else None,
+        # graphiti 判定的失效（T-0281：误判多，只标注不过滤）
+        "invalid_at": e.invalid_at.isoformat() if e.invalid_at else None,
+        "expired_at": e.expired_at.isoformat() if e.expired_at else None,
         "created_at": e.created_at.isoformat() if e.created_at else None,
     } for e in edges]
     # 检索即使用:bump 命中 fact 的背书 episode(MCP kg_search 的真实取用)。bump=0 关闭。
@@ -3706,7 +3709,7 @@ async def search_semantic(request: Request) -> JSONResponse:
             await driver.execute_query(
                 "MATCH ()-[e:RELATES_TO]->() WHERE e.fact IN $facts AND e.episodes IS NOT NULL "
                 "UNWIND e.episodes AS epu "
-                "MATCH (ep:Episodic {uuid: epu}) "
+                "MATCH (ep:Episodic {uuid: epu}) WHERE NOT coalesce(ep.archived, false) "
                 "SET ep.usage_count = coalesce(ep.usage_count,0)+1, "
                 "    ep.retrieval_count = coalesce(ep.retrieval_count,0)+1, "
                 "    ep.last_used_at = $now",

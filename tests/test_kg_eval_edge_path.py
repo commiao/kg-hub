@@ -42,7 +42,8 @@ class FakeGraphiti:
         if self.error is not None:
             raise self.error
         edges = [SimpleNamespace(fact=f, source_node_uuid="s", target_node_uuid="t",
-                                 valid_at=None, created_at=None) for f in self.facts]
+                                 valid_at=None, invalid_at=None, expired_at=None,
+                                 created_at=None) for f in self.facts]
         return SimpleNamespace(edges=edges[:config.limit])
 
 
@@ -60,6 +61,7 @@ class SharedConfig(unittest.TestCase):
         """kg_search 的真实入口 /api/search_semantic 也只走 cosine——kg_eval 镜像的就是它。"""
         import json
         from unittest.mock import AsyncMock, patch
+        import graphiti_client
         import kg_hub_server
         g = FakeGraphiti(facts=["a", "b", "c"])
         req = SimpleNamespace(query_params={"q": "graph backend", "num_results": "2", "bump": "0"})
@@ -69,7 +71,8 @@ class SharedConfig(unittest.TestCase):
         self.assertEqual([o["fact"] for o in body["results"]], ["a", "b"])
         self.assertEqual(len(g.configs), 1)
         self.assertEqual(_method_names(g.configs[0]), ["cosine_similarity"])
-        self.assertEqual(g.configs[0].limit, 2)
+        # 多取 RETIRED_HEADROOM 条抵扣已退休的边（T-0281），返回仍按请求条数截断
+        self.assertEqual(g.configs[0].limit, 2 + graphiti_client.RETIRED_HEADROOM)
 
     def test_kg_eval_uses_the_shared_function(self):
         import graphiti_client
@@ -84,13 +87,14 @@ class RunQuestion(unittest.TestCase):
 
     def test_edges_come_from_vec_only_search(self):
         import tools.kg_eval as K
+        from graphiti_client import RETIRED_HEADROOM
         g = FakeGraphiti(facts=[f"fact {i} falkordb" for i in range(40)])
         r = asyncio.run(K.run_question(g, self.ITEM, {"num_edge_results": 50}, verbose=False))
         self.assertEqual(r["n_edges"], 30)          # 与 /api/search_semantic 一样封顶 30
         self.assertEqual(r["edge_error"], "")
         self.assertEqual(len(g.configs), 1)
         self.assertEqual(_method_names(g.configs[0]), ["cosine_similarity"])
-        self.assertEqual(g.configs[0].limit, 30)
+        self.assertEqual(g.configs[0].limit, 30 + RETIRED_HEADROOM)
 
     def test_shared_config_is_not_mutated_by_limit(self):
         import tools.kg_eval as K

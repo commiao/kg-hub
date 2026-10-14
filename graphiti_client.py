@@ -105,11 +105,53 @@ EDGE_VEC_ONLY_SEARCH.edge_config.search_methods = [
 ] or EDGE_VEC_ONLY_SEARCH.edge_config.search_methods
 
 
+# 治理退休（T-0281）：背书 episode 全部 archived 的边不再召回，与 /api/search 的 agg()
+# 同一规则（查不到背书的边保留）。只认 archived，不按 expired_at/invalid_at 过滤：
+# 2026-10-14 实测 22% 的边被 graphiti 判为失效，且成簇（一条概述类 episode 入图就
+# 失效上千条），抽样多数仍成立；硬过滤会把 FalkorDB 这类正确答案挤出 top-10。
+# 失效与否由 /api/search_semantic 原样带出 invalid_at/expired_at，交给使用方判断。
+RETIRED_HEADROOM = 10   # 多取几条抵扣被退休的，常见情况下仍只扫一次
+_RETIRED_ROUNDS = 3     # 不够再翻倍补取，最多扫三次
+
+_search_log = logging.getLogger("kg_hub.search")
+
+
+async def _drop_retired(driver, edges: list) -> list:
+    eps = sorted({str(u) for e in edges for u in (getattr(e, "episodes", None) or [])})
+    if not eps:
+        return edges
+    try:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (ep:Episodic) WHERE ep.uuid IN $u "
+            "RETURN ep.uuid AS u, coalesce(ep.archived, false) AS arch", u=eps)
+    except Exception as exc:  # noqa: BLE001 — 与 /api/search 一致：查不到就不过滤
+        _search_log.warning("[search] archived lookup failed, not filtering: %s", exc)
+        return edges
+    archived = {str(r["u"]): bool(r.get("arch")) for r in rows if r.get("u") is not None}
+
+    def retired(e) -> bool:
+        backing = [archived[str(u)] for u in (getattr(e, "episodes", None) or [])
+                   if str(u) in archived]
+        return bool(backing) and all(backing)
+
+    return [e for e in edges if not retired(e)]
+
+
 async def search_edges_semantic(g: "Graphiti", query: str, limit: int) -> list:
-    """仅 cosine 的语义边检索，返回 EntityEdge 列表（顺序即相关度排名）。"""
-    cfg = _copy.deepcopy(EDGE_VEC_ONLY_SEARCH)
-    cfg.limit = limit
-    return (await g._search(query=query, config=cfg)).edges
+    """仅 cosine 的语义边检索，返回 EntityEdge 列表（顺序即相关度排名）。
+
+    已退休（背书 episode 全部 archived）的边被剔除，并补取到 limit 条。
+    """
+    fetch = limit + RETIRED_HEADROOM
+    for _ in range(_RETIRED_ROUNDS):
+        cfg = _copy.deepcopy(EDGE_VEC_ONLY_SEARCH)
+        cfg.limit = fetch
+        edges = (await g._search(query=query, config=cfg)).edges
+        live = await _drop_retired(g.driver, edges)
+        if len(live) >= limit or len(edges) < fetch:
+            break
+        fetch *= 2
+    return live[:limit]
 
 
 # FalkorDB connection (Docker container `kg-hub-falkordb`). Reads from
