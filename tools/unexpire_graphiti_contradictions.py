@@ -172,11 +172,15 @@ def dry_run(graph, *, since=None, manifest=None, samples=8):
     for category in counts:
         uuids = [row[0] for row, cat in classified if cat == category]
         picked = rng.sample(uuids, min(samples, len(uuids)))
+        # Truncate here, not with Cypher left(): FalkorDB cuts bytes, and a split
+        # multi-byte character makes the whole reply undecodable (2026-10-14).
         facts = graph.ro_query(
             "MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $u "
-            "RETURN e.uuid, left(e.fact, 140), e.valid_at, e.invalid_at",
+            "RETURN e.uuid, e.fact, e.valid_at, e.invalid_at",
             {"u": picked}, timeout=TIMEOUT_MS).result_set
-        report["samples"][category] = [list(map(str, fact)) for fact in facts]
+        report["samples"][category] = [
+            [str(uuid), str(fact)[:140], str(valid_at), str(invalid_at)]
+            for uuid, fact, valid_at, invalid_at in facts]
     if manifest:
         restore_rows = [row for row, cat in classified if cat == RESTORE]
         write_manifest(manifest, restore_rows, since=since, counts=dict(counts))

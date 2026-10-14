@@ -36,7 +36,7 @@ class FakeGraph:
         self.reads.append((query, params))
         if query == tool.LOAD:
             return Result([list(r) for r in self.rows])
-        return Result([[u, "fact " + u, "v", "i"] for u in params["u"]])
+        return Result([[u, "事实" * 100, "v", "i"] for u in params["u"]])
 
     def query(self, query, params=None, timeout=None):
         self.writes.append((query, params))
@@ -122,6 +122,10 @@ class ManifestAndWriteTests(unittest.TestCase):
         header, frozen = tool.read_manifest(self.path)
         self.assertEqual(header["rows"], 1)
         self.assertEqual(frozen, [{"uuid": "old", "invalid_at": T(3), "expired_at": T(4)}])
+        # Samples are cut in Python; Cypher left() cuts bytes and breaks UTF-8 replies.
+        sample_query = graph.reads[-1][0]
+        self.assertNotIn("left(", sample_query)
+        self.assertEqual(report["samples"][tool.RESTORE][0][1], "事实" * 70)
 
     def test_apply_guards_on_frozen_values_batches_and_holds_the_writer_lock(self):
         rows = [{"uuid": str(i), "invalid_at": T(3), "expired_at": T(4)} for i in range(7)]
