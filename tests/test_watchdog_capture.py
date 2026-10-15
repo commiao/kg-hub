@@ -16,7 +16,8 @@ from tools.watchdog import (CaptureDecision, apply_capture_decision,
 
 def _snap(host="h", age=60, stale=False, blockers=None, overall="green"):
     return {"_host": host, "_age_s": age, "_stale": stale,
-            "overall": overall, "blockers": blockers or []}
+            "overall": overall, "blockers": blockers or [],
+            "hook_inventory": [{"tool": "codex", "hooks": []}]}
 
 
 def _liveness(*, online=(), offline=(), source_state="fresh", age=10):

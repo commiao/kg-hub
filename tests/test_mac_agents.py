@@ -148,6 +148,36 @@ def _render_for_test(text: str) -> str:
     return re.sub(r"@[A-Z_]+@", "x", text)
 
 
+def prepared_install_env(test):
+    """Isolated installed fixture: a new schedule must be testable before deployment.
+
+    Render paths against the canonical repository, independent of the caller's
+    worktree. No real LaunchAgent or secret is read or changed by these tests.
+    """
+    temp = tempfile.TemporaryDirectory()
+    test.addCleanup(temp.cleanup)
+    home = Path(temp.name)
+    common = subprocess.check_output(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True)
+    canonical = str(Path(common.strip()).parent)
+    code, venv = str(home / ".local/share/kg-hub/current"), str(home / ".local/share/kg-hub/venv")
+    target = home / "Library/LaunchAgents"
+    target.mkdir(parents=True)
+    for path in TemplateTests().templates():
+        text = path.read_text()
+        for key, value in (("__CODE__", code), ("__VENV__", venv),
+                           ("__GITREPO__", canonical), ("__HOME__", str(home))):
+            text = text.replace(key, value)
+        text = re.sub(r"@[A-Z_]+@", "fixture-value", text)
+        (target / path.name).write_text(text.rstrip() + "\n")
+    stub = home / "launchd.sh"
+    stub.write_text("launchd_label() { echo com.stub.label; }\nlaunchd_reload() { return 0; }\n")
+    env = {**os.environ, "HOME": str(home), "KG_HUB_CODE_ROOT": code, "KG_HUB_VENV": venv,
+           "FLEET_OPS_LAUNCHD_LIB": str(stub), "KG_HUB_FEISHU_WEBHOOK": "fixture-value"}
+    env.pop("KG_HUB_GIT_REPO", None)
+    return env
+
+
 class InstallScriptTests(unittest.TestCase):
     def setUp(self):
         self.source = INSTALL.read_text("utf-8")
@@ -324,15 +354,19 @@ class InstallScriptTests(unittest.TestCase):
             self.assertNotIn("unbound variable", cold.stderr,
                              "对照组：C 本该不触发；不成立说明夹具有问题")
 
-    def test_check_mode_runs_clean_against_this_machine(self):
-        # 模板必须能逐字节还原出机器上正在跑的那份，否则「进仓库」这件事本身就
-        # 引入了行为变化。这台机器上装了才跑；别的机器跳过。
-        target = Path.home() / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
-        if not target.exists():
-            self.skipTest("这台机器上没装 kg-hub 的 launchd 服务")
+    def test_check_mode_accepts_rendered_install_and_rejects_cadence_drift(self):
+        env = prepared_install_env(self)
         done = subprocess.run(["bash", str(INSTALL), "--check"],
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=60, env=env)
         self.assertEqual(done.returncode, 0, done.stderr)
+        target = Path(env["HOME"]) / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
+        doc = plistlib.loads(target.read_bytes())
+        self.assertEqual(doc["StartInterval"], 120)
+        target.write_text(target.read_text().replace("<integer>120</integer>", "<integer>600</integer>"))
+        drift = subprocess.run(["bash", str(INSTALL), "--check"],
+                               capture_output=True, text=True, timeout=60, env=env)
+        self.assertNotEqual(drift.returncode, 0)
+        self.assertIn("不一致", drift.stderr)
 
     def test_the_git_repo_placeholder_does_not_follow_whichever_checkout_ran_it(self):
         """`__GITREPO__` 必须解析成**这台机器约定的那棵工作树**，
@@ -386,11 +420,9 @@ class InstallScriptTests(unittest.TestCase):
             # deploy/ 覆盖进去再跑：这样验的是手上这份代码在 worktree 里的行为。
             shutil.rmtree(checkout / "deploy", ignore_errors=True)
             shutil.copytree(ROOT / "deploy", checkout / "deploy")
-            target = Path.home() / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
-            if not target.exists():
-                self.skipTest("这台机器上没装 kg-hub 的 launchd 服务")
+            env = prepared_install_env(self)
             done = subprocess.run(["bash", str(checkout / "deploy/mac/install.sh"),
-                                   "--check"], capture_output=True, text=True, timeout=120)
+                                   "--check"], capture_output=True, text=True, timeout=120, env=env)
             self.assertEqual(done.returncode, 0,
                              f"--check 从 worktree 跑红了：{done.stdout[-700:]}")
         finally:
@@ -429,9 +461,6 @@ class NonGitCheckoutTests(unittest.TestCase):
 
     def test_an_explicit_repo_makes_it_work(self):
         """给了约定的工作树就该正常工作 —— 拒绝不能变成「从产物里根本用不了」。"""
-        target = Path.home() / "Library/LaunchAgents/com.kg-hub.capture-probe.plist"
-        if not target.exists():
-            self.skipTest("这台机器上没装 kg-hub 的 launchd 服务")
         # **必须传约定的那棵主工作树，不是 ROOT。** ROOT 是「测试碰巧在哪个检出里」，
         # 而机器上装的 plist 指向主工作树 —— 拿 ROOT 去比，比的是两个不同的东西。
         # 同一个毛病在这个文件里今天已经是第三次（准则 28）。
@@ -439,7 +468,7 @@ class NonGitCheckoutTests(unittest.TestCase):
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=str(ROOT), capture_output=True, text=True, timeout=60)
         self.assertEqual(canonical.returncode, 0, canonical.stderr)
-        env = {**os.environ,
+        env = {**prepared_install_env(self),
                "KG_HUB_GIT_REPO": str(Path(canonical.stdout.strip()).parent)}
         done = subprocess.run(["bash", str(self._artifact_copy()), "--check"],
                               capture_output=True, text=True, timeout=120, env=env)

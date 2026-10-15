@@ -214,7 +214,7 @@ def emit_alert(severity: str, kind: str, message: str, attempt: int = 1) -> bool
     return delivered
 
 
-def deliver_alerts(state, anomalies, details, blocker_ids):
+def deliver_alerts(state, anomalies, details, blocker_ids, hook_ids=None):
     """Persist unacknowledged deliveries separately from observed health.
 
     Retry once per watchdog cycle. Supersede obsolete pending messages with the
@@ -231,11 +231,17 @@ def deliver_alerts(state, anomalies, details, blocker_ids):
     # 故障解除（capture_blocked 为假）时清空，下一次故障从零记起。
     # 旧状态没有这个键时以上一轮集合起步，与旧行为衔接，升级当轮不会多报。
     alerted = set(state.get("capture_blocker_alerted", old_ids))
+    old_hooks = set(state.get("codex_hook_ids", []))
+    current_hooks = old_hooks if hook_ids is None else set(hook_ids)
+    alerted_hooks = set(state.get("codex_hook_alerted", old_hooks))
+    if not anomalies.get("codex_hooks_unhealthy"):
+        alerted_hooks = set()
     if not anomalies.get("capture_blocked"):
         alerted = set()
     for kind, bad in anomalies.items():
         changed = bad != bool(previous.get(kind, False))
-        added = kind == "capture_blocked" and bad and bool(new_ids - alerted)
+        added = bad and ((kind == "capture_blocked" and bool(new_ids - alerted))
+                         or (kind == "codex_hooks_unhealthy" and bool(current_hooks - alerted_hooks)))
         if changed or added:
             pending[kind] = {
                 "severity": "fire" if bad else "clear",
@@ -245,6 +251,10 @@ def deliver_alerts(state, anomalies, details, blocker_ids):
             }
     if anomalies.get("capture_blocked"):
         alerted |= new_ids
+    if anomalies.get("codex_hooks_unhealthy"):
+        alerted_hooks |= current_hooks
+    state["codex_hook_ids"] = sorted(current_hooks)
+    state["codex_hook_alerted"] = sorted(alerted_hooks)
     # Checkpoint BEFORE any network call: a crash can duplicate, never lose, it.
     checkpoint = dict(state, anomalies=anomalies, pending_alerts=pending,
                       capture_blocker_ids=sorted(new_ids),
@@ -401,6 +411,8 @@ class CaptureDecision(NamedTuple):
     stale: list[str] | None
     source_errors: tuple[str, ...] = ()
     blocker_ids: tuple[str, ...] = ()
+    codex_hooks: tuple[str, ...] | None = ()
+    codex_hook_ids: tuple[str, ...] = ()
 
 
 GATEWAY_ALERTS = {
@@ -593,6 +605,34 @@ def _capture_probe_hosts(cfg: dict) -> list[str]:
     return [str(host).strip() for host in raw if str(host).strip()]
 
 
+def _codex_hook_problems(snapshot: dict, host: str) -> tuple[list[str], list[str]] | None:
+    """Consume the native hash/trust verdict; do not infer trust from idle traffic."""
+    inventories = snapshot.get("hook_inventory")
+    if not isinstance(inventories, list):
+        return None
+    codex = next((t for t in inventories if isinstance(t, dict) and t.get("tool") == "codex"), None)
+    if not codex or not isinstance(codex.get("hooks"), list):
+        return None
+    problems, identities = [], []
+    for hook in codex["hooks"]:
+        if not isinstance(hook, dict):
+            return None
+        if hook.get("state") != "red":
+            continue
+        approval = hook.get("approval", "unknown")
+        key = hook.get("key") or hook.get("id") or "inspection"
+        current_hash = hook.get("current_hash") or "unavailable"
+        identity = f"{normalize_host(host)}:{key}:{current_hash}:{approval}"
+        reason = hook.get("status_detail") or {
+            "missing": "未批准", "modified": "hash 不匹配", "unknown": "无法核验",
+            "not-configured": "必需插件未加载或已禁用",
+        }.get(approval, "hook 异常")
+        problems.append(f"{host} · {hook.get('event', '?')}：{reason}\n"
+                        f"    key={key}；当前 hash={current_hash}")
+        identities.append(identity)
+    return problems, identities
+
+
 def judge_snapshots(snaps: list[dict], cfg: dict,
                     liveness: dict | None = None) -> CaptureDecision:
     """纯判定：快照 → 每个异常维度各自的 known-bad/known-good/unknown。
@@ -607,6 +647,8 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         DEFAULT_CAPTURE_STALE_AFTER_S // 60) * 60
     blocked, stale = [], []
     blocker_ids = []
+    hook_problems, hook_ids = [], []
+    hooks_unknown = False
     source_errors: list[str] = []
     if isinstance(liveness, dict) and liveness.get("source_state") != "fresh":
         source_errors.append(str(
@@ -622,6 +664,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         if not isinstance(sn, dict):
             blocked_unknown = True
             stale_unknown = True
+            hooks_unknown = True
             source_errors.append("topology snapshot 不是 object")
             continue
         host = str(sn.get("_host") or "?")
@@ -634,6 +677,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         host_labels.setdefault(key, host)
 
     if not host_labels:
+        hooks_unknown = True
         blocked_unknown = stale_unknown = True
         source_errors.append("topology 没有可判定的采集 host")
 
@@ -642,10 +686,12 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         if sn is None:
             state, state_detail = device_state(liveness, host, aliases)
             if state == "online":
+                hooks_unknown = True
                 stale.append(f"{host} 设备在线，但从未收到采集链路快照")
             elif state == "unknown":
                 blocked_unknown = True
                 stale_unknown = True
+                hooks_unknown = True
                 source_errors.append(state_detail)
             # offline/online 都明确说明旧 blocker 不适用；仅 unknown 才 HOLD。
             continue
@@ -656,6 +702,7 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
         if snapshot_stale is None:
             blocked_unknown = True
             stale_unknown = True
+            hooks_unknown = True
             source_errors.append(f"{host} topology snapshot 缺少有效年龄")
             continue
         if snapshot_stale:
@@ -665,16 +712,29 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
             else:
                 state, state_detail = device_state(liveness, host, aliases)
             if state == "online":
+                hooks_unknown = True
                 stale.append(
                     f"{host} 设备在线，但探针 {int(age or 0) // 60} 分钟未上报")
             elif state == "unknown":
                 blocked_unknown = True
                 stale_unknown = True
+                hooks_unknown = True
                 source_errors.append(state_detail)
             # known online/offline 时旧 blocker 都不再可信且应清除；只有 unknown
             # host 才 HOLD。fresh blocker 会在其它 host 分支重新把聚合态判为 BAD。
             continue
+        hook_check = _codex_hook_problems(sn, host)
+        if hook_check is None:
+            hooks_unknown = True
+            source_errors.append(f"{host} Codex hook 清单不可用，无法核验升级后的信任状态")
+        else:
+            hook_problems.extend(hook_check[0])
+            hook_ids.extend(hook_check[1])
         for b in (sn.get("blockers") or []):
+            # A dedicated incident owns Codex trust failures. Keep other capture
+            # blockers independent, so an existing incident cannot hide a new hook.
+            if hook_check is not None and b.get("id") in ("hook:codex", "hook-inventory:codex"):
+                continue
             blocker_ids.append(f"{key}:{b.get('id') or b.get('label', '?')}")
             blocked.append(f"{host} · {b.get('label', '?')}: {b.get('detail', '')}")
 
@@ -684,7 +744,9 @@ def judge_snapshots(snaps: list[dict], cfg: dict,
     return CaptureDecision(
         blocked_decision, stale_decision,
         tuple(dict.fromkeys(error for error in source_errors if error)),
-        tuple(sorted(set(blocker_ids))))
+        tuple(sorted(set(blocker_ids))),
+        tuple(hook_problems) if hook_problems else (None if hooks_unknown else ()),
+        tuple(sorted(set(hook_ids))))
 
 
 # unknown 最多沿用几轮。
@@ -828,6 +890,28 @@ def apply_search_probe(pstatus: str, plat: float, pmsg: str, prev_anomalies: dic
             f"kg-hub 搜索变慢：连续 {streak} 轮超过 {SLOW_SECONDS:.0f}s"
             f"（本轮 {plat:.1f}s，平时约 2.5s）—— 常见原因是 FalkorDB 正在大批量写入；"
             f"持续不退再查 GRAPH.SLOWLOG kg_hub 与 kg_hub_server 负载")
+
+
+def apply_codex_hook_decision(decision, previous, anomalies, details,
+                              prev_counters, counters):
+    kind = "codex_hooks_unhealthy"
+    if decision.codex_hooks is None or (decision.blocked is None and not decision.codex_hooks):
+        streak = int(prev_counters.get(kind + "_unknown", 0)) + 1
+        counters[kind + "_unknown"] = streak
+        anomalies[kind] = _hold_or_release(kind, bool(previous.get(kind)), streak,
+                                         details, "Codex hook 信任状态")
+    else:
+        counters[kind + "_unknown"] = 0
+        anomalies[kind] = bool(decision.codex_hooks)
+        if decision.codex_hooks:
+            details[kind] = ("Codex hook 未批准、定义变化或核验失败，可能导致静默断采：\n"
+                             + "\n".join(decision.codex_hooks[:6])
+                             + "\n请在 Codex /hooks 审阅并批准当前定义；"
+                               "不要只添加旧 key 或绕过信任校验。\n看 /dashboard/topology 的 Hook 面板。")
+        else:
+            details[kind + ":clear"] = (
+                "当前可判定的在线设备不再报告 Codex hook 异常；"
+                "离线设备不据此认定已重新批准。看 /dashboard/topology。")
 
 
 def main() -> int:
@@ -1064,6 +1148,8 @@ def main() -> int:
         decision = check_capture_chain(cfg) if alive else CaptureDecision(None, None)
         apply_capture_decision(
             decision, prev_anomalies, new_anomalies, details, prev_counters, new_counters)
+        apply_codex_hook_decision(decision, prev_anomalies, new_anomalies, details,
+                                  prev_counters, new_counters)
 
     # Independent from capture decisions: readiness 503 must not erase capture
     # monitoring, and missing/idle business traffic is not an invalid API key.
@@ -1074,7 +1160,8 @@ def main() -> int:
 
     pending, blocker_ids, blocker_alerted = deliver_alerts(
         state, new_anomalies, details,
-        decision.blocker_ids if decision.blocked is not None else None)
+        decision.blocker_ids if decision.blocked is not None else None,
+        hook_ids=decision.codex_hook_ids if decision.codex_hooks is not None else None)
     # 这里是整份重写：deliver_alerts 存进 checkpoint 的键，不在这张清单上就会被
     # 冲掉。capture_blocker_alerted 漏掉的话，下一轮又退回「只和上一轮比」。
     save_state({
@@ -1082,6 +1169,8 @@ def main() -> int:
         "pending_alerts": pending,
         "capture_blocker_ids": blocker_ids,
         "capture_blocker_alerted": blocker_alerted,
+        "codex_hook_ids": state.get("codex_hook_ids", []),
+        "codex_hook_alerted": state.get("codex_hook_alerted", []),
         "counters": new_counters,
         "last_run": now_iso(),
         "last_stats": stats,
