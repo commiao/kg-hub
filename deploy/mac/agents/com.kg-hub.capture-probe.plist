@@ -35,7 +35,7 @@
 	<key>StandardOutPath</key>
 	<string>__HOME__/.kg-hub/logs/capture-probe.out.log</string>
 	<key>StartInterval</key>
-	<integer>600</integer>
+	<integer>120</integer>
 	<key>WorkingDirectory</key>
 	<string>__CODE__</string>
 </dict>

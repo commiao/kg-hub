@@ -20,7 +20,7 @@
 | Label | 频率 | 干什么 | 挂了会怎样 |
 |---|---|---|---|
 | `claude-mem-guard` | 5 分钟 | 杀 claude-mem 空转 hook（插件 CPU 死循环）+ 同步断路器开关 | 断路器失灵；空转进程烧 CPU |
-| `capture-probe` | 10 分钟 | 采集链路 Mac 侧探针，拓扑图数据来源 | 拓扑图变瞎 |
+| `capture-probe` | 2 分钟 | 采集链路 Mac 侧探针，拓扑图数据来源 | 拓扑图变瞎 |
 | `claude-mem-dual-ingest`（在 `optional/`） | 15 分钟 | 合并新旧两代 claude-mem 库，同步到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |

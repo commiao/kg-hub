@@ -55,7 +55,7 @@ NAS device_liveness 容器 ── 每分钟读取 host Tailscale LocalAPI ──
 
 | 归属 | 告警 | 定性 |
 |---|---|---|
-| kg-hub 本体(14) | `server_down` `queue_backlog` `stuck_jobs` `recent_errors` `extraction_failing` `capsule_stale` `falkordb_slow` `falkordb_unreachable` `refinery_stalled` `capture_blocked` `capture_probe_stale` `capture_monitor_unhealthy` `held_growth`(最近 1 小时结果未知进待核验的任务数) `model_breaker_auto`(held 激增保护自动断开了 kg_hub 模型调用) | 本职 |
+| kg-hub 本体(15) | `server_down` `queue_backlog` `stuck_jobs` `recent_errors` `extraction_failing` `capsule_stale` `falkordb_slow` `falkordb_unreachable` `refinery_stalled` `capture_blocked` `codex_hooks_unhealthy` `capture_probe_stale` `capture_monitor_unhealthy` `held_growth`(最近 1 小时结果未知进待核验的任务数) `model_breaker_auto`(held 激增保护自动断开了 kg_hub 模型调用) | 本职 |
 | kg-hub 作为网关消费方(2) | `gateway_consumer_config_drift` `gateway_consumer_contract_unhealthy`(`check_model_gateway_consumer_contract`) | 本职:核对的是 kg-hub 自己的调用合同 |
 | 模型网关自身(7) | `gateway_monitor_unhealthy` 与 `GATEWAY_ALERTS` 六项(`gateway_not_ready` … `gateway_provider_circuit_open`),经 kg-hub 拓扑取数(`check_gateway_monitor`) | **搭车**:网关属 credvault(T-0046);09-08 接入 readiness 告警,09-18 加上自动断路告警,都是为复用现成的飞书通道 |
 | NAS 宿主机(1) | `disk_temp_high` | **搭车**:2026-08-16 过热停机 24 小时无人知,临时加入 |
