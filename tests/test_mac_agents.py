@@ -28,6 +28,7 @@ README = ROOT / "deploy" / "mac" / "README.md"
 EXPECTED = {
     "com.kg-hub.capsule-watch", "com.kg-hub.capture-probe",
     "com.kg-hub.claude-mem-guard",
+    "com.kg-hub.claude-mem-upgrade-acceptance",
     "com.kg-hub.feedback-digest",
     # weekly-report 已于 2026-10-14 迁到 NAS 的 weekly_report 容器（T-0269）。
     # 日更的源码漂移巡检：查 NAS 上跑的源码是不是等于 git 里的某个 commit。
