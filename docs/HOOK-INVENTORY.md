@@ -183,3 +183,59 @@ python3 ~/.local/share/kg-hub/current/tools/claude_mem_upgrade_acceptance.py --f
 常态触发时延为下一轮 2 分钟 + 原生检查/预演/投递耗时；Mac 睡眠时不会运行，唤醒
 后再检查。状态、日志和飞书命名通道异常应及时排查；此检查不替代 NAS 独立 hook
 健康告警、真实会话采集落库验收或显式 `--live` 的真实飞书通道验证。
+
+## 升级验收失败的可重复隔离演练
+
+`tools/drill_upgrade_acceptance_failure.py` 复用当前产物里的
+`claude_mem_upgrade_acceptance.accept()` 状态机，在一个独立进程中替换其检查输入。
+真实检查、hook、采集和生产告警均不注入故障。每次创建新演练编号和私有状态目录，
+按以下顺序验证：本地 HTTP 503 → pending 第 1 次保留 → 第 2 次成功重试 → 两轮
+重复失败静默 → 模拟恢复清空待发/通知标记 → 两轮恢复后跳过且不发消息。
+
+```bash
+# 默认：全部为本机模拟，只访问 127.0.0.1，不连接 NAS，也不读取飞书通道配置。
+python3 ~/.local/share/kg-hub/current/tools/drill_upgrade_acceptance_failure.py
+
+# 仍用本地模拟通知，但额外只读核验 NAS 生产告警状态。
+python3 ~/.local/share/kg-hub/current/tools/drill_upgrade_acceptance_failure.py --verify-nas
+
+# 显式允许：首轮仍在本机被拒，重试时向飞书发一条带编号的失败演练告警。
+# 此模式同时执行 NAS 前后只读核验。
+python3 ~/.local/share/kg-hub/current/tools/drill_upgrade_acceptance_failure.py --send-feishu
+```
+
+该入口和配套传输器都不接受 `--live`，也不会调用 `drill_codex_hooks.py`。
+本演练的 preflight 是标明 `local-simulated` 的本地夹具，不冒充真实 NAS 预演。
+既有升级自动验收仍调用真实默认预演；它不自动运行本节的失败演练。
+
+`--send-feishu` 使用已安装 `feishu-notify` 技能的 `kg-hub` 命名通道，只允许一次
+真实发送尝试。标题和正文均标注 `【演练】`，无需修复任何真实 hook；没有第二条
+恢复通知。成功须 HTTP 2xx 且业务码为整数 0，不能只看 HTTP 或发送器退出码。
+实际接收可按演练编号在飞书回读核对；该脚本本身不申请或使用群消息读取权限。
+超时、拒绝或回执不完整会立即停止并保留 pending，不自动重试真实通道，不能
+因为结果不明就重新执行。先核对飞书演练编号和回执，避免重复发消息。
+
+### 生产隔离核验与回执范围
+
+- 默认在演练前后只读比对本机 hook 配置、当前正式验收状态及其登记的插件源文件
+  SHA-256；配置存在时还读取对应采集库计数和 worker 健康/PID。源库以 SQLite
+  `mode=ro` 打开，worker 仅查询本机 `/api/health`，不启动或重启进程。健康读取
+  最多两次、每次 5 秒；持续不可读时返回未能确认，不冒充采集健康。
+- 默认不启动 Codex 原生检查进程，不验证实时信任是否健康，只证明已检查配置文件
+  未变化。采集实例未配置时记录 `capture_checked=false`，不能当作真实采集验收。
+  允许正常采集增加观察数；worker PID、数据库实例、健康状态须一致。
+- 默认 NAS 回执范围为 `not-queried-local-mode`。`--verify-nas` 和 `--send-feishu`
+  通过 SSH 独立进程只读比对真实 watchdog 的异常标志、pending 摘要、hook 告警身份
+  和告警日志摘要，确认演练编号没有混入。正常 last_run 更新不算污染；真实告警
+  同时变化时演练返回非零，需排查并发变化，不自动清理或恢复生产状态。
+- NAS 使用与现有演练一致的 Docker 入口和 `kg-hub-watchdog`；可用 `--ssh-host`
+  或 `KG_HUB_NAS_SSH` 指定 SSH 目标，跳板别名需 `KG_HUB_SSH_ALLOW_PROXYJUMP=1`。
+  默认模式不依赖 NAS 或飞书配置；显式发送需要已安装的命名通道发送技能。
+- 本地目录默认 `~/.kg-hub/state/drills/upgrade-failure/<演练编号>/`，也可通过
+  `--output-dir` 指定父目录。目录 0700，回执和快照 0600，保留各轮状态、传输回执、
+  生产核验快照、控制器 SHA-256；不记录 webhook 或发送器原始错误输出。
+  演练结束后只有被动证据，没有定时任务会接手这份临时 pending。
+
+退出码 0 表示**所选模式及核验范围**全部通过，1 表示失败/无法确认，2 表示参数错误。
+若失败，查看 `receipt.json` 的 stage、failure_reason/error_type、deliveries 和各轮快照；
+不要把 `ok=false` 的部分回执当成功，不改真实 hook 或生产队列来让演练变绿。

@@ -85,7 +85,11 @@ NAS compose 里的 `kg-hub-watchdog` 容器,每 ~90s 跑 `tools/watchdog.py`,**�
 
 升级后的隔离演练入口、飞书送达标准、回执与失败处理见
 [Hook 运维文档](HOOK-INVENTORY.md#升级后的一键隔离告警演练)。
-默认不发送，`--live` 才验证真实通道；生产告警状态和采集数据不参与演练。
+默认不发送，`--live` 才验证两条异常/恢复通知；生产告警状态和采集数据不参与演练。
+
+升级验收失败通道使用独立入口 `drill_upgrade_acceptance_failure.py`，默认只在本机
+模拟重试和去重；显式 `--send-feishu` 才发一条失败演练告警，恢复保持静默。
+详见 [失败演练运维说明](HOOK-INVENTORY.md#升级验收失败的可重复隔离演练)。
 
 ## 关键端点 / 路径速查
 | 项 | 值 |
