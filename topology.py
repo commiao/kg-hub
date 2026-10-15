@@ -707,8 +707,8 @@ function renderHooks(){
     const cards = inv.map(t=>{
       const sum=t.summary||{};
       const rows=(t.hooks||[]).map(h=>{
-        const status=!h.configured?(h.state==='red'?'缺失':'未配置'):
-          h.approval==='missing'?'未批准':h.state==='amber'?'范围受限':'已配置';
+        const status=h.status_detail||(!h.configured?(h.state==='red'?'缺失':'未配置'):
+          h.approval==='missing'?'未批准':h.state==='amber'?'范围受限':'已配置');
         return `<div class="hrow ${esc(h.state||'grey')}">
           <div><span class="statusdot ${esc(h.state||'grey')}"></span>
             <span class=event>${esc(h.event||'—')}</span>
@@ -717,6 +717,7 @@ function renderHooks(){
             <div class=meta>${esc(h.purpose||h.action||'—')}</div></div>
           <div class=hstatus><b>${esc(status)}</b>
             <div class=meta>${esc(h.scope||'—')} · ${esc(evidenceText(h.runtime_evidence))}</div>
+            ${h.current_hash?`<div class=meta>当前 hash：${esc(h.current_hash)}</div>`:''}
             ${h.coverage?`<div class=meta>⚠ ${esc(h.coverage)}</div>`:''}
           </div></div>`;
       }).join('');

@@ -45,6 +45,7 @@
     "heartbeat": "任务续租",
     "push": "注入知识",
     "ops-context": "运维状态",
+    "post-compact": "压缩后标记记忆待恢复",
     "bridge": "兼容桥"
   },
   "tools": [
@@ -81,9 +82,8 @@
       "label": "Codex",
       "difference": "插件 Hook · 需逐项批准",
       "sources": [
-        {"kind": "latest_glob", "path": "~/.codex/plugins/cache/*/claude-mem/*/hooks/codex-hooks.json", "scope": "claude-mem 插件"}
+        {"kind": "codex_runtime", "path": "Codex hooks/list", "scope": "生效配置与插件"}
       ],
-      "approval": "~/.codex/config.toml",
       "expected": [
         {"component": "claude-mem", "required": true}
       ]

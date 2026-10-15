@@ -114,10 +114,88 @@ def _component(command: str, components: list[dict]) -> dict | None:
     return None
 
 
-def _codex_approved(config: str, item: dict) -> bool:
-    event = EVENT_NORM.get(item["event"], re.sub(r"(?<!^)(?=[A-Z])", "_", item["event"]).lower())
-    key = f"codex-hooks.json:{event}:{item['group_index']}:{item['hook_index']}"
-    return key in config
+APPROVAL_LABELS = {
+    "missing": "未批准", "modified": "定义已变更，hash 不匹配",
+    "unknown": "无法核验批准状态", "disabled": "已禁用",
+    "not-configured": "未配置", "approved": "已批准，hash 匹配",
+    "managed": "策略托管", "not-required": "已配置",
+}
+
+
+def _codex_inventory(tool: dict, components: list, actions: dict,
+                     tool_seen: dict, push_seen: dict) -> dict:
+    try:
+        from .codex_hooks import read_hooks, HookInspectionError
+    except ImportError:
+        from codex_hooks import read_hooks, HookInspectionError
+    cwd = tool.get("cwd") or str(HOME)
+    items = []
+    try:
+        entry = read_hooks(cwd)
+        warnings = entry.get("warnings", [])
+        for hook in entry["hooks"]:
+            command = hook.get("command", "")
+            comp = _component(command, components)
+            cid = comp["id"] if comp else "custom"
+            status = hook["trustStatus"]
+            approval = {"trusted": "approved", "managed": "managed",
+                        "modified": "modified", "untrusted": "missing"}.get(status, "unknown")
+            if not hook["enabled"]:
+                approval = "disabled"
+            state = ("grey" if approval == "disabled" else "green"
+                     if approval in ("approved", "managed") else "red")
+            event = hook["eventName"][0].upper() + hook["eventName"][1:]
+            action = _action(command)
+            items.append({
+                "id": "codex:" + hook["key"], "key": hook["key"],
+                "event": event, "matcher": hook.get("matcher") or "",
+                "source": hook["sourcePath"], "scope": hook.get("source", "unknown"),
+                "plugin_id": hook.get("pluginId"), "current_hash": hook["currentHash"],
+                "trust_status": status, "enabled": hook["enabled"],
+                "component": cid, "label": comp["label"] if comp else "自定义 hook",
+                "action": action,
+                "purpose": actions.get(action) or (comp or {}).get("purpose") or "未登记用途",
+                "configured": True, "approval": approval, "state": state,
+                "status_detail": APPROVAL_LABELS[approval],
+                "timeout": hook.get("timeoutSec"), "async": bool(hook.get("async")),
+                "runtime_evidence": _runtime_evidence("codex", cid, tool_seen, push_seen),
+            })
+        for expected in tool.get("expected", []):
+            cid = expected["component"]
+            if any(h["component"] == cid and h["enabled"] for h in items):
+                continue
+            items.append({
+                "id": f"codex:missing:{cid}", "event": "—", "matcher": "",
+                "source": "Codex hooks/list", "scope": "", "component": cid,
+                "label": cid, "purpose": "期望组件未启用或未被 Codex 加载",
+                "configured": False, "approval": "not-configured",
+                "state": "red" if expected.get("required") else "grey",
+                "runtime_evidence": {"kind": "none", "detail": "没有执行证据"},
+            })
+    except HookInspectionError as exc:
+        warnings = []
+        items = [{"id": "codex:inspection-error", "event": "配置核验",
+                  "component": "unknown", "label": "Codex 原生核验", "purpose": str(exc),
+                  "source": "Codex hooks/list", "scope": "", "configured": False,
+                  "approval": "unknown", "state": "red", "status_detail": str(exc),
+                  "runtime_evidence": {"kind": "none", "detail": "不能确认配置或 hash"}}]
+    states = [h["state"] for h in items]
+    return {
+        "tool": "codex", "label": tool["label"],
+        "state": "red" if "red" in states else "amber" if warnings else "green" if "green" in states else "grey",
+        "difference": "Codex 原生清单 · 当前 hash 与信任状态", "warnings": warnings,
+        "sources": [{"path": "Codex hooks/list", "scope": str(cwd),
+                     "found": not any(h["approval"] == "unknown" for h in items),
+                     "resolved": sorted({h["source"] for h in items})}],
+        "hooks": items,
+        "summary": {"total": len(items),
+                    "configured": sum(h["configured"] for h in items),
+                    "missing": sum(not h["configured"] for h in items),
+                    "unapproved": sum(h["approval"] in ("missing", "modified") for h in items),
+                    "hash_mismatch": sum(h["approval"] == "modified" for h in items),
+                    "disabled": sum(h["approval"] == "disabled" for h in items),
+                    "limited_scope": 0},
+    }
 
 
 def _push_last_seen() -> dict[str, datetime]:
@@ -165,6 +243,9 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
     inventories = []
 
     for tool in registry.get("tools", []):
+        if tool["id"] == "codex":
+            inventories.append(_codex_inventory(tool, components, actions, tool_seen, push_seen))
+            continue
         raw: list[dict] = []
         source_status = []
         for source in tool.get("sources", []):
@@ -182,13 +263,6 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
                 else:
                     raw.extend(_flatten_hooks(path, source.get("scope", "")))
 
-        approval_text = ""
-        approval_path = tool.get("approval")
-        if approval_path:
-            p = _expand(approval_path)
-            if p.exists():
-                approval_text = p.read_text(errors="replace")
-
         items = []
         found_components = set()
         for item in raw:
@@ -205,7 +279,7 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
             cid = comp["id"] if comp else "custom"
             found_components.add(cid)
             action = _action(item["command"])
-            approved = _codex_approved(approval_text, item) if approval_path else True
+            approved = True
             state = "green" if approved else "red"
             items.append({
                 **{k: v for k, v in item.items() if k != "command"},
@@ -215,7 +289,7 @@ def collect(tool_seen: dict | None = None) -> list[dict]:
                 "action": action,
                 "purpose": actions.get(action) or (comp or {}).get("purpose") or "未登记用途",
                 "configured": True,
-                "approval": "approved" if approved else "missing",
+                "approval": "not-required",
                 "state": state,
                 "runtime_evidence": _runtime_evidence(
                     tool["id"], cid, tool_seen, push_seen),
