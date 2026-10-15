@@ -37,9 +37,20 @@ from pathlib import Path
 KNOWN_KEYS: tuple[str, ...] = ("claude_mem.observation", "kg_hub.entity_extract")
 
 # 每个 key 在拓扑上挂在哪个节点：给 UI 用，避免前端再写一份映射。
+# 值必须是探针真实上报的节点 id（tools/capture_probe.py：claude-mem 那格的 id 是
+# "worker"，label 才是 "claude-mem"）。2026-10-15 查出这里一直写的是 "claude-mem"，
+# 从接线那天起 claude-mem 的开关就没在拓扑上出现过——测试用的也是同一个假 id。
 KEY_NODES: dict[str, str] = {
-    "claude_mem.observation": "claude-mem",
+    "claude_mem.observation": "worker",
     "kg_hub.entity_extract": "refinery",
+}
+
+# 开关不画在这里、但**同一个开关**在这里也硬拦截的节点。kg_hub.entity_extract
+# 的硬挡在 kg-hub 的唯一模型出口（model_gateway_client），所以它断开时停的不只是
+# refinery：ingester、OpenClaw、MCP 直写等一切进 kg-hub 的抽取都停。拓扑上只在
+# refinery 画一个可按的开关（两个按钮会让人以为是两个闸），出口节点只如实标状态。
+EXIT_NODES: dict[str, str] = {
+    "kg_hub.entity_extract": "kghub",
 }
 
 # 这一路是否**真的有东西在执行这个开关**。
