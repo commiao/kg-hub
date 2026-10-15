@@ -10,7 +10,7 @@ Mac 探针 `tools/capture_probe.py` 调用 `tools/hook_inventory.py`，读取真
 - 事件与 matcher
 - 逻辑组件及职责
 - 配置来源和生效范围（用户级 / 项目级 / 插件）
-- Codex trusted hash 是否批准
+- Codex 原生 `hooks/list` 的当前 hash、信任状态及是否启用
 - 最近执行证据（有日志时）或明确标注“只能确认配置”
 
 ## 状态语义
@@ -36,3 +36,18 @@ Mac 探针 `tools/capture_probe.py` 调用 `tools/hook_inventory.py`，读取真
 
 4. 部署 `topology.py` 后运行一次 `capture_probe.py --report --exit-zero`，
    让线上面板收到新格式快照。
+
+## Codex 核验来源
+
+探针通过本机 Codex app-server 的 `hooks/list` 查询生效 hook，直接使用运行时的
+`currentHash`、`trustStatus` 和完整 key。它不再扫描插件缓存，不再用配置里的
+key 子串证明已批准，也不复制 Codex 的 hash 算法。`modified`（hash 不匹配）、
+`untrusted`（未批准）、必需组件未加载、核验失败都报红；禁用项单列。
+拓扑与详细清单复用同一次查询结果，配置警告标黄。探针不会批准任何 hook。
+
+探针默认核对用户目录的全局生效配置；可在注册表的 Codex 项设置 `cwd` 核对
+指定项目作用域。`KG_HUB_CODEX_BINARY` 可指定本机 Codex 可执行文件；常见
+桌面安装路径与 PATH 为后备来源。接口不存在、超时或元数据不全时明确报核验失败。
+
+修复信任后仍须验证真实会话登记、工具调用进入 observer task 队列和观察落库，
+不能用配置绿灯替代采集证据。

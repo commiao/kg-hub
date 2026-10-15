@@ -406,14 +406,8 @@ def probe_devices() -> list[dict]:
     return nodes
 
 
-def probe_hooks(tool_seen: dict) -> list[dict]:
-    """hook 层：配置是否在 + 是否存在已知的失信风险。
-
-    codex 的 trusted_hash 机制是 T-0021 的现场：approve 过的 hook 集合与
-    磁盘上实际的 hook 集合不一致 → Codex 静默拒绝执行。这里把两个集合都
-    数出来做对比，而**不是数 trusted_hash 的条数**（数量不是判据，见
-    INVESTIGATION-RULES 附录「判据陷阱」）。
-    """
+def probe_hooks(tool_seen: dict, hook_inventory: list | None = None) -> list[dict]:
+    """Configuration plus native Codex trust/hash checks; inventory is shared by both views."""
     nodes: list[dict] = []
 
     # --- Claude Code：plugin 注册在 settings.json ---
@@ -433,40 +427,24 @@ def probe_hooks(tool_seen: dict) -> list[dict]:
     nodes.append({"id": "hook:claude", "layer": "hook", "label": "Claude Code",
                   "state": cc_state, "detail": cc_detail})
 
-    # --- Codex：trusted_hash 集合 vs 磁盘 hook 集合 ---
-    cx_cfg = HOME / ".codex" / "config.toml"
-    cx_state, cx_detail = GREY, "config.toml 不存在"
-    if cx_cfg.exists():
-        txt = cx_cfg.read_text(errors="replace")
-        approved = set(re.findall(r"codex-hooks\.json:([a-z_]+:\d+:\d+)", txt))
-        on_disk: set[str] = set()
-        ev_map = {"SessionStart": "session_start", "UserPromptSubmit": "user_prompt_submit",
-                  "PreToolUse": "pre_tool_use", "PostToolUse": "post_tool_use", "Stop": "stop"}
-        for hp in sorted(HOME.glob(".codex/plugins/cache/*/claude-mem/*/hooks/codex-hooks.json")):
-            try:
-                hooks = json.loads(hp.read_text())["hooks"]
-            except Exception:  # noqa: BLE001
-                continue
-            for ev, arr in hooks.items():
-                for gi, grp in enumerate(arr if isinstance(arr, list) else []):
-                    for hi, _ in enumerate(grp.get("hooks", [])):
-                        on_disk.add(f"{ev_map.get(ev, ev.lower())}:{gi}:{hi}")
-            break  # 只看第一个（最新）安装
-        if not on_disk:
-            cx_state = AMBER if "codex" in tool_seen else RED
-            cx_detail = "磁盘上找不到 codex-hooks.json"
-        else:
-            missing = on_disk - approved     # 磁盘上有但没 approve → 会被静默拒绝
-            stale = approved - on_disk       # approve 过但 hook 已不存在 → 无害残留
-            if missing:
-                cx_state = RED
-                cx_detail = (f"{len(missing)} 个 hook 未 approve（会被静默拒绝）："
-                             + ", ".join(sorted(missing)))
-            else:
-                cx_state = GREEN
-                cx_detail = f"{len(on_disk)} 个 hook 全部已 approve"
-                if stale:
-                    cx_detail += f"；另有 {len(stale)} 条旧残留（无害）"
+    # Use exactly the same native trust/hash verdict as the detailed Hook panel.
+    if hook_inventory is None:
+        try:
+            from .hook_inventory import collect as collect_hook_inventory
+        except ImportError:
+            from hook_inventory import collect as collect_hook_inventory
+        hook_inventory = collect_hook_inventory(tool_seen)
+    cx = next((t for t in hook_inventory if t["tool"] == "codex"), None)
+    if cx is None:
+        cx_state, cx_detail = RED, "Codex 原生 hook 清单缺失，无法核验"
+    else:
+        cx_state = cx["state"]
+        bad = [h for h in cx["hooks"] if h["state"] == RED]
+        cx_detail = ("；".join(f"{h['event']}：{h.get('status_detail') or h['approval']}"
+                              for h in bad) if bad else
+                     f"{cx['summary']['configured']} 个已加载 hook，信任状态与当前 hash 已核验")
+        if cx.get("warnings"):
+            cx_detail += "；Codex 配置有警告"
     nodes.append({"id": "hook:codex", "layer": "hook", "label": "Codex",
                   "state": cx_state, "detail": cx_detail})
 
@@ -1329,11 +1307,11 @@ def collect() -> dict:
     tool_nodes, tool_seen = probe_tools()
     oc_nodes = probe_openclaw()
     tool_nodes += [n for n in oc_nodes if n["layer"] == "tool"]
-    hook_nodes = probe_hooks(tool_seen)
     # 详细 hook 清单与职责由 config/hook_registry.json 统一维护。拓扑里的 hook
     # 节点保留作链路概览；独立 Hook 面板读取这份 inventory，区分配置/批准/执行证据。
     from hook_inventory import collect as collect_hook_inventory
     hook_inventory = collect_hook_inventory(tool_seen)
+    hook_nodes = probe_hooks(tool_seen, hook_inventory)
     # hook 行序对齐工具行序，否则拓扑图上 tool→hook 的连线会交叉
     order = [n["id"].split(":", 1)[1] for n in tool_nodes]
     hook_nodes.sort(key=lambda h: (order.index(h["id"].split(":", 1)[1])
@@ -1367,7 +1345,8 @@ def collect() -> dict:
                 "label": f"{tool['label']} Hook",
                 "detail": "；".join(
                     f"{h['event']} {h['label']}："
-                    + ("未批准" if h["approval"] == "missing" else "未配置")
+                    + (h.get("status_detail") or {"missing": "未批准", "modified": "hash 不匹配",
+                       "unknown": "无法核验", "not-configured": "未配置"}.get(h["approval"], h["approval"]))
                     for h in bad[:4]),
             })
             worst = RED

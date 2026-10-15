@@ -66,30 +66,6 @@ class HookInventoryTest(unittest.TestCase):
             self.assertNotIn("command", hook)
             self.assertNotIn("NEVER_SHOW", json.dumps(result))
 
-    def test_codex_unapproved_hook_is_red(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp_path = Path(td)
-            hook_path = tmp_path / "codex-hooks.json"
-            hook_path.write_text(json.dumps({
-                "hooks": {"SessionStart": [{
-                    "hooks": [{"command": "node worker-service.cjs hook codex context"}]
-                }]}
-            }))
-            config = tmp_path / "config.toml"
-            config.write_text("[hooks.state]\n")
-            reg = _registry(tmp_path, [{
-                "id": "codex", "label": "Codex",
-                "sources": [{"kind": "json", "path": str(hook_path), "scope": "插件"}],
-                "approval": str(config),
-                "expected": [{"component": "claude-mem", "required": True}],
-            }])
-            with mock.patch.object(H, "REGISTRY_PATH", reg), \
-                    mock.patch.object(H, "PUSH_LOG", tmp_path / "none.log"):
-                result = H.collect()
-            self.assertEqual(result[0]["state"], "red")
-            self.assertEqual(result[0]["summary"]["unapproved"], 1)
-            self.assertEqual(result[0]["hooks"][0]["approval"], "missing")
-
     def test_required_component_missing_is_explicit(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
