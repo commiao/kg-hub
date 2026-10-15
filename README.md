@@ -166,33 +166,30 @@ ready 状态，绝不请求模型。
 
 按"症状 → 原因 → 处置"组织，半夜被叫醒时照着做。
 
-### MCP 调用全部失败，错误含 `ONNXRuntimeError NO_SUCHFILE ... model_optimized.onnx`
+### 检索全部失败，错误含 `ONNXRuntimeError NO_SUCHFILE ... model_optimized.onnx`
 
-- **原因**：fastembed 默认把嵌入模型缓存在 `/var/folders/sz/.../T/fastembed_cache/`，这是 macOS NSTemporaryDirectory，**系统会周期性清理**（典型 3 天）。模型一被清，kg_hub_server 的 Graphiti 单例就读不到 `.onnx`。
-- **临时修复**：用项目 venv 重下模型
-  ```bash
-  /Users/mac/work-ai/kg-hub/spike-graphiti/.venv/bin/python -c "
-  from huggingface_hub import hf_hub_download
-  hf_hub_download(repo_id='qdrant/bge-small-en-v1.5-onnx-q', filename='model_optimized.onnx')
-  "
-  ```
-  ⚠️ **不要用 `curl` 直连**——HuggingFace 已迁到 Xet CAS (`cas-bridge.xethub.hf.co`)，macOS 系统 curl 用的 LibreSSL 跟它握不上手，必须走 Python `huggingface_hub` 库（原生支持 Xet）。
-- **长期修复**：把 fastembed 缓存改到不会被清的目录
-  ```bash
-  # 在 LaunchAgent plist 的 EnvironmentVariables 里加：
-  FASTEMBED_CACHE_PATH=/Users/mac/.cache/fastembed
-  ```
+> 2026-10 起服务跑在 NAS 的 Docker 里（`kg-hub-server` 等容器）。早期 Mac 本地服务（launchd
+> `com.kg-hub.server`、本机 8080 端口、fastembed 缓存在会被系统清理的 `/var/folders`）已退役，
+> 当年的「Mac 上用 `spike-graphiti/.venv` 重下模型、`kill -9` 让 launchd 拉起」不再适用。
 
-### kg_hub_server 端口监听但所有请求卡死（含 `/health`）
-
-- **症状**：`lsof -nP -iTCP:8080` 显示 `*:8080 LISTEN`，但 `curl /health` 30 秒无响应；`ps` 看 CPU 时间几乎不动。
-- **原因**：服务在启动时如果 fastembed 模型缺失（见上一条），`get_graphiti()` 单例进入损坏状态——端口可监听但 Graphiti 用不了。SIGTERM 不响应。
-- **处置**：
+- **原因**：嵌入模型（fastembed `BAAI/bge-small-en-v1.5`，即 HF 仓库 `qdrant/bge-small-en-v1.5-onnx-q`）
+  放在挂载目录 `/volume2/4T/kg-hub-data/models`（容器内 `/models`）。容器强制离线
+  （`FASTEMBED_LOCAL_FILES_ONLY=true`，NAS 连不上 HuggingFace），所以这个目录缺文件或被删，就会报这个错。
+- **处置**：在 Mac 上用 fastembed 自己下载一份（目录结构和 fastembed 写出的完全一致，含
+  `files_metadata.json`），核对模型哈希后同步到 NAS，再重启容器：
   ```bash
-  kill -9 $(pgrep -f kg_hub_server.py)
-  # com.kg-hub.server.plist 已设 KeepAlive，30s 内自动重启
-  # 等到 curl http://127.0.0.1:8080/health 返回 200 即恢复
+  ~/.local/share/kg-hub/venv/bin/python -c "
+  from fastembed import TextEmbedding
+  TextEmbedding('BAAI/bge-small-en-v1.5', cache_dir='/tmp/fastembed-seed')"
+  # 必须与图里已有向量用的是同一个模型，否则新旧向量对不上、语义检索悄悄变差。
+  # 2026-10-15 线上模型的 model_optimized.onnx 指向 blob 51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431：
+  readlink /tmp/fastembed-seed/models--qdrant--bge-small-en-v1.5-onnx-q/snapshots/*/model_optimized.onnx
+  rsync -a /tmp/fastembed-seed/ commiao@100.123.208.32:/volume2/4T/kg-hub-data/models/
+  ssh commiao@100.123.208.32 'sudo -n /var/packages/ContainerManager/target/usr/bin/docker restart kg-hub-server'
   ```
+  哈希不一致说明上游换了模型，**不要同步**，先停下来评估（换模型需要重算全部向量）。
+  ⚠️ 不要用 `curl` 直接下载：HuggingFace 已迁到 Xet CAS，macOS 自带 curl 握不上手，要走 Python 库。
+- **确认恢复**：在 NAS 上 `curl -s http://127.0.0.1:17171/health` 返回 200，再用 MCP `kg_search` 查一条。
 
 ### `/api/ingest` 返回 `writer.lock timeout after 180s`
 
