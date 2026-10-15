@@ -753,7 +753,7 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
                      gateway_node: dict | None, keys: dict | None, timing: dict,
                      calls_per_obs: float | None, now: datetime) -> list[dict]:
     """把各段证据翻译成「卡在哪、为什么、怎么办」，停流在前，慢流在后。"""
-    from topology import refinery_halt
+    from topology import gateway_route_disabled, refinery_halt
     found: list[dict] = []
 
     def add(stage, level, title, evidence, action, deliberate=False, since=None):
@@ -790,7 +790,12 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
             "refinery 只在工作窗口内消化；窗口外只写心跳",
             "若要提速，评估扩大工作窗口（refinery_window 配置）", deliberate=True)
     reason = status.get("recovery_reason")
-    if status.get("provider_wait"):
+    if gateway_route_disabled(status):
+        add("gateway", "stop", "网关侧已断路：kg_hub.entity_extract 路由被禁用",
+            gateway_route_disabled(status),
+            "确认原因后在 credvault 看板恢复该路由（enabled）；kg-hub 不改网关配置",
+            deliberate=True)
+    elif status.get("provider_wait"):
         add("gateway", "stop", "供应商限流：网关暂停发送，在途任务排队等待",
             "已提交的任务留在网关队列里等供应商恢复（不放弃、不重复付费）；refinery 暂不送新任务",
             "等待自动恢复：网关定时放一条真实请求试探；额度恢复时间以供应商控制台为准")

@@ -13,7 +13,13 @@ INFRA_FAILURES = frozenset({
     "upstream_error", "provider_circuit_open", "gateway_unavailable",
     "terminal_write_unavailable", "net",
 })
-PAUSING_FAILURES = INFRA_FAILURES | {"quota", "daily_quota", "rate_limited"}
+# The gateway's per-business circuit break (route enabled=false). It is an
+# operator decision on the credvault board, not an outage: the readiness probe
+# cannot see it (/health/ready does not report per-route enabled), so only a
+# real request tells whether the route is back. Wait long between such tries.
+ROUTE_DISABLED = "business_route_disabled"
+ROUTE_DISABLED_DELAY = 300
+PAUSING_FAILURES = INFRA_FAILURES | {"quota", "daily_quota", "rate_limited", ROUTE_DISABLED}
 PROBE_DELAYS = (5, 15, 30, 60, 300)
 # Gateway readiness reads several durable ledgers (each may wait on SQLite).
 # Production returned healthy after 15.9s; the former 5s proxy timeout kept
@@ -32,7 +38,8 @@ def record_failure(state: dict, reason: str, *, cycle: int, interval: int,
         # Pauses before this one in the current run of provider 429s.
         earlier = state.get("rate_streak", 0) - (state.get("reason") == "rate_limited")
         delay = (quota_delay if reason == "quota" else
-                 rate_limit_delay(earlier) if reason == "rate_limited" else 5)
+                 rate_limit_delay(earlier) if reason == "rate_limited" else
+                 ROUTE_DISABLED_DELAY if reason == ROUTE_DISABLED else 5)
         retry_at = now + delay
     # An infrastructure refusal from a second in-flight task must not shorten
     # a daily quota wait. The readiness endpoint does not guarantee quota left.
@@ -86,6 +93,7 @@ def status_fields(state: dict) -> dict:
         "quota_paused": reason in {"quota", "daily_quota"},
         "rate_limited": reason == "rate_limited",
         "upstream_error_paused": reason in INFRA_FAILURES,
+        "gateway_route_disabled": reason == ROUTE_DISABLED,
         "recovery_reason": reason,
         "recovery_retry_at": state.get("retry_at"),
         "recovery_probe_attempt": state.get("probe_attempt", 0),

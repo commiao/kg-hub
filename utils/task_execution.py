@@ -14,7 +14,10 @@ log = logging.getLogger("kg_hub.task_execution")
 # (provider 429, gateway quota). The observation itself is fine: such a run is
 # "deferred" -- not reviewed, and not one of the task's three failed attempts.
 REFUSED_BEFORE_RESULT = frozenset({
-    "rate_limited", "quota_exhausted", "daily_quota_exhausted"})
+    "rate_limited", "quota_exhausted", "daily_quota_exhausted",
+    # The gateway's per-business circuit break refuses before any billable
+    # work; an operator decision is not a failed attempt of this task.
+    "business_route_disabled"})
 
 
 async def read_task(driver, sd, sid):

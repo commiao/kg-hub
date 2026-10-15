@@ -278,6 +278,43 @@ def annotate_breakers(snap: dict, state: dict) -> None:
                               "检索不受影响")
 
 
+GATEWAY_ROUTE_DISABLED = "business_route_disabled"
+
+
+def gateway_route_disabled(status: dict | None) -> str | None:
+    """refinery 看到的「网关侧按业务 key 断路」证据（kg_hub.entity_extract），没有则 None。
+
+    网关的 /health/ready 不报每条路由的 enabled（credvault 只在内部用它过滤告警），
+    所以 kg-hub 读不到网关开关本身，只能如实报**真实请求撞到的**结果。两条来路：
+    - 队列作业被网关扣着，扣的原因是 business_route_disabled（kg-hub 的常规路径）；
+    - 直连请求被 503 拒绝，refinery 因此暂停（回退路径）。
+    开关在 credvault 看板，kg-hub 不写网关配置，所以这里只出文案，不出按钮。
+    """
+    status = status if isinstance(status, dict) else {}
+    if status.get("provider_wait") and status.get("provider_wait_code") == GATEWAY_ROUTE_DISABLED:
+        return ("网关已暂停 kg_hub.entity_extract（路由 enabled=false）：已提交的作业留在网关队列，"
+                "恢复后自动执行，不计费、不算失败；refinery 暂不送新任务")
+    if (status.get("gateway_route_disabled")
+            or status.get("recovery_reason") == GATEWAY_ROUTE_DISABLED):
+        return ("网关拒绝 kg_hub.entity_extract（503 business_route_disabled，计费前拒绝）："
+                "refinery 已暂停，每 5 分钟用一条真实请求确认是否恢复")
+    return None
+
+
+def annotate_gateway_route(snap: dict, evidence: str | None) -> None:
+    """网关侧已断路：模型网关与 kg-hub 两个节点标 amber（有意停流，不是故障）。
+
+    不挂 node["breaker"]：那会画出一个可按的开关，而这个开关归 credvault 看板。
+    """
+    if not evidence:
+        return
+    line = ("⛔ 网关侧已断路：" + evidence
+            + "\n开关在 credvault 看板（路由 enabled），恢复请在那里操作；kg-hub 不改网关配置")
+    for node in snap.get("nodes", []) or []:
+        if isinstance(node, dict) and node.get("id") in ("gateway", "kghub"):
+            _mark_breaker(snap, node, "网关侧已断路", line)
+
+
 def annotate_gateway(snap: dict, node: dict, edge: dict) -> dict:
     """只在含 kg-hub 节点的快照上挂网关节点(NAS 侧那一段只画一份)。"""
     nodes = snap.get("nodes")
@@ -409,7 +446,10 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
                     for edge in snap.get("edges", []):
                         if "refinery" in (edge.get("from"), edge.get("to")):
                             edge["state"] = node["state"]
-        # 断路器最后挂：它是有意的停流，必须盖过上面的活跃度/网关着色。
+        # 断路最后挂：它是有意的停流，必须盖过上面的活跃度/网关着色。网关侧在前，
+        # kg-hub 自己的断路器在后——两边都断时 kg-hub 节点显示自己的开关。
+        if gw_node is not None:
+            annotate_gateway_route(snap, gateway_route_disabled(refinery_status))
         annotate_breakers(snap, breaker_state)
         snaps.append(snap)
     return snaps
@@ -497,6 +537,10 @@ def refinery_halt(status: dict | None) -> dict:
         result["deliberate"] = True
         reason = str(status.get("breaker_reason") or "").strip()
         gates.append("人工断路" + (f"（{reason}）" if reason else ""))
+    # 网关侧断路同样是有意的（credvault 看板切的），只是开关不在 kg-hub。
+    if gateway_route_disabled(status):
+        result["deliberate"] = True
+        gates.append("网关侧断路（kg_hub.entity_extract）")
     result["gates"] = gates
     result["halted"] = bool(result["window_open"] and gates)
     return result
@@ -640,7 +684,7 @@ g.brk:hover .brkbox{filter:brightness(1.25)}
   <span><i style="background:var(--grey)"></i>未配置</span>
   <span>虚线 = 该跳有滞后或中断</span>
   <span>点线 = 跨层直连（如 OpenClaw 不走 claude-mem，绕行走最近空闲通道）</span>
-  <span>「通 / 已断开」按钮 = 断路器，全系统只有两个：claude-mem（claude_mem.observation）、refinery（kg_hub.entity_extract，同一开关在 kg-hub 模型出口硬拦截）</span>
+  <span>「通 / 已断开」按钮 = 断路器，全系统只有两个：claude-mem（claude_mem.observation）、refinery（kg_hub.entity_extract，同一开关在 kg-hub 模型出口硬拦截）。「网关侧已断路」= credvault 看板关了该业务路由，没有按钮，恢复去 credvault 看板</span>
 </div>
 <svg width=0 height=0 style="position:absolute"><defs>
 <marker id=ag viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>

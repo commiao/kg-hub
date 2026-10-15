@@ -53,6 +53,10 @@ class QueueCancelled(QueueRetryWithNewKey):
 # #67). It holds such a job as queued and records the refusal in job.error.
 PROVIDER_RATE_LIMITED = 'provider_rate_limited'
 CANCELLED = 'cancelled_by_caller'
+# The gateway's per-business circuit break (credvault 2790c59): the route is
+# disabled by an operator. The queue holds such a job (disposition=paused) and
+# re-dispatches it until the route is enabled again; nothing is billed.
+BUSINESS_ROUTE_DISABLED = 'business_route_disabled'
 
 
 def provider_refused(job):
@@ -92,15 +96,21 @@ _provider_wait = {}
 def _note_provider_wait(job):
     now = time.time()
     ready_at = job.get('ready_at')
+    code = (job.get('error') or {}).get('code')
+    # The gateway holds a job for different reasons (provider rate limit, open
+    # circuit, quota, an operator-disabled route); keep its code so the board
+    # can say which one instead of calling every hold a rate limit.
     _provider_wait.update(seen_at=now, since=_provider_wait.get('since', now),
-                          retry_at=ready_at if isinstance(ready_at, (int, float)) else None)
+                          retry_at=ready_at if isinstance(ready_at, (int, float)) else None,
+                          code=code if isinstance(code, str) else None)
 
 
 def provider_wait():
-    """{'since', 'retry_at'} while the gateway holds kg-hub jobs, else None."""
+    """{'since', 'retry_at', 'code'} while the gateway holds kg-hub jobs, else None."""
     if not _provider_wait or time.time() - _provider_wait['seen_at'] > PROVIDER_WAIT_TTL:
         return None
-    return {'since': _provider_wait['since'], 'retry_at': _provider_wait['retry_at']}
+    return {'since': _provider_wait['since'], 'retry_at': _provider_wait['retry_at'],
+            'code': _provider_wait.get('code')}
 
 
 def request_body(kwargs):

@@ -353,6 +353,9 @@ async def cleanup_stuck_jobs(graphiti) -> int:
         # 有键漏下来,不该让观测为一次运维动作白锁 24h。
         "  AND (k.error_kind IN ['quota_exhausted', 'rate_limited', "
         "                        'gateway_unavailable', 'breaker_open', "
+        # business_route_disabled:网关那一侧的人工断路(credvault 看板切路由
+        # enabled=false),与 breaker_open 同一类,只是开关在网关。
+        "                        'business_route_disabled', "
         "                        'provider_circuit_open', 'terminal_write_unavailable', "
         "                        'daily_quota_exhausted', "
         # upstream_error:网关/供应商回的 5xx。同属"与观测内容无关",没有理由比
@@ -446,6 +449,13 @@ def classify_extract_error(exc: BaseException, *, offscript: bool = False) -> st
         if isinstance(error, dict):
             if error.get("code") == "provider_circuit_open":
                 return "provider_circuit_open"
+            # 网关侧按业务 key 断路(credvault 2790c59):路由 enabled=false,在任何
+            # 计费动作之前拒绝。和上面的人工断路器同一回事,只是开关在网关、归
+            # credvault 看板管。不归进来就落到下面的 5xx 兜底成 upstream_error:
+            # 任务执行记一次 failed(占掉 3 次重试里的一次),预拆路径还会把观测
+            # 推进 needs_reconciliation 等人工。
+            if error.get("code") == "business_route_disabled":
+                return "business_route_disabled"
             if error.get("code") == "idempotency_terminal_write_unavailable":
                 return "terminal_write_unavailable"
     if getattr(exc, "status_code", None) == 429:
