@@ -2590,6 +2590,8 @@ async def search(request: Request) -> JSONResponse:
                 "source_node_uuid": str(e.source_node_uuid),
                 "target_node_uuid": str(e.target_node_uuid),
                 "valid_at": e.valid_at.isoformat() if e.valid_at else None,
+                "invalid_at": e.invalid_at.isoformat() if e.invalid_at else None,
+                "expired_at": e.expired_at.isoformat() if e.expired_at else None,
                 "created_at": e.created_at.isoformat() if e.created_at else None,
                 "episodes": [],   # 统一在合并后按 fact 批量补,不依赖 EntityEdge.episodes
                 "sem": 1.0 - rank / max(len(sem_edges), 1),   # 排名转分
@@ -2608,6 +2610,7 @@ async def search(request: Request) -> JSONResponse:
         exact_rows, _, _ = await driver.execute_query(
             "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $q "
             "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+            "e.invalid_at AS ia, e.expired_at AS xa, "
             "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
             q=query.lower(), lim=pool)
         if not exact_rows:
@@ -2617,6 +2620,7 @@ async def search(request: Request) -> JSONResponse:
                 exact_rows, _, _ = await driver.execute_query(
                     "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
                     "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+                    "e.invalid_at AS ia, e.expired_at AS xa, "
                     "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
                     lim=pool, **term_params,
                 )
@@ -2626,6 +2630,7 @@ async def search(request: Request) -> JSONResponse:
                 alias_rows, _, _ = await driver.execute_query(
                     "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
                     "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+                    "e.invalid_at AS ia, e.expired_at AS xa, "
                     "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
                     lim=pool,
                     **term_params,
@@ -2641,6 +2646,7 @@ async def search(request: Request) -> JSONResponse:
                 cand[fact] = {
                     "fact": fact, "source_node_uuid": str(r.get("su")),
                     "target_node_uuid": str(r.get("tu")), "valid_at": r.get("va"),
+                    "invalid_at": r.get("ia"), "expired_at": r.get("xa"),
                     "created_at": r.get("ca"),
                     "episodes": [str(u) for u in (r.get("eps") or [])],
                     "sem": 0.0, "exact": True,

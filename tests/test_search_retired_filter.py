@@ -171,5 +171,51 @@ class SemanticEndpoint(unittest.TestCase):
         self.assertIn("NOT coalesce(ep.archived, false)", cypher)
 
 
+@unittest.skipUnless(HAVE_GRAPHITI, "需要 graphiti_core（镜像里有；本机系统 python 没有）")
+class SearchEndpointExpiry(unittest.TestCase):
+    """/api/search 两条腿（语义、子串）都要带出失效字段，与 /api/search_semantic 一致。
+    MCP kg_search 在语义检索出错时回退到这里，kg-use skill 也直接用它。"""
+
+    SUB_IA, SUB_XA = "2026-06-01T12:00:00+00:00", "2026-06-08T07:58:28.099900+00:00"
+
+    def run_search(self, ranked, substring_rows):
+        import kg_hub_server
+
+        class StatusDriver:
+            async def execute_query(self, cypher, **params):
+                if "CONTAINS $q" in cypher:
+                    return substring_rows, None, None
+                return [], None, None
+
+        g = FakeGraphiti(ranked, FakeDriver(archived=set()))
+        req = SimpleNamespace(query_params={"q": "falkordb", "num_results": "10", "bump": "0"})
+        with patch.object(kg_hub_server, "get_graphiti", AsyncMock(return_value=g)), \
+                patch.object(kg_hub_server, "get_status_driver", return_value=StatusDriver()):
+            resp = run(kg_hub_server.search(req))
+        return {r["fact"]: r for r in json.loads(resp.body)["results"]}
+
+    def test_both_legs_expose_expiry(self):
+        ranked = [edge("semantic superseded", ["live"], invalid=True), edge("semantic current", ["live"])]
+        rows = [{"fact": "substring superseded", "su": "s", "tu": "t", "va": None,
+                 "ia": self.SUB_IA, "xa": self.SUB_XA, "ca": None, "eps": []},
+                {"fact": "substring current", "su": "s", "tu": "t", "va": None,
+                 "ia": None, "xa": None, "ca": None, "eps": []}]
+        out = self.run_search(ranked, rows)
+        self.assertEqual(out["semantic superseded"]["invalid_at"], T.isoformat())
+        self.assertEqual(out["semantic superseded"]["expired_at"], T.isoformat())
+        self.assertIsNone(out["semantic current"]["invalid_at"])
+        self.assertEqual(out["substring superseded"]["invalid_at"], self.SUB_IA)
+        self.assertEqual(out["substring superseded"]["expired_at"], self.SUB_XA)
+        self.assertIsNone(out["substring current"]["expired_at"])
+
+    def test_substring_queries_return_expiry_columns(self):
+        """三条子串查询（原句、全词、别名）都要取 invalid_at/expired_at，否则对应结果恒为 null。"""
+        import inspect
+        import kg_hub_server
+        src = inspect.getsource(kg_hub_server.search)
+        self.assertEqual(src.count("e.created_at AS ca, e.episodes AS eps"), 3)
+        self.assertEqual(src.count("e.invalid_at AS ia, e.expired_at AS xa"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
