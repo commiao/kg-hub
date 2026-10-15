@@ -144,7 +144,7 @@ class BreakerStateTests(unittest.TestCase):
     def test_known_keys_match_the_two_topology_nodes(self):
         self.assertEqual(set(breakers.KNOWN_KEYS), {CM, KG})
         self.assertEqual(set(breakers.KEY_NODES), set(breakers.KNOWN_KEYS))
-        self.assertEqual(breakers.KEY_NODES[CM], "claude-mem")
+        self.assertEqual(breakers.KEY_NODES[CM], "worker")
         self.assertEqual(breakers.KEY_NODES[KG], "refinery")
 
 
@@ -240,23 +240,26 @@ class TopologyAnnotationTests(unittest.TestCase):
 
     def snap(self):
         return {"nodes": [
-            {"id": "claude-mem", "layer": "worker", "label": "claude-mem",
+            {"id": "worker", "layer": "worker", "label": "claude-mem",
              "state": "green"},
             {"id": "refinery", "layer": "consumer", "label": "refinery",
              "state": "green"},
-            {"id": "kg-hub", "layer": "kghub", "label": "kg-hub", "state": "green"},
+            {"id": "kghub", "layer": "kghub", "label": "kg-hub", "state": "green"},
+        ], "edges": [
+            {"from": "refinery", "to": "kghub", "state": "green"},
+            {"from": "kghub", "to": "gateway", "state": "green"},
         ]}
 
     def test_switch_lands_on_exactly_the_two_model_calling_nodes(self):
         snap = self.snap()
         self.T.annotate_breakers(snap, breakers.read_state(self.path))
         by_id = {n["id"]: n for n in snap["nodes"]}
-        self.assertIn("breaker", by_id["claude-mem"])
+        self.assertIn("breaker", by_id["worker"])
         self.assertIn("breaker", by_id["refinery"])
         # 不调模型的节点不该长出开关——开关是控制面，多一个都是误操作入口。
-        self.assertNotIn("breaker", by_id["kg-hub"])
+        self.assertNotIn("breaker", by_id["kghub"])
         self.assertEqual(by_id["refinery"]["breaker"]["key"], KG)
-        self.assertEqual(by_id["claude-mem"]["breaker"]["key"], CM)
+        self.assertEqual(by_id["worker"]["breaker"]["key"], CM)
 
     def test_tripped_node_reads_as_deliberate_not_as_a_fault(self):
         breakers.set_tripped(KG, True, by="dashboard", reason="悬账在涨",
@@ -270,7 +273,7 @@ class TopologyAnnotationTests(unittest.TestCase):
         self.assertEqual(node["state"], "amber")
         self.assertEqual(node["sub"], "已人工断开")
         # 另一个节点不受影响。
-        other = next(n for n in snap["nodes"] if n["id"] == "claude-mem")
+        other = next(n for n in snap["nodes"] if n["id"] == "worker")
         self.assertFalse(other["breaker"]["tripped"])
         self.assertEqual(other["state"], "green")
 
@@ -284,14 +287,58 @@ class TopologyAnnotationTests(unittest.TestCase):
         self.assertTrue(node["breaker"]["tripped"])
         self.assertEqual(node["sub"], "断路状态不可读")
         # 两路都接线了,所以损坏对两路一视同仁:都按已断开。
-        other = next(n for n in snap["nodes"] if n["id"] == "claude-mem")
+        other = next(n for n in snap["nodes"] if n["id"] == "worker")
         self.assertTrue(other["breaker"]["corrupt"])
         self.assertTrue(other["breaker"]["tripped"])
         self.assertEqual(other["sub"], "断路状态不可读")
 
+    def test_switch_node_ids_are_what_the_probe_actually_emits(self):
+        # 2026-10-15：KEY_NODES 写的是 "claude-mem"，探针上报的 id 是 "worker"，
+        # claude-mem 的开关从接线起就没在图上出现过——测试用的也是同一个假 id。
+        probe = Path(__file__).resolve().parent.parent.joinpath(
+            "tools", "capture_probe.py").read_text("utf-8")
+        for node_id in (*breakers.KEY_NODES.values(), *breakers.EXIT_NODES.values()):
+            self.assertIn(f'"id": "{node_id}"', probe)
+
+    def test_entity_extract_trip_also_marks_the_kghub_exit(self):
+        # 硬挡在 kg-hub 模型出口：断开时所有入图抽取都停，不只是 refinery。
+        breakers.set_tripped(KG, True, by="dashboard", path=self.path)
+        snap = self.snap()
+        self.T.annotate_breakers(snap, breakers.read_state(self.path))
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        self.assertNotIn("breaker", by_id["kghub"])   # 不多画一个可按的开关
+        self.assertEqual(by_id["kghub"]["state"], "amber")
+        self.assertEqual(by_id["kghub"]["sub"], "模型出口已断路")
+        edges = {(e["from"], e["to"]): e["state"] for e in snap["edges"]}
+        self.assertEqual(edges[("refinery", "kghub")], "amber")
+        self.assertEqual(edges[("kghub", "gateway")], "amber")
+
+    def test_auto_trip_says_auto_not_manual(self):
+        breakers.set_tripped(KG, True, by="auto:held-surge", reason="悬账", path=self.path)
+        snap = self.snap()
+        self.T.annotate_breakers(snap, breakers.read_state(self.path))
+        node = next(n for n in snap["nodes"] if n["id"] == "refinery")
+        self.assertEqual(node["sub"], "已自动断开")
+
+    def test_trip_does_not_hide_a_real_fault(self):
+        breakers.set_tripped(KG, True, by="dashboard", path=self.path)
+        snap = self.snap()
+        snap["nodes"][1]["state"] = "red"
+        self.T.annotate_breakers(snap, breakers.read_state(self.path))
+        self.assertEqual(snap["nodes"][1]["state"], "red")
+
+    def test_breakers_annotated_after_activity_colouring(self):
+        # refinery 活跃度曾把「已断开」盖回绿色：断路器必须最后挂。
+        source = Path(__file__).resolve().parent.parent.joinpath(
+            "topology.py").read_text("utf-8")
+        body = source[source.index("async def _load_snapshots"):
+                      source.index("async def breakers_state")]
+        self.assertGreater(body.index("annotate_breakers(snap"),
+                           body.index("refinery_activity(refinery_status"))
+
     def test_missing_node_is_not_an_error(self):
         # 某台设备上没有 refinery 很正常，不该因此炸掉整张图。
-        snap = {"nodes": [{"id": "kg-hub", "layer": "kghub", "label": "kg-hub"}]}
+        snap = {"nodes": [{"id": "kghub", "layer": "kghub", "label": "kg-hub"}]}
         self.T.annotate_breakers(snap, breakers.read_state(self.path))
         self.assertNotIn("breaker", snap["nodes"][0])
 
@@ -359,7 +406,7 @@ class EnforcementHonestyTests(unittest.TestCase):
         # 现在两路都接线了，所以用一个临时的「未接线」来钉这条规则本身：
         # 只要 ENFORCED 是假，图上就不许显示成已断。
         breakers.set_tripped(CM, True, by="tester", path=self.path)
-        snap = {"nodes": [{"id": "claude-mem", "layer": "worker",
+        snap = {"nodes": [{"id": "worker", "layer": "worker",
                            "label": "claude-mem", "state": "green"}]}
         with mock.patch.dict(breakers.ENFORCED, {CM: False}):
             self.T.annotate_breakers(snap, breakers.read_state(self.path))

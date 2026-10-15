@@ -214,11 +214,34 @@ def gateway_quota_node(usage: dict | None, refinery_status: dict | None, *,
     return node, edge
 
 
+def _breaker_sub(entry: dict, corrupt: bool) -> str:
+    if corrupt:
+        return "断路状态不可读"
+    # 自动断开（held-surge 守卫）和人工断开要说清楚：恢复前该先查的东西不一样。
+    return "已自动断开" if str(entry.get("by") or "").startswith("auto:") else "已人工断开"
+
+
+def _mark_breaker(snap: dict, node: dict, sub: str, line: str) -> None:
+    """断路是有意的，不是故障：amber，不盖掉真故障的 red；出边一起变 amber。"""
+    if node.get("state") != "red":
+        node["state"] = "amber"
+    node["sub"] = sub
+    node["idle_human"] = None
+    node["detail"] = line + ("\n" + node["detail"] if node.get("detail") else "")
+    for edge in snap.get("edges", []) or []:
+        if isinstance(edge, dict) and edge.get("from") == node.get("id") \
+                and edge.get("state") != "red":
+            edge["state"] = "amber"
+
+
 def annotate_breakers(snap: dict, state: dict) -> None:
     """把断路器状态挂到它管的那个节点上。
 
     只挂 `breakers.KEY_NODES` 里列出的节点。挂不上（快照里没有那个节点）就算了：
     拓扑是按设备快照拼的，某台机器上没有 refinery 很正常，不该因此报错。
+
+    必须在其他节点着色（refinery 活跃度、网关）**之后**调用：2026-10-15 查出
+    refinery 活跃度会把「已断开」覆盖回绿色，图上 refinery→kg-hub 全绿而入图为 0。
     """
     by_id = {n.get("id"): n for n in snap.get("nodes", []) if isinstance(n, dict)}
     for key, node_id in breakers.KEY_NODES.items():
@@ -242,9 +265,17 @@ def annotate_breakers(snap: dict, state: dict) -> None:
             node["breaker"]["tripped"] = False
             continue
         if entry["tripped"]:
-            # 断路是人为的,不是故障:用 amber 而不是 red,别和真出事的红混在一起。
-            node["state"] = "amber"
-            node["sub"] = "已人工断开" if not state["corrupt"] else "断路状态不可读"
+            sub = _breaker_sub(entry, state["corrupt"])
+            _mark_breaker(snap, node, sub,
+                          f"⛔ 断路器 {key} {sub}"
+                          + (f"：{entry.get('reason')}" if entry.get("reason") else "")
+                          + (f"\n{entry.get('at')} by {entry.get('by')}" if entry.get("at") else ""))
+            exit_node = by_id.get(breakers.EXIT_NODES.get(key))
+            if exit_node is not None:
+                _mark_breaker(snap, exit_node, "模型出口已断路",
+                              f"⛔ 模型出口硬拦截：{key} {sub}（开关在 refinery 节点）\n"
+                              "refinery、ingester、OpenClaw、MCP 直写等所有入图抽取都不会发出模型调用；"
+                              "检索不受影响")
 
 
 def annotate_gateway(snap: dict, node: dict, edge: dict) -> dict:
@@ -363,7 +394,6 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         snap["_recv"] = recv
         snap["_age_s"] = age
         annotate_liveness(snap, liveness, aliases, stale_after_s=stale_after_s)
-        annotate_breakers(snap, breaker_state)
         if gw_node is not None:
             annotate_gateway(snap, gw_node, gw_edge)
             activity = refinery_activity(refinery_status, now)
@@ -379,6 +409,8 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
                     for edge in snap.get("edges", []):
                         if "refinery" in (edge.get("from"), edge.get("to")):
                             edge["state"] = node["state"]
+        # 断路器最后挂：它是有意的停流，必须盖过上面的活跃度/网关着色。
+        annotate_breakers(snap, breaker_state)
         snaps.append(snap)
     return snaps
 
@@ -508,14 +540,14 @@ _HTML = r"""<!doctype html>
 }}
 *{box-sizing:border-box}
 body{margin:0;padding:20px;background:var(--bg);color:var(--fg);
-  font:14px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro SC","PingFang SC",system-ui,sans-serif}
-h1{font-size:17px;margin:0 0 4px;font-weight:600}
-.sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro SC","PingFang SC",system-ui,sans-serif}
+h1{font-size:21px;margin:0 0 4px;font-weight:600}
+.sub{color:var(--mut);font-size:14px;margin-bottom:18px}
 .host{background:var(--card);border:1px solid var(--line);border-radius:10px;
   padding:16px;margin-bottom:18px}
 .hh{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-.hh b{font-size:14px}
-.pill{font-size:11px;padding:2px 9px;border-radius:20px;border:1px solid var(--line);
+.hh b{font-size:17px}
+.pill{font-size:13px;padding:2px 9px;border-radius:20px;border:1px solid var(--line);
   color:var(--mut);white-space:nowrap}
 .pill.green{color:#fff;background:var(--green);border-color:transparent}
 .pill.amber{color:#211d10;background:var(--amber);border-color:transparent}
@@ -524,12 +556,13 @@ h1{font-size:17px;margin:0 0 4px;font-weight:600}
 .host.disconnected .wrap{opacity:.42;filter:grayscale(1)}
 .host.blind .wrap{opacity:.6}
 .host.disconnected{border-style:dashed}
-/* 自适应：宽屏用原尺寸，窄屏等比缩放，保证 kg-hub 那一列永远在首屏内 */
+/* 宽屏铺满（可放大），窄屏最多缩到原尺寸的 80% 再横向滚动 —— 之前 max-width:1180px
+   把 1700px 宽的图硬压成七成，节点字实际只有 8px，看不清（用户 2026-10-15 指出）。 */
 .wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-svg{display:block;width:100%;height:auto;max-width:1180px}
-.lname{fill:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
-.nlabel{fill:var(--fg);font-size:11.5px;font-weight:500}
-.nidle{fill:var(--mut);font-size:10.5px}
+svg{display:block;width:100%;height:auto}
+.lname{fill:var(--mut);font-size:13px;text-transform:uppercase;letter-spacing:.06em}
+.nlabel{fill:var(--fg);font-size:14.5px;font-weight:500}
+.nidle{fill:var(--mut);font-size:12.5px}
 .box{fill:var(--card);stroke:var(--line)}
 .box.green{stroke:var(--green)} .box.amber{stroke:var(--amber)}
 .box.red{stroke:var(--red);stroke-width:2} .box.grey{stroke:var(--grey)}
@@ -546,23 +579,23 @@ g.n{cursor:pointer} g.n:hover .box{filter:brightness(1.06)}
    行为,必须一眼看出可点、且和旁边只读的状态圆点区分开。 */
 g.brk{cursor:pointer}
 g.brk:hover .brkbox{filter:brightness(1.25)}
-.brkbox{stroke-width:1}
-.brkbox.on{fill:color-mix(in srgb,var(--green) 22%,transparent);stroke:var(--green)}
-.brkbox.off{fill:color-mix(in srgb,var(--red) 26%,transparent);stroke:var(--red)}
-.brkbox.bad{fill:color-mix(in srgb,var(--amber) 26%,transparent);stroke:var(--amber)}
-.brktext{font-size:9.5px;font-weight:600;text-anchor:middle;pointer-events:none}
+.brkbox{stroke-width:1.2}
+.brkbox.on{fill:color-mix(in srgb,var(--green) 22%,var(--card));stroke:var(--green)}
+.brkbox.off{fill:color-mix(in srgb,var(--red) 26%,var(--card));stroke:var(--red)}
+.brkbox.bad{fill:color-mix(in srgb,var(--amber) 26%,var(--card));stroke:var(--amber)}
+.brktext{font-size:12px;font-weight:600;text-anchor:middle;pointer-events:none}
 .brktext.on{fill:var(--green)} .brktext.off{fill:var(--red)}
 .brktext.bad{fill:var(--amber)}
 .blockers{margin-top:12px;border-left:3px solid var(--red);padding:8px 12px;
   background:color-mix(in srgb,var(--red) 8%,transparent);border-radius:0 6px 6px 0}
-.blockers div{font-size:12.5px;margin:3px 0}
-.det{margin-top:10px;font-size:12px;color:var(--mut);border-top:1px solid var(--line);
+.blockers div{font-size:14px;margin:3px 0}
+.det{margin-top:10px;font-size:13.5px;color:var(--mut);border-top:1px solid var(--line);
   padding-top:10px;display:none;white-space:pre-wrap}
-.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--mut);margin-top:6px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mut);margin-top:6px}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
 .band{fill:var(--band)}
 .bandsep{stroke:var(--line);stroke-width:1.2;opacity:1}
-.bandtag{fill:var(--mut);font-size:10px;letter-spacing:.4px}
+.bandtag{fill:var(--mut);font-size:12px;letter-spacing:.4px}
 .empty{color:var(--mut);padding:30px;text-align:center;border:1px dashed var(--line);
   border-radius:10px}
 .back{display:inline-block;margin:0 0 .5rem;font-size:13px;color:var(--mut);
@@ -570,7 +603,7 @@ g.brk:hover .brkbox{filter:brightness(1.25)}
 .back:hover{text-decoration:underline}
 .tabs{display:flex;gap:6px;margin:10px 0 14px}
 .tab{border:1px solid var(--line);background:var(--card);color:var(--mut);
-  border-radius:7px;padding:5px 12px;cursor:pointer;font:inherit;font-size:12px}
+  border-radius:7px;padding:6px 14px;cursor:pointer;font:inherit;font-size:14px}
 .tab.on{color:var(--fg);border-color:var(--green);
   background:color-mix(in srgb,var(--green) 10%,var(--card))}
 .hookpanel{display:none}
@@ -607,6 +640,7 @@ g.brk:hover .brkbox{filter:brightness(1.25)}
   <span><i style="background:var(--grey)"></i>未配置</span>
   <span>虚线 = 该跳有滞后或中断</span>
   <span>点线 = 跨层直连（如 OpenClaw 不走 claude-mem，绕行走最近空闲通道）</span>
+  <span>「通 / 已断开」按钮 = 断路器，全系统只有两个：claude-mem（claude_mem.observation）、refinery（kg_hub.entity_extract，同一开关在 kg-hub 模型出口硬拦截）</span>
 </div>
 <svg width=0 height=0 style="position:absolute"><defs>
 <marker id=ag viewBox="0 0 8 8" refX=6 refY=4 markerWidth=5 markerHeight=5 orient=auto>
@@ -626,8 +660,8 @@ const D = __DATA__;
 // 列间距**不再是常量** —— 见 renderHost 里的 gapW：按实际穿过的连线数算。
 // 等宽间隙是上一版的病根：设备→工具要过 9 条线、worker→存储只过 1 条，
 // 给同样的 46px，前者被压成每条 5px 的一团麻。
-const LH = 86, LH_C = 60, PADT = 34, BW = 104, BH = 42;   // LH_C: 无工具的行
-const GAP_BASE = 52, GAP_LANE = 17;   // 间隙宽 = BASE + 过线数 * LANE
+const LH = 96, LH_C = 80, PADT = 40, BW = 136, BH = 52;   // LH_C: 无工具的行
+const GAP_BASE = 40, GAP_LANE = 12;   // 间隙宽 = BASE + 过线数 * LANE
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
@@ -964,13 +998,13 @@ function renderHost(s, hi){
     dets.push(`<div class=det id="${did}"><b>${esc(n.label)}</b>  [${esc(n.state)}]\n`
       + `${esc(n.detail||'')}\n`
       + (n.metrics ? esc(JSON.stringify(n.metrics)) : '') + `</div>`);
-    const idle = n.idle_human ? `空闲 ${esc(n.idle_human)}` : (n.sub ? esc(n.sub) : '');
+    const idle = n.idle_human ? `空闲 ${n.idle_human}` : (n.sub || '');
     return `<g class=n data-det="${did}">`
-      + `<title>${esc(n.detail||n.label)}</title>`
+      + `<title>${esc([n.label, idle, n.detail].filter(Boolean).join('\n'))}</title>`
       + `<rect class="box ${esc(n.state)}" x="${p.x}" y="${p.y}" width="${BW}" height="${BH}" rx="8"/>`
-      + `<circle class="dot ${esc(n.state)}" cx="${p.x+13}" cy="${p.y+15}" r="4.5"/>`
-      + `<text class=nlabel x="${p.x+24}" y="${p.y+19}">${esc(n.label)}</text>`
-      + `<text class=nidle x="${p.x+24}" y="${p.y+34}">${idle}</text>`
+      + `<circle class="dot ${esc(n.state)}" cx="${p.x+14}" cy="${p.y+17}" r="5"/>`
+      + `<text class=nlabel x="${p.x+26}" y="${p.y+22}">${esc(clip(n.label, BW-34))}</text>`
+      + `<text class=nidle x="${p.x+26}" y="${p.y+41}">${esc(clip(idle, BW-34, 12.5))}</text>`
       + `</g>` + breakerSwitch(n, p);
   }).join('')).join('');
 
@@ -993,11 +1027,24 @@ function renderHost(s, hi){
   return `<div class="host ${s._disconnected?'disconnected':''} ${s._snapshot_stale&&ds==='unknown'?'blind':''}">
     <div class=hh><b>${esc(s._host)}</b>
       <span class="pill ${esc(overall)}">${esc(overall)}</span>${device}${age}${stale}${blind}</div>
-    <div class=wrap><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+    <div class=wrap><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="min-width:${Math.round(W*0.8)}px">
       ${bandSvg}${heads}${bracket}${edges}${boxes}
     </svg></div>
     ${blockers}${dets.join('')}
   </div>`;
+}
+
+// 节点框里放不下的文字截断加省略号；全文在悬停提示和点开的详情里。
+// 宽度按字号估：CJK ≈ 1em，ASCII ≈ 0.58em。
+function clip(t, px, fs){
+  t = String(t==null?'':t); fs = fs || 14.5;
+  let w = 0, out = '';
+  for (const ch of t) {
+    const cw = (ch.charCodeAt(0) > 0x2e80 ? 1 : 0.58) * fs;
+    if (w + cw > px) return out.replace(/\s+$/,'') + '…';
+    w += cw; out += ch;
+  }
+  return out;
 }
 
 function fmt(sec){
@@ -1019,24 +1066,26 @@ function breakerSwitch(n, p){
   // 没有执行方的开关不画成可按的样子。假开关比没开关更危险。
   const cls = !b.enforced ? 'bad'
     : (b.corrupt ? 'bad' : (b.tripped ? 'off' : 'on'));
+  const auto = String(b.by||'').startsWith('auto:');
   const text = !b.enforced ? '未接线'
-    : (b.corrupt ? '不可读' : (b.tripped ? '已断开' : '通'));
+    : (b.corrupt ? '不可读' : (b.tripped ? (auto ? '自动断开' : '已断开') : '通'));
   // 生效延迟必须说出来:操作员按下之后要知道该等多久,不能以为是瞬时的。
   const lag = b.lag_s > 0 ? `\n生效延迟最多 ${b.lag_s} 秒（经守护脚本同步）` : '';
-  const w = 46, h = 16, x = p.x + BW - w - 6, y = p.y + BH - h - 5;
+  // 挂在节点右下沿外侧，不占框内那两行字的位置（框内放不下「标签+状态+开关」）。
+  const w = 62, h = 20, x = p.x + BW - w - 8, y = p.y + BH - 6;
   const tip = !b.enforced
     ? '这一路还没有执行方：开关存得下但不会生效，先别指望它（见 T-0066）'
     : b.corrupt
     ? '断路器状态读不动，已按断开处理；点此重写一份干净状态'
     : (b.tripped
-        ? `已人工断开${b.reason?'：'+b.reason:''}${b.at?'\n'+b.at:''}${b.by?' by '+b.by:''}${lag}\n点此恢复`
+        ? `${auto?'已自动断开':'已人工断开'}${b.reason?'：'+b.reason:''}${b.at?'\n'+b.at:''}${b.by?' by '+b.by:''}${lag}\n点此恢复`
         : '切断后：源头停止取数，队列原样保留，恢复后从断点接着跑' + lag + '\n点此切断');
   return `<g class=brk data-key="${esc(b.key)}" data-tripped="${b.tripped?1:0}"`
     + ` data-enforced="${b.enforced?1:0}" data-lag="${b.lag_s|0}"`
     + ` data-label="${esc(n.label)}">`
     + `<title>${esc(tip)}</title>`
     + `<rect class="brkbox ${cls}" x="${x}" y="${y}" width="${w}" height="${h}" rx="8"/>`
-    + `<text class="brktext ${cls}" x="${x+w/2}" y="${y+11.5}">${esc(text)}</text>`
+    + `<text class="brktext ${cls}" x="${x+w/2}" y="${y+14.5}">${esc(text)}</text>`
     + `</g>`;
 }
 
