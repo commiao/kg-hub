@@ -83,7 +83,8 @@ python3 ~/.local/share/kg-hub/current/tools/drill_codex_hooks.py
 python3 ~/.local/share/kg-hub/current/tools/drill_codex_hooks.py --live
 ```
 
-升级 claude-mem、Codex 或 watchdog 后运行 `--live`，再在飞书核对相同演练编号的
+升级 claude-mem 后由下节的自动验收先运行默认预演。若需验证真实飞书通道，
+再显式运行 `--live`，并在飞书核对相同演练编号的
 两条消息。异常标题和恢复标题均带 `【演练】`；异常同时含虚拟的 PostCompact
 未批准、PostToolUse hash 失效以及 `DRILL_ONLY` key。**不需要实际取消批准、
 修改 hash 或修复任何真实 hook。** 同一异常和同一恢复各再判定一轮，确认各只投递一次。
@@ -132,3 +133,53 @@ NAS 重启可能清理 `/tmp`，本地回执可长期留存；人工清理时仅
 演练覆盖“虚拟未批准/hash 失效 → 已部署判定 → 隔离队列 → 飞书 → 恢复/去重”。
 飞书 API 接受不等于人已阅读，也不验证定时探针实际时延或真实采集落库；这些仍需
 查看线上 Hook 面板的新鲜原生信任证据，并用真实会话的采集证据验证。
+
+## claude-mem 升级后的自动验收
+
+`com.kg-hub.claude-mem-upgrade-acceptance` 在本机每 120 秒运行
+`tools/claude_mem_upgrade_acceptance.py`。它检测**当前原生 hooks/list 选中的**
+claude-mem hook key/hash/信任/启用状态、定义及包清单内容，以及本机
+`~/.local/share/claude-mem/current/RELEASE.json` 的 commit 和验收脚本内容。
+不扫描 cache 猜最新版本；插件管理器更新和本机 runtime 发布均可触发。
+
+第一次安装，或上述指纹变化后，验收依次执行：
+
+1. 只读核对 claude-mem hook 已加载、启用，信任为 trusted/managed；
+   未批准、hash 失效、禁用、必需插件缺失和原生接口不可读均失败。
+2. 执行 `drill_codex_hooks.py --output-dir <独立验收目录>/runs`，不传 `--live`。
+   仅接受 dry-run、消息模拟且未送达、去重通过、临时队列为空、生产状态未使用的回执。
+3. 保存验收指纹、结果和预演回执路径。成功且指纹未变时后续轮次跳过预演；
+   失败时下轮重试默认预演。任何自动路径都不会发送那两条演练通知。
+
+升级命令完成后也可立即执行同一个入口作为验收门：
+
+```bash
+python3 ~/.local/share/kg-hub/current/tools/claude_mem_upgrade_acceptance.py --force
+```
+
+退出码 0 为通过/成功指纹未变；1 为验收失败，2 为控制器错误，75 为另一次验收持锁
+（本次没有取得验收结果，稍后重试，不能按通过处理）。
+实际升级操作本身仍沿用各工具原流程；该入口不执行升级、批准 hook、重启 worker、
+切换采集世代或写入真实采集数据库。单独的 launchd 作业避免延长或阻塞 capture-probe。
+
+### 失败告警与隔离
+
+失败发送 `claude-mem 升级验收失败` 通知，包含指纹、原因和回执路径。
+这是一条**真实验收失败通知**，与 `--live` 的两条模拟异常/恢复通知有不同标题。
+使用已安装的 `feishu-notify` 技能，指定 `kg-hub` 命名通道；凭据仍在
+`~/.config/feishu-notify/webhooks.json`，不放命令行。验收通过时静默，不发模拟恢复。
+
+默认状态目录是 `~/.kg-hub/state/claude-mem-upgrade-acceptance/`，仅含本任务的
+`acceptance.json`、锁和 `runs/` 下每次新建的预演回执。目录 0700，状态 0600。
+**不使用生产 watchdog.json、生产待发队列和去重状态**；NAS 预演也仍只用独立进程
+和 `/tmp/codex-hook-drill-*`。真实拓扑、hook 信任配置和采集数据均不参与故障注入。
+
+告警先落本任务的 pending 再投递；投递失败下轮重试，确认成功后才清除。
+同一失败指纹已通知后不重复发送；新版本/定义失败会重新告警。验收后来通过会
+撤销已过期的待发失败消息，下次独立失败可再次通知。通知超时或进程在确认前崩溃
+可能重复投递；不以无回执推断已送达。状态损坏会保留原文件、报控制器失败并直接
+尝试通知；此时无法依赖损坏状态去重，须人工修复验收状态，不能清理生产队列代替。
+
+常态触发时延为下一轮 2 分钟 + 原生检查/预演/投递耗时；Mac 睡眠时不会运行，唤醒
+后再检查。状态、日志和飞书命名通道异常应及时排查；此检查不替代 NAS 独立 hook
+健康告警、真实会话采集落库验收或显式 `--live` 的真实飞书通道验证。

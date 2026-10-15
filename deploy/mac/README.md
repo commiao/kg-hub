@@ -1,6 +1,6 @@
 # Mac 本机服务定义
 
-这台 Mac 上由本仓库管的 7 个 launchd 服务。**这里是唯一真源**，机器上
+这台 Mac 上由本仓库管的 7 个默认 launchd 服务。**这里是唯一真源**，机器上
 `~/Library/LaunchAgents/` 里的那份是渲染出来的副本。
 
 其中 6 个姓 `com.kg-hub.*`，还有一个是 `com.claude-mem.worker`——它不姓 kg-hub，
@@ -15,18 +15,20 @@
 后果：这台 Mac 挂了要凭记忆重建；改调度没有历史也没人 review；另一个 actor 不
 知道你动过。
 
-## 6 个服务
+## 默认与可选服务
 
 | Label | 频率 | 干什么 | 挂了会怎样 |
 |---|---|---|---|
 | `claude-mem-guard` | 5 分钟 | 杀 claude-mem 空转 hook（插件 CPU 死循环）+ 同步断路器开关 | 断路器失灵；空转进程烧 CPU |
 | `capture-probe` | 2 分钟 | 采集链路 Mac 侧探针，拓扑图数据来源 | 拓扑图变瞎 |
+| `claude-mem-upgrade-acceptance` | 2 分钟，定义/版本变化时验收 | 原生信任核验 + 隔离默认预演；失败发飞书 | 升级后验收失败可能漏报 |
 | `claude-mem-dual-ingest`（在 `optional/`） | 15 分钟 | 合并新旧两代 claude-mem 库，同步到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |
+| `source-drift` | 每天 9:25 | 核对 NAS 源码与 git 提交 | 源码漂移可能漏报 |
 | `com.claude-mem.worker` | 常驻 | claude-mem 采集 worker 的**兜底看门人** | 见下 |
 
-前三个是链路的一部分，中间两个是报表，最后一个见下。
+采集探针、同步和守护属于链路；胶囊与反馈作业产出报表；升级验收独立运行。
 
 周报 `weekly-report` 已于 2026-10-14 迁到 NAS（compose 服务 `weekly_report`，T-0269）：
 数据和凭据都在 NAS，Mac 端从 2026-08-23 之后再没产出过一份报告。已装在 Mac 上的旧作业
@@ -148,7 +150,11 @@ claude-mem 的隔离交接准备后，按完整 Label 单独安装。
 
 ## Codex / claude-mem 升级后的告警验证
 
-运行 `python3 ~/.local/share/kg-hub/current/tools/drill_codex_hooks.py --live`，
+自动验收由 `com.kg-hub.claude-mem-upgrade-acceptance` 每 2 分钟检查生效版本/定义变化，
+只运行默认预演并在失败时告警；手动立即验收用
+`python3 ~/.local/share/kg-hub/current/tools/claude_mem_upgrade_acceptance.py --force`。
+
+显式运行 `python3 ~/.local/share/kg-hub/current/tools/drill_codex_hooks.py --live`，
 可在独立临时状态中验证未批准/hash 失效的异常和恢复通知，不影响真实采集和生产
 告警队列。不加 `--live` 仅预演，不发飞书。依赖、回执和失败处理见
 [Hook 运维文档](../../docs/HOOK-INVENTORY.md#升级后的一键隔离告警演练)。
