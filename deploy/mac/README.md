@@ -145,3 +145,10 @@ claude-mem 的隔离交接准备后，按完整 Label 单独安装。
 旧 worker 不重启；`claude-mem-legacy-preserved.json` 保留期间，补丁守护
 仅维护客户端文件，禁止自动重启。隔离交接流程详见 claude-mem 的
 `deploy/ISOLATED-CAPTURE.md`；任何不确定交付均保留，不自动重试。
+
+## Codex / claude-mem 升级后的告警验证
+
+运行 `python3 ~/.local/share/kg-hub/current/tools/drill_codex_hooks.py --live`，
+可在独立临时状态中验证未批准/hash 失效的异常和恢复通知，不影响真实采集和生产
+告警队列。不加 `--live` 仅预演，不发飞书。依赖、回执和失败处理见
+[Hook 运维文档](../../docs/HOOK-INVENTORY.md#升级后的一键隔离告警演练)。

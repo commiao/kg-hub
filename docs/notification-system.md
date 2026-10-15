@@ -81,6 +81,12 @@ NAS compose 里的 `kg-hub-watchdog` 容器,每 ~90s 跑 `tools/watchdog.py`,**�
 
 ---
 
+## Codex hook 通道演练
+
+升级后的隔离演练入口、飞书送达标准、回执与失败处理见
+[Hook 运维文档](HOOK-INVENTORY.md#升级后的一键隔离告警演练)。
+默认不发送，`--live` 才验证真实通道；生产告警状态和采集数据不参与演练。
+
 ## 关键端点 / 路径速查
 | 项 | 值 |
 |---|---|
