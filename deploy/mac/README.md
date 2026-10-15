@@ -158,3 +158,10 @@ claude-mem 的隔离交接准备后，按完整 Label 单独安装。
 可在独立临时状态中验证未批准/hash 失效的异常和恢复通知，不影响真实采集和生产
 告警队列。不加 `--live` 仅预演，不发飞书。依赖、回执和失败处理见
 [Hook 运维文档](../../docs/HOOK-INVENTORY.md#升级后的一键隔离告警演练)。
+
+
+失败告警通道也可独立演练：
+`python3 ~/.local/share/kg-hub/current/tools/drill_upgrade_acceptance_failure.py` 默认
+只做本地模拟；`--send-feishu` 才发一条标注演练的失败告警，并只读核验 NAS。
+重试、去重、恢复静默和回执范围见
+[升级验收失败演练](../../docs/HOOK-INVENTORY.md#升级验收失败的可重复隔离演练)。
