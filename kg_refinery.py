@@ -690,11 +690,18 @@ POLL_MAX_WAIT_S = int(ingest_ceiling_sec())
 # meanwhile no batch sends anything new.
 PROVIDER_WAIT_FRESH_S = 120
 _provider_wait_seen = [0.0]
+# Why the gateway holds them (job error code): a provider rate limit and an
+# operator-disabled route look the same to the queue but not to the operator.
+_provider_wait_code: list[str | None] = [None]
 
 
 def provider_waiting(now: float | None = None) -> bool:
     return ((time.time() if now is None else now) - _provider_wait_seen[0]
             < PROVIDER_WAIT_FRESH_S)
+
+
+def provider_wait_code(now: float | None = None) -> str | None:
+    return _provider_wait_code[0] if provider_waiting(now) else None
 
 
 async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) -> str:
@@ -720,13 +727,17 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
                     return "quota"
                 if kind == "daily_quota_exhausted":
                     return "daily_quota"
-                if kind in recovery.INFRA_FAILURES or kind == "rate_limited":
+                if (kind in recovery.INFRA_FAILURES
+                        or kind in {"rate_limited", recovery.ROUTE_DISABLED}):
                     return kind
             if st in ("ok", "skipped", "error", "needs_reconciliation"):
                 return st
         held = code == 200 and st == "pending" and bool(d.get("provider_wait"))
         if held:
             _provider_wait_seen[0] = time.time()
+            wait = d.get("provider_wait")
+            code = wait.get("code") if isinstance(wait, dict) else None
+            _provider_wait_code[0] = code if isinstance(code, str) else None
         # code == 0(网络层)或 5xx:瞬时故障,继续轮询直到 max_wait
         delay = POLL_STEPS_S[min(step, len(POLL_STEPS_S) - 1)]
         step += 1
@@ -792,6 +803,7 @@ _MOMENTARY_DEFAULTS: dict[str, object] = {
     "quota_paused": False,
     "rate_limited": False,
     "upstream_error_paused": False,
+    "gateway_route_disabled": False,
     "recovery_reason": None,
     "recovery_retry_at": None,
     "recovery_probe_attempt": 0,
@@ -1015,15 +1027,20 @@ async def process_batch(rows: list[dict], wm: dict, cfg: dict,
         elif st in recovery.PAUSING_FAILURES:
             # The error key can remain for an hour. Cool down this observation,
             # not every unrelated observation that is still eligible to run.
-            backoff[oid] = [backoff.get(oid, [0, 0])[0] + 1,
-                            cycle + RATE_LIMIT_PAUSE_CYCLES,
-                            time.time() + RATE_LIMIT_PAUSE_CYCLES * INTERVAL]
+            # A gateway-side circuit break says nothing about any observation:
+            # the whole queue waits, and this one is simply the next try.
+            if st != recovery.ROUTE_DISABLED:
+                backoff[oid] = [backoff.get(oid, [0, 0])[0] + 1,
+                                cycle + RATE_LIMIT_PAUSE_CYCLES,
+                                time.time() + RATE_LIMIT_PAUSE_CYCLES * INTERVAL]
             if quota_pause is not None:
                 recovery.record_failure(
                     quota_pause, st, cycle=cycle, interval=INTERVAL,
                     quota_delay=QUOTA_PAUSE_CYCLES * INTERVAL)
             stats["quota_paused" if st in {"quota", "daily_quota"} else
-                  "rate_limited" if st == "rate_limited" else "upstream_error"] = 1
+                  "rate_limited" if st == "rate_limited" else
+                  "gateway_route_disabled" if st == recovery.ROUTE_DISABLED
+                  else "upstream_error"] = 1
             defer(st)
             log.warning("[%s] obs-%d → %s; observation cooling, queue awaits readiness",
                         kind, oid, st)
@@ -1303,6 +1320,7 @@ async def main() -> int:
                     backoff_pending=len(backoff),
                     **recovery.status_fields(quota_pause),
                     provider_wait=provider_waiting(),
+                    provider_wait_code=provider_wait_code(),
                     breaker_open=False, breaker_reason="",
                     watermark={"ingested": len(wm["ingested"]),
                                "rejected": len(wm["rejected"]),
