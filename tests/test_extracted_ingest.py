@@ -56,6 +56,19 @@ class NormalizeTest(unittest.TestCase):
                                     ENTITY_TYPES, EDGE_TYPES)
 
 
+class LexicalTest(unittest.TestCase):
+    def test_vector_candidates_need_lexical_support(self):
+        same = xi._lexically_same
+        self.assertTrue(same("qwen.token_plan", "qwen-token-plan"))
+        self.assertTrue(same("tests/test_effective_quota_deploy.py", "test_effective_quota_deploy.py"))
+        self.assertTrue(same("model-gateway-private 网络", "model-gateway-private"))
+        self.assertTrue(same("Writer Lock", "writer_lock"))
+        # 2026-10-17 冒烟里的两次误并
+        self.assertFalse(same("实际额度来源修正发布（T-0046）", "反思改进项落实专项 (REF-001~005)"))
+        self.assertFalse(same("effective-quota 发布脚本不入仓导致本机测试 FileNotFoundError", "docs/effective-quota"))
+        self.assertFalse(same("kg-hub", "kg-hub-server 镜像"))  # 短名不能靠包含吃掉长名的一半以下
+
+
 class FakeEmbedder:
     async def create_batch(self, texts):
         return [[float(len(t))] * 3 for t in texts]
