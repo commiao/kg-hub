@@ -33,7 +33,8 @@ MCP_SRC = (ROOT / "mcp_server.py").read_text("utf-8")
 COMPOSE = (ROOT / "docker-compose.yml").read_text("utf-8")
 
 READ_ENDPOINTS = ("/api/stats", "/api/search", "/api/search_semantic",
-                  "/api/node_neighbors", "/api/path_between", "/api/episode_search")
+                  "/api/node_neighbors", "/api/path_between", "/api/episode_search",
+                  "/api/episode")
 
 
 class _Bed(unittest.TestCase):

@@ -3156,8 +3156,100 @@ async def stats(request: Request) -> JSONResponse:
     })
 
 
+_EPISODE_PREVIEW_DEFAULT_CHARS = 600
+_EPISODE_PREVIEW_MAX_CHARS = 8000
+_EPISODE_FETCH_DEFAULT_CHARS = 32_000
+_EPISODE_FETCH_MAX_CHARS = 64_000
+_EPISODE_FETCH_CANDIDATE_ROWS = 10
+
+
+def bounded_int_param(raw: object, default: int, low: int, high: int) -> int:
+    """Parse an optional integer query param, clamping into [low, high]; garbage → default."""
+    try:
+        value = int(str(raw).strip()) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, low), high)
+
+
+def episode_preview_payload(item: dict, preview_chars: int) -> dict:
+    """One episode_search result row. Callers that pass no preview_chars keep the 600-char contract."""
+    content = item.get("content") or ""
+    limit = bounded_int_param(preview_chars, _EPISODE_PREVIEW_DEFAULT_CHARS, 1, _EPISODE_PREVIEW_MAX_CHARS)
+    return {
+        "name": item.get("name"),
+        "source": item.get("source"),
+        "score": item.get("score"),
+        "uuid": item.get("uuid"),
+        "body_preview": content[:limit],
+        "content_chars": len(content),
+        "truncated": len(content) > limit,
+    }
+
+
+def episode_fetch_payload(rows: list[dict], max_chars: int) -> dict | None:
+    """Pick the newest active row among same-name duplicates and bound its content.
+
+    Episodic names repeat when the same document was ingested with and without a
+    platform tag; the newest created_at wins and `duplicates` says how many we skipped.
+    """
+    candidates = [row for row in rows if isinstance(row, dict) and row.get("name")]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    chosen = candidates[0]
+    content = chosen.get("content") or ""
+    limit = bounded_int_param(max_chars, _EPISODE_FETCH_DEFAULT_CHARS, 1, _EPISODE_FETCH_MAX_CHARS)
+    return {
+        "status": "ok",
+        "uuid": chosen.get("uuid"),
+        "name": chosen.get("name"),
+        "source": chosen.get("source"),
+        "created_at": chosen.get("created_at"),
+        "content": content[:limit],
+        "content_chars": len(content),
+        "truncated": len(content) > limit,
+        "duplicates": len(candidates) - 1,
+    }
+
+
+async def episode_fetch(request: Request) -> JSONResponse:
+    """GET /api/episode?name=|uuid=&max_chars= — one active episode's full content, read-only.
+
+    No delivery log, no retrieval bump: this is the "open the source" step after a
+    search already counted the delivery. Bounded by max_chars (default 32K, cap 64K).
+    """
+    name = (request.query_params.get("name") or "").strip()
+    uuid_raw = (request.query_params.get("uuid") or "").strip()
+    if not name and not uuid_raw:
+        return JSONResponse({"status": "error", "code": "bad_request", "message": "missing name or uuid"},
+                            status_code=400)
+    if uuid_raw:
+        try:
+            uuid_raw = str(uuidlib.UUID(uuid_raw))
+        except ValueError:
+            return JSONResponse({"status": "error", "code": "bad_request", "message": "invalid uuid"},
+                                status_code=400)
+    max_chars = bounded_int_param(request.query_params.get("max_chars"),
+                                  _EPISODE_FETCH_DEFAULT_CHARS, 1, _EPISODE_FETCH_MAX_CHARS)
+    where = "n.uuid = $key" if uuid_raw else "n.name = $key"
+    driver = get_status_driver()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (n:Episodic) WHERE NOT coalesce(n.archived, false) AND " + where + " "
+        "RETURN n.uuid AS uuid, n.name AS name, n.source_description AS source, "
+        "n.content AS content, n.created_at AS created_at "
+        f"LIMIT {_EPISODE_FETCH_CANDIDATE_ROWS}",
+        key=uuid_raw or name,
+    )
+    payload = episode_fetch_payload([dict(r) for r in rows], max_chars)
+    if payload is None:
+        return JSONResponse({"status": "error", "code": "not_found", "message": "episode not found"},
+                            status_code=404)
+    return JSONResponse(payload)
+
+
 async def episode_search(request: Request) -> JSONResponse:
-    """GET /api/episode_search?q=&num_results= — fulltext over Episodic (+ substring fallback)."""
+    """GET /api/episode_search?q=&num_results=&preview_chars= — fulltext over Episodic (+ substring fallback)."""
     q = (request.query_params.get("q") or "").strip()
     if not q:
         return JSONResponse({"status": "error", "message": "missing q"}, status_code=400)
@@ -3165,6 +3257,9 @@ async def episode_search(request: Request) -> JSONResponse:
         lim = min(max(int(request.query_params.get("num_results", "5")), 1), 15)
     except (TypeError, ValueError):
         lim = 5
+    # 默认仍是 600 字：mcp_server 和 tools 不传就不变。editorial 传 preview_chars 拿长预览。
+    preview_chars = bounded_int_param(request.query_params.get("preview_chars"),
+                                      _EPISODE_PREVIEW_DEFAULT_CHARS, 1, _EPISODE_PREVIEW_MAX_CHARS)
     driver = get_status_driver()
     # disabled 时 pool=lim（查询与今日字节一致，避免平局下返回不同子集）；enabled 时放大供重排
     pool = min(lim * 3, 45) if _DELIVERY.get("enabled") else lim
@@ -3174,7 +3269,7 @@ async def episode_search(request: Request) -> JSONResponse:
         rows, _, _ = await driver.execute_query(
             "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
             "WHERE NOT coalesce(node.archived, false) "
-            "RETURN node.name AS name, node.content AS content, "
+            "RETURN node.name AS name, node.uuid AS uuid, node.content AS content, "
             "node.source_description AS source, score "
             f"ORDER BY score DESC LIMIT {pool}",
             q=q,
@@ -3189,7 +3284,7 @@ async def episode_search(request: Request) -> JSONResponse:
         rows, _, _ = await driver.execute_query(
             "MATCH (n:Episodic) WHERE (n.name CONTAINS $q OR n.content CONTAINS $q) "
             "AND NOT coalesce(n.archived, false) "
-            "RETURN n.name AS name, n.content AS content, "
+            "RETURN n.name AS name, n.uuid AS uuid, n.content AS content, "
             f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
             q=q,
         )
@@ -3199,7 +3294,7 @@ async def episode_search(request: Request) -> JSONResponse:
             clause, term_params = all_terms_clause(terms, ("n.name", "n.content"))
             rows, _, _ = await driver.execute_query(
                 "MATCH (n:Episodic) WHERE NOT coalesce(n.archived, false) AND " + clause + " "
-                "RETURN n.name AS name, n.content AS content, "
+                "RETURN n.name AS name, n.uuid AS uuid, n.content AS content, "
                 f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
                 **term_params,
             )
@@ -3208,14 +3303,14 @@ async def episode_search(request: Request) -> JSONResponse:
             clause, term_params = all_terms_clause(alias.expand_terms, ("n.name", "n.content"))
             alias_rows, _, _ = await driver.execute_query(
                 "MATCH (n:Episodic) WHERE NOT coalesce(n.archived, false) AND " + clause + " "
-                "RETURN n.name AS name, n.content AS content, "
+                "RETURN n.name AS name, n.uuid AS uuid, n.content AS content, "
                 f"n.source_description AS source, 0.0 AS score LIMIT {pool}",
                 **term_params,
             )
             if alias_rows:
                 rows.extend(alias_rows)
                 applied_aliases.append(alias.rule_id)
-    items = [{"name": r.get("name"), "source": r.get("source"),
+    items = [{"name": r.get("name"), "source": r.get("source"), "uuid": r.get("uuid"),
               "score": r.get("score"), "content": r.get("content")} for r in rows]
     items = _tiered_rerank(items, lim)          # G5：type-weighted（enabled=false 时等价原样）
     _log_delivery("episode_search", q, items)   # G6-lite
@@ -3232,12 +3327,7 @@ async def episode_search(request: Request) -> JSONResponse:
                 names=names, now=datetime.now(tz=timezone.utc).isoformat())
         except Exception as exc:  # noqa: BLE001
             logger.warning("[episode_search] retrieval bump failed: %s", exc)
-    results = [{
-        "name": it.get("name"),
-        "source": it.get("source"),
-        "score": it.get("score"),
-        "body_preview": (it.get("content") or "")[:600],
-    } for it in items]
+    results = [episode_preview_payload(it, preview_chars) for it in items]
     return JSONResponse({"status": "ok", "query_expansions": applied_aliases, "results": results})
 
 
@@ -5718,6 +5808,7 @@ app = Starlette(
         Route("/api/stats", stats, methods=["GET"]),
         Route("/api/quality-summary", quality_summary, methods=["GET"]),
         Route("/api/episode_search", episode_search, methods=["GET"]),
+        Route("/api/episode", episode_fetch, methods=["GET"]),
         Route("/api/episode_exact_match", episode_exact_match, methods=["POST"]),
         Route("/api/node_neighbors", node_neighbors, methods=["GET"]),
         Route("/api/path_between", path_between, methods=["GET"]),
