@@ -96,6 +96,10 @@ from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from utils.batch_answer import batch_fallbacks_total  # noqa: E402
+from utils.extracted_ingest import (  # noqa: E402
+    ExtractedEntity, ExtractedEdge, EXTRACTOR_MODEL_PATTERN, normalize_extraction,
+    write_extraction, check_keys,
+)
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
@@ -1683,6 +1687,188 @@ async def ingest(request: Request) -> JSONResponse:
          "hint": "extraction running in background; check status via poll_url or just kg_search later. episode_uuid populated when extraction completes."},
         status_code=202,
     )
+
+
+class ExtractedIngestBody(IngestBody):
+    """预抽取入库的请求体：IngestBody 全部字段 + 调用方自带的实体/关系与来源标记。
+
+    extractor_model 是来源标记（如 claude-fable-5-1 / claude-haiku-5-5），只用于落图分组对比，
+    不是网关业务 key，也不会触发任何模型调用。
+    """
+    extractor_model: str
+    extractor_session: str | None = None
+    prompt_version: str | None = None
+    entities: list[ExtractedEntity]
+    edges: list[ExtractedEdge] = []
+
+
+async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extraction,
+                                  ref_time: datetime) -> None:
+    """预抽取写图，套用与 /api/ingest 相同的 task_executions 记账与排空计数。
+
+    没有模型调用，所以没有 model_attempts 行；task_executions 仍记一行 succeeded，
+    这样 tools/digest_retro 的「每 500 条复盘」门禁对这条路同样生效。
+    """
+    from utils.task_execution import run_task_execution
+
+    sd, sid = body.source_description, body.source_obs_id
+
+    async def worker():
+        started = datetime.now(tz=timezone.utc)
+        lock_acquired = None
+        try:
+            async with _ingest_execution_lock(owner=f"api_ingest_extracted({sd})",
+                                              timeout_seconds=INGEST_LOCK_TIMEOUT_SEC):
+                lock_acquired = datetime.now(tz=timezone.utc)
+                result = await write_extraction(
+                    graphiti.driver, graphiti.embedder, extraction,
+                    name=body.name, episode_body=body.episode_body, source_description=sd,
+                    reference_time=ref_time, extractor_model=body.extractor_model,
+                    group_id=GROUP_ID, extractor_session=body.extractor_session,
+                    prompt_version=body.prompt_version)
+            try:
+                await _tag_schema_fields(graphiti, result.episode_uuid, body)
+            except Exception:  # noqa: BLE001 — 元数据打标失败不影响入图
+                logger.exception("[ingest_extracted:schema_tag_failed] uuid=%s", result.episode_uuid)
+            await update_ingested_key_status(
+                graphiti, sd, sid, "ok", episode_uuid=result.episode_uuid,
+                nodes=result.nodes_new + result.nodes_reused,
+                edges=result.edges_new + result.edges_reused)
+            _record_ingest_timing(started, lock_acquired, datetime.now(tz=timezone.utc), "ok")
+            logger.info("[ingest_extracted:done] sd=%s sid=%s uuid=%s model=%s nodes=%d+%d edges=%d+%d",
+                        sd, sid, result.episode_uuid, body.extractor_model, result.nodes_new,
+                        result.nodes_reused, result.edges_new, result.edges_reused)
+            return result
+        except WriterLockBusy:
+            await update_ingested_key_status(graphiti, sd, sid, "error",
+                                             error_message="writer.lock busy")
+            _record_ingest_timing(started, None, None, "lock_timeout")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[ingest_extracted:error] sd=%s sid=%s", sd, sid)
+            try:
+                await update_ingested_key_status(
+                    graphiti, sd, sid, "error", error_message=f"{type(exc).__name__}: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+            _record_ingest_timing(started, lock_acquired, None, "error")
+            return None
+
+    _extraction_started()
+    try:
+        return await run_task_execution(
+            driver=graphiti.driver, sd=sd, sid=sid, worker=worker,
+            journal_factory=journal_from_backup_env,
+            business_result_persisted=_persisted_business_result,
+            deadline_seconds=MIN_CLIENT_TIMEOUT_SEC)
+    finally:
+        _extraction_finished()
+
+
+async def ingest_extracted(request: Request) -> JSONResponse:
+    """POST /api/ingest_extracted — 调用方自带实体/关系的入库（不调模型）。
+
+    同步返回：{"status": "ok", episode_uuid, nodes_new, nodes_reused, edges_new, edges_reused,
+    "stats": 归一阶段的纪律指标}。幂等与 /api/ingest 同键 (source_description, source_obs_id)；
+    已入库返回 status=skipped。断路器不管这条路：它本来就不花钱。
+    """
+    left = drain_seconds_left()
+    if left > 0:
+        refused = note_drain_refusal()
+        logger.info("[drain] 挡下第 %d 次预抽取写入，剩余 %.0fs", refused, left)
+        return JSONResponse(
+            {"status": "error", "code": "draining", "retry_after_seconds": int(left) + 1},
+            status_code=503, headers={"Retry-After": str(int(left) + 1)})
+    try:
+        raw = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "bad_json", "message": str(exc)}, status_code=400)
+    try:
+        body = ExtractedIngestBody.model_validate(raw)
+    except ValidationError as exc:
+        return JSONResponse({"status": "error", "code": "bad_schema", "message": exc.errors()}, status_code=400)
+    if not EXTRACTOR_MODEL_PATTERN.fullmatch(body.extractor_model):
+        return JSONResponse({"status": "error", "code": "bad_extractor_model"}, status_code=400)
+    try:
+        ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "bad_reference_time"}, status_code=400)
+    try:
+        extraction = normalize_extraction(body.entities, body.edges,
+                                          set(ENTITY_TYPES), set(EDGE_TYPES))
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "code": "bad_extraction", "message": str(exc)}, status_code=400)
+    if not extraction.entities:
+        return JSONResponse({"status": "error", "code": "empty_extraction",
+                             "message": "至少要有一个实体；确实无可抽取内容请不要提交"}, status_code=400)
+    try:
+        g = await get_graphiti()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "graphiti_unavailable",
+                             "diagnostic": type(exc).__name__}, status_code=503)
+    request_id = str(uuidlib.uuid4())
+    try:
+        await asyncio.to_thread(_backup_episode, body, ref_time, request_id)
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "ingest_backup_unavailable"}, status_code=503)
+    try:
+        await cleanup_stuck_jobs(g)
+    except Exception:  # noqa: BLE001
+        logger.exception("[ingest_extracted:cleanup_failed] continuing anyway")
+    try:
+        merge_result = await merge_or_get_ingested_key(
+            g, body.source_description, body.source_obs_id, request_id, body.name)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "ingest_failed",
+                             "diagnostic": type(exc).__name__}, status_code=500)
+    sd, sid = body.source_description, body.source_obs_id
+    if not merge_result["newly_created"]:
+        st = merge_result["status"]
+        if st == "ok":
+            return JSONResponse({"status": "skipped", "reason": "duplicate",
+                                 "episode_uuid": merge_result["episode_uuid"],
+                                 "source_description": sd, "source_obs_id": sid})
+        if st == "pending":
+            return JSONResponse({"status": "in_progress", "source_description": sd,
+                                 "source_obs_id": sid}, status_code=202)
+        return JSONResponse({"status": st, "code": "previous_attempt_" + str(st),
+                             "message": merge_result.get("error_message")
+                             or "delete the IngestedKey to retry",
+                             "source_description": sd, "source_obs_id": sid}, status_code=409)
+    result = await _run_recorded_extracted(g, body, extraction, ref_time)
+    if result is None:
+        rows, _, _ = await g.driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "RETURN k.error_message AS error_message", sd=sd, sid=sid)
+        return JSONResponse({"status": "error", "code": "ingest_failed",
+                             "message": (rows[0].get("error_message") if rows else None),
+                             "source_description": sd, "source_obs_id": sid}, status_code=500)
+    return JSONResponse({
+        "status": "ok", "episode_uuid": result.episode_uuid,
+        "nodes_new": result.nodes_new, "nodes_reused": result.nodes_reused,
+        "edges_new": result.edges_new, "edges_reused": result.edges_reused,
+        "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"]}
+                     for k, v in result.resolved.items()},
+        "stats": extraction.stats, "extractor_model": body.extractor_model,
+        "source_description": sd, "source_obs_id": sid})
+
+
+async def ingest_extracted_check(request: Request) -> JSONResponse:
+    """POST /api/ingest_extracted/check — 批量查 (sd, sid) 的 IngestedKey 状态（只读）。"""
+    try:
+        raw = await request.json()
+        items = raw.get("items") if isinstance(raw, dict) else None
+        if (not isinstance(items, list) or len(items) > 500
+                or not all(isinstance(i, dict) and isinstance(i.get("source_description"), str)
+                           and isinstance(i.get("source_obs_id"), str) for i in items)):
+            raise ValueError("items 必须是最多 500 个 {source_description, source_obs_id}")
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "bad_request", "message": str(exc)}, status_code=400)
+    found = await check_keys(get_status_driver(), items)
+    return JSONResponse({"status": "ok", "items": [
+        {"source_description": i["source_description"], "source_obs_id": i["source_obs_id"],
+         **(found.get((i["source_description"], i["source_obs_id"])) or {"status": None, "episode_uuid": None})}
+        for i in items]})
 
 
 async def ingest_status(request: Request) -> JSONResponse:
@@ -5796,6 +5982,8 @@ app = Starlette(
         Route("/health", health, methods=["GET"]),
         Route("/api/model-readiness", model_readiness, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
+        Route("/api/ingest_extracted", ingest_extracted, methods=["POST"]),
+        Route("/api/ingest_extracted/check", ingest_extracted_check, methods=["POST"]),
         Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
         Route("/api/ingest/reconciliation", ingest_reconciliation, methods=["GET"]),
