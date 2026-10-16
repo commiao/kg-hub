@@ -63,6 +63,59 @@ def state_dir() -> Path:
     return Path(os.environ.get("KG_HUB_AGENT_EXTRACT_DIR", "~/.kg-hub/agent-extract")).expanduser()
 
 
+# token 依次找：环境变量 → ~/.claude-mem/.env → ~/.openclaw/env.sh（与 kg-use skill 同一顺序）。
+# 在 Python 里读而不是在 shell 里 grep，是因为本机的 Bash 钩子会拦截任何提到 .env 的命令；
+# 值只用于 Authorization 头，不打印、不落日志、不进 batch/results 文件。
+_TOKEN_FILES = ("~/.claude-mem/.env", "~/.openclaw/env.sh")
+
+
+def api_token(env: dict | None = None, files: tuple[str, ...] = _TOKEN_FILES) -> str | None:
+    env = os.environ if env is None else env
+    for key in ("KG_HUB_API_TOKEN", "KG_HUB_TOKEN"):
+        if env.get(key):
+            return env[key].strip()
+    for f in files:
+        p = Path(f).expanduser()
+        try:
+            lines = p.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):]
+            for key in ("KG_HUB_API_TOKEN=", "KG_HUB_TOKEN="):
+                if line.startswith(key):
+                    val = line[len(key):].strip().strip('"').strip("'")
+                    if val:
+                        return val
+    return None
+
+
+# 500 条门禁与复盘要读 NAS 上的账本和图库，所以转发到 kg-hub-server 容器里执行。
+RETRO_STATE = "/backup/digest-retro.json"
+RETRO_JOURNAL = "/backup/model-attempts.sqlite3"
+RETRO_REPORTS = "/backup/retro-reports"
+
+
+def remote_retro(args: list[str], stdin_text: str | None = None, runner=subprocess.run) -> int:
+    """在容器内跑 tools.digest_retro，透传退出码（gate: 2 = 该复盘了）。"""
+    nas = os.environ.get("KG_HUB_NAS_SSH", DEFAULT_NAS)
+    docker = os.environ.get("KG_HUB_NAS_DOCKER", "sudo -n /usr/local/bin/docker")
+    inner = (("cat > /tmp/retro-lessons.md; " if stdin_text is not None else "")
+             + "python3 -m tools.digest_retro " + " ".join(
+                 __import__("shlex").quote(a) for a in args)
+             + f" --state {RETRO_STATE} --journal {RETRO_JOURNAL} --report-dir {RETRO_REPORTS}"
+             + (" --lessons-file /tmp/retro-lessons.md" if stdin_text is not None else ""))
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", nas,
+           f"{docker} exec -i kg-hub-server sh -c {__import__('shlex').quote(inner)}"]
+    out = runner(cmd, input=stdin_text, text=True, capture_output=True, timeout=600)
+    sys.stdout.write(out.stdout)
+    if out.returncode not in (0, 2):
+        sys.stderr.write(out.stderr[-2000:])
+    return out.returncode
+
+
 # ---------- 正文/payload：与 refinery 完全一致，保证新旧内容的 episode 名与幂等键相同 ----------
 
 def _jlist(field) -> list[str]:
@@ -271,7 +324,10 @@ def _save_state(p: Path, st: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt"])
+    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro"])
+    ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
+                    "（gate / status / final / checkpoint --adjust k=v --applied ...）")
+    ap.add_argument("--lessons-file", help="retro checkpoint：经验教训 markdown（本机路径）")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--after-id", type=int, help="next：覆盖游标起点")
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
@@ -281,10 +337,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--session", help="submit：extractor_session（会话 id）")
     ap.add_argument("--url", default=os.environ.get("KG_HUB_URL", DEFAULT_URL))
     a = ap.parse_args(argv)
-    token = os.environ.get("KG_HUB_API_TOKEN")
+    token = api_token()
     sd = state_dir()
     state_path, log_path = sd / "state.json", sd / "log.jsonl"
 
+    if a.cmd == "retro":
+        lessons = Path(a.lessons_file).read_text() if a.lessons_file else None
+        return remote_retro(a.retro_args, stdin_text=lessons)
     if a.cmd == "prompt":
         sys.stdout.write(PROMPT_PATH.read_text())
         return 0

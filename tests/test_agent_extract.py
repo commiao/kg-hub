@@ -45,6 +45,31 @@ class IdentityTest(unittest.TestCase):
             self.assertEqual(p[k], i[k], k)
 
 
+class TokenAndRetroTest(unittest.TestCase):
+    def test_token_env_then_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "envfile"
+            f.write_text("# c\nexport KG_HUB_API_TOKEN=\"abc\"\nOTHER=1\n")
+            self.assertEqual(ax.api_token({"KG_HUB_API_TOKEN": "fromenv"}, (str(f),)), "fromenv")
+            self.assertEqual(ax.api_token({}, (str(f),)), "abc")
+            self.assertIsNone(ax.api_token({}, (str(Path(d) / "missing"),)))
+
+    def test_remote_retro_forwards_args_and_rc(self):
+        calls = []
+
+        def runner(cmd, **kw):
+            calls.append((cmd, kw))
+            return type("R", (), {"returncode": 2, "stdout": "due=True\n", "stderr": ""})()
+        rc = ax.remote_retro(["gate", "--every", "500"], runner=runner)
+        self.assertEqual(rc, 2)
+        cmd = calls[0][0]
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("python3 -m tools.digest_retro gate --every 500 --state /backup/digest-retro.json", cmd[-1])
+        rc = ax.remote_retro(["checkpoint", "--adjust", "live_per_cycle=20"], stdin_text="教训", runner=runner)
+        self.assertEqual(calls[1][1]["input"], "教训")
+        self.assertIn("--lessons-file /tmp/retro-lessons.md", calls[1][0][-1])
+
+
 class SelectTest(unittest.TestCase):
     def test_select_skips_existing_and_rejected(self):
         from unittest import mock
