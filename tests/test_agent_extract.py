@@ -8,6 +8,7 @@ _os.environ.setdefault("KG_HUB_API_TOKEN", "unit-test-only-token")
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tools import agent_extract as ax
@@ -53,6 +54,18 @@ class TokenAndRetroTest(unittest.TestCase):
             self.assertEqual(ax.api_token({"KG_HUB_API_TOKEN": "fromenv"}, (str(f),)), "fromenv")
             self.assertEqual(ax.api_token({}, (str(f),)), "abc")
             self.assertIsNone(ax.api_token({}, (str(Path(d) / "missing"),)))
+
+    def test_retro_passes_unknown_options_through(self):
+        calls = []
+
+        def runner(cmd, **kw):
+            calls.append(cmd)
+            return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+        with unittest.mock.patch.object(ax, "remote_retro",
+                                        lambda args, stdin_text=None, runner=runner: (calls.append(args), 0)[1]):
+            rc = ax.main(["retro", "gate", "--every", "500"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[-1], ["gate", "--every", "500"])
 
     def test_remote_retro_forwards_args_bundle_and_rc(self):
         import io

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
-PROMPT_VERSION = "agent-v1"
+PROMPT_VERSION = "agent-v2"   # v1 → v2：第 1 轮（haiku）复盘后的规则澄清，见 config/agent_extract_prompt.md 末尾
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_NAS = "commiao@100.123.208.32"
 DEFAULT_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
@@ -357,7 +357,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", help="submit：extractor_model，如 claude-fable-5-1")
     ap.add_argument("--session", help="submit：extractor_session（会话 id）")
     ap.add_argument("--url", default=os.environ.get("KG_HUB_URL", DEFAULT_URL))
-    a = ap.parse_args(argv)
+    # retro 的参数要原样透传给 digest_retro（如 --every 500 / --adjust k=v），所以用 parse_known_args
+    a, extra = ap.parse_known_args(argv)
+    if a.cmd == "retro":
+        a.retro_args = list(a.retro_args) + list(extra)
+    elif extra:
+        ap.error(f"unrecognized arguments: {' '.join(extra)}")
     token = api_token()
     sd = state_dir()
     state_path, log_path = sd / "state.json", sd / "log.jsonl"

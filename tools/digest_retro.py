@@ -81,6 +81,15 @@ KNOBS: dict[str, dict] = {
     "parallel_tasks": {
         "applies": "服务端环境变量 KG_HUB_PARALLEL_TASKS",
         "implemented": True, "metric": "uncertain_share"},
+    "prompt_version": {
+        "applies": "config/agent_extract_prompt.md 的规则版本（tools/agent_extract.PROMPT_VERSION），只在模型切换边界改",
+        "implemented": True, "metric": "edges_per_episode"},
+    "batch_size": {
+        "applies": "执行器 tools/agent_extract next --n（每批观测数）",
+        "implemented": True, "metric": "wall_p90_s"},
+    "type_guard_on_resolution": {
+        "applies": "服务端 utils/extracted_ingest：向量召回的候选必须带抽出的实体类型标签才复用（精确同名不受限）",
+        "implemented": True, "metric": "untyped_share"},
     "edge_schema_map_on_ingest": {
         "applies": "入图时把 schema 外边名映射为 relates_to 并保留原名（待实现）",
         "implemented": False, "metric": "edge_in_schema"},
@@ -391,11 +400,12 @@ async def load_graph(driver, since: str, until: str) -> tuple[list[dict], list[d
     async def q(cy, **p):
         rows, _, _ = await driver.execute_query(cy, **p)
         return rows
+    # 边数用 episode 自带的 entity_edges（graphiti add_episode 与预抽取路径都写它）：
+    # 「扫全部边看 r.episodes 包含」在 16 万条边上每条 episode 都要全表扫，500 条就撞 30s 查询上限。
     eps = await q(
         "MATCH (e:Episodic) WHERE toString(e.created_at) >= $s AND toString(e.created_at) < $u "
         "OPTIONAL MATCH (e)-[:MENTIONS]->(n) WITH e, count(n) AS k "
-        "OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE e.uuid IN r.episodes "
-        "RETURN e.uuid AS u, k AS entities, count(r) AS edges", s=since, u=until)
+        "RETURN e.uuid AS u, k AS entities, size(coalesce(e.entity_edges, [])) AS edges", s=since, u=until)
     edges = await q(
         "MATCH (a)-[r:RELATES_TO]->(b) WHERE toString(r.created_at) >= $s AND toString(r.created_at) < $u "
         "WITH a.uuid+'|'+toLower(r.name)+'|'+b.uuid AS k, toLower(r.name) AS n, count(r) AS c "
@@ -453,11 +463,25 @@ def main(argv: list[str] | None = None) -> int:
     if not a.journal:
         raise SystemExit("status/gate/checkpoint 需要 --journal")
     since = st.window_since()
-    graph = None
-    if a.graph_count:
+    until = _now()
+
+    async def graph_phase(need_metrics: bool):
+        """图库相关的读全部放在同一个事件循环里：build → 查 → close。
+        2026-10-17 第 1 轮实测：分两次 asyncio.run 时驱动的 Redis 连接绑在已关闭的第一个循环上，
+        close 抛 Event loop is closed，checkpoint 连续 13 次失败、gate 偶发 rc=1。"""
         from graphiti_client import build_graphiti  # 容器内
-        graph = asyncio.run(build_graphiti())
-        n = asyncio.run(graph_succeeded_since(graph.driver, since))
+        g = await build_graphiti()
+        try:
+            count = await graph_succeeded_since(g.driver, since) if a.graph_count else None
+            triple = await load_graph(g.driver, since, until) if need_metrics else None
+        finally:
+            await g.driver.close()
+        return count, triple
+
+    graph_triple = None
+    if a.graph_count or (a.cmd == "checkpoint" and not a.no_graph):
+        count, graph_triple = asyncio.run(graph_phase(a.cmd == "checkpoint" and not a.no_graph))
+        n = count if a.graph_count else succeeded_since(a.journal, since)
     else:
         n = succeeded_since(a.journal, since)
     if a.cmd == "status":
@@ -472,18 +496,11 @@ def main(argv: list[str] | None = None) -> int:
     lessons = Path(a.lessons_file).read_text() if a.lessons_file else ""
     if not lessons.strip() and not a.force:
         raise SystemExit("checkpoint 必须带 --lessons-file（经验教训不能为空）；确需空复盘用 --force")
-    until = _now()
     metrics = task_metrics(load_tasks(a.journal, since))
     if a.graph_count:
         metrics["succeeded"] = n
-    if not a.no_graph:
-        if graph is None:
-            from graphiti_client import build_graphiti  # 容器内
-            graph = asyncio.run(build_graphiti())
-        try:
-            eps, edges, ents = asyncio.run(load_graph(graph.driver, since, until))
-        finally:
-            asyncio.run(graph.driver.close())
+    if graph_triple is not None:
+        eps, edges, ents = graph_triple
         metrics.update(graph_metrics(eps, edges, ents))
     rec = st.checkpoint(succeeded_since=n, metrics=metrics, lessons=lessons,
                         adjustments=_parse_adjust(a.adjust), applied=a.applied, now=until, force=a.force)

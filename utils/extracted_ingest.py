@@ -229,7 +229,8 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
                            group_id: str, extractor_session: str | None = None,
                            prompt_version: str | None = None,
                            episode_uuid: str | None = None,
-                           node_match_min: float = NODE_MATCH_MIN) -> WriteResult:
+                           node_match_min: float = NODE_MATCH_MIN,
+                           type_guard: bool = True) -> WriteResult:
     """把归一后的抽取写进图。driver 只需 execute_query；embedder 只需 create_batch。"""
     now = datetime.now(tz=timezone.utc)
     now_iso = now.isoformat()
@@ -243,7 +244,11 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         if not rows:
             rows, _, _ = await driver.execute_query(
                 _FIND_SIMILAR, g=group_id, v=[float(x) for x in vec], min=node_match_min)
-            rows = [r for r in rows if _lexically_same(ent.name, r.get("name") or "")]
+            # 第 1 轮（haiku）复盘：按名字近似合并不看类型，把 Issue 并进了 Config、Tool 并进了 Issue、
+            # 文件并进了同名不同路径的另一个文件。向量候选还要带抽出的类型标签才复用。
+            rows = [r for r in rows
+                    if _lexically_same(ent.name, r.get("name") or "")
+                    and (not type_guard or ent.type in (r.get("labels") or []))]
         if rows:
             resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True,
                                  "matched_name": rows[0].get("name")}
