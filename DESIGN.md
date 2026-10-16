@@ -108,18 +108,29 @@
 
 **理由**：先验证中央 KG 本身有意义。本地副本能减少网络依赖、增加离线能力，但工作量翻倍。**先跑通中央版本，体验有缺再加副本**。
 
-### 决策 4：实体抽取继续用 qwen3.6-plus
+### 决策 4：实体抽取的模型由网关路由决定（原「继续用 qwen3.6-plus」）
 
-> ⚠️ **此处是历史模型选型，不再是调用契约。** 当前调用契约是
-> `kg_hub.entity_extract` business key；最终 provider/model 由 model-gateway 路由解析。
+> ⚠️ **模型选型不再是 kg-hub 仓库的锁定决策。** kg-hub 业务层只提交
+> `kg_hub.entity_extract` business key；真实 provider/模型由 credvault 生产路由表
+> （credvault 仓库 `config/routes.nas.json`）决定。换模型、核对现状，看路由表及其 git 历史，
+> 以及 [docs/gateway-model-quality-20261017.md](docs/gateway-model-quality-20261017.md)
+> 的质量画像（模型差异已体现在图质量上，不是纯运维细节）。
 
-**选择**：复用 claude-mem 现有的百炼 coding plan
+**路由历史**（据 credvault 路由表 git 历史与上述质量报告；09-20 之前部分仅有代码注释佐证）：
 
-**Rejected**：
+| 时间 | 实际模型 |
+|---|---|
+| 2026-06 ~ 08 | qwen3.6-plus（百炼；6~7 月直连，8 月起经网关） |
+| 2026-09-20 ~ 09-28 | qwen3.8-flash（09 月前后 qianfan 也曾在用，混合） |
+| 2026-10-06 起 | qianfan `deepseek-v4-flash-0731` |
+
+**历史选择（2026-05，当时的理由，保留备查）**：复用 claude-mem 现有的百炼 coding plan，实体抽取用 qwen3.6-plus。
+
+**Rejected（当时）**：
 - ❌ 用本地开源小模型：质量不够
 - ❌ 用 GPT-4 / Claude：花钱
 
-**理由**：免费、已经接好、qwen 在中文实体抽取上够用、跟 claude-mem 数据流一致避免风格漂移。
+**当时的理由**：免费、已经接好、qwen 在中文实体抽取上够用、跟 claude-mem 数据流一致避免风格漂移。
 
 ### 决策 5：MCP 作为唯一客户端接入协议
 
@@ -185,7 +196,7 @@
 - ❌ LightRAG / Mem0 / Letta：定位错位或图能力弱
 
 **理由**：
-- **已验证可行**：2026-05-14 SPIKE 用 5 个真实 OpenClaw 样例 + qwen3.6-plus 跑通：**27 实体 / 17 边**；因果链关键节点（CAPSULE-NOTIFICATION-ROUTE-2026 / notify-send.sh / Cron / 投资晚报 / 战略规划群 / 实战验证）全部到位；语义搜索 "Cron 通知失败怎么修的" 第一条返回实战验证 fact。**LLM 自创了边名（PROPOSES_SOLUTION / MISROUTED_TO 等）而非 v0.2 schema 名（implemented_as / caused_by），证实 entity_types/edge_types 约束是 Phase 1 必做项**
+- **已验证可行**：2026-05-14 SPIKE 用 5 个真实 OpenClaw 样例 + qwen3.6-plus（历史说明：当时的模型，非现行）跑通：**27 实体 / 17 边**；因果链关键节点（CAPSULE-NOTIFICATION-ROUTE-2026 / notify-send.sh / Cron / 投资晚报 / 战略规划群 / 实战验证）全部到位；语义搜索 "Cron 通知失败怎么修的" 第一条返回实战验证 fact。**LLM 自创了边名（PROPOSES_SOLUTION / MISROUTED_TO 等）而非 v0.2 schema 名（implemented_as / caused_by），证实 entity_types/edge_types 约束是 Phase 1 必做项**
 - **bi-temporal provenance**：每条边自带 `valid_at` / `invalid_at` / `created_at` / `expired_at`，强过 OpenClaw 的 weak provenance
 - **内置 MCP server**：省掉一整层封装工作
 - **多后端解耦**：今天用 Kuzu，明天换 Neo4j，业务代码不动
@@ -194,7 +205,7 @@
 **已知局限（Phase 1 要处理）**：
 - 默认 LLM 抽取的边类型是自创名字（如 `IMPLEMENTS_ARTIFACT`），不是 v0.2 schema 的 `implemented_as`。**必须通过 `entity_types=` / `edge_types=` 参数约束**
 - graphiti-core 0.29 的 Kuzu driver **不自动建 FTS 索引**，要手动 `INSTALL fts; LOAD fts;` + 跑 4 条 `CREATE_FTS_INDEX`
-- 调用 qwen3.6-plus 时必须注入 `extra_body={"thinking":{"type":"disabled"}}`，否则强制 tool_choice 被拒
+- （历史说明：SPIKE 时的 qwen3.6-plus 专属约束，现行模型由网关路由决定）调用 qwen3.6-plus 时必须注入 `extra_body={"thinking":{"type":"disabled"}}`，否则强制 tool_choice 被拒
 - （历史 SPIKE）当时直连端点时 `load_dotenv` 需要 `override=True`；生产代码现已禁止读取
   claude-mem/provider token，只接受网关 caller token、私网 gateway URL 和 business key
 

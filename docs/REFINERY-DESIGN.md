@@ -75,7 +75,7 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
   - `POST /refinery/sessions/events`:`{session_id, tool, project?, seq, events:[{role, content, ts, tool_name?}]}` — 增量追加,幂等键 `(session_id, seq)`
   - `POST /refinery/sessions/close`:`{session_id}` — 显式收口;另有 30min 无事件自动视为结束(对齐现有"中断>30min"惯例)
   - 缓冲落盘(refinery-state jsonl),重启不丢
-- **会话结束触发提炼**:LLM(同 `_llm_complete` 配置,qwen3.6-plus 百炼)按 claude-mem 的 observation 骨架(type/title/facts/narrative/concepts 六字段,prompt 形状对齐 `plugin src/sdk/prompts.ts`,产出走同一质量闸+同一 `/api/ingest` 规范化。**一个会话产出 1-N 条 observation + 1 条 summary**,不逐消息
+- **会话结束触发提炼**:LLM(同 `_llm_complete` 配置,qwen3.6-plus 百炼;历史说明:设计时的模型,现行以网关路由为准)按 claude-mem 的 observation 骨架(type/title/facts/narrative/concepts 六字段,prompt 形状对齐 `plugin src/sdk/prompts.ts`,产出走同一质量闸+同一 `/api/ingest` 规范化。**一个会话产出 1-N 条 observation + 1 条 summary**,不逐消息
 - **OpenClaw 适配器**(VPS 侧一个小 tailer,标准库,形状照抄 `vps_push_capsules.py` 的水印/重试纪律):tail `~/.openclaw/agents/main/sessions/*.jsonl`(处理 `.reset.` 改名+行 offset 续读),会话结束(读到新 session 首行/文件轮转/30min 静默)即把该会话 transcript 推给 `/refinery/sessions/*`;`user/assistant/toolResult` 三种 role 直接映射契约
 - **kb-001 收窄**(决策⑤):prompt 改为只从"新增文档和任务产出"提炼,删去"对话记录"源;会话知识由 refinery 会话级提炼接管。过渡期靠 `/api/ingest` 幂等 + 图侧去重兜底
 
