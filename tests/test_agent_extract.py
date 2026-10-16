@@ -54,20 +54,25 @@ class TokenAndRetroTest(unittest.TestCase):
             self.assertEqual(ax.api_token({}, (str(f),)), "abc")
             self.assertIsNone(ax.api_token({}, (str(Path(d) / "missing"),)))
 
-    def test_remote_retro_forwards_args_and_rc(self):
+    def test_remote_retro_forwards_args_bundle_and_rc(self):
+        import io
+        import tarfile
         calls = []
 
         def runner(cmd, **kw):
             calls.append((cmd, kw))
-            return type("R", (), {"returncode": 2, "stdout": "due=True\n", "stderr": ""})()
+            return type("R", (), {"returncode": 2, "stdout": b"due=True\n", "stderr": b""})()
         rc = ax.remote_retro(["gate", "--every", "500"], runner=runner)
         self.assertEqual(rc, 2)
         cmd = calls[0][0]
         self.assertEqual(cmd[0], "ssh")
-        self.assertIn("python3 -m tools.digest_retro gate --every 500 --state /backup/digest-retro.json", cmd[-1])
+        self.assertIn("python3 /tmp/retro/digest_retro.py gate --every 500 --state /backup/digest-retro.json", cmd[-1])
+        names = tarfile.open(fileobj=io.BytesIO(calls[0][1]["input"])).getnames()
+        self.assertEqual(names, ["retro/digest_retro.py"])
         rc = ax.remote_retro(["checkpoint", "--adjust", "live_per_cycle=20"], stdin_text="教训", runner=runner)
-        self.assertEqual(calls[1][1]["input"], "教训")
-        self.assertIn("--lessons-file /tmp/retro-lessons.md", calls[1][0][-1])
+        tar = tarfile.open(fileobj=io.BytesIO(calls[1][1]["input"]))
+        self.assertEqual(tar.extractfile("retro/lessons.md").read().decode(), "教训")
+        self.assertIn("--lessons-file /tmp/retro/lessons.md", calls[1][0][-1])
 
 
 class SelectTest(unittest.TestCase):

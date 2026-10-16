@@ -98,21 +98,41 @@ RETRO_JOURNAL = "/backup/model-attempts.sqlite3"
 RETRO_REPORTS = "/backup/retro-reports"
 
 
+def _retro_bundle(stdin_text: str | None) -> bytes:
+    """把本机的 tools/digest_retro.py（和可选的 lessons）打成 tar 送进容器。
+
+    容器里那份 digest_retro 是上次发布的版本；复盘逻辑的修正不该等一次排空发布。
+    digest_retro 只依赖标准库（schema/graphiti_client 在 /app 上按需 import）。"""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        src = Path(__file__).resolve().parent / "digest_retro.py"
+        tar.add(src, arcname="retro/digest_retro.py")
+        if stdin_text is not None:
+            data = stdin_text.encode()
+            info = tarfile.TarInfo("retro/lessons.md")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 def remote_retro(args: list[str], stdin_text: str | None = None, runner=subprocess.run) -> int:
-    """在容器内跑 tools.digest_retro，透传退出码（gate: 2 = 该复盘了）。"""
+    """在容器内跑 digest_retro，透传退出码（gate: 2 = 该复盘了）。"""
+    import shlex
     nas = os.environ.get("KG_HUB_NAS_SSH", DEFAULT_NAS)
     docker = os.environ.get("KG_HUB_NAS_DOCKER", "sudo -n /usr/local/bin/docker")
-    inner = (("cat > /tmp/retro-lessons.md; " if stdin_text is not None else "")
-             + "python3 -m tools.digest_retro " + " ".join(
-                 __import__("shlex").quote(a) for a in args)
+    inner = ("rm -rf /tmp/retro && mkdir -p /tmp/retro && tar -x -C /tmp && "
+             "cd /app && PYTHONPATH=/app python3 /tmp/retro/digest_retro.py "
+             + " ".join(shlex.quote(a) for a in args)
              + f" --state {RETRO_STATE} --journal {RETRO_JOURNAL} --report-dir {RETRO_REPORTS}"
-             + (" --lessons-file /tmp/retro-lessons.md" if stdin_text is not None else ""))
+             + (" --lessons-file /tmp/retro/lessons.md" if stdin_text is not None else ""))
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", nas,
-           f"{docker} exec -i kg-hub-server sh -c {__import__('shlex').quote(inner)}"]
-    out = runner(cmd, input=stdin_text, text=True, capture_output=True, timeout=600)
-    sys.stdout.write(out.stdout)
+           f"{docker} exec -i kg-hub-server sh -c {shlex.quote(inner)}"]
+    out = runner(cmd, input=_retro_bundle(stdin_text), capture_output=True, timeout=600)
+    sys.stdout.write(out.stdout.decode(errors="replace"))
     if out.returncode not in (0, 2):
-        sys.stderr.write(out.stderr[-2000:])
+        sys.stderr.write(out.stderr.decode(errors="replace")[-2000:])
     return out.returncode
 
 
