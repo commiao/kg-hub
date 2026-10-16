@@ -43,20 +43,10 @@ PROMPT_VERSION = "agent-v1"
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_NAS = "commiao@100.123.208.32"
 DEFAULT_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
-# 与 kg_refinery.fetch_rows 逐字段一致；platform_source 供质量闸按平台定阈值。
-_REMOTE_SQL = (
-    "SELECT o.id, o.project, o.type, o.title, o.subtitle, o.facts, o.narrative, o.concepts, "
-    "o.files_read, o.files_modified, o.created_at, o.content_hash, o.generated_by_model, "
-    "o.relevance_count, s.platform_source FROM observations o "
-    "LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id "
-    "WHERE o.id > ? ORDER BY o.id ASC LIMIT ?")
-_REMOTE_SCRIPT = """
-import json, sqlite3, sys
-db, after, limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-c = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True); c.row_factory = sqlite3.Row
-rows = [dict(r) for r in c.execute(%r, (after, limit))]
-print(json.dumps(rows, ensure_ascii=False))
-""" % _REMOTE_SQL
+DEFAULT_WATERMARK = "/volume2/4T/kg-hub-data/refinery-state/watermark.json"
+# NAS 端的选取逻辑在 tools/agent_extract_remote.py（只依赖标准库，经 ssh 标准输入送过去执行）：
+# 按 refinery 的 watermark（boundary_id 之后、不在 ingested/rejected/held 里）取「真正待处理」的观测。
+_REMOTE_SCRIPT_PATH = Path(__file__).resolve().parent / "agent_extract_remote.py"
 
 
 def state_dir() -> Path:
@@ -188,16 +178,22 @@ def to_identity(obs: dict) -> dict:
 
 # ---------- 取观测 ----------
 
-def fetch_remote_rows(after_id: int, limit: int) -> list[dict]:
+def fetch_remote_pending(after_id: int, limit: int) -> dict:
+    """返回 {"rows": [...], "boundary", "after", "scanned", "skipped_by_watermark", "exhausted"}。"""
     nas = os.environ.get("KG_HUB_NAS_SSH", DEFAULT_NAS)
     db = os.environ.get("KG_HUB_NAS_CLAUDE_MEM_DB", DEFAULT_DB)
+    wm = os.environ.get("KG_HUB_NAS_WATERMARK", DEFAULT_WATERMARK)
     out = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", nas,
-         "python3", "-", db, str(after_id), str(limit)],
-        input=_REMOTE_SCRIPT, text=True, capture_output=True, timeout=120)
+         "python3", "-", db, wm, str(after_id), str(limit)],
+        input=_REMOTE_SCRIPT_PATH.read_text(), text=True, capture_output=True, timeout=180)
     if out.returncode != 0:
         raise RuntimeError(f"ssh/sqlite 读取失败 rc={out.returncode}: {out.stderr.strip()[:200]}")
     return json.loads(out.stdout)
+
+
+def fetch_remote_rows(after_id: int, limit: int) -> list[dict]:
+    return fetch_remote_pending(after_id, limit)["rows"]
 
 
 def _http(method: str, url: str, body: dict | None, token: str | None, timeout: int = 120):
@@ -376,20 +372,23 @@ def main(argv: list[str] | None = None) -> int:
         st = _load_state(state_path)
         after = a.after_id if a.after_id is not None else int(st.get("cursor", 0))
         cfg = load_config()
-        rows = fetch_remote_rows(after, max(a.n * 4, 40))
+        remote = fetch_remote_pending(after, max(a.n * 4, 40))
+        rows = remote["rows"]
         if not rows:
-            print(json.dumps({"picked": 0, "message": "游标之后没有观测了", "cursor": after}))
+            print(json.dumps({"picked": 0, "message": "游标之后没有待处理观测了", "cursor": remote["after"],
+                              "boundary": remote["boundary"], "exhausted": remote["exhausted"]}))
             return 0
         idents = [to_identity(r) for r in rows]
         existing = check_existing(idents, a.url, token)
         picked, stats = select_batch(rows, cfg, a.n, existing)
+        stats.update({"boundary": remote["boundary"], "skipped_by_watermark": remote["skipped_by_watermark"]})
         st["batches"] = int(st.get("batches", 0)) + 1
         batch_id = f"b{st['batches']:04d}"
         # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没挑到 n 条时），
         # 中间被闸拒/已入库的不会再看第二遍。
         last_considered = picked[-1]["id"] if len(picked) >= a.n else rows[-1]["id"]
         batch = {"batch_id": batch_id, "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                 "after_id": after, "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
+                 "after_id": remote["after"], "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
                  "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked}
         out = Path(a.out) if a.out else sd / f"batch-{batch_id}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
