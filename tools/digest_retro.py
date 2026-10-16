@@ -431,6 +431,10 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     st = RetroState(a.state, every=a.every)
+    # 首次创建就落盘：窗口起点（started_at）必须固定，否则每次 gate 都从「现在」起数，
+    # succeeded_since 永远到不了阈值，门禁形同虚设。
+    if not st.path.exists():
+        st.save()
     if a.cmd == "final":
         sys.stdout.write(render_final(st))
         return 0

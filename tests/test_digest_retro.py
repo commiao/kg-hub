@@ -146,8 +146,13 @@ class JournalLoaderTest(unittest.TestCase):
             state = Path(d) / "retro.json"
             # 新状态的 since 是现在，账本里的旧任务不算 → 不该复盘
             self.assertEqual(dr.main(["gate", "--state", str(state), "--journal", str(j), "--every", "2"]), 0)
+            # 首次 gate 必须把状态（窗口起点）落盘，否则每次都从「现在」起数
+            self.assertTrue(state.exists())
+            first_since = json.loads(state.read_text())["started_at"]
+            dr.main(["gate", "--state", str(state), "--journal", str(j)])
+            self.assertEqual(json.loads(state.read_text())["started_at"], first_since)
             # 把 started_at 拨回去，让窗口覆盖账本任务
-            data = json.loads(state.read_text()) if state.exists() else None
+            data = None
             st = dr.RetroState(state, every=2); st.data["started_at"] = "2026-10-01T00:00:00+00:00"; st.save()
             self.assertEqual(dr.main(["gate", "--state", str(state), "--journal", str(j)]), 2)
             with self.assertRaises(SystemExit):  # 经验教训不能为空
