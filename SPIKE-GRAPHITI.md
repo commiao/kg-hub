@@ -19,7 +19,7 @@ Concrete numbers (re-run 2026-05-14 21:00 GMT+8):
 | Causal chain reconstruction (vs OpenClaw target) | ✅ all key nodes present (CAPSULE-NOTIFICATION-ROUTE-2026 / notify-send.sh / Cron / 投资晚报 / 战略规划群 / 实战验证 fix) |
 | Natural-language search top-1 | "Cron 通知失败怎么修的" → 实战验证 fact |
 | ⚠️ LLM-coined edge names | PROPOSES_SOLUTION / MISROUTED_TO / INCLUDES_COMPONENT 等。**Phase 1 必须用 entity_types/edge_types 约束** |
-| LLM | qwen3.6-plus via 百炼 Anthropic-compatible endpoint |
+| LLM | qwen3.6-plus via 百炼 Anthropic-compatible endpoint（历史说明：SPIKE 时的模型，现行以网关路由为准） |
 | LLM cost | $0 (covered by user's 百炼 coding plan) |
 | End-to-end runtime (5 episodes) | ~110 s |
 
@@ -104,7 +104,7 @@ Cron ← FIXES_ISSUE_FOR ← 通知路由统一配置系统 (= capsule title)
 
 1. ✅ Adopt **Graphiti** as L3 (KG storage + entity/relation extraction + search)
 2. ✅ Keep **Kuzu** for now (embedded, Tailscale-zero-deploy spike-friendly). Re-evaluate Neo4j/FalkorDB at Phase 2 when push agent runs concurrently.
-3. ✅ Keep **qwen3.6-plus via 百炼** as LLM (decision 4 unchanged — proven to work end-to-end)
+3. ✅ Keep **qwen3.6-plus via 百炼** as LLM (decision 4 unchanged — proven to work end-to-end) — *历史说明：这是 SPIKE 当时的结论；决策 4 现已改为模型由网关路由决定，见 DESIGN.md 决策 4*
 4. ⚠️ Future Phase 1: pass `entity_types={Capsule, KnowledgeDoc, Issue, Fix, Concept, ...}` and `edge_types={diagnosed_by, fixed_by, ...}` to constrain extraction to v0.2 schema
 5. ⚠️ Future Phase 1: bundle the 4 fixes above into a small `kg_hub.bootstrap` helper so Phase 1 doesn't rediscover them
 6. ⚠️ Phase 0 通过门槛 needs revisiting: with Graphiti doing the heavy lifting, "150 capsules + 50 implicit relations" target is easily achievable. Re-anchor on **schema fidelity** and **multi-hop query latency** instead.
