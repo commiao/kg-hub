@@ -50,6 +50,7 @@ SCOPE_ALLOWLIST: dict[str, frozenset[tuple[str, str]]] = {
         ("GET", "/api/node_neighbors"),
         ("GET", "/api/path_between"),
         ("GET", "/api/episode_search"),
+        ("GET", "/api/episode"),
     }),
 }
 
