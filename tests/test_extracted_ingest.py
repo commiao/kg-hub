@@ -59,7 +59,9 @@ class NormalizeTest(unittest.TestCase):
 class LexicalTest(unittest.TestCase):
     def test_vector_candidates_need_lexical_support(self):
         same = xi._lexically_same
-        self.assertTrue(same("qwen.token_plan", "qwen-token-plan"))
+        # 第 2 轮后的取舍：代码类标识符只认完全相等（分隔符有意义），宁可多一个节点也不并错近名
+        self.assertFalse(same("qwen.token_plan", "qwen-token-plan"))
+        self.assertTrue(same("qwen.token_plan", "QWEN.TOKEN_PLAN"))
         self.assertTrue(same("tests/test_effective_quota_deploy.py", "test_effective_quota_deploy.py"))
         self.assertTrue(same("model-gateway-private 网络", "model-gateway-private"))
         self.assertTrue(same("Writer Lock", "writer_lock"))
@@ -67,6 +69,31 @@ class LexicalTest(unittest.TestCase):
         self.assertFalse(same("实际额度来源修正发布（T-0046）", "反思改进项落实专项 (REF-001~005)"))
         self.assertFalse(same("effective-quota 发布脚本不入仓导致本机测试 FileNotFoundError", "docs/effective-quota"))
         self.assertFalse(same("kg-hub", "kg-hub-server 镜像"))  # 短名不能靠包含吃掉长名的一半以下
+        # 第 2 轮（opus）复盘：同类型近名误并
+        self.assertFalse(same("tests/test_phase1m.py", "tests/test_phase1p.py", "File"))
+        self.assertFalse(same("deploy-standard 准则 19–22", "deploy-standard 准则 26–28"))
+        self.assertFalse(same("2026-09-19 网关付费请求全 503", "2026-09-18 早间网关全量 503"))
+        self.assertFalse(same("kg-hub:deploy/nas/release.sh", "deploy/nas-release.sh", "File"))
+        self.assertTrue(same("credvault:deploy/nas-release.sh", "deploy/nas-release.sh", "File"))  # 全路径 vs 子路径
+        self.assertFalse(same("deploy/nas/release.sh", "deploy/nas-release.sh", "File"))
+        self.assertFalse(same("max_tokens 路由上限裁剪", "max_tokens"))
+        self.assertFalse(same("candidate_source_boundary", "same_candidate_source_boundary"))
+        self.assertFalse(same("credvault dashboard 发布作业恢复", "credvault dashboard 安全删除凭证"))
+        self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))   # 占比 ≥0.8 的包含仍算同物
+        self.assertTrue(same("Writer Lock", "writer_lock"))
+
+    def test_dry_run_resolves_without_writing(self):
+        n = xi.normalize_extraction(ents(("kg-hub", "Project", ""), ("Brand New Thing", "Concept", "")), [],
+                                    ENTITY_TYPES, EDGE_TYPES)
+        d = FakeDriver(existing_names={"kg-hub": "u-kghub"})
+        r = asyncio.run(xi.write_extraction(d, FakeEmbedder(), n, name="x", episode_body="b", source_description="sd",
+                                            reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc),
+                                            extractor_model="m", group_id="kg_hub", dry_run=True))
+        self.assertEqual((r.nodes_new, r.nodes_reused, r.episode_uuid), (1, 1, ""))
+        self.assertEqual(r.resolved["kg-hub"]["uuid"], "u-kghub")
+        self.assertIsNone(r.resolved["brand new thing"]["uuid"])
+        writes = [c for c, _ in d.calls if c.startswith(("MERGE", "MATCH (source", "MATCH (e:Episodic"))]
+        self.assertEqual(writes, [])
 
 
 class FakeEmbedder:

@@ -165,6 +165,17 @@ class SubmitTest(unittest.TestCase):
             self.assertEqual(body["edges"][0]["name"], "BINDS")
             lines = [json.loads(l) for l in log.read_text().splitlines()]
             self.assertEqual(len(lines), 2)
+            # dry-run：带 dry_run 标记、不记 log、不记名字
+            posted.clear()
+            names = Path(d) / "names.tsv"
+            recs2 = ax.submit_results(batch, results, model="claude-haiku-5-5", session="s", url="http://x",
+                                      token="tok", post=fake_post, log_path=log, dry_run=True, names_path=names)
+            self.assertTrue(posted[0][1]["dry_run"])
+            self.assertEqual(len(log.read_text().splitlines()), 2)
+            self.assertFalse(names.exists())
+            ax.submit_results(batch, results, model="claude-haiku-5-5", session="s", url="http://x",
+                              token="tok", post=fake_post, log_path=log, names_path=names)
+            self.assertEqual(names.read_text(), "Tool\tmodel-gateway\n")
             summary = ax.summarize_log(lines)
             self.assertEqual(summary["claude-haiku-5-5"]["ok"], 1)
             self.assertEqual(summary["claude-haiku-5-5"]["empty"], 1)

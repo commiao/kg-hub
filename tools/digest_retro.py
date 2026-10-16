@@ -90,6 +90,13 @@ KNOBS: dict[str, dict] = {
     "type_guard_on_resolution": {
         "applies": "服务端 utils/extracted_ingest：向量召回的候选必须带抽出的实体类型标签才复用（精确同名不受限）",
         "implemented": True, "metric": "untyped_share"},
+    "resolution_strictness": {
+        "applies": "服务端 utils/extracted_ingest 的词面校验：代码类名字只认完全相等、只差数字不复用、"
+                   "包含占比 CONTAIN_MIN_SHARE、difflib LEXICAL_MIN_RATIO（需发布）",
+        "implemented": True, "metric": "dup_triple_share"},
+    "submit_dry_run": {
+        "applies": "执行器 tools/agent_extract submit --dry-run：写入前预览每个实体会并到谁",
+        "implemented": True, "metric": "dup_triple_share"},
     "edge_schema_map_on_ingest": {
         "applies": "入图时把 schema 外边名映射为 relates_to 并保留原名（待实现）",
         "implemented": False, "metric": "edge_in_schema"},
@@ -268,6 +275,21 @@ class RetroState:
         self.rounds.append(rec)
         return rec
 
+    def tune(self, adjustments: dict, force: bool = False) -> dict:
+        """把调参补登记到最后一轮（checkpoint 之后决定的调参）。"""
+        unknown = [k for k in adjustments if k not in KNOBS]
+        unimplemented = [k for k in adjustments if k in KNOBS and not KNOBS[k]["implemented"]]
+        if unknown and not force:
+            raise ValueError(f"未登记的旋钮：{unknown}")
+        if unimplemented and not force:
+            raise ValueError(f"旋钮尚未实现，不能记为已应用：{unimplemented}")
+        last = self.rounds[-1]
+        changes = {k: {"from": self.tuning.get(k), "to": v} for k, v in adjustments.items()}
+        self.tuning.update(adjustments)
+        last.setdefault("adjustments", {}).update(changes)
+        last["tuning_after"] = dict(self.tuning)
+        return changes
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
@@ -438,7 +460,7 @@ def _parse_adjust(items: list[str]) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["status", "gate", "checkpoint", "final"])
+    ap.add_argument("cmd", choices=["status", "gate", "checkpoint", "final", "tune"])
     ap.add_argument("--state", required=True, help="digest-retro.json 路径（状态卷）")
     ap.add_argument("--journal", help="model-attempts.sqlite3 路径")
     ap.add_argument("--every", type=int, default=DEFAULT_EVERY)
@@ -459,6 +481,16 @@ def main(argv: list[str] | None = None) -> int:
         st.save()
     if a.cmd == "final":
         sys.stdout.write(render_final(st))
+        return 0
+    if a.cmd == "tune":
+        # 复盘之后、下一轮开始之前补登记调参：执行者在 checkpoint 时只记录建议，由主会话决定后用本命令
+        # 落到上一轮的 adjustments（from→to）与当前 tuning，最终对比仍能把它算作「实践过的优化」。
+        if not st.rounds:
+            raise SystemExit("还没有任何一轮，先 checkpoint")
+        changes = st.tune(_parse_adjust(a.adjust), force=a.force)
+        st.save()
+        print(json.dumps({"round": st.rounds[-1]["round"], "adjustments": changes, "tuning": st.tuning},
+                         ensure_ascii=False, indent=2))
         return 0
     if not a.journal:
         raise SystemExit("status/gate/checkpoint 需要 --journal")

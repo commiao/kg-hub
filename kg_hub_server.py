@@ -1700,6 +1700,8 @@ class ExtractedIngestBody(IngestBody):
     prompt_version: str | None = None
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge] = []
+    # 只做消解不写图：返回每个实体会复用到哪个旧实体（第 2 轮复盘要求的写入前预览）
+    dry_run: bool = False
 
 
 async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extraction,
@@ -1806,6 +1808,23 @@ async def ingest_extracted(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"status": "error", "code": "graphiti_unavailable",
                              "diagnostic": type(exc).__name__}, status_code=503)
+    if body.dry_run:
+        # 不备份、不建键、不加锁：只读消解。
+        try:
+            preview = await write_extraction(
+                g.driver, g.embedder, extraction, name=body.name, episode_body=body.episode_body,
+                source_description=body.source_description, reference_time=ref_time,
+                extractor_model=body.extractor_model, group_id=GROUP_ID, dry_run=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[ingest_extracted:dry_run_failed]")
+            return JSONResponse({"status": "error", "code": "dry_run_failed",
+                                 "diagnostic": type(exc).__name__}, status_code=500)
+        return JSONResponse({
+            "status": "dry_run", "nodes_new": preview.nodes_new, "nodes_reused": preview.nodes_reused,
+            "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"]}
+                         for k, v in preview.resolved.items()},
+            "stats": extraction.stats, "extractor_model": body.extractor_model,
+            "source_description": body.source_description, "source_obs_id": body.source_obs_id})
     request_id = str(uuidlib.uuid4())
     try:
         await asyncio.to_thread(_backup_episode, body, ref_time, request_id)
