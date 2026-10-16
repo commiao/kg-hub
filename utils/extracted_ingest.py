@@ -29,7 +29,11 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
-NODE_MATCH_MIN = 0.92        # bge-small 384 维上同名异写（大小写/空格）通常 ≥0.95
+# 2026-10-17 冒烟实测：bge-small-en 对中文短名的余弦普遍偏高，0.92 把「实际额度来源修正发布」
+# 并到了「反思改进项落实专项」、把「…本机测试 FileNotFoundError」并到了「docs/effective-quota」。
+# 所以向量只负责召回候选，复用还要过词面校验（_lexically_same）。
+NODE_MATCH_MIN = 0.95
+LEXICAL_MIN_RATIO = 0.72
 MAX_ENTITIES = 60
 MAX_EDGES = 120
 MAX_NAME_LEN = 200
@@ -84,6 +88,28 @@ class NormalizedExtraction:
 
 def _norm_key(name: str) -> str:
     return " ".join(name.split()).lower()
+
+
+_LEX_STRIP = re.compile(r"[\s\-_./\\:：（）()\[\]【】,，;；'\"`·]+")
+
+
+def _lex(name: str) -> str:
+    return _LEX_STRIP.sub("", (name or "").lower())
+
+
+def _lexically_same(a: str, b: str) -> bool:
+    """向量召回的候选必须在词面上也站得住：去掉分隔符后一个包含另一个（≥4 字符），
+    或 difflib 相似度 ≥ LEXICAL_MIN_RATIO。"""
+    import difflib
+    x, y = _lex(a), _lex(b)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    if len(short) >= 4 and short in long_ and len(short) / len(long_) >= 0.5:
+        return True
+    return difflib.SequenceMatcher(None, x, y).ratio() >= LEXICAL_MIN_RATIO
 
 
 def normalize_extraction(entities: list[ExtractedEntity], edges: list[ExtractedEdge],
@@ -217,6 +243,7 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         if not rows:
             rows, _, _ = await driver.execute_query(
                 _FIND_SIMILAR, g=group_id, v=[float(x) for x in vec], min=node_match_min)
+            rows = [r for r in rows if _lexically_same(ent.name, r.get("name") or "")]
         if rows:
             resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True,
                                  "matched_name": rows[0].get("name")}

@@ -374,6 +374,16 @@ def succeeded_since(journal_path: str | Path, since: str) -> int:
     return int(n)
 
 
+# 会话自抽取路径（/api/ingest_extracted）：观测如果早先失败过，账本里已有它的执行记录，
+# 重跑不会再记一行（utils/task_execution 的既有契约，#163 查实），按账本数会严重漏计。
+# 图里 extraction_mode='agent' 的 episode 才是这条路「成功入库」的正本。
+async def graph_succeeded_since(driver, since: str, until: str | None = None) -> int:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (e:Episodic) WHERE e.extraction_mode = 'agent' AND toString(e.created_at) > $s "
+        "AND ($u IS NULL OR toString(e.created_at) <= $u) RETURN count(e) AS c", s=since, u=until)
+    return int(rows[0]["c"]) if rows else 0
+
+
 async def load_graph(driver, since: str, until: str) -> tuple[list[dict], list[dict], list[dict]]:
     """在 kg-hub-server 容器内用 graphiti driver 跑三条只读聚合（FalkorDB 不支持 =~）。"""
     _, entity_types = schema_names()
@@ -426,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--adjust", action="append", default=[], help="checkpoint：key=value，可多次")
     ap.add_argument("--applied", action="append", default=[], help="checkpoint：本轮已应用的上一轮调参说明")
     ap.add_argument("--no-graph", action="store_true", help="checkpoint：不查图库（容器外）")
+    ap.add_argument("--graph-count", action="store_true",
+                    help="succeeded 按图里 extraction_mode=agent 的 episode 数，而不是账本（会话自抽取路径用）")
     ap.add_argument("--report-dir", default=os.environ.get("KG_HUB_RETRO_REPORTS", "~/.kg-hub/reports/retro"))
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args(argv)
@@ -441,7 +453,13 @@ def main(argv: list[str] | None = None) -> int:
     if not a.journal:
         raise SystemExit("status/gate/checkpoint 需要 --journal")
     since = st.window_since()
-    n = succeeded_since(a.journal, since)
+    graph = None
+    if a.graph_count:
+        from graphiti_client import build_graphiti  # 容器内
+        graph = asyncio.run(build_graphiti())
+        n = asyncio.run(graph_succeeded_since(graph.driver, since))
+    else:
+        n = succeeded_since(a.journal, since)
     if a.cmd == "status":
         print(json.dumps({"round_next": len(st.rounds) + 1, "every": st.every, "since": since,
                           "succeeded_since": n, "due": st.due(n), "tuning": st.tuning},
@@ -456,13 +474,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("checkpoint 必须带 --lessons-file（经验教训不能为空）；确需空复盘用 --force")
     until = _now()
     metrics = task_metrics(load_tasks(a.journal, since))
+    if a.graph_count:
+        metrics["succeeded"] = n
     if not a.no_graph:
-        from graphiti_client import build_graphiti  # 容器内
-        g = asyncio.run(build_graphiti())
+        if graph is None:
+            from graphiti_client import build_graphiti  # 容器内
+            graph = asyncio.run(build_graphiti())
         try:
-            eps, edges, ents = asyncio.run(load_graph(g.driver, since, until))
+            eps, edges, ents = asyncio.run(load_graph(graph.driver, since, until))
         finally:
-            asyncio.run(g.driver.close())
+            asyncio.run(graph.driver.close())
         metrics.update(graph_metrics(eps, edges, ents))
     rec = st.checkpoint(succeeded_since=n, metrics=metrics, lessons=lessons,
                         adjustments=_parse_adjust(a.adjust), applied=a.applied, now=until, force=a.force)

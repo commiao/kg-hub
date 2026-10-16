@@ -116,6 +116,7 @@ def remote_retro(args: list[str], stdin_text: str | None = None, runner=subproce
              "cd /app && PYTHONPATH=/app python3 /tmp/retro/digest_retro.py "
              + " ".join(shlex.quote(a) for a in args)
              + f" --state {RETRO_STATE} --journal {RETRO_JOURNAL} --report-dir {RETRO_REPORTS}"
+             + (" --graph-count" if args and args[0] != "final" else "")
              + (" --lessons-file /tmp/retro/lessons.md" if stdin_text is not None else ""))
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", nas,
            f"{docker} exec -i kg-hub-server sh -c {shlex.quote(inner)}"]
@@ -280,10 +281,14 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
             payload = build_payload(item, res, model=model, session=session)
             t0 = time.monotonic()
             code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
+            # 消解到了不同名字的旧实体：这是误并的高发区，必须让执行者看见
+            mismatch = [f"{k} → {v.get('matched_name')}" for k, v in (d.get("resolved") or {}).items()
+                        if v.get("reused") and (v.get("matched_name") or "").lower() != k]
             rec = {"id": oid, "status": d.get("status") or f"http_{code}", "http": code, "model": model,
                    "latency_s": round(time.monotonic() - t0, 2), "episode_uuid": d.get("episode_uuid"),
                    "nodes_new": d.get("nodes_new"), "nodes_reused": d.get("nodes_reused"),
                    "edges_new": d.get("edges_new"), "edges_reused": d.get("edges_reused"),
+                   "reuse_mismatch": mismatch,
                    "stats": d.get("stats"), "error": d.get("code") if code >= 400 else None}
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
                     "project": item.get("project"), "type": item.get("type")})
@@ -411,7 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print(json.dumps({"submitted": len(recs), "by_status": counts,
                       "items": [{k: r.get(k) for k in ("id", "status", "nodes_new", "nodes_reused",
-                                                        "edges_new", "edges_reused", "error")} for r in recs]},
+                                                        "edges_new", "edges_reused", "reuse_mismatch", "error")}
+                                for r in recs]},
                      ensure_ascii=False, indent=1))
     return 0
 

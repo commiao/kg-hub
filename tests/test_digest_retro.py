@@ -123,6 +123,21 @@ class StateTest(unittest.TestCase):
         self.assertIn("`normalize_edge_names`: None → True", rd)
 
 
+class GraphCountTest(unittest.TestCase):
+    def test_graph_succeeded_since_counts_agent_episodes_only(self):
+        import asyncio
+        seen = {}
+
+        class D:
+            async def execute_query(self, cypher, **params):
+                seen.update(params); seen["cypher"] = cypher
+                return [{"c": 7}], None, None
+        n = asyncio.run(dr.graph_succeeded_since(D(), "2026-10-17T00:00:00+00:00"))
+        self.assertEqual(n, 7)
+        self.assertIn("extraction_mode = 'agent'", seen["cypher"])
+        self.assertEqual((seen["s"], seen["u"]), ("2026-10-17T00:00:00+00:00", None))
+
+
 class JournalLoaderTest(unittest.TestCase):
     def test_counts_and_calls_from_journal(self):
         with tempfile.TemporaryDirectory() as d:
