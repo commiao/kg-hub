@@ -108,6 +108,19 @@ class StateTest(unittest.TestCase):
         self.assertEqual(r2["adjustments"]["live_per_cycle"], {"from": 20, "to": 30})
         self.assertEqual(r2["window"]["since"], "2026-10-17T01:00:00+00:00")
 
+    def test_tune_records_into_last_round(self):
+        st = dr.RetroState(self.state, every=2)
+        st.checkpoint(succeeded_since=2, metrics={"edge_in_schema": 0.3}, lessons="x", adjustments={},
+                      now="2026-10-17T01:00:00+00:00")
+        with self.assertRaises(ValueError):
+            st.tune({"entity_name_filter": True})
+        ch = st.tune({"prompt_version": "agent-v3", "resolution_strictness": "v3"})
+        self.assertEqual(ch["prompt_version"], {"from": None, "to": "agent-v3"})
+        self.assertEqual(st.rounds[-1]["adjustments"]["resolution_strictness"]["to"], "v3")
+        self.assertEqual(st.tuning["prompt_version"], "agent-v3")
+        st.save()
+        self.assertIn("prompt_version", dr.render_final(dr.RetroState(self.state)))
+
     def test_final_report_lists_practiced_with_deltas(self):
         st = dr.RetroState(self.state, every=2)
         st.checkpoint(succeeded_since=2, metrics={"edge_in_schema": 0.3, "succeeded": 2}, lessons="边名太乱，先归一",

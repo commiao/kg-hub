@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
-PROMPT_VERSION = "agent-v2"   # v1 → v2：第 1 轮（haiku）复盘后的规则澄清，见 config/agent_extract_prompt.md 末尾
+PROMPT_VERSION = "agent-v3"   # v1→v2 第 1 轮（haiku）复盘；v2→v3 第 2 轮（opus）复盘，见 config/agent_extract_prompt.md 末尾
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_NAS = "commiao@100.123.208.32"
 DEFAULT_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
@@ -252,8 +252,9 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
 
 
 def build_payload(item: dict, result: dict, *, model: str, session: str | None,
-                  prompt_version: str = PROMPT_VERSION) -> dict:
+                  prompt_version: str = PROMPT_VERSION, dry_run: bool = False) -> dict:
     return {
+        **({"dry_run": True} if dry_run else {}),
         "name": item["name"], "episode_body": item["episode_body"],
         "source_description": item["source_description"], "source_obs_id": item["source_obs_id"],
         "reference_time": item["reference_time"], "sync": True,
@@ -266,7 +267,10 @@ def build_payload(item: dict, result: dict, *, model: str, session: str | None,
 
 
 def submit_results(batch: dict, results: dict, *, model: str, session: str | None, url: str,
-                   token: str | None, post=_http, log_path: Path | None = None) -> list[dict]:
+                   token: str | None, post=_http, log_path: Path | None = None,
+                   dry_run: bool = False, names_path: Path | None = None) -> list[dict]:
+    """dry_run：只让服务端做消解不写图，返回每个实体会并到谁；不记 log。
+    names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。"""
     by_id = {int(i["id"]): i for i in batch["items"]}
     out = []
     for res in results.get("items", [results] if "entities" in results else []):
@@ -278,7 +282,7 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
         if not res.get("entities"):
             rec = {"id": oid, "status": "empty", "model": model}
         else:
-            payload = build_payload(item, res, model=model, session=session)
+            payload = build_payload(item, res, model=model, session=session, dry_run=dry_run)
             t0 = time.monotonic()
             code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
             # 消解到了不同名字的旧实体：这是误并的高发区，必须让执行者看见
@@ -293,9 +297,15 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
                     "project": item.get("project"), "type": item.get("type")})
         out.append(rec)
+        if dry_run:
+            continue
         if log_path is not None:
             with log_path.open("a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if names_path is not None and rec.get("status") == "ok":
+            with names_path.open("a") as f:
+                for e in res.get("entities", []):
+                    f.write(f"{e.get('type')}\t{e.get('name')}\n")
     return out
 
 
@@ -349,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
                     "（gate / status / final / checkpoint --adjust k=v --applied ...）")
     ap.add_argument("--lessons-file", help="retro checkpoint：经验教训 markdown（本机路径）")
+    ap.add_argument("--dry-run", action="store_true", help="submit：只让服务端消解不写图，看每个实体会并到谁")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--after-id", type=int, help="next：覆盖游标起点")
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
@@ -397,9 +408,12 @@ def main(argv: list[str] | None = None) -> int:
         # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没挑到 n 条时），
         # 中间被闸拒/已入库的不会再看第二遍。
         last_considered = picked[-1]["id"] if len(picked) >= a.n else rows[-1]["id"]
+        # 前瞻：本批之后紧接着的观测标题（第 2 轮复盘：跨批的更正在下一批才出现，抽取者看不到）
+        lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
+                     for r in rows if r["id"] > last_considered][:a.n]
         batch = {"batch_id": batch_id, "created_at": datetime.now(tz=timezone.utc).isoformat(),
                  "after_id": remote["after"], "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
-                 "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked}
+                 "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked, "lookahead": lookahead}
         out = Path(a.out) if a.out else sd / f"batch-{batch_id}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(batch, ensure_ascii=False, indent=1))
@@ -415,11 +429,12 @@ def main(argv: list[str] | None = None) -> int:
     batch = json.loads(Path(a.batch).read_text())
     results = json.loads(Path(a.file).read_text())
     recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
-                          token=token, log_path=log_path)
+                          token=token, log_path=log_path, dry_run=a.dry_run,
+                          names_path=sd / f"names-{a.model}.tsv")
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    print(json.dumps({"submitted": len(recs), "by_status": counts,
+    print(json.dumps({"submitted": len(recs), "by_status": counts, "dry_run": a.dry_run,
                       "items": [{k: r.get(k) for k in ("id", "status", "nodes_new", "nodes_reused",
                                                         "edges_new", "edges_reused", "reuse_mismatch", "error")}
                                 for r in recs]},

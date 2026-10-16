@@ -33,7 +33,14 @@ from pydantic import BaseModel, Field
 # 并到了「反思改进项落实专项」、把「…本机测试 FileNotFoundError」并到了「docs/effective-quota」。
 # 所以向量只负责召回候选，复用还要过词面校验（_lexically_same）。
 NODE_MATCH_MIN = 0.95
-LEXICAL_MIN_RATIO = 0.72
+# 第 2 轮（opus）复盘：同类型近名仍误并 17 对——只差一个字符/数字/日期（test_phase1m→1p、准则 19–22→26–28）、
+# 跨仓库同名文件（kg-hub 与 credvault 的 release.sh）、描述性名字被泛名吸进（max_tokens 路由上限裁剪→max_tokens）。
+# 所以：代码类名字（标识符/路径）只认完全相等；只在数字上不同的一律不是同一对象；包含规则占比提到 0.8；
+# difflib 阈值提到 0.85。
+LEXICAL_MIN_RATIO = 0.85
+CONTAIN_MIN_SHARE = 0.8
+# 标识符/路径一类的名字：ASCII 字母数字加 . / _ - : ( ) 组成，没有空格和非 ASCII
+_CODE_LIKE = re.compile(r"^[A-Za-z0-9_./:\-()~@]+$")
 MAX_ENTITIES = 60
 MAX_EDGES = 120
 MAX_NAME_LEN = 200
@@ -97,17 +104,32 @@ def _lex(name: str) -> str:
     return _LEX_STRIP.sub("", (name or "").lower())
 
 
-def _lexically_same(a: str, b: str) -> bool:
-    """向量召回的候选必须在词面上也站得住：去掉分隔符后一个包含另一个（≥4 字符），
-    或 difflib 相似度 ≥ LEXICAL_MIN_RATIO。"""
+def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
+    """向量召回的候选必须在词面上也站得住。
+
+    - 去分隔符后完全相等 → 同一对象（大小写/空格/标点差异）。
+    - 只在数字上不同（phase1m/phase1p 不算数字，但 19–22 / 26–28、相邻日期算）→ 不是同一对象。
+    - 代码类名字（标识符、路径）或 File/Config 类型 → 只认完全相等。
+    - 其余：一方包含另一方且短名占长名 ≥ CONTAIN_MIN_SHARE，或 difflib ≥ LEXICAL_MIN_RATIO。
+    """
     import difflib
+    if entity_type in ("File", "Config") or (_CODE_LIKE.match(a.strip()) and _CODE_LIKE.match(b.strip())):
+        # 代码类：分隔符有意义（deploy/nas/release.sh ≠ deploy/nas-release.sh），只认大小写无关的完全相等，
+        # 唯一例外是同一文件的「全路径」与「文件名/子路径」（在 / 或 : 边界上是后缀）
+        la, lb = " ".join(a.split()).lower(), " ".join(b.split()).lower()
+        if la == lb:
+            return True
+        short, long_ = (la, lb) if len(la) <= len(lb) else (lb, la)
+        return any(long_.endswith(sep + short) for sep in ("/", ":"))
     x, y = _lex(a), _lex(b)
     if not x or not y:
         return False
     if x == y:
         return True
+    if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y):
+        return False
     short, long_ = (x, y) if len(x) <= len(y) else (y, x)
-    if len(short) >= 4 and short in long_ and len(short) / len(long_) >= 0.5:
+    if len(short) >= 4 and short in long_ and len(short) / len(long_) >= CONTAIN_MIN_SHARE:
         return True
     return difflib.SequenceMatcher(None, x, y).ratio() >= LEXICAL_MIN_RATIO
 
@@ -230,8 +252,10 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
                            prompt_version: str | None = None,
                            episode_uuid: str | None = None,
                            node_match_min: float = NODE_MATCH_MIN,
-                           type_guard: bool = True) -> WriteResult:
-    """把归一后的抽取写进图。driver 只需 execute_query；embedder 只需 create_batch。"""
+                           type_guard: bool = True, dry_run: bool = False) -> WriteResult:
+    """把归一后的抽取写进图。driver 只需 execute_query；embedder 只需 create_batch。
+
+    dry_run=True：只做嵌入与消解，不写任何东西（第 2 轮复盘：让抽取者在写入前看到会并到哪个旧实体）。"""
     now = datetime.now(tz=timezone.utc)
     now_iso = now.isoformat()
     ep_uuid = episode_uuid or str(uuidlib.uuid4())
@@ -247,7 +271,7 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
             # 第 1 轮（haiku）复盘：按名字近似合并不看类型，把 Issue 并进了 Config、Tool 并进了 Issue、
             # 文件并进了同名不同路径的另一个文件。向量候选还要带抽出的类型标签才复用。
             rows = [r for r in rows
-                    if _lexically_same(ent.name, r.get("name") or "")
+                    if _lexically_same(ent.name, r.get("name") or "", ent.type)
                     and (not type_guard or ent.type in (r.get("labels") or []))]
         if rows:
             resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True,
@@ -255,6 +279,10 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
             nodes_reused += 1
             continue
         new_uuid = str(uuidlib.uuid4())
+        if dry_run:
+            resolved[ent.key] = {"uuid": None, "reused": False, "matched_name": None}
+            nodes_new += 1
+            continue
         entity_data = {
             "uuid": new_uuid, "name": ent.name, "name_embedding": [float(x) for x in vec],
             "group_id": group_id, "summary": ent.summary, "created_at": now_iso,
@@ -265,6 +293,9 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         resolved[ent.key] = {"uuid": new_uuid, "reused": False, "matched_name": None}
         nodes_new += 1
 
+    if dry_run:
+        return WriteResult(episode_uuid="", nodes_new=nodes_new, nodes_reused=nodes_reused,
+                           edges_new=0, edges_reused=0, resolved=resolved)
     await driver.execute_query(
         _SAVE_EPISODE, uuid=ep_uuid, name=name, group_id=group_id,
         source_description=source_description, source="text", content=episode_body,
