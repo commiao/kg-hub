@@ -27,9 +27,8 @@ from tools.digest_retro import schema_names, DIRTY_PREFIXES  # noqa: E402
 
 _EP = ("MATCH (e:Episodic) WHERE e.group_id = $g "
        "OPTIONAL MATCH (e)-[:MENTIONS]->(n) WITH e, count(n) AS k "
-       "OPTIONAL MATCH ()-[r:RELATES_TO]->() WHERE e.uuid IN r.episodes "
        "RETURN coalesce(e.extractor_model, 'legacy:' + substring(toString(e.created_at),0,7)) AS src, "
-       "count(DISTINCT e) AS eps, sum(k) AS mentions, count(r) AS edges, "
+       "count(e) AS eps, sum(k) AS mentions, sum(size(coalesce(e.entity_edges, []))) AS edges, "
        "sum(CASE WHEN k = 0 THEN 1 ELSE 0 END) AS zero_entities")
 _EDGES = ("MATCH (a)-[r:RELATES_TO]->(b) WHERE r.group_id = $g "
           "WITH coalesce(r.extractor_model, 'legacy:' + substring(toString(r.created_at),0,7)) AS src, "

@@ -92,7 +92,7 @@ class FakeDriver:
             # 用向量长度反查哪个实体（FakeEmbedder 用名字长度编码）
             for key, (u, name) in self.similar.items():
                 if params["v"][0] == float(len(name)):
-                    return [{"uuid": u, "name": name, "labels": ["Entity"], "score": 0.97}], None, None
+                    return [{"uuid": u, "name": name, "labels": ["Entity", "Tool"], "score": 0.97}], None, None
             return [], None, None
         if cypher.startswith("MATCH (a:Entity {uuid: $src})-[e:RELATES_TO"):
             u = self.existing_edges.get((params["src"], params["name"], params["dst"]))
@@ -140,6 +140,23 @@ class WriteTest(unittest.TestCase):
         self.assertTrue(all("vecf32" in c for c, _ in d.calls if c.startswith("MERGE (n:Entity") or c.startswith("MATCH (source:Entity")))
         link = [p for c, p in d.calls if c.startswith("MATCH (e:Episodic {uuid: $uuid}) SET e.entity_edges")][0]
         self.assertEqual(set(link["entity_edges"]), {"e-old", new_edge["uuid"]})
+
+    def test_type_guard_blocks_cross_type_vector_reuse(self):
+        n = xi.normalize_extraction(ents(("connection-status 监控", "Tool", "探针")), [], ENTITY_TYPES, EDGE_TYPES)
+
+        class D(FakeDriver):
+            async def execute_query(self, cypher, **params):
+                if "vec.cosineDistance(n.name_embedding" in cypher:
+                    return [{"uuid": "u-issue", "name": "connection-status 监控误报", "labels": ["Entity", "Issue"], "score": 0.97}], None, None
+                return await super().execute_query(cypher, **params)
+        r = asyncio.run(xi.write_extraction(D(), FakeEmbedder(), n, name="x", episode_body="b",
+                                            source_description="sd", reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc),
+                                            extractor_model="m", group_id="kg_hub", episode_uuid="ep"))
+        self.assertEqual((r.nodes_new, r.nodes_reused), (1, 0))   # Issue 候选不能当 Tool 复用
+        r = asyncio.run(xi.write_extraction(D(), FakeEmbedder(), n, name="x", episode_body="b",
+                                            source_description="sd", reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc),
+                                            extractor_model="m", group_id="kg_hub", episode_uuid="ep", type_guard=False))
+        self.assertEqual((r.nodes_new, r.nodes_reused), (0, 1))
 
     def test_check_keys(self):
         class D:
