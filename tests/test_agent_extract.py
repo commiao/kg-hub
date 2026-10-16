@@ -75,6 +75,33 @@ class TokenAndRetroTest(unittest.TestCase):
         self.assertIn("--lessons-file /tmp/retro/lessons.md", calls[1][0][-1])
 
 
+class RemotePendingTest(unittest.TestCase):
+    def test_select_pending_respects_boundary_and_watermark(self):
+        import sqlite3
+        from tools import agent_extract_remote as rm
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "claude-mem.db"
+            c = sqlite3.connect(db)
+            c.execute("CREATE TABLE sdk_sessions (memory_session_id TEXT, platform_source TEXT)")
+            c.execute("CREATE TABLE observations (id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT, "
+                      "type TEXT, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, concepts TEXT, files_read TEXT, "
+                      "files_modified TEXT, created_at TEXT, content_hash TEXT, generated_by_model TEXT, relevance_count INTEGER)")
+            for i in range(1, 11):
+                c.execute("INSERT INTO observations (id, project, type, title, created_at, content_hash, relevance_count) "
+                          "VALUES (?,?,?,?,?,?,0)", (i, "p", "discovery", f"t{i}", "2026-10-01T00:00:00Z", f"h{i}"))
+            c.commit(); c.close()
+            wm = Path(d) / "watermark.json"
+            wm.write_text(json.dumps({"boundary_id": 4, "ingested": [5, 6], "rejected": [7], "held": [8]}))
+            r = rm.select_pending(str(db), str(wm), 0, 5, chunk=2)
+            self.assertEqual([x["id"] for x in r["rows"]], [9, 10])   # 1-4 归 backlog 线；5-8 已处理/待核验
+            self.assertEqual((r["after"], r["boundary"], r["skipped_by_watermark"], r["exhausted"]), (4, 4, 4, True))
+            r = rm.select_pending(str(db), str(wm), 8, 1)
+            self.assertEqual([x["id"] for x in r["rows"]], [9])
+            self.assertFalse(r["exhausted"])
+            r = rm.select_pending(str(db), str(Path(d) / "missing.json"), 9, 5)
+            self.assertEqual([x["id"] for x in r["rows"]], [10])      # 无水位文件：不排除，只按游标
+
+
 class SelectTest(unittest.TestCase):
     def test_select_skips_existing_and_rejected(self):
         from unittest import mock
