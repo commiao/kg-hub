@@ -67,6 +67,16 @@ loop:
 - 「最优方式」的判据：合规率与脏命名达标（≥90% / ≤2%）前提下，每条耗时与 token 最低者；
   若 haiku 达标，就没有理由用更贵的。
 
+## 4.1 冒烟（2026-10-17）定下的两条执行细节
+
+- **消解误并要当场看。** `submit` 输出里的 `reuse_mismatch` 列出「抽出的名字 → 复用到的旧实体名」；
+  服务端已加词面校验（向量阈值 0.95 + 去分隔符包含或 difflib ≥ 0.72），但仍可能并错。
+  每批看一眼，误并的写进 lessons，连续出现就提高 `LEXICAL_MIN_RATIO`（服务端旋钮，需发布）。
+- **门禁按图计数。** 早先失败过的观测在账本里已有执行记录，重跑不再记行；`agent_extract retro`
+  默认给 digest_retro 传 `--graph-count`，succeeded 数的是图里 `extraction_mode='agent'` 的 episode。
+  账本口径的每条耗时对这条路为空，耗时看 `agent_extract status` 的 `latency_med_s`（服务端写图
+  的时延，不含会话抽取时间）。
+
 ## 5. 红线
 
 - 断路器不动；refinery 保持不提交；本协议不触发任何网关调用。
