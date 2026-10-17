@@ -115,12 +115,14 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     import difflib
     if entity_type in ("File", "Config") or (_CODE_LIKE.match(a.strip()) and _CODE_LIKE.match(b.strip())):
         # 代码类：分隔符有意义（deploy/nas/release.sh ≠ deploy/nas-release.sh），只认大小写无关的完全相等，
-        # 唯一例外是同一文件的「全路径」与「文件名/子路径」（在 / 或 : 边界上是后缀）
+        # 唯一例外是同一文件的「全路径」与「文件名/子路径」（在 / 边界上是后缀）。
+        # 第 3 轮复盘：`:` 不能算边界——规则 16 用 `仓库:路径` 区分跨仓库同名文件，
+        # `credvault:tests/x.py` 若在 `:` 上放行就会并回 kg-hub 的 `tests/x.py`。
         la, lb = " ".join(a.split()).lower(), " ".join(b.split()).lower()
         if la == lb:
             return True
         short, long_ = (la, lb) if len(la) <= len(lb) else (lb, la)
-        return any(long_.endswith(sep + short) for sep in ("/", ":"))
+        return long_.endswith("/" + short)
     x, y = _lex(a), _lex(b)
     if not x or not y:
         return False
@@ -203,8 +205,10 @@ _FIND_EXACT = (
 _FIND_SIMILAR = (
     "MATCH (n:Entity) WHERE n.group_id = $g AND n.name_embedding IS NOT NULL "
     "WITH n, (2 - vec.cosineDistance(n.name_embedding, vecf32($v)))/2 AS score "
+    # 第 3 轮复盘：候选顺序要确定，否则 dry-run 与正式提交会并到不同节点；同分按 uuid 定序，
+    # 取前 5 个再过词面/类型校验，而不是只看最相似的那一个。
     "WHERE score > $min RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, score "
-    "ORDER BY score DESC LIMIT 1")
+    "ORDER BY score DESC, n.uuid ASC LIMIT 5")
 _SAVE_NODE = (
     "MERGE (n:Entity {uuid: $entity_data.uuid}) SET n:{labels} SET n = $entity_data "
     "SET n.name_embedding = vecf32($entity_data.name_embedding) RETURN n.uuid AS uuid")

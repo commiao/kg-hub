@@ -74,7 +74,8 @@ class LexicalTest(unittest.TestCase):
         self.assertFalse(same("deploy-standard 准则 19–22", "deploy-standard 准则 26–28"))
         self.assertFalse(same("2026-09-19 网关付费请求全 503", "2026-09-18 早间网关全量 503"))
         self.assertFalse(same("kg-hub:deploy/nas/release.sh", "deploy/nas-release.sh", "File"))
-        self.assertTrue(same("credvault:deploy/nas-release.sh", "deploy/nas-release.sh", "File"))  # 全路径 vs 子路径
+        self.assertFalse(same("credvault:deploy/nas-release.sh", "deploy/nas-release.sh", "File"))  # 仓库:路径 是另一仓库的文件
+        self.assertTrue(same("credvault/deploy/nas-release.sh", "deploy/nas-release.sh", "File"))   # 全路径 vs 子路径
         self.assertFalse(same("deploy/nas/release.sh", "deploy/nas-release.sh", "File"))
         self.assertFalse(same("max_tokens 路由上限裁剪", "max_tokens"))
         self.assertFalse(same("candidate_source_boundary", "same_candidate_source_boundary"))
