@@ -186,6 +186,17 @@ class WriteTest(unittest.TestCase):
                                             extractor_model="m", group_id="kg_hub", episode_uuid="ep", type_guard=False))
         self.assertEqual((r.nodes_new, r.nodes_reused), (0, 1))
 
+    def test_check_names(self):
+        class D:
+            async def execute_query(self, cypher, **params):
+                self.names = params["names"]
+                return [{"name": "claude-mem-obs-1", "status": "ok"}], None, None
+        d = D()
+        got = asyncio.run(xi.check_names(d, ["claude-mem-obs-1", "claude-mem-obs-2"]))
+        self.assertEqual(got, {"claude-mem-obs-1": "ok"})
+        self.assertEqual(d.names, ["claude-mem-obs-1", "claude-mem-obs-2"])
+        self.assertEqual(asyncio.run(xi.check_names(d, [])), {})
+
     def test_check_keys(self):
         class D:
             async def execute_query(self, cypher, **params):

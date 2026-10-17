@@ -749,6 +749,61 @@ async def poll_until_done(sd: str, sid: str, max_wait: int = POLL_MAX_WAIT_S) ->
     return "timeout"
 
 
+# ---------- 与图对账：别的路径已入库的观测记为完成 ----------
+GRAPH_SYNC_INTERVAL_SEC = int(os.environ.get("KG_HUB_REFINERY_GRAPH_SYNC_SEC", "600"))
+GRAPH_SYNC_MAX_IDS = int(os.environ.get("KG_HUB_REFINERY_GRAPH_SYNC_MAX_IDS", "10000"))
+_graph_sync_state = {"last_at": 0.0, "total": 0}
+
+
+def pending_live_ids(wm: dict, boundary: int, ids: list[int]) -> list[int]:
+    """live 线上还没进任何水位集合的观测 id。"""
+    done = wm.get("ingested", set()) | wm.get("rejected", set()) | wm.get("failed", set()) | wm.get("held", set())
+    return [i for i in ids if i > boundary and i not in done]
+
+
+def apply_graph_statuses(wm: dict, statuses: dict[str, str]) -> int:
+    """把图里已 ok 的 claude-mem-obs-N 记进 ingested，返回新记的条数。"""
+    n = 0
+    for name, st in statuses.items():
+        if st == "ok" and name.startswith("claude-mem-obs-"):
+            try:
+                oid = int(name[len("claude-mem-obs-"):])
+            except ValueError:
+                continue
+            if oid not in wm["ingested"]:
+                wm["ingested"].add(oid)
+                n += 1
+    return n
+
+
+def sync_graph_ingested(wm: dict, boundary: int, *, now: float | None = None,
+                        http=None, fetch=None) -> dict | None:
+    """每 GRAPH_SYNC_INTERVAL_SEC 一次：拿 live 线待处理的名字问 /api/ingest/check_names，
+    status=ok 的记为 ingested。返回本次对账摘要；没到时间或没有待处理返回 None。"""
+    now = time.time() if now is None else now
+    if now - _graph_sync_state["last_at"] < GRAPH_SYNC_INTERVAL_SEC:
+        return None
+    _graph_sync_state["last_at"] = now
+    http = http or _http
+    fetch = fetch or (lambda: fetch_ids(min_id_exclusive=boundary))
+    pending = pending_live_ids(wm, boundary, fetch())[:GRAPH_SYNC_MAX_IDS]
+    if not pending:
+        return None
+    synced = 0
+    for i in range(0, len(pending), 500):
+        names = [f"claude-mem-obs-{oid}" for oid in pending[i:i + 500]]
+        code, d = http("POST", f"{KG_HUB_URL}/api/ingest/check_names", {"names": names}, timeout=60)
+        if code != 200:
+            log.warning("[graph_sync] check_names http %s，本轮停止", code)
+            break
+        synced += apply_graph_statuses(wm, d.get("items") or {})
+    _graph_sync_state["total"] += synced
+    write_status(graph_synced={"last": synced, "total": _graph_sync_state["total"],
+                               "checked": len(pending),
+                               "at": datetime.now(timezone.utc).isoformat()})
+    return {"checked": len(pending), "synced": synced, "total": _graph_sync_state["total"]}
+
+
 async def ingest_via_api(obs: dict, scenario: str = "backlog") -> str:
     """返回终态或无内容的 HTTP 类别，供状态页诊断 deferred。"""
     p = to_payload(obs)
@@ -1231,6 +1286,16 @@ async def main() -> int:
             released = release_request.apply(STATE_DIR, wm, save_watermark)
             if released is not None:
                 log.warning("[release_request] %s", json.dumps(released, ensure_ascii=False))
+            # 别的路径（会话自抽取 /api/ingest_extracted）入库的观测，水位只能靠问图才知道：
+            # 断路器断开期间本进程一条都不提交，看板的「队列剩余」会一直停在旧值（2026-10-17 实测
+            # 1,528 条已入库，看板仍显示 15,026 待处理）。放在断路器之前，断开期间也要对账。
+            try:
+                synced = await asyncio.to_thread(sync_graph_ingested, wm, wm.get("boundary_id") or 0)
+                if synced:
+                    save_watermark(wm)
+                    log.info("[graph_sync] %s", json.dumps(synced, ensure_ascii=False))
+            except Exception:  # noqa: BLE001 — 对账失败不影响本轮
+                log.exception("[graph_sync] failed (non-fatal)")
             # —— 人工断路器:排在所有门控最前面 ——
             # 这是**停流**,不是拒绝。开关一关本轮一条都不选、一条都不提交,所以
             # 既不产生请求也不产生错误——不会出现"关了开关却一直撞墙报错、把

@@ -347,6 +347,19 @@ _CHECK_KEYS = (
     "RETURN it.sd AS sd, it.sid AS sid, k.status AS status, k.episode_uuid AS episode_uuid")
 
 
+_CHECK_NAMES = ("MATCH (k:IngestedKey) WHERE k.name IN $names "
+                "RETURN k.name AS name, k.status AS status")
+
+
+async def check_names(driver, names: list[str]) -> dict[str, str]:
+    """按 episode 名批量查 IngestedKey 状态。refinery 用它把别的路径（会话自抽取）已入库的
+    观测记为完成——否则断路器断开期间它一条都不提交，水位永远不知道这些观测已经进图。"""
+    if not names:
+        return {}
+    rows, _, _ = await driver.execute_query(_CHECK_NAMES, names=list(names))
+    return {r["name"]: r.get("status") for r in rows if r.get("name")}
+
+
 async def check_keys(driver, items: list[dict]) -> dict[tuple[str, str], dict]:
     """批量查 IngestedKey 状态，供执行者跳过已入库的观测。"""
     if not items:
