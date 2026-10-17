@@ -98,7 +98,7 @@ from utils import token_auth  # noqa: E402
 from utils.batch_answer import batch_fallbacks_total  # noqa: E402
 from utils.extracted_ingest import (  # noqa: E402
     ExtractedEntity, ExtractedEdge, EXTRACTOR_MODEL_PATTERN, normalize_extraction,
-    write_extraction, check_keys,
+    write_extraction, check_keys, check_names,
 )
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
@@ -1888,6 +1888,23 @@ async def ingest_extracted_check(request: Request) -> JSONResponse:
         {"source_description": i["source_description"], "source_obs_id": i["source_obs_id"],
          **(found.get((i["source_description"], i["source_obs_id"])) or {"status": None, "episode_uuid": None})}
         for i in items]})
+
+
+async def ingest_check_names(request: Request) -> JSONResponse:
+    """POST /api/ingest/check_names — 按 episode 名批量查 IngestedKey 状态（只读，最多 500 个）。
+
+    refinery 每隔一段时间拿待处理观测的名字来问，把别的路径（会话自抽取）已入库的记为完成，
+    看板的队列剩余才会随之下降。"""
+    try:
+        raw = await request.json()
+        names = raw.get("names") if isinstance(raw, dict) else None
+        if (not isinstance(names, list) or len(names) > 500
+                or not all(isinstance(n, str) and 0 < len(n) <= 200 for n in names)):
+            raise ValueError("names 必须是最多 500 个字符串")
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "bad_request", "message": str(exc)}, status_code=400)
+    found = await check_names(get_status_driver(), names)
+    return JSONResponse({"status": "ok", "items": {n: found.get(n) for n in names}})
 
 
 async def ingest_status(request: Request) -> JSONResponse:
@@ -6003,6 +6020,7 @@ app = Starlette(
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest_extracted", ingest_extracted, methods=["POST"]),
         Route("/api/ingest_extracted/check", ingest_extracted_check, methods=["POST"]),
+        Route("/api/ingest/check_names", ingest_check_names, methods=["POST"]),
         Route("/api/drain", drain, methods=["POST"]),
         Route("/api/ingest/status", ingest_status, methods=["GET"]),
         Route("/api/ingest/reconciliation", ingest_reconciliation, methods=["GET"]),

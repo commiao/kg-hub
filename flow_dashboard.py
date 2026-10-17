@@ -710,7 +710,7 @@ def merge_graph_increments(created: dict | None, graph: list[dict] | None) -> No
     """把同一时间桶的 kg-hub 入图数并进 claude-mem 新增那一行，供同图对比。
 
     两边按同一规则分桶（北京时间小时，超过 2 天按自然日），按标签对齐。
-    只计 claude-mem 来源（积压线 + live 线），其他源不是 claude-mem 产出的。
+    只计 claude-mem 来源（积压线 + live 线 + 会话自抽取），其他源不是 claude-mem 产出的。
     图查询失败时整列为 None（未知），查询成功而桶里没有 Episode 才是 0。"""
     if not created:
         return
@@ -723,7 +723,8 @@ def merge_graph_increments(created: dict | None, graph: list[dict] | None) -> No
         g = by_label.get(row["label"], {})
         row["kg_backlog"] = g.get("积压线", 0)
         row["kg_live"] = g.get("live 线", 0)
-        row["kg_ingested"] = row["kg_backlog"] + row["kg_live"]
+        row["kg_agent"] = g.get("会话自抽取", 0)   # 会话自抽取路径（/api/ingest_extracted）入库的 claude-mem 观测
+        row["kg_ingested"] = row["kg_backlog"] + row["kg_live"] + row["kg_agent"]
         known.append(row["kg_ingested"])
     created["kg_total"] = sum(known) if graph is not None else None
 
@@ -1221,6 +1222,7 @@ async def _graph_daily(driver, boundary: object, now: datetime) -> list[dict]:
         "WITH n, substring(n.created_at, 0, 10) AS bucket "
         "WITH bucket, CASE "
         "  WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
+        "  WHEN n.extraction_mode = 'agent' THEN '会话自抽取' "
         "  WHEN toInteger(substring(n.name, 15)) <= $boundary THEN '积压线' "
         "  ELSE 'live 线' END AS lane "
         "RETURN bucket, lane, count(*) AS c ORDER BY bucket",
@@ -1245,6 +1247,7 @@ async def _graph_period(driver, boundary: object, start: datetime, end: datetime
         "MATCH (n:Episodic) WHERE n.created_at >= $since AND n.created_at < $until "
         "WITH n, substring(n.created_at,0,13) AS hour "
         "WITH hour, CASE WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
+        "WHEN n.extraction_mode = 'agent' THEN '会话自抽取' "
         "WHEN toInteger(substring(n.name,15)) <= $boundary THEN '积压线' "
         "ELSE 'live 线' END AS lane RETURN hour, lane, count(*) AS c ORDER BY hour",
         since=start.isoformat(), until=end.isoformat(), boundary=int(boundary or 0))
@@ -1478,7 +1481,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=cards id=kgqueuecards></div>
 <div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。单个采样间隔内源库增减 ≥200 条记为同步补灌（橙色虚线），不计入速度；极端值贴边显示，光标仍读出原值。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
-<div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#B79CED"></i>其他源</div>
+<div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#D97706"></i>会话自抽取<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
 </section>
@@ -1572,7 +1575,7 @@ function stack(target,rows,label,parts){const box=$(target);
   +parts.map(p=>{const v=p[1](r)||0;return v?'<i title="'+p[0]+' '+v+'" style="width:'+(v*100/peak)+'%;background:'+p[2]+'"></i>':''}).join('')
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
 stack('daily',(Pd.graph||[]).slice().reverse(),r=>r.label.slice(5),[
- ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['其他源',r=>r['其他源'],'#B79CED']]);
+ ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['会话自抽取',r=>r['会话自抽取'],'#D97706'],['其他源',r=>r['其他源'],'#B79CED']]);
 
 const CC=D.claude_mem_created;
 if(!CC){$('cmcreated').innerHTML='<div class=note>暂无数据：refinery 尚未写入新增计数</div>'}
@@ -1628,7 +1631,7 @@ if(CC)backlogData.push({title:'claude-mem 新增 vs kg-hub 入图（每'+(CC.gra
   gapMinutes:CC.granularity==='day'?36*60:90,
   rows:CC.rows.map(r=>({...r,label:r.label+' 北京时间'+(r.partial&&r.count!==null?' · 仅部分覆盖':'')})),
   series:[['claude-mem 新增','count','#D97706'],['kg-hub 入图','kg_ingested','#1D9E75']],
-  extra:r=>Number.isFinite(r.kg_ingested)?['<span>入图其中 积压线 '+r.kg_backlog+' · live '+r.kg_live+'</span>']:[]});
+  extra:r=>Number.isFinite(r.kg_ingested)?['<span>入图其中 积压线 '+r.kg_backlog+' · live '+r.kg_live+' · 会话自抽取 '+(r.kg_agent||0)+'</span>']:[]});
 const backlogX=(spec,at)=>rangeX(at);
 // A single outlier (e.g. a delayed sync from before bursts were flagged) must not
 // flatten every normal point onto the zero line: robust charts scale to P2–P98
