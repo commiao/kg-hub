@@ -44,7 +44,7 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
         ], type_ignores=[]))
         namespace = {"os": os, "EpisodeType": type("EpisodeType", (), {"text": "text"}),
                      "GROUP_ID": "kg_hub", "ENTITY_TYPES": {}, "EDGE_TYPES": {},
-                     "EDGE_TYPE_MAP": {}}
+                     "EDGE_TYPE_MAP": {}, "CUSTOM_EXTRACTION_INSTRUCTIONS": ""}
         exec(compile(module, str(source), "exec"), namespace)
         graphiti = Graphiti()
         with patch.dict(os.environ, {"KG_HUB_GRAPHITI_CONTEXT_CHECKPOINT": "0"}):
