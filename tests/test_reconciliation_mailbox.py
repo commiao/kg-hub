@@ -662,5 +662,82 @@ class UntrackedRowBackoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.prepared), 6)
 
 
+class FailedAttemptsMonotonicTests(unittest.TestCase):
+    """T-0238：失败次数只增不减。网关拿已收下的版本比，变小就整条拒收。"""
+
+    FIELDS = dict(step_id=ZERO_STEP, retryable=False, reason="business_state_unknown")
+
+    def test_success_does_not_lower_reported_failures(self):
+        # 2026-10-11 线上那一条：先报 reconciliation/失败 1 次，再报 succeeded/失败 0 次。
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            store.prepare_report("source", "id-1", state="reconciliation",
+                                 failed_attempts=1, **self.FIELDS)
+            done = store.prepare_report("source", "id-1", state="succeeded",
+                                        failed_attempts=0, step_id=ZERO_STEP,
+                                        retryable=False, reason="business_result_persisted")
+            self.assertEqual((done["state"], done["failed_attempts"], done["version"]),
+                             ("succeeded", 1, 1))
+            self.assertEqual(store.read_report(done["task_id"])["failed_attempts"], 1)
+
+    def test_clamped_report_is_still_unchanged_next_cycle(self):
+        # 夹住之后，下一轮同样的现算值不能每次都产生一个新版本。
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            store.prepare_report("source", "id-1", state="reconciliation",
+                                 failed_attempts=2, **self.FIELDS)
+            first = store.prepare_report("source", "id-1", state="reconciliation",
+                                         failed_attempts=0, **self.FIELDS)
+            again = store.prepare_report("source", "id-1", state="reconciliation",
+                                         failed_attempts=0, **self.FIELDS)
+            self.assertEqual(first["version"], 0)          # 与上一版完全相同，不写
+            self.assertEqual(again["version"], 0)
+            self.assertEqual(again["failed_attempts"], 2)
+
+    def test_failures_can_still_grow(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            store.prepare_report("source", "id-1", state="reconciliation",
+                                 failed_attempts=1, **self.FIELDS)
+            grown = store.prepare_report("source", "id-1", state="reconciliation",
+                                         failed_attempts=2, **self.FIELDS)
+            self.assertEqual((grown["failed_attempts"], grown["version"]), (2, 1))
+
+    def test_exhausted_budget_cannot_stay_retryable(self):
+        # 夹到上限后还标可重试，网关会以 retry_waiting 计数冲突拒收。
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            store.prepare_report("source", "id-1", state="reconciliation",
+                                 failed_attempts=3, **self.FIELDS)
+            report = store.prepare_report("source", "id-1", state="retry_waiting",
+                                          failed_attempts=1, step_id=ZERO_STEP,
+                                          retryable=True, reason="manual_retry_available")
+            self.assertEqual((report["failed_attempts"], report["retryable"]), (3, False))
+
+    def test_worker_path_keeps_the_count_when_history_shrinks(self):
+        # 走 prepare_task_report：执行记录先有 1 次失败，之后被改写或清理成 0 次。
+        class Journal:
+            failed = 1
+
+            def find_task(self, *_):
+                return []
+
+            def task_execution_summary(self, *_):
+                return {"execution_count": 1, "failed_attempts": self.failed,
+                        "active": False, "executions": [{"state": "failed"}]}
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = MailboxStore(Path(temp) / "mailbox.sqlite3")
+            journal = Journal()
+            row = {"source_description": "source", "source_obs_id": "id-1",
+                   "status": "needs_reconciliation", "error_kind": "stale_pending_with_evidence"}
+            first = prepare_task_report(store, journal, row, deadline_seconds=180)
+            self.assertEqual(first["failed_attempts"], 1)
+            journal.failed = 0
+            done = prepare_task_report(store, journal, {**row, "status": "ok", "error_kind": None},
+                                       deadline_seconds=180, business_result_persisted=True)
+            self.assertEqual((done["state"], done["failed_attempts"]), ("succeeded", 1))
+
+
 if __name__ == "__main__":
     unittest.main()
