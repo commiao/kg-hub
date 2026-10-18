@@ -786,20 +786,31 @@ refresh_drift_verdict() {
   [ "${DRY_RUN:-0}" != 1 ] || return 0
   checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
   [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
+  local status_file="$HOME/.cache/kg-hub/source-drift.status" before after verdict
+  before=$(cat "$status_file" 2>/dev/null || true)
   set +e
-  python3 "$checker" --status-file "$HOME/.cache/kg-hub/source-drift.status" \
-    >/dev/null 2>&1
+  python3 "$checker" --status-file "$status_file" >/dev/null 2>&1
   local rc=$?
   set -e
-  # 三档，不能并成两档。原来写的是「非零一律算刷新成功，因为非零也可能只是确实
-  # 有漂移」—— 那句把「有漂移」和「检测压根没跑成」混成了一句，而后者状态文件
-  # **根本没写**，此时说「已刷新」是假话。准则 10 的要害正是「能改变判决的动作
-  # 要对判决负责」。
-  case "$rc" in
-    0) say "  巡检判决已刷新：一致" ;;
-    1) say "  巡检判决已刷新：有待处理项，见 $HOME/.cache/kg-hub/source-drift.status" ;;
-    *) say "  ⚠ 巡检判决**没有**刷新（检测退出 ${rc}）；状态文件可能还是发布前那条"
-       say "    以 $HOME/.cache/kg-hub/source-drift.status 里的时间戳为准" ;;
+  after=$(cat "$status_file" 2>/dev/null || true)
+  # 说不说「已刷新」，看状态文件这次有没有被写、写的是什么，不看退出码。原来按退出码
+  # 分三档（0 一致 / 1 有待处理项 / 其他没刷新），而退出码两头都有歧义：
+  #   1 = 写了 drift，也 = 未捕获异常、什么都没写
+  #   2 = 写了 error（连不上 NAS、主干判不了），也 = 参数解析失败、什么都没写
+  # 2026-10-18 实测：检查器崩掉、状态文件根本不存在，这里照样报「已刷新：有待处理项」。
+  # 准则 10 的要害是「能改变判决的动作要对判决负责」，说「已刷新」之前得先确认它
+  # 真被刷新了。
+  if [ -z "$after" ] || [ "$after" = "$before" ]; then
+    say "  ⚠ 巡检判决**没有**刷新（检测退出 ${rc}）；状态文件还是发布前那条"
+    say "    手动补一次：python3 ${checker} --status-file ${status_file}"
+    return 0
+  fi
+  verdict=$(printf '%s\n' "$after" | cut -f2)
+  case "$verdict" in
+    ok)    say "  巡检判决已刷新：一致" ;;
+    drift) say "  巡检判决已刷新：有待处理项，见 ${status_file}" ;;
+    error) say "  巡检判决已刷新：这次没查成（error），原因见 ${status_file}" ;;
+    *)     say "  ⚠ 巡检判决写成了不认识的「${verdict}」（检测退出 ${rc}），见 ${status_file}" ;;
   esac
 }
 
