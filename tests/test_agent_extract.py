@@ -288,5 +288,66 @@ class ProvenanceAndRunTest(unittest.TestCase):
                     ax.main(["run", "bogus", "--run-id", "x"])
 
 
+
+class DryRunGateTest(unittest.TestCase):
+    """四条红线之 2「每批先 dry-run」由工具自己执行：--dry-run 记标记，正式提交逐 id 核对，没预览过的拒绝。"""
+
+    def _files(self, d):
+        b, r = Path(d) / "b.json", Path(d) / "r.json"
+        b.write_text(json.dumps({"batch_id": "b0009", "items": [ax.to_identity(OBS),
+                                                                  ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}))
+        r.write_text(json.dumps({"items": [
+            {"id": 29995, "entities": [{"name": "x", "type": "Tool"}], "edges": []},
+            {"id": 2, "entities": []}]}))
+        return b, r
+
+    def test_marker_and_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d)
+            results = {"items": [{"id": 1, "entities": [{"name": "a", "type": "Tool"}]},
+                                 {"id": 2, "entities": []},
+                                 {"id": 3, "entities": [{"name": "c", "type": "Tool"}]}]}
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [1, 3])   # 空 entities 的 2 不要求
+            ax.record_dryrun(sd, "b1", [{"id": 1, "status": "dry_run"}, {"id": 9, "status": "http_500"}],
+                             now="2026-10-19T00:00:00+00:00")
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [3])      # 失败的 9 不算预览过
+            ax.record_dryrun(sd, "b1", [{"id": 3, "status": "dry_run"}])        # 分两次 dry-run 取并集
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [])
+            self.assertEqual(json.loads(ax.dryrun_marker_path(sd, "b1").read_text())["ids"], [1, 3])
+            self.assertEqual(ax.dryrun_missing(sd, "b2", results), [1, 3])   # 别的批不沾光
+
+    def test_submit_refuses_until_dry_run_then_allows(self):
+        posted = []
+
+        def fake_post(method, url, body, token):
+            posted.append(body.get("dry_run", False))
+            return 200, {"status": "dry_run" if body.get("dry_run") else "ok", "episode_uuid": "u",
+                         "stats": {"entities_in": 1, "edges_in": 0}, "resolved": {}}
+        with tempfile.TemporaryDirectory() as d:
+            b, r = self._files(d)
+            env = {"KG_HUB_AGENT_EXTRACT_DIR": d}
+            real = ax.submit_results
+            # submit_results 的 post 参数在定义时就绑定了 _http，patch 模块属性不生效；包一层把假 post 塞进去，
+            # 测试绝不能真的打到 NAS
+            with unittest.mock.patch.dict(_os.environ, env), \
+                    unittest.mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": fake_post})):
+                with self.assertRaises(SystemExit) as cm:              # 没 dry-run 过：拒绝，且一条都没发
+                    ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
+                self.assertIn("还没 dry-run", str(cm.exception))
+                self.assertEqual(posted, [])
+                self.assertEqual(ax.main(["dryrun-check", "--batch", str(b), "--file", str(r)]), 1)
+                self.assertEqual(ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m", "--dry-run"]), 0)
+                self.assertEqual(posted, [True])
+                self.assertTrue((Path(d) / "dryrun-b0009.json").exists())
+                self.assertEqual(ax.main(["dryrun-check", "--batch", str(b), "--file", str(r)]), 0)
+                self.assertEqual(ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"]), 0)
+                self.assertEqual(posted, [True, False])
+                # 明确跳过：另一批没 dry-run 也放行
+                b2 = Path(d) / "b2.json"
+                b2.write_text(json.dumps({"batch_id": "b0010", "items": [ax.to_identity(OBS)]}))
+                self.assertEqual(ax.main(["submit", "--batch", str(b2), "--file", str(r), "--model", "m",
+                                          "--skip-dryrun-check"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

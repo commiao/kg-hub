@@ -14,8 +14,9 @@
 - **规则作为任务 system 内容**：把 `config/agent_extract_prompt.md` 全文放进任务说明开头。
 - **qoder 可切模型，是「同工具不同模型」对照的最佳位置**：同一样本（`--sample ab-sample-20261017`）、同一规则版本，
   只换 qoder 里选的模型，每个模型一个 run_id，`--model` 填真实模型 id。这样图口径的差异才能归因到模型。
-- **钩子入口**：`tools/qoder_cm_hook.sh` 是现成的 qoder 钩子包装（它负责把项目目录传对），
-  「提交前必须 dry-run」的检查可以挂在同一入口上；钩子只检查不改 results。
+- **提交前必须 dry-run 由工具自己把关**：`agent_extract submit` 正式提交时会核对本批是否 dry-run 过，没预览过的 id
+  直接拒绝。要在 qoder 钩子里提前拦，调 `python -m tools.agent_extract dryrun-check --batch <b> --file <r>`（rc 1 = 有没预览的）；
+  `tools/qoder_cm_hook.sh` 是现成的 qoder 钩子包装（它负责把项目目录传对），可挂在同一入口上。钩子只检查不改 results。
 - **项目目录**：IDEA 插件的 `process.cwd()` 指向插件目录，命令要在仓库根目录下跑（`cd` 到 kg-hub 检出再执行），
   否则 `tools/agent_extract` 找不到 `config/`。
 - **自报成本**：qoder 的 token 看其用量面板；每批记一行，run 结束时汇总进 `run end`。

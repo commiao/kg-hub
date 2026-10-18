@@ -9,7 +9,10 @@
   next    取下一批待处理观测：从 NAS 的 claude-mem.db 副本按 id 游标读、过 utils/ingest_filter 质量闸
           （与 refinery 同一份 config）、再问 /api/ingest_extracted/check 跳过已入库的；写 batch 文件
   submit  把会话写好的抽取结果（按 id 对应 batch 里的观测）逐条 POST；每条的终态、纪律指标、耗时
-          追加到 log.jsonl；游标推进到本批最大 id。--executor / --run-id 是来源标记的另外两个维度
+          追加到 log.jsonl；游标推进到本批最大 id。**正式提交前必须对同一批做过 --dry-run**（四条红线之 2，
+          docs/EXTRACTION-EVAL-FRAMEWORK.md §2）：--dry-run 成功后在状态目录记 dryrun-<batch_id>.json，
+          正式提交时逐 id 核对，没预览过的 id 拒绝提交；确需跳过用 --skip-dryrun-check 明确表态
+  dryrun-check  只做上面那个核对（rc 0 = 全部预览过，1 = 有没预览的），给 codex / qoder 的钩子用--executor / --run-id 是来源标记的另外两个维度
           （执行工具、实验 run；docs/EXTRACTION-EVAL-FRAMEWORK.md §1），缺省从 KG_HUB_EXECUTOR /
           KG_HUB_RUN_ID 取，都没有就不打
   status  按 extractor_model（或 --group-by run_id / executor）汇总 log.jsonl：条数、纪律指标均值、每条耗时、
@@ -323,6 +326,34 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
     return out
 
 
+# ---------- 提交前必须 dry-run：由工具自己执行，不靠执行器记得 ----------
+
+def dryrun_marker_path(sd: Path, batch_id: str) -> Path:
+    return sd / f"dryrun-{batch_id}.json"
+
+
+def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = None) -> Path:
+    """把这次 dry-run 预览过的 id（服务端真的回了 dry_run 的那些）追加进标记文件。
+    同一批可以分几次 dry-run，取并集。"""
+    p = dryrun_marker_path(sd, batch_id)
+    seen: set[int] = set()
+    if p.exists():
+        seen.update(int(x) for x in json.loads(p.read_text()).get("ids", []))
+    seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
+                             "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
+    return p
+
+
+def dryrun_missing(sd: Path, batch_id: str, results: dict) -> list[int]:
+    """results 里带实体的 id 中，哪些还没在这一批的 dry-run 标记里。空 entities 的 id 不要求（它不会提交）。"""
+    p = dryrun_marker_path(sd, batch_id)
+    seen = {int(x) for x in json.loads(p.read_text()).get("ids", [])} if p.exists() else set()
+    items = results.get("items", [results] if "entities" in results else [])
+    return sorted({int(r["id"]) for r in items if r.get("entities")} - seen)
+
+
 SUMMARY_KEYS = ("model", "run_id", "executor")
 
 
@@ -478,7 +509,7 @@ def _save_state(p: Path, st: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run"])
+    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check"])
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
                     "（gate / status / final / checkpoint --adjust k=v --applied ...）；run：start / end")
     ap.add_argument("--executor", default=os.environ.get("KG_HUB_EXECUTOR") or None,
@@ -495,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--wall-s", type=float, help="run end：执行器自报总耗时（秒），缺省按 started_at→ended_at")
     ap.add_argument("--lessons-file", help="retro checkpoint：经验教训 markdown（本机路径）")
     ap.add_argument("--dry-run", action="store_true", help="submit：只让服务端消解不写图，看每个实体会并到谁")
+    ap.add_argument("--skip-dryrun-check", action="store_true",
+                    help="submit：跳过「本批必须先 dry-run」的核对（默认拒绝没预览过的 id；跳过要写进 lessons）")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--after-id", type=int, help="next：覆盖游标起点")
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
@@ -578,15 +611,31 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"batch": str(out), "picked": len(picked), "cursor": last_considered,
                           **stats}, ensure_ascii=False))
         return 0
+    if a.cmd == "dryrun-check":
+        if not (a.batch and a.file):
+            raise SystemExit("dryrun-check 需要 --batch --file")
+        batch = json.loads(Path(a.batch).read_text())
+        results = json.loads(Path(a.file).read_text())
+        missing = dryrun_missing(sd, batch.get("batch_id") or "?", results)
+        print(json.dumps({"batch": batch.get("batch_id"), "missing": missing, "ok": not missing}))
+        return 1 if missing else 0
     # submit
     if not (a.batch and a.file and a.model):
         raise SystemExit("submit 需要 --batch --file --model")
     batch = json.loads(Path(a.batch).read_text())
     results = json.loads(Path(a.file).read_text())
+    batch_id = batch.get("batch_id") or "?"
+    if not a.dry_run and not a.skip_dryrun_check:
+        missing = dryrun_missing(sd, batch_id, results)
+        if missing:
+            raise SystemExit(f"本批 {batch_id} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}{'…' if len(missing) > 10 else ''}）；"
+                             f"先 submit --dry-run，确需跳过加 --skip-dryrun-check 并写进 lessons")
     recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
                           token=token, log_path=log_path, dry_run=a.dry_run,
                           names_path=sd / f"names-{a.model}.tsv",
                           executor=a.executor, run_id=a.run_id)
+    if a.dry_run:
+        record_dryrun(sd, batch_id, recs)
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
