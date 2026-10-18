@@ -113,6 +113,8 @@ class ExportContractTests(unittest.TestCase):
             witness = Path(tmp) / "w.sqlite3"
             make_witness(witness)
             payload = E.collect(witness)
+            self.assertIn("attempt_window", payload)
+            self.assertTrue(all(set(row) == {"at", "business_key"} for row in payload["attempt_events"]))
             self.assertEqual(payload["ceilings"]["kg_hub.entity_extract"]["daily_requests"],
                              120000)
             self.assertEqual(payload["effective_limits"], {})

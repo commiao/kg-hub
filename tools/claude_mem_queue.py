@@ -62,13 +62,13 @@ def collect(home: Path, http_json, now: float) -> dict:
                     offset=f.tell()
                 db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)',(str(path),stat.st_ino,offset))
             health, health_error = http_json(f'http://127.0.0.1:{port}/api/health',timeout=4,retries=1)
-            data, error = http_json(f'http://127.0.0.1:{port}/api/processing-status',timeout=4,retries=1)
+            data, error = http_json(f'http://127.0.0.1:{port}/api/processing-status',timeout=15,retries=1)
             depth = (data or {}).get('queueDepth')
             valid = not error and isinstance(depth,int) and not isinstance(depth,bool) and depth>=0
             pid = str((health or {}).get('pid') or '') if not health_error else ''
             held, held_error = reconciliation_count(home / directory / 'claude-mem.db')
             current.append({'held':held,'held_error':held_error,'worker':worker,'port':port,'depth':depth if valid else None,
-                            'at':now,'pid':pid,'error':None if valid else '队列接口不可用或响应无效'})
+                            'at':now,'pid':pid,'error':None if valid else ('队列接口不可用：'+str(error) if error else '队列响应 queueDepth 无效')})
             db.execute('INSERT OR REPLACE INTO samples (worker,bucket,at,depth,pid,source,held) VALUES (?,?,?,?,?,?,?)',
                        (worker,int(now)//3600,now,depth if valid else None,pid,'live',held))
         db.execute('DELETE FROM samples WHERE at<?',(cutoff,))
