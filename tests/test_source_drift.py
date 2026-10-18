@@ -628,5 +628,89 @@ class UnreachableNasTests(unittest.TestCase):
             D.remote_hashes("x@y", str(self.src), ["a.py"])
 
 
+# 假检查器：按 FAKE_VERDICT 往 --status-file 写一行（none 表示什么都不写），按 FAKE_RC 退出。
+FAKE_CHECKER = """import os, sys
+from datetime import datetime, timezone
+verdict, rc = os.environ["FAKE_VERDICT"], int(os.environ["FAKE_RC"])
+if verdict != "none":
+    path = sys.argv[sys.argv.index("--status-file") + 1]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"{datetime.now(timezone.utc).isoformat()}\\t{verdict}\\tdetail\\n")
+sys.exit(rc)
+"""
+
+
+class RefreshVerdictBehaviourTests(unittest.TestCase):
+    """发布后刷新判决：说不说「已刷新」，以状态文件这次有没有被写为准。
+
+    上面 PostReleaseRefreshTests 只断言源码文本，从没执行过这个函数。原来它按退出码
+    分档，而退出码两头都有歧义 —— 1 既是 drift 也是未捕获异常，2 既是 error 也是参数
+    解析失败。2026-10-18 实测：检查器崩掉、状态文件根本不存在，它照样报「已刷新：
+    有待处理项」。
+
+    这里把函数从 release.sh 原样摘出来，旁边放一个假检查器，在 `set -euo pipefail`
+    和 UTF-8 locale 下真跑（发布脚本本身就是这么跑的；准则 31）。HOME 指进沙箱。
+    """
+
+    def setUp(self):
+        import re
+        import shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="refresh-verdict-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        nas = self.tmp / "deploy" / "nas"
+        nas.mkdir(parents=True)
+        source = (ROOT / "deploy" / "nas" / "release.sh").read_text("utf-8")
+        body = re.search(r"^refresh_drift_verdict\(\) \{\n.*?^\}\n", source, re.M | re.S)
+        self.assertIsNotNone(body, "release.sh 里找不到 refresh_drift_verdict")
+        (nas / "fn.sh").write_text(body.group(0))
+        (nas / "check_source_drift.py").write_text(FAKE_CHECKER)
+        self.home = self.tmp / "home"
+        self.status = self.home / ".cache" / "kg-hub" / "source-drift.status"
+        self.fn = nas / "fn.sh"
+
+    def refresh(self, verdict: str, rc: int, previous: str | None = "base\tok\tSENTINEL\n"):
+        if previous is not None:
+            self.status.parent.mkdir(parents=True, exist_ok=True)
+            self.status.write_text(previous)
+        done = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; say() { printf "%s\\n" "$*" >&2; }; '
+                           'source "$1"; refresh_drift_verdict', "_", str(self.fn)],
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "LC_ALL": "en_US.UTF-8",
+                 "FAKE_VERDICT": verdict, "FAKE_RC": str(rc)},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, f"刷新失败不该让发布失败：{done.stderr}")
+        return done.stderr
+
+    def test_written_verdicts_are_reported_as_written(self):
+        for verdict, rc, says in (("ok", 0, "巡检判决已刷新：一致"),
+                                  ("drift", 1, "巡检判决已刷新：有待处理项"),
+                                  ("error", 2, "巡检判决已刷新：这次没查成（error）")):
+            with self.subTest(verdict=verdict):
+                self.assertIn(says, self.refresh(verdict, rc))
+
+    def test_a_crashed_checker_is_not_reported_as_pending_items(self):
+        """未捕获异常退出 1、什么都没写 —— 原来正好顺着 1 的分支报成「有待处理项」。"""
+        out = self.refresh("none", 1)
+        self.assertIn("没有**刷新", out)
+        self.assertNotIn("已刷新", out)
+        self.assertIn("SENTINEL", self.status.read_text())
+
+    def test_an_unwritten_exit_two_is_not_reported_as_refreshed(self):
+        """参数解析失败也退出 2，同样什么都没写。"""
+        out = self.refresh("none", 2)
+        self.assertIn("没有**刷新", out)
+        self.assertNotIn("已刷新", out)
+
+    def test_exit_zero_without_a_status_file_is_not_refreshed_either(self):
+        out = self.refresh("none", 0, previous=None)
+        self.assertIn("没有**刷新", out)
+
+    def test_an_unknown_verdict_is_named_not_guessed(self):
+        out = self.refresh("maybe", 0)
+        self.assertIn("不认识的「maybe」", out)
+        self.assertNotIn("已刷新：一致", out)
+
+
 if __name__ == "__main__":
     unittest.main()
