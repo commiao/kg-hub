@@ -76,6 +76,22 @@ class GroupByTest(unittest.TestCase):
         self.assertTrue(lines[3].startswith("| codex | 2 | 5.0 | 4.5 | 0.0% | — |"))
         self.assertTrue(xc.render(t, "run_id").startswith("| run |"))
 
+    def test_gateway_single_is_its_own_group(self):
+        """网关单次抽取与 graphiti 归一后的内容共用 extractor_model 标签，必须按 extraction_mode 分开。"""
+        for cypher in (xc._EP, xc._EDGES, xc._ENTS):
+            self.assertIn("extraction_mode = 'gateway_single'", cypher)
+            self.assertIn("'gateway_single:' + coalesce(", cypher)
+        src = "gateway_single:gateway:kg_hub.entity_extract"
+        t = xc.aggregate(
+            [{"src": "gateway:kg_hub.entity_extract", "eps": 2, "mentions": 18, "edges": 13, "zero_entities": 0},
+             {"src": src, "eps": 2, "mentions": 11, "edges": 8, "zero_entities": 0}],
+            [{"src": src, "name": "depends_on", "count": 8, "dups": 0}],
+            [{"src": src, "name": "FalkorDB", "summary_len": 40, "l": ["Entity", "Tool"]}])
+        self.assertEqual((t[src]["edges_per_episode"], t[src]["edge_in_schema"]), (4.0, 1.0))
+        self.assertEqual(t["gateway:kg_hub.entity_extract"]["edges_per_episode"], 6.5)
+        rows = [l.split(" | ")[0].strip("| ") for l in xc.render(t).splitlines()[2:]]
+        self.assertEqual(rows, ["gateway:kg_hub.entity_extract", src])
+
 
 if __name__ == "__main__":
     unittest.main()

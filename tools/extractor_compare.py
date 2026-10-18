@@ -7,6 +7,9 @@
   extractor_tool   执行工具（claude-code / codex / qoder / script）；没有的归 ``unknown``
   run_id           实验 run（docs/EXTRACTION-EVAL-FRAMEWORK.md §3 的运行清单）；没有的归 ``unknown``
 后两个字段 2026-10-19 才加（框架 §8-1），之前入图的内容全是 ``unknown``，不回填。
+网关单次抽取（KG_HUB_INGEST_MODE=single_pass）的 episode/节点/边带 ``extraction_mode='gateway_single'``，
+它们的 extractor_model 与 graphiti 模式归一后打的是同一个路由标签，所以按 extractor_model 分组时单独成组：
+``gateway_single:<extractor_model>``，这样同一路由模型的两种链路能并排比。
 
 指标与报告第 3 节、tools/digest_retro.py 同口径：实体/条、边/条、零实体/零边占比、边名合规率
 （schema 15 个名，大小写不敏感）、不同边名数、重复三元组、实体有类型、脏命名、摘要均长。
@@ -30,15 +33,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.digest_retro import schema_names, DIRTY_PREFIXES  # noqa: E402
 
+GATEWAY_SINGLE_PREFIX = "gateway_single:"
 GROUP_KEYS = ("extractor_model", "extractor_tool", "run_id")
 
 
 def source_expr(var: str, group_by: str = "extractor_model") -> str:
-    """分组键的 Cypher 表达式。extractor_model 缺省回落到 legacy:<月份>，其余字段缺省为 unknown。"""
+    """分组键的 Cypher 表达式。extractor_model：gateway_single 单列，其余缺省回落到 legacy:<月份>；
+    另两个字段缺省为 unknown。"""
     if group_by not in GROUP_KEYS:
         raise ValueError(f"--group-by 只能是 {GROUP_KEYS}")
     if group_by == "extractor_model":
-        return f"coalesce({var}.extractor_model, 'legacy:' + substring(toString({var}.created_at),0,7))"
+        return (f"CASE WHEN {var}.extraction_mode = 'gateway_single' "
+                f"THEN '{GATEWAY_SINGLE_PREFIX}' + coalesce({var}.extractor_model, '?') "
+                f"ELSE coalesce({var}.extractor_model, 'legacy:' + substring(toString({var}.created_at),0,7)) END")
     return f"coalesce({var}.{group_by}, 'unknown')"
 
 
