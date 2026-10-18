@@ -82,6 +82,11 @@ def plan_node_fixes(nodes: list[dict], entity_types: set[str], since: datetime) 
 _RENAME_EDGES = ("UNWIND $items AS it MATCH ()-[r:RELATES_TO {uuid: it.uuid}]->() "
                  "SET r.raw_name = it.raw, r.name = it.name RETURN count(r) AS c")
 _TAG_EPISODE = ("MATCH (e:Episodic {uuid: $u}) SET e.extraction_mode = 'gateway', e.extractor_model = $label")
+# 本次新建的边与实体也打来源标记（与会话自抽取路径一致），extractor_compare 才能按模型分组它们
+_TAG_EDGES = ("UNWIND $ids AS id MATCH ()-[r:RELATES_TO {uuid: id}]->() "
+              "WHERE r.extractor_model IS NULL SET r.extractor_model = $label RETURN count(r) AS c")
+_TAG_NODES = ("MATCH (n:Entity) WHERE n.uuid IN $ids AND n.extractor_model IS NULL "
+              "SET n.extractor_model = $label RETURN count(n) AS c")
 _MARK_DIRTY = "MATCH (n:Entity) WHERE n.uuid IN $ids SET n.dirty_name = true RETURN count(n) AS c"
 _OTHER_MENTIONS = ("MATCH (n:Entity {uuid: $u}) OPTIONAL MATCH (n)<-[m:MENTIONS]-(x:Episodic) "
                    "WHERE x.uuid <> $ep RETURN count(m) AS others")
@@ -125,4 +130,20 @@ async def post_ingest_normalize(driver, *, episode_uuid: str, edges: list[dict],
         await driver.execute_query(_MARK_DIRTY, ids=plan.dirty_existing)
         stats["dirty_marked"] = len(plan.dirty_existing)
     await driver.execute_query(_TAG_EPISODE, u=episode_uuid, label=extractor_label)
+    edge_ids = [e["uuid"] for e in edges if e.get("uuid") and e["uuid"] not in gone]
+    if edge_ids:
+        await driver.execute_query(_TAG_EDGES, ids=edge_ids, label=extractor_label)
+    new_node_ids = []
+    for n in nodes:
+        created = n.get("created_at")
+        if isinstance(created, str):
+            created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        if created is not None and created.tzinfo is None:
+            created = created.replace(tzinfo=since.tzinfo)
+        if created is not None and created >= since and n["uuid"] not in plan.dirty_new:
+            new_node_ids.append(n["uuid"])
+    if new_node_ids:
+        await driver.execute_query(_TAG_NODES, ids=new_node_ids, label=extractor_label)
+    stats["tagged_edges"] = len(edge_ids)
+    stats["tagged_nodes"] = len(new_node_ids)
     return stats
