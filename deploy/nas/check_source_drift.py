@@ -109,6 +109,47 @@ except ImportError as exc:                       # noqa: BLE001 —— 要的就
         "fleet-ops 产物缺失或 current 软链断了。这不等于没漂，只是这次判不了。")
 RELEASE = REPO / "deploy" / "nas" / "release.sh"
 
+# 远端读取失败的两种可辨认原因。255 是 ssh 自己的退出码（连接、认证失败）；3 是下面
+# 几条远端命令的约定：cd 进源码目录失败就 exit 3。
+SSH_FAILED = 255
+SRC_MISSING = 3
+
+
+class RemoteUnavailable(Exception):
+    """读不了 NAS：连不上、源码目录不在、或远端命令没跑完。
+
+    这和「NAS 上确实没有某个文件」是两件事，处置相反：前者去修连接，后者去查谁动了
+    生产。2026-10-18 实测把前者报成了后者 —— NAS 不可达时远端清单为空，于是每个跟踪
+    文件都被判成「NAS 上没有」，以 drift 写进状态文件（「380 处实质不一致」）；默认
+    跑法则在 live_commit 处 SystemExit，状态文件根本不写，留着上一条 ok。
+    main 统一把它接成 error，三态里本来就留着这一格。
+    """
+
+
+def _ssh(ssh_target: str, command: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25", ssh_target,
+         command],
+        capture_output=True, text=True)
+
+
+def _oneline(text: str) -> str:
+    """原因会进一行一条的状态文件；ssh 的 stderr 常有多行（例如先打一句 Warning）。"""
+    return " ".join(text.split())[:200] or "无输出"
+
+
+def _require_remote(proc: subprocess.CompletedProcess, ssh_target: str, src: str,
+                    what: str) -> None:
+    """远端命令没有明确成功，就不许把它的输出当成 NAS 的真实状态。"""
+    if proc.returncode == 0:
+        return
+    why = _oneline(proc.stderr)
+    if proc.returncode == SSH_FAILED:
+        raise RemoteUnavailable(f"连不上 NAS（{ssh_target}），{what}没取到：{why}")
+    if proc.returncode == SRC_MISSING:
+        raise RemoteUnavailable(f"NAS 上没有源码目录 {src}，{what}没取到")
+    raise RemoteUnavailable(f"取{what}的远端命令退出 {proc.returncode}：{why}")
+
 
 def set_repo(path) -> None:
     """覆盖被检查的仓库。默认是脚本自己所在的那棵树。"""
@@ -191,14 +232,14 @@ def looks_like_backup(name: str) -> bool:
 
 def live_commit(ssh_target: str, src: str) -> str:
     """线上正在跑的那个 commit。取自 release.sh 自己写的 .env，不是我们猜的。"""
-    proc = subprocess.run(
-        ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25", ssh_target,
-         f"grep '^KG_HUB_IMAGE_TAG=' '{src}/.env' 2>/dev/null | head -1 | cut -d= -f2-"],
-        capture_output=True, text=True)
+    proc = _ssh(ssh_target,
+                f"grep '^KG_HUB_IMAGE_TAG=' '{src}/.env' 2>/dev/null | head -1 | cut -d= -f2-")
+    if proc.returncode == SSH_FAILED:
+        _require_remote(proc, ssh_target, src, "线上镜像标签")
     value = proc.stdout.strip()
     if not re.fullmatch(r"[0-9a-f]{7,40}", value):
-        raise SystemExit(
-            f"读不到线上镜像标签（拿到 {value!r}）：{proc.stderr.strip() or '无输出'}")
+        raise RemoteUnavailable(
+            f"读不到线上镜像标签（拿到 {value!r}）：{_oneline(proc.stderr)}")
     return value
 
 
@@ -214,11 +255,15 @@ def tracked_at(ref: str) -> list[str]:
 
 
 def remote_listing(ssh_target: str, src: str) -> list[str]:
-    """NAS 上实际存在的文件（去掉允许的非跟踪项）。"""
-    proc = subprocess.run(
-        ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25", ssh_target,
-         f"cd '{src}' 2>/dev/null && find . -type f 2>/dev/null"],
-        capture_output=True, text=True)
+    """NAS 上实际存在的文件（去掉允许的非跟踪项）。
+
+    取不到就抛 RemoteUnavailable，绝不返回空清单 —— 空清单会让每个跟踪文件都被判成
+    「NAS 上没有」。find 自己的报错（个别目录读不了）照旧不算失败，所以末尾显式 exit 0。
+    """
+    proc = _ssh(ssh_target,
+                f"cd '{src}' 2>/dev/null || exit {SRC_MISSING}; "
+                "find . -type f 2>/dev/null; exit 0")
+    _require_remote(proc, ssh_target, src, "NAS 文件清单")
     out = []
     for line in proc.stdout.splitlines():
         name = line.strip().removeprefix("./")
@@ -236,12 +281,13 @@ def remote_hashes(ssh_target: str, src: str, names: list[str]) -> dict[str, str]
     # 清单可能上千条，命令行有长度上限；分批发。
     for i in range(0, len(safe), 250):
         quoted = " ".join(f"'{n}'" for n in safe[i:i + 250])
-        proc = subprocess.run(
-            ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=25", ssh_target,
-             f"cd '{src}' 2>/dev/null && for f in {quoted}; do "
-             f"[ -f \"$f\" ] && printf '%s %s\\n' "
-             f"\"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$f\"; done"],
-            capture_output=True, text=True)
+        # 循环最后一轮的 [ -f ] 为假时整条命令会以 1 结束，所以同样显式 exit 0：
+        # 「这个文件不在」是正常结果（键不出现），「这批根本没查成」才要抛。
+        proc = _ssh(ssh_target,
+                    f"cd '{src}' 2>/dev/null || exit {SRC_MISSING}; for f in {quoted}; do "
+                    f"[ -f \"$f\" ] && printf '%s %s\\n' "
+                    f"\"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$f\"; done; exit 0")
+        _require_remote(proc, ssh_target, src, "NAS 文件摘要")
         for line in proc.stdout.splitlines():
             parts = line.split(None, 1)
             if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
@@ -387,7 +433,21 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.repo is not None:
         set_repo(args.repo)
+    try:
+        return _judge(args)
+    except RemoteUnavailable as exc:
+        # 两种清单模式不出判决（既有用例钉着），而且它们的 stdout 是给 release.sh 读的
+        # 机器清单 —— 原因只走 stderr。退出码非零，让调用方知道「这次没查成」，
+        # 而不是「查了，什么都没有」（prune_orphans 正是按「不是明确成功就不删」写的）。
+        if args.list_extra or args.list_prunable:
+            print(f"🟠 {exc}", file=sys.stderr)
+        else:
+            print(f"🟠 {exc}")
+            write_status(args.status_file, "error", str(exc))
+        return 2
 
+
+def _judge(args: argparse.Namespace) -> int:
     config = release_config()
     ssh_target, src = config["ssh"], config["src"]
     ref = args.ref or live_commit(ssh_target, src)
