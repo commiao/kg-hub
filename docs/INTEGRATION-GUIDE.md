@@ -89,14 +89,14 @@ KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
 - **MCP**:`~/.cursor/mcp.json` 加 `muxcp`。
 - **PUSH + capture**:`<工程>/.cursor/hooks.json` 的 `beforeSubmitPrompt` 里挂两类——
   - claude-mem 的 `hook cursor session-init/observation/...`(capture,写规则文件机制);
-  - `kg_push_hook.py --format cursor`(注入,写 `.cursor/rules/kg-hub-canonical.mdc`,`alwaysApply:true`)。
+  - `/bin/sh ~/.local/share/kg-hub/current/tools/kg_push_hook.sh --format cursor`(注入,写 `.cursor/rules/kg-hub-canonical.mdc`,`alwaysApply:true`)。同 3.1,走包装脚本,不直接调 `kg_push_hook.py`。
 
 ### 3.3 Qoder(桌面版 + IDEA 插件)✅
 **两个 Qoder 共用同一后端** `~/.qoder/shared_client`,都读 `~/.qoder/settings.json`。配一次,两者通用。
 - **MCP**:`~/.qoder/mcp.json` 加 `muxcp`(本项目已是)。
 - **PUSH + capture**:`~/.qoder/settings.json` 的 `hooks`(Claude-Code 式:`SessionStart`/`UserPromptSubmit`/`PostToolUse`/`Stop`):
   - claude-mem 捕获钩子 **经 wrapper 调用** `tools/qoder_cm_hook.sh <mode>`(见下"坑3");
-  - `SessionStart` 追加一组(**不设 matcher = match-all**)跑 `kg_push_hook.py --format claude`(Qoder 的 SessionStart source 值和 Claude Code 不同,matcher 写死会不触发)。
+  - `SessionStart` 追加一组(**不设 matcher = match-all**)跑 `/bin/sh ~/.local/share/kg-hub/current/tools/kg_push_hook.sh --format claude`(Qoder 的 SessionStart source 值和 Claude Code 不同,matcher 写死会不触发;同 3.1,走包装脚本)。
 - ⚠️ **改完必须重启 Qoder 后端 daemon 才生效**(见"坑1")。
 
 ### 3.4 Codex ✅
@@ -130,6 +130,11 @@ KG_HUB_FEISHU_WEBHOOK=<可选:连不上时告警>
 **坑6:claude-mem worker 空转烧 CPU(#2188)。** bun-runner 收空 stdin 会死循环。已用 `tools/claude_mem_guard.sh` + launchd 兜底(累计 CPU>120s 的 claude-mem hook 进程自动清+告警)。换设备记得也装这个守护。
 
 **坑7:claude-mem 不产新 obs。** 多半是 runtime 没装好 / 找不到 `claude` 可执行文件 → `~/.claude-mem/settings.json` 设 `CLAUDE_CODE_PATH`,并 `npx claude-mem@latest install` 重建 + 重启 worker。
+
+**坑8:PUSH 注入悄悄失效,会话照常打开。** hook 失败不阻塞会话,所以坏了也没人发现(2026-10 曾连续数天每次都 Connection refused:三处配置都直接调 `kg_push_hook.py`,venv 已删、也拿不到 `KG_HUB_URL`)。
+- **怎么判断**:看 `<kg-hub 工作树>/data/.push_hook.log`(包装脚本固定写这里;发布目录不可变、不能写)。近期有 `OK fmt=<工具>` 行才算在工作;只有 `START` 或 `failed` 就是坏的。
+- **配置在哪**(都不在仓库里,换机器要逐处配):Claude Code `~/.claude/settings.json`、Qoder `~/.qoder/settings.json`、Cursor `<工程>/.cursor/hooks.json`;三处都调 `tools/kg_push_hook.sh`,见 3.1–3.3。Codex 没有这类 hook(见 3.4)。
+- **改了 `tools/kg_push_hook.py` 要做 Mac 侧发布才生效**:hook 跑的是发布产物 `~/.local/share/kg-hub/current`,见 `deploy/mac/README.md`。
 
 ---
 
@@ -179,7 +184,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $KG_HUB_URL/api/stats        # 图规�
 | 现象 | 排查 |
 |---|---|
 | 工具调 kg_* 无返回 | `tailscale status`;`curl $KG_HUB_URL/health`;muxcp 是否在该工具 MCP 配置里 |
-| PUSH 没注入 | `python3 tools/kg_push_hook.py --probe`;确认跑它的 python 能读到 `.env` |
+| PUSH 没注入 | 先看 `data/.push_hook.log` 近期有没有 `OK fmt=` 行(坑8);再 `python3 tools/kg_push_hook.py --probe`,确认跑它的 python 能读到 `.env` |
 | capture 无新会话 | 看坑1(Qoder 重启 daemon)/坑6/坑7;`sdk_sessions` 是否有该工具平台的新行 |
 | project 标成版本号 | 坑2(wrapper 设 `CLAUDE_PROJECT_DIR`)|
 | 传文件群晖失败 | 坑4(`cat\|ssh` 管道)|
