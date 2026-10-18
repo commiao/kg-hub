@@ -207,5 +207,37 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(asyncio.run(xi.check_keys(D(), [])), {})
 
 
+
+class ProvenanceFieldsTest(unittest.TestCase):
+    """框架 §8-1：extractor_tool / run_id 随 episode、新实体、新边落图；不给时为 None（与旧内容一致）。"""
+
+    def _write(self, **kw):
+        n = xi.normalize_extraction(ents(("Brand New", "Concept", ""), ("Other New", "Tool", "")),
+                                    edges(("Brand New", "references", "Other New", "f")), ENTITY_TYPES, EDGE_TYPES)
+        d = FakeDriver()
+        asyncio.run(xi.write_extraction(d, FakeEmbedder(), n, name="x", episode_body="b", source_description="sd",
+                                        reference_time=datetime(2026, 10, 19, tzinfo=timezone.utc),
+                                        extractor_model="m", group_id="kg_hub", episode_uuid="ep", **kw))
+        ep = [p for c, p in d.calls if c.startswith("MERGE (e:Episodic")][0]
+        node = [p for c, p in d.calls if c.startswith("MERGE (n:Entity")][0]["entity_data"]
+        edge = [p for c, p in d.calls if c.startswith("MATCH (source:Entity")][0]["edge_data"]
+        cy = [c for c, _ in d.calls if c.startswith("MERGE (e:Episodic")][0]
+        return ep, node, edge, cy
+
+    def test_tool_and_run_id_written_everywhere(self):
+        ep, node, edge, cy = self._write(extractor_tool="codex", run_id="20261019-codex-s50")
+        self.assertIn("extractor_tool: $extractor_tool, run_id: $run_id", cy)
+        self.assertEqual((ep["extractor_tool"], ep["run_id"]), ("codex", "20261019-codex-s50"))
+        self.assertEqual((node["extractor_tool"], node["run_id"]), ("codex", "20261019-codex-s50"))
+        self.assertEqual((edge["extractor_tool"], edge["run_id"]), ("codex", "20261019-codex-s50"))
+        self.assertEqual(edge["extractor_model"], "m")
+
+    def test_defaults_to_none_for_compat(self):
+        ep, node, edge, _ = self._write()
+        self.assertEqual((ep["extractor_tool"], ep["run_id"]), (None, None))
+        self.assertEqual((node["extractor_tool"], node["run_id"]), (None, None))
+        self.assertEqual((edge["extractor_tool"], edge["run_id"]), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

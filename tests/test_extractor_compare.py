@@ -28,7 +28,53 @@ class AggregateTest(unittest.TestCase):
         self.assertEqual((hk["edge_in_schema"], hk["zero_entity_share"], hk["edge_distinct_names"]), (1.0, 0.25, 1))
         md = xc.render(t)
         self.assertTrue(md.splitlines()[2].startswith("| legacy:2026-10 |"))
-        self.assertIn("| claude-haiku-5-5 | 4 | 6.0 | 4.0 | 25.0% | 100.0% | 1 |", md)
+        self.assertIn("| claude-haiku-5-5 | 4 | 6.0 | 4.0 | 25.0% | — | 100.0% | 1 |", md)
+
+
+
+class GroupByTest(unittest.TestCase):
+    """框架 §8-1：按 extractor_tool / run_id 分组；旧内容没有这两个字段 → unknown，不回落月份。"""
+
+    def test_source_expr_and_queries(self):
+        self.assertIn("coalesce(e.extractor_model, 'legacy:'", xc.source_expr("e"))
+        self.assertEqual(xc.source_expr("r", "extractor_tool"), "coalesce(r.extractor_tool, 'unknown')")
+        self.assertEqual(xc.source_expr("n", "run_id"), "coalesce(n.run_id, 'unknown')")
+        with self.assertRaises(ValueError):
+            xc.source_expr("e", "created_at")
+        ep, edges, ents = xc.queries("run_id")
+        for q in (ep, edges, ents):
+            self.assertIn("run_id, 'unknown') AS src", q)
+            self.assertNotIn("legacy:", q)
+        self.assertIn("AS zero_edges", ep)
+        self.assertEqual(xc.queries("extractor_model"), (xc._EP, xc._EDGES, xc._ENTS))
+
+    def test_collect_passes_group_by_queries_to_driver(self):
+        class D:
+            def __init__(self):
+                self.seen = []
+
+            async def execute_query(self, cy, **p):
+                self.seen.append((cy, p))
+                return [], None, None
+        d = D()
+        import asyncio
+        t = asyncio.run(xc.collect(d, "kg_hub", "extractor_tool"))
+        self.assertEqual(t, {})
+        self.assertEqual(len(d.seen), 3)
+        self.assertTrue(all("extractor_tool, 'unknown') AS src" in cy and p == {"g": "kg_hub"} for cy, p in d.seen))
+
+    def test_zero_edge_share_and_render_by_tool(self):
+        eps = [{"src": "unknown", "eps": 4, "mentions": 8, "edges": 6, "zero_entities": 0, "zero_edges": 1},
+               {"src": "codex", "eps": 2, "mentions": 10, "edges": 9, "zero_entities": 0}]   # 旧 json 没有 zero_edges
+        t = xc.aggregate(eps, [], [])
+        self.assertEqual(t["unknown"]["zero_edge_share"], 0.25)
+        self.assertIsNone(t["codex"]["zero_edge_share"])
+        md = xc.render(t, "extractor_tool")
+        lines = md.splitlines()
+        self.assertTrue(lines[0].startswith("| 执行器 | episodes | 实体/条 | 边/条 | 零实体 | 零边 |"))
+        self.assertTrue(lines[2].startswith("| unknown | 4 | 2.0 | 1.5 | 0.0% | 25.0% |"))   # 没打标的排前面
+        self.assertTrue(lines[3].startswith("| codex | 2 | 5.0 | 4.5 | 0.0% | — |"))
+        self.assertTrue(xc.render(t, "run_id").startswith("| run |"))
 
     def test_gateway_single_is_its_own_group(self):
         """网关单次抽取与 graphiti 归一后的内容共用 extractor_model 标签，必须按 extraction_mode 分开。"""

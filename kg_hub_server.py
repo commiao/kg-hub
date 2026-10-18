@@ -1874,6 +1874,10 @@ class ExtractedIngestBody(IngestBody):
     extractor_model: str
     extractor_session: str | None = None
     prompt_version: str | None = None
+    # 2026-10-19 框架 §1：执行工具（claude-code / codex / qoder / script）与实验 run 是独立于模型的两个变量，
+    # 都是可选来源标记；缺省 null，与已入图的旧 episode 一致（读侧 coalesce）。
+    extractor_tool: str | None = None
+    run_id: str | None = None
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge] = []
     # 只做消解不写图：返回每个实体会复用到哪个旧实体（第 2 轮复盘要求的写入前预览）
@@ -1903,7 +1907,8 @@ async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extractio
                     name=body.name, episode_body=body.episode_body, source_description=sd,
                     reference_time=ref_time, extractor_model=body.extractor_model,
                     group_id=GROUP_ID, extractor_session=body.extractor_session,
-                    prompt_version=body.prompt_version)
+                    prompt_version=body.prompt_version, extractor_tool=body.extractor_tool,
+                    run_id=body.run_id)
             try:
                 await _tag_schema_fields(graphiti, result.episode_uuid, body)
             except Exception:  # noqa: BLE001 — 元数据打标失败不影响入图
@@ -1967,6 +1972,11 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "bad_schema", "message": exc.errors()}, status_code=400)
     if not EXTRACTOR_MODEL_PATTERN.fullmatch(body.extractor_model):
         return JSONResponse({"status": "error", "code": "bad_extractor_model"}, status_code=400)
+    # 两个可选来源标记与 extractor_model 同一字符集：它们会作为分组键出现在报表与 Cypher 参数里
+    if body.extractor_tool is not None and not EXTRACTOR_MODEL_PATTERN.fullmatch(body.extractor_tool):
+        return JSONResponse({"status": "error", "code": "bad_extractor_tool"}, status_code=400)
+    if body.run_id is not None and not EXTRACTOR_MODEL_PATTERN.fullmatch(body.run_id):
+        return JSONResponse({"status": "error", "code": "bad_run_id"}, status_code=400)
     try:
         ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001
@@ -2045,6 +2055,7 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"]}
                      for k, v in result.resolved.items()},
         "stats": extraction.stats, "extractor_model": body.extractor_model,
+        "extractor_tool": body.extractor_tool, "run_id": body.run_id,
         "source_description": sd, "source_obs_id": sid})
 
 
