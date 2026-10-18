@@ -106,6 +106,15 @@ class MailboxStore:
                 raise RuntimeError("mailbox task identity collision")
             if row:
                 old = json.loads(row[3])
+                # 失败次数只增不减：网关按已收下的版本校验，变小就整条 "stale task
+                # report" 拒收，任务从此停在 reconciliation（T-0238：2026-10-11 一条
+                # 成功报告带着 0 次失败去覆盖之前报过的 1 次）。本地次数是每次现算的，
+                # 执行记录的状态会被改写、也会被夜间清理删掉，现算值可能变小。
+                prior = old.get("failed_attempts")
+                if type(prior) is int and prior > data["failed_attempts"]:
+                    data["failed_attempts"] = prior
+                    if prior >= data["max_attempts"]:
+                        data["retryable"] = False   # 网关：可重试必须还有剩余次数
                 old.pop("version", None)
                 if old == data:
                     # 2026-10-10: every cycle re-prepared ~7400 unchanged reports,
