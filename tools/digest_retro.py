@@ -103,6 +103,24 @@ KNOBS: dict[str, dict] = {
     "entity_name_filter": {
         "applies": "入图时把 commit 哈希/绝对路径/任务号降级为属性而非节点（待实现）",
         "implemented": False, "metric": "dirty_name_share"},
+    # 网关侧四个旋钮（docs/EXTRACTION-EVAL-FRAMEWORK.md §3）：全是 kg-hub-server 的环境变量，
+    # 改后需发布服务端才生效；运行清单 runs/<run_id>.json 的 knobs 里记「本次实验假定的值」。
+    "gateway.post_normalize": {
+        "applies": "服务端环境变量 KG_HUB_POST_NORMALIZE（默认 1；网关路径入图后边名归 schema、无类型兜底、"
+                   "脏命名降级，见 utils/gateway_post_normalize），改后需发布 kg-hub-server",
+        "implemented": True, "metric": "edge_in_schema"},
+    "gateway.custom_extraction": {
+        "applies": "服务端环境变量 KG_HUB_CUSTOM_EXTRACTION（默认 1；把 config/gateway_extraction_instructions.md "
+                   "注入 graphiti 抽取提示词），改后需发布 kg-hub-server；改指令正文也需发布",
+        "implemented": True, "metric": "edge_in_schema"},
+    "gateway.max_tokens": {
+        "applies": "服务端环境变量 KG_HUB_LLM_MAX_TOKENS（默认 8192；graphiti_client 单次模型调用的输出上限，"
+                   "长观测截断看这里），改后需发布 kg-hub-server",
+        "implemented": True, "metric": "zero_edge_share"},
+    "gateway.edge_empty_retry": {
+        "applies": "抽边阶段空结果守卫：ENTITIES ≥ 4 且 edges 为空时追加提示重问一次（待实现，用户决定；"
+                   "成本上限 +7% 调用），落地后为服务端环境变量，需发布",
+        "implemented": False, "metric": "zero_edge_share"},
 }
 
 THRESHOLDS = {

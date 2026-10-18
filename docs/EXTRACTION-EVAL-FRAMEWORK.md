@@ -22,7 +22,7 @@
 
 | 变量 | 取值举例 | 在哪记录 | 混杂风险 |
 |---|---|---|---|
-| 执行器 `executor` | claude-code / codex / qoder / dskhress / script（直连网关的脚本） | 来源标记 `extractor_tool`（待加） | 会话型执行器的模型随工具走，必须单独记模型 |
+| 执行器 `executor` | claude-code / codex / qoder / dskhress / script（直连网关的脚本） | 来源标记 `extractor_tool`（已加，与 `run_id` 一起随 episode/实体/边入图） | 会话型执行器的模型随工具走，必须单独记模型 |
 | 模型 `model` | claude-fable-5-1 / claude-opus-5-5 / gpt-5-codex / deepseek-v4-flash / qwen3.6-plus | `extractor_model`（已有） | 换模型时不许同时改规则（10-17 三轮犯过） |
 | 规则 `rules` | 提示词版本 + schema + 服务端旋钮（消解阈值、归一、自定义指令、max_tokens、空边守卫） | `prompt_version`（已有）+ 运行清单里的旋钮快照 | 服务端旋钮改了要发布，记 commit |
 | 样本 `sample` | 冻结样本集 id（`ab-sample-20261017` 50 条分层）或 id 区间 | 运行清单 | 不同批观测的难度不同，跨样本不比密度 |
@@ -41,10 +41,14 @@ python -m tools.agent_extract next   --n 20 --out batch.json          # 取待�
 <执行器按 config/agent_extract_prompt.md 抽取，写 results.json：{items:[{id, entities, edges}]}>
 python -m tools.agent_extract submit --batch batch.json --file results.json --dry-run   # 看消解会并到谁
 python -m tools.agent_extract submit --batch batch.json --file results.json \
-        --model <模型id> --session <会话或运行id> [--executor <工具名> --run-id <run_id>]   # 后两项待加
+        --model <模型id> --session <会话或运行id> [--executor <工具名> --run-id <run_id>]   # 后两项缺省取 KG_HUB_EXECUTOR / KG_HUB_RUN_ID
 python -m tools.agent_extract status                                   # 提交口径：ok/empty/reuse_mismatch/时延
 python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 每 500 条
 ```
+
+每次实验前后各一条：`agent_extract run start --run-id <id> --executor <工具> --model <模型>`（建运行清单，§3）、
+`agent_extract run end --run-id <id> --input-tokens N --output-tokens N`（收尾自报成本）。
+各工具可直接粘贴的任务说明在 `docs/executors/`（claude-code / codex / qoder，公共部分 `_common.md`）。
 
 执行器必须满足的四条（放进每个工具的任务说明里）：
 1. 抽取只用提示词文件里的 schema，不自创类型和边名；没有知识就提交空 entities，不凑数。
@@ -76,7 +80,8 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 ```
 
 旋钮名沿用 `tools/digest_retro.py` 的 `KNOBS` 登记表；网关侧四个旋钮（归一、自定义指令、max_tokens、空边守卫）
-要补登记（§8）。没登记的旋钮 `checkpoint` 会拒绝，这是防「改了没记」的闸。
+已登记为 `gateway.*`（前三个是服务端环境变量 `KG_HUB_POST_NORMALIZE` / `KG_HUB_CUSTOM_EXTRACTION` / `KG_HUB_LLM_MAX_TOKENS`，
+改后需发布；空边守卫未实现，只能记为建议）。没登记的旋钮 `checkpoint` 和 `run start` 都会拒绝，这是防「改了没记」的闸。
 
 ## 4. 三个测量面合成一张表
 
@@ -86,8 +91,10 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 | 提交口径（消解与纪律） | `/api/ingest_extracted` 返回与状态目录 | `agent_extract status` | ok/empty/skipped、reuse_mismatch/条、服务端写图时延 |
 | 成本口径 | 网关路径：账本 `/backup/model-attempts.sqlite3`（按 `source_description` 前缀索引取）；会话路径：运行清单自报 | `ab_score --journal`、本文 §4.2 的统计脚本思路 | 每条调用次数、每条输入/输出 token、每条 wall、阶段分布 |
 
-待写的 `tools/eval_report.py --run-id A --run-id B ...`：读三面，按 run 并排成一张 markdown 表，列顺序固定为
-纪律 → 丰富度 → 消解 → 成本 → 检索（`tools/kg_eval.py` 固定问题集的召回）。判据沿用替代方案第二部分 §2 的目标列。
+`tools/eval_report.py --run-id A --run-id B ...`（已写）：读三面，按 run（或 `--model` / `--executor`）并排成一张 markdown 表，
+列顺序固定为纪律 → 丰富度 → 消解 → 成本 → 检索（`tools/kg_eval.py` 固定问题集的召回，`--recall label=值` 手填）。
+图口径在容器外用 `--graph-json`（容器内 `extractor_compare --json --group-by run_id` 的导出）喂入；
+成本「自报」（运行清单）与「账本」（`--journal`，复用 ab_score 口径）分列不相加。判据沿用替代方案第二部分 §2 的目标列。
 
 网关路径的成本基线（2026-10-18 第二批 54 条，deepseek）：每条 7.07 次调用、67.6k 输入 token；属性 37%、消解 28%、
 抽边 18%、去重 14%。任何「链路优化」的成本影响都按这张分布算增量，不凭感觉。
@@ -132,14 +139,15 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 
 | # | 事项 | 位置 | 大小 |
 |---|---|---|---|
-| 1 | 来源标记加 `extractor_tool`、`run_id`；`agent_extract submit` 加 `--executor`、`--run-id`；`extractor_compare` 支持按这两列分组 | utils/extracted_ingest.py、tools/agent_extract.py、tools/extractor_compare.py | 小，需发布服务端 |
-| 2 | `KNOBS` 登记网关侧四个旋钮；运行清单读写（`agent_extract run start/end`） | tools/digest_retro.py、tools/agent_extract.py | 小 |
+| 1 | 来源标记加 `extractor_tool`、`run_id`；`agent_extract submit` 加 `--executor`、`--run-id`；`extractor_compare` 支持按这两列分组 | utils/extracted_ingest.py、tools/agent_extract.py、tools/extractor_compare.py | 已做（PR #188）；服务端部分需发布后才入图 |
+| 2 | `KNOBS` 登记网关侧四个旋钮；运行清单读写（`agent_extract run start/end`） | tools/digest_retro.py、tools/agent_extract.py | 已做（PR #188） |
 | 3 | 脚本执行器 `tools/model_extract.py`：同一提示词经网关 ab 路由调任意模型 | 依赖 credvault#117 启用路由 + 凭据（用户侧） | 中 |
-| 4 | `tools/eval_report.py`：三面合一张表 | 新文件，复用 ab_score / extractor_compare / status | 中 |
+| 4 | `tools/eval_report.py`：三面合一张表 | 新文件，复用 ab_score / extractor_compare / status | 已做（PR #188） |
 | 5 | 金标 20 条 + 评分器 `tools/gold_score.py` | docs/gold/、新文件 | 中，人工部分由用户或执行者判 |
-| 6 | 各工具的任务说明模板（codex / qoder / dskhress 各一份，内容就是 §2 的四条 + 五步命令） | docs/executors/ | 小 |
+| 6 | 各工具的任务说明模板（claude-code / codex / qoder 各一份 + 公共部分，内容就是 §2 的四条 + 五步命令） | docs/executors/ | 已做（PR #188）；dskhress 待其接入时再补 |
 
-1、2、4、6 不依赖用户决定，可以直接做；3 依赖网关路由与凭据；5 的人工判定需要有人花半天。
+1、2、4、6 已在 PR #188 做完（其中 1 的服务端改动要发布 kg-hub-server 才会写进图；发布前 `--executor` / `--run-id`
+只记在本地 log 与运行清单里，服务端按 pydantic 默认忽略多余字段不报错）；3 依赖网关路由与凭据；5 的人工判定需要有人花半天。
 
 ## 9. 风险与边界
 
