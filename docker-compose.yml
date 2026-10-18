@@ -147,6 +147,8 @@ services:
       - KG_HUB_INGEST_BACKUP_PATH=/backup/ingest-backup.jsonl
       # 并行预抽取在写锁外执行，提交时仍校验图读集。
       - KG_HUB_PARALLEL_EXTRACTION=${KG_HUB_PARALLEL_EXTRACTION:-1}
+      # /api/ingest 抽取方式：graphiti（多阶段，现状）| single_pass（一次调用出实体+关系，见 docs/GATEWAY-EXTRACTION-OPTIMIZATION.md §6）。
+      - KG_HUB_INGEST_MODE=${KG_HUB_INGEST_MODE:-graphiti}
       # 8 槽对照未提升吞吐且触发阶段账本 SQLite 锁错误，恢复验收过的 6 槽。
       - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-6}
       # Stable per-observation canary for indexed broad edge search; 0 retains exact search.

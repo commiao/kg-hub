@@ -68,3 +68,69 @@
   再做 9/10/11（看每条调用数与吞吐），最后做 A/B（[CLAUDE-EXTRACTION-REPLACEMENT-PLAN.md](CLAUDE-EXTRACTION-REPLACEMENT-PLAN.md) 第二部分）
   把 deepseek / qwen / Claude 放到同一套链路纪律下比，那时比的才是模型本身。
 - 目标线：边名合规 ≥ 90%、无类型实体 ≤ 2%、脏命名 ≤ 2%、重复三元组 ≤ 1%、零边 ≤ 1%、每条调用 ≤ 5 次。
+
+## 6. 单次抽取模式（KG_HUB_INGEST_MODE=single_pass，2026-10-19）
+
+### 动机：问题在链路结构，不在某一次调用
+
+[extraction-model-comparison-20261017.md](extraction-model-comparison-20261017.md) §4.1 的 50 条验证把纪律指标拉平之后，
+剩下的病根是 graphiti 的多阶段结构本身。成本基线来自 2026-10-18 第二批 54 条的账本核查
+（[EXTRACTION-EVAL-FRAMEWORK.md](EXTRACTION-EVAL-FRAMEWORK.md)「成本口径」一节，PR #186）：
+
+| 指标 | graphiti 多阶段（网关 deepseek-v4-flash） | 会话自抽取（一次调用出实体+关系，三轮 1,500 条） |
+|---|---|---|
+| 每条观测模型调用 | **7.07 次** | 1 次 |
+| 每条输入 token | **67.6k**（属性 37%、消解 28%、抽边 18%、去重 14%） | 一次提示词 + 正文 |
+| 零边 episode | **20%**（§4.1 为 11/52），账本核查证实是「抽边」那一次调用直接返回 `edges: []` | 0–0.2% |
+| 边名合规 | 归一后 100%（归一前约 95%） | 100% |
+
+抽边阶段拿到的是前一阶段消解完的实体清单，模型在没有正文语境的情况下「看不出关系」就给空数组；
+在这一步追问重试只是再花一次钱赌同一个模型换个心情，不治根。会话自抽取路径证明：**同一个
+提示词里一次给全实体和关系**，零边几乎消失。单次抽取模式就是把那条路搬到网关路径上。
+
+### 做了什么
+
+- `utils/single_pass_extract.py`：system = [config/agent_extract_prompt.md](../config/agent_extract_prompt.md) 正文 +
+  单次调用补充约定；user = 观测元数据 + 正文；强制模型以工具调用返回 `{entities:[{name,type,summary}], edges:[{source,target,name,fact}]}`。
+  经**同一个**网关客户端（`graphiti_client.SingleAttemptAnthropicClient`，业务键 `kg_hub.entity_extract`，
+  Idempotency 账本）只调一次，账本 stage 记为 `single_pass`；形状错误由客户端按既有 `reject_model_result`
+  标记后抛出，不追问、不重试。付过费的答案尽量用上：容忍 `items` 包装/多余 `id`、补空 summary、截断超长字段、
+  丢弃缺 source/target 的边。
+- `kg_hub_server._single_pass_extract_inner`：模型调用在**写锁之外**（它不读图），拿到结果后 `normalize_extraction`
+  归一，再由 `utils.extracted_ingest.write_extraction` 落图（与 `/api/ingest_extracted` 同一段消解/写图逻辑：
+  向量 0.95 + 词面 + 类型守卫）。episode 与新建节点/边带 `extraction_mode='gateway_single'`、
+  `extractor_model=KG_HUB_GATEWAY_MODEL_LABEL`、`prompt_version=<提示词文件版本号>`。
+  IngestedKey 状态、nodes/edges 计数、断路器（网关出口 `assert_closed`）、`needs_reconciliation` + held 守卫、
+  `error_kind` 分类与 graphiti 模式同一套代码。
+- 不走的东西：predigest 分流的观测（catalog 仅存 / 长文预拆，处理的是胶囊和长文档）仍按原路；stage checkpoint
+  不适用（一次调用没有中间态，重试靠账本按幂等钥匙重放）；`post_ingest_normalize` 不再需要（归一在写入前完成）。
+- 看板 `flow_dashboard` 的入图分桶把 `gateway_single` 单列为「网关单次」；`tools/extractor_compare.py` 把它单独成组
+  `gateway_single:<extractor_model>`（与 graphiti 归一后打的同一个路由标签分开，同一模型的两种链路能并排比）。
+
+### 开关与切回
+
+| 项 | 值 |
+|---|---|
+| 环境变量 | `KG_HUB_INGEST_MODE=graphiti`（默认，线上现状）/ `single_pass` |
+| 位置 | `docker-compose.yml` kg-hub-server 服务已透传 `${KG_HUB_INGEST_MODE:-graphiti}`；在 NAS 的 compose `.env` 里设值后 `compose up -d kg-hub-server` |
+| 生效确认 | `GET /health` 返回 `ingest_mode` 字段 |
+| 非法值 | 服务端启动即报错（不会静默回到某一种） |
+| 切回 | 把变量改回 `graphiti`（或删掉）并重启服务端；已入图内容不受影响，两种模式的 episode 可按 `extraction_mode` 区分 |
+| 建议同时设 | `KG_HUB_GATEWAY_MODEL_LABEL=<当前路由模型，如 deepseek-v4-flash-0731>`，让 extractor_compare 的组名直接写明模型 |
+
+### 验证步骤（需要发布服务端，并由用户恢复断路器）
+
+1. 发布带本改动的服务端，`KG_HUB_INGEST_MODE=single_pass`；`curl /health` 看到 `"ingest_mode": "single_pass"`。
+2. 用户恢复 `kg_hub.entity_extract` 断路器，让 refinery 送 **50 条**（与 §4.1 同口径：满 50 条断开）。
+3. 账本口径（`model_attempts`，stage=`single_pass`）：每条调用次数（目标 1）、每条输入/输出 token、终态分布。
+4. 图口径（容器内 `python3 -m tools.extractor_compare`，看 `gateway_single:*` 那一组，与 §4.1 的 graphiti 行并排）：
+
+   | 指标 | 目标 | 对照（§4.1 graphiti 多阶段） |
+   |---|---|---|
+   | 零边率 | **≤ 2%** | 21% |
+   | 每条调用次数 | 1 | 7.07 |
+   | 每条 token | 记录实测 | 67.6k 输入 |
+   | 边名合规 | 100% | 100%（归一后） |
+   | 误并（dry-run 口径：同样本先 `POST /api/ingest_extracted` 带 `dry_run=true` 看会并到哪个旧实体） | 与第 3 轮会话自抽取同档（0.15/条） | — |
+
+5. 任一指标不达标：把变量改回 `graphiti` 重启即切回；本模式的 episode 可按 `extraction_mode='gateway_single'` 单独审查或撤销。

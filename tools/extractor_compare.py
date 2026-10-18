@@ -3,6 +3,9 @@
 分组键：episode 的 ``extractor_model``（会话自抽取路径写入）；没有该字段的旧内容按
 ``created_at`` 月份归为 ``legacy:<YYYY-MM>``（对应网关时代的模型：06–08 qwen3.6-plus、
 09 混合、10 deepseek，见 docs/gateway-model-quality-20261017.md）。
+网关单次抽取（KG_HUB_INGEST_MODE=single_pass）的 episode/节点/边带 ``extraction_mode='gateway_single'``，
+它们的 extractor_model 与 graphiti 模式归一后打的是同一个路由标签，所以单独成组：
+``gateway_single:<extractor_model>``，这样同一路由模型的两种链路能并排比。
 
 指标与报告第 3 节、tools/digest_retro.py 同口径：实体/条、边/条、零边占比、边名合规率
 （schema 15 个名，大小写不敏感）、不同边名数、重复三元组、实体有类型、脏命名、摘要均长。
@@ -25,17 +28,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.digest_retro import schema_names, DIRTY_PREFIXES  # noqa: E402
 
+GATEWAY_SINGLE_PREFIX = "gateway_single:"
+
+
+def _src(var: str) -> str:
+    """分组键表达式：gateway_single 单列，其余按 extractor_model，没有就按月份归 legacy。"""
+    return (f"CASE WHEN {var}.extraction_mode = 'gateway_single' "
+            f"THEN '{GATEWAY_SINGLE_PREFIX}' + coalesce({var}.extractor_model, '?') "
+            f"ELSE coalesce({var}.extractor_model, 'legacy:' + substring(toString({var}.created_at),0,7)) END")
+
+
 _EP = ("MATCH (e:Episodic) WHERE e.group_id = $g "
        "OPTIONAL MATCH (e)-[:MENTIONS]->(n) WITH e, count(n) AS k "
-       "RETURN coalesce(e.extractor_model, 'legacy:' + substring(toString(e.created_at),0,7)) AS src, "
+       f"RETURN {_src('e')} AS src, "
        "count(e) AS eps, sum(k) AS mentions, sum(size(coalesce(e.entity_edges, []))) AS edges, "
        "sum(CASE WHEN k = 0 THEN 1 ELSE 0 END) AS zero_entities")
 _EDGES = ("MATCH (a)-[r:RELATES_TO]->(b) WHERE r.group_id = $g "
-          "WITH coalesce(r.extractor_model, 'legacy:' + substring(toString(r.created_at),0,7)) AS src, "
+          f"WITH {_src('r')} AS src, "
           "a.uuid+'|'+toLower(r.name)+'|'+b.uuid AS k, toLower(r.name) AS n, count(r) AS c "
           "RETURN src, n AS name, sum(c) AS count, sum(CASE WHEN c>1 THEN c-1 ELSE 0 END) AS dups")
 _ENTS = ("MATCH (n:Entity) WHERE n.group_id = $g "
-         "RETURN coalesce(n.extractor_model, 'legacy:' + substring(toString(n.created_at),0,7)) AS src, "
+         f"RETURN {_src('n')} AS src, "
          "n.name AS name, size(coalesce(n.summary,'')) AS summary_len, labels(n) AS l")
 
 
