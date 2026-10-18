@@ -226,7 +226,9 @@ def build_llm() -> AnthropicClient:
     # provider or legacy ANTHROPIC_AUTH_TOKEN.
     auth_token = gateway_token()
     model = gateway_model()
-    cfg = LLMConfig(api_key=auth_token, model=model, max_tokens=4096)
+    # 2026-10-17 存量画像：零实体/零边 episode（deepseek 时代 1.8%）主要是长观测在 4096 下被截断，而路由允许 8192。
+    cfg = LLMConfig(api_key=auth_token, model=model,
+                    max_tokens=int(os.environ.get("KG_HUB_LLM_MAX_TOKENS", "8192")))
     # Gateway owns provider choice and cost ceilings. SDK transport retries are
     # disabled centrally; every logical call gets one stable Idempotency-Key.
     min_interval = float(os.environ.get("KG_HUB_LLM_MIN_INTERVAL_SEC", "4.0"))

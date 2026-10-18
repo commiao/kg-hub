@@ -100,6 +100,7 @@ from utils.extracted_ingest import (  # noqa: E402
     ExtractedEntity, ExtractedEdge, EXTRACTOR_MODEL_PATTERN, normalize_extraction,
     write_extraction, check_keys, check_names,
 )
+from utils.gateway_post_normalize import post_ingest_normalize  # noqa: E402
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
@@ -950,6 +951,10 @@ INGEST_LOCK_RETRIES = ingest_budget.INGEST_LOCK_RETRIES
 INGEST_LOCK_BACKOFF_SEC = ingest_budget.INGEST_LOCK_BACKOFF_SEC
 # Phase B' 长文档预拆开关(REFINERY-DESIGN §3')。默认关,灰度经 compose env 打开。
 PREDIGEST_ENABLED = os.environ.get("KG_HUB_PREDIGEST", "0").lower() in ("1", "true", "yes")
+# 网关路径入图后的硬约束归一（默认开；KG_HUB_POST_NORMALIZE=0 关）。来源标记用路由标签而不是真实模型名：
+# kg-hub 不知道网关后面是谁，标签由部署方按路由表填（如 gateway:qianfan/deepseek-v4-flash-0731）。
+POST_NORMALIZE_ENABLED = os.environ.get("KG_HUB_POST_NORMALIZE", "1").lower() in ("1", "true", "yes")
+GATEWAY_MODEL_LABEL = os.environ.get("KG_HUB_GATEWAY_MODEL_LABEL", "gateway:kg_hub.entity_extract").strip()
 
 
 async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
@@ -1363,6 +1368,22 @@ async def _do_extract_inner(
             episode_uuid = str(result.episode.uuid)  # type: ignore[attr-defined]
         except Exception:
             pass
+        # 网关路径的硬约束归一（docs/GATEWAY-EXTRACTION-OPTIMIZATION.md 第 1 节）：边名归 schema、
+        # 无类型兜底、脏命名降级、来源标记。确定性、零模型调用、失败不影响入图。
+        if POST_NORMALIZE_ENABLED and episode_uuid:
+            try:
+                norm = await post_ingest_normalize(
+                    graphiti.driver, episode_uuid=episode_uuid,
+                    edges=[{"uuid": e.uuid, "name": e.name} for e in result.edges],
+                    nodes=[{"uuid": n.uuid, "name": n.name, "labels": list(n.labels or []),
+                            "created_at": n.created_at} for n in result.nodes],
+                    edge_types=set(EDGE_TYPES), entity_types=set(ENTITY_TYPES), since=started,
+                    extractor_label=GATEWAY_MODEL_LABEL)
+                nodes -= norm["dirty_removed"]
+                edges -= norm["edges_unlinked"]
+                logger.info("[ingest:normalize] sd=%s sid=%s %s", sd, sid, norm)
+            except Exception:  # noqa: BLE001
+                logger.exception("[ingest:normalize_failed] uuid=%s (non-fatal)", episode_uuid)
         # openclaw 知识胶囊:进图即打 provenance(直推链路的 NAS 侧自动打标,
         # 取代原 Mac 侧 tools/tag_provenance 的每轮补标)。覆写优先,失败不阻塞。
         if body.name.startswith("openclaw-capsule-") and episode_uuid:
