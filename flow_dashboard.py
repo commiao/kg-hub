@@ -138,17 +138,23 @@ def time_range(key: str, now: datetime) -> dict:
 
 
 def _model_attempt_rows(since: datetime) -> list[tuple]:
-    """Read the existing journal without its schema setup or write transaction."""
-    backup = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
-    if not backup:
-        raise FileNotFoundError("KG_HUB_INGEST_BACKUP_PATH 未配置")
-    path = Path(backup).with_name("model-attempts.sqlite3")
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2) as db:
-        return db.execute(
-            "SELECT http_started_at, updated_at, phase FROM model_attempts "
-            "WHERE http_started_at >= ?", (since.isoformat(),)).fetchall()
+    """Gateway witness attempts are the shared source for quota and call counts.
+
+    The former local SDK journal excludes requests executed by the public queue.
+    Exported events contain timestamps and business keys only. Missing coverage
+    is unavailable, never a fabricated zero. Durations are not in this source.
+    """
+    from topology import GATEWAY_USAGE_PATH, _read_json
+    data = _read_json(GATEWAY_USAGE_PATH)
+    window = data.get("attempt_window", {})
+    floor, end = _parse_ts(window.get("start")), _parse_ts(window.get("end"))
+    if not floor or not end or floor > since or not isinstance(data.get("attempt_events"), list):
+        raise ValueError("网关调用明细未覆盖所选区间")
+    if (datetime.now(timezone.utc) - end).total_seconds() > 1200:
+        raise ValueError("网关调用明细已过期")
+    return [(event["at"], None, "gateway_attempt") for event in data["attempt_events"]
+            if event.get("business_key") == "kg_hub.entity_extract"
+            and _parse_ts(event.get("at")) and _parse_ts(event["at"]) >= since]
 
 
 def key_metric_trends(*, now: datetime, commits: list[dict],
@@ -234,6 +240,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                 if phase == "completed" and ended and started <= ended <= now:
                     duration_by_hour.setdefault(b["hour"], []).append(
                         (ended-started).total_seconds())
+            if phase == "gateway_attempt":
+                continue
             # Integrate call-seconds over each hour, including calls spanning boundaries.
             # An interrupted, unresolved call has no known end. Cap its
             # interval so a stale journal row cannot look in flight for days.
@@ -256,7 +264,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                 b["call_duration_avg"] = round(sum(values) / len(values), 1)
             bucket_at = _parse_ts(b["hour"] + ":00:00+00:00")
             elapsed = max(0, (min(now, bucket_at + timedelta(hours=1)) - max(start, bucket_at)).total_seconds())
-            b["model_inflight_avg"] = round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None
+            b["model_inflight_avg"] = (None if any(row[2] == "gateway_attempt" for row in attempts)
+                                       else round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None)
             if b["ingested"] and b["model_calls"] is not None:
                 b["calls_per_ingested"] = round(b["model_calls"] / b["ingested"], 1)
     return buckets
@@ -1334,7 +1343,7 @@ async def collect_flow(range_key: str = "today") -> dict:
         errors.append(f"小时入图状态不可读：{type(exc).__name__}")
     attempts = None
     try:
-        attempts = await asyncio.to_thread(_model_attempt_rows, start - timedelta(hours=24))
+        attempts = await asyncio.to_thread(_model_attempt_rows, start)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"模型调用账本不可读：{type(exc).__name__}")
     since = start.timestamp()
@@ -1348,6 +1357,10 @@ async def collect_flow(range_key: str = "today") -> dict:
         errors.append(f"提交遥测历史快照不可读：{type(exc).__name__}")
     trends = key_metric_trends(now=end, window_start=start, commits=commits, attempts=attempts,
                                outcomes=outcomes, archived_commits=archived_commits)
+    # Witness exports counts only, not provider completion times or slot occupancy.
+    for row in trends:
+        row["model_inflight_avg"] = None
+        row["call_duration_avg"] = None
     try:
         remaining_history = await asyncio.to_thread(backlog_remaining_history, status, now)
     except (OSError, sqlite3.Error) as exc:

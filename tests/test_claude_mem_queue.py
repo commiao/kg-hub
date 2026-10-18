@@ -29,6 +29,18 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(len(b['history']),2)
             self.assertTrue((home/'.kg-hub/state/claude-mem-queue.sqlite3').exists())
 
+    def test_slow_status_budget_and_preserved_failure_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def http(url, **kw):
+                if url.endswith('health'):
+                    return {'pid': 42}, None
+                # Real production endpoint takes 6–8 seconds under backlog.
+                return ({'queueDepth': 1300}, None) if kw['timeout'] >= 10 else (None, 'TimeoutError')
+            self.assertEqual(collect(Path(tmp), http, NOW)['current'][1]['depth'], 1300)
+            bad = collect(Path(tmp), lambda *a, **kw: (None, 'TimeoutError'), NOW+60)
+            self.assertIsNone(bad['current'][1]['depth'])
+            self.assertIn('TimeoutError', bad['current'][1]['error'])
+
     def test_incremental_log_import_does_not_replace_live_or_read_partial_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             home=Path(tmp);logs=home/'.claude-mem/logs';logs.mkdir(parents=True)
