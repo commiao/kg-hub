@@ -520,6 +520,33 @@ else
   say "当前线上标签：$PREV"
 fi
 
+# 准则 43：发布的单位是提交，不是 PR —— 线上标签到目标之间别人合并的改动会一起上线。
+# 这里只把它们摆到眼前、不拦：作者想不想现在上线，要人看 PR 说明或任务来判断。
+# 2026-10-14 发 #147 时夹带了作者注明「no NAS deployment」的 #145，靠人记得去查才发现。
+list_unreleased_merges() {
+  local prev="$1" target="$2" repo="$3" lines n
+  if [ -z "$prev" ]; then
+    say "  本次会上线的提交：线上没有标签（首次发布），无从比对"
+    return 0
+  fi
+  if ! git -C "$repo" rev-parse --verify --quiet "${prev}^{commit}" >/dev/null; then
+    say "  ⚠ 线上标签 ${prev} 在本地仓库里找不到对应提交，列不出会一起上线的改动 —— 先 git fetch 或人工核对"
+    return 0
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "$prev" "$target"; then
+    say "  ⚠ 目标 ${target} 不包含线上的 ${prev}：这是回退或分叉，线上有、目标没有的改动会被撤下"
+    return 0
+  fi
+  lines=$(git -C "$repo" log --oneline --first-parent "${prev}..${target}")
+  n=$(printf '%s\n' "$lines" | grep -c . || true)
+  say "  本次会一起上线的提交（线上 ${prev} → 目标 ${target}，first-parent 共 ${n} 笔）："
+  [ -n "$lines" ] && printf '%s\n' "$lines" | sed 's/^/    /' >&2
+  say "  别人合并的先确认作者的发布意图（deploy-standard 准则 43）"
+}
+if [ "$mode" = release ]; then
+  list_unreleased_merges "$PREV" "$SHA" "$REPO"
+fi
+
 if [ "$mode" = rollback ]; then
   PRIOR=$(on_nas "grep '^KG_HUB_IMAGE_TAG_PREV=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
   [ -n "$PRIOR" ] || die "没有记录上一次的标签，无法自动回滚"
