@@ -954,6 +954,22 @@ PREDIGEST_ENABLED = os.environ.get("KG_HUB_PREDIGEST", "0").lower() in ("1", "tr
 # 网关路径入图后的硬约束归一（默认开；KG_HUB_POST_NORMALIZE=0 关）。来源标记用路由标签而不是真实模型名：
 # kg-hub 不知道网关后面是谁，标签由部署方按路由表填（如 gateway:qianfan/deepseek-v4-flash-0731）。
 POST_NORMALIZE_ENABLED = os.environ.get("KG_HUB_POST_NORMALIZE", "1").lower() in ("1", "true", "yes")
+
+
+def _load_custom_extraction_instructions() -> str:
+    """config/gateway_extraction_instructions.md 的全文；KG_HUB_CUSTOM_EXTRACTION=0 关闭。
+    让网关后面的任何模型在抽取时就看到 schema 纪律，而不是只靠入图后归一兜底。"""
+    if os.environ.get("KG_HUB_CUSTOM_EXTRACTION", "1").lower() not in ("1", "true", "yes"):
+        return ""
+    path = Path(__file__).resolve().parent / "config" / "gateway_extraction_instructions.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return text if len(text) <= 6000 else text[:6000]
+
+
+CUSTOM_EXTRACTION_INSTRUCTIONS = _load_custom_extraction_instructions()
 GATEWAY_MODEL_LABEL = os.environ.get("KG_HUB_GATEWAY_MODEL_LABEL", "gateway:kg_hub.entity_extract").strip()
 
 
@@ -1049,6 +1065,10 @@ async def _optional_checkpointed_add_episode(graphiti, name: str,
                   source_description=sd, reference_time=ref_time, group_id=GROUP_ID,
                   entity_types=ENTITY_TYPES, edge_types=EDGE_TYPES,
                   edge_type_map=EDGE_TYPE_MAP)
+    if CUSTOM_EXTRACTION_INSTRUCTIONS:
+        # graphiti 0.29 把它注入节点与边两个抽取提示词（docs/GATEWAY-EXTRACTION-OPTIMIZATION.md 建议 6）。
+        # 它参与 stage checkpoint 的 digest，所以改指令文件会让在途任务的断点失效、从头重抽——按设计。
+        kwargs["custom_extraction_instructions"] = CUSTOM_EXTRACTION_INSTRUCTIONS
     from utils.ingest_workflow import current_workflow
     workflow = current_workflow()
     if workflow is not None:

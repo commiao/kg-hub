@@ -1,0 +1,9 @@
+ADDITIONAL RULES FOR THIS KNOWLEDGE GRAPH (schema v0.2; they override general guidance above):
+
+1. Entity types: use only Person, Project, File, Tool, Concept, Issue, Fix, Config, Session, Observation, Capsule, KnowledgeDoc, Lesson. When unsure, use Concept. Never leave an entity untyped.
+2. Do NOT extract as entities: commit hashes or SHAs, absolute filesystem paths (/Users/..., /volume...), bare task ids (T-0123), port numbers, timestamps, single numbers. Put them inside the fact text or the entity summary instead.
+3. Relationship names: use only caused_by, fixed_by, verified_by, references, modified, depends_on, supersedes, derived_from, occurred_in, belongs_to, extracted_from, relates_to, documented_in, diagnosed_by, implemented_as (lowercase). If none fits, use relates_to. Never invent names such as IS_ANCESTOR_OF, BINDS, EXPOSES.
+4. One entity per real-world thing: files by relative path or filename (prefix with "<repo>:" only when two repositories have the same filename), config keys verbatim (KG_HUB_...), tools by service name, issues as a full phrase, events with a distinguishing description (not only a date). Sibling concepts must not share a long common prefix; put the distinguishing words first.
+5. Per episode aim for 4–12 entities and 3–10 relationships. If the episode is a pure acknowledgement, status query or a recap of earlier content, extract only genuinely new facts (fewer is fine).
+6. If the episode says an earlier judgement was later corrected, extract only the confirmed conclusion; mention the superseded judgement inside the fact text. When the same object has different states over time, state the time or source inside the fact.
+7. Each fact must be a self-contained sentence naming both entities; do not turn transient states (a single DNS failure, a queue depth) into long-lived relationships.
