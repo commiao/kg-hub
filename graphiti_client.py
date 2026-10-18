@@ -220,6 +220,42 @@ class SingleAttemptAnthropicClient(AnthropicClient):
         return response
 
 
+    async def generate_text(
+        self,
+        messages: list[Message],
+        max_tokens: int | None = None,
+        prompt_name: str | None = None,
+    ) -> tuple[str, dict]:
+        """一次调用、**不挂工具**，返回模型文本块拼接与账本捕获 sink。
+
+        2026-10-19 单次抽取首批 11 条实测：经网关的 deepseek 在强制工具调用下 11 次都不写
+        ``edges`` 键，唯一一次写了的，边的 JSON 从工具入参里溢出成了文本块（供应商侧的工具调用
+        解析不可靠）。让模型直接输出 JSON 文本、由调用方解析，绕开那一层。调用方解析失败时
+        用返回的 sink 调 ``reject_model_result``，账本里这份答案才不会在重试时被原样回放。
+        """
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        stage = graphiti_model_stage(prompt_name)
+        stage_scope = model_stage(stage) if stage else nullcontext()
+        system_message = messages[0]
+        user_messages = [{"role": m.role, "content": m.content} for m in messages[1:]]
+        with stage_scope, capture_model_result() as source:
+            result = await self.client.messages.create(
+                system=system_message.content,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                messages=user_messages,
+                model=self.model,
+            )
+        usage = getattr(result, "usage", None)
+        input_tokens = (getattr(usage, "input_tokens", 0) or 0) if usage else 0
+        output_tokens = (getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        self.token_tracker.record(prompt_name, input_tokens, output_tokens)
+        text = "".join(getattr(b, "text", "") or "" for b in (result.content or [])
+                       if getattr(b, "type", "") == "text")
+        return text, source
+
+
 def build_llm() -> AnthropicClient:
     # LLMConfig insists on a non-empty key although the separately constructed
     # SDK client owns transport. Reuse the gateway caller token, never a direct

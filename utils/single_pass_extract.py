@@ -15,13 +15,15 @@ user 给观测，强制模型以工具调用返回 ``{entities, edges}``，经**
 from __future__ import annotations
 
 import os
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from utils.extracted_ingest import (
     ExtractedEntity, ExtractedEdge, MAX_EDGES, MAX_ENTITIES, MAX_FACT_LEN, MAX_NAME_LEN,
@@ -37,6 +39,8 @@ except ImportError:  # pragma: no cover - 容器与 venv 都有 graphiti_core
 
 # ---------- 入图模式开关 ----------
 INGEST_MODE_GRAPHITI = "graphiti"
+logger = logging.getLogger("kg_hub.single_pass")
+
 INGEST_MODE_SINGLE_PASS = "single_pass"
 INGEST_MODES = (INGEST_MODE_GRAPHITI, INGEST_MODE_SINGLE_PASS)
 INGEST_MODE_ENV = "KG_HUB_INGEST_MODE"
@@ -56,7 +60,8 @@ SINGLE_CALL_ADDENDUM = """
 - 本次只有**一条**观测，直接返回 `{"entities": [...], "edges": [...]}`：不要 `items` 包装，不要 `id` 字段。
 - 没有 `lookahead`、`names-<model>.tsv`、`submit --dry-run`，规则 19、20 不适用；其余规则照常。
 - 实体与关系**一次给全**：先列实体，再给关系，关系的 source/target 必须逐字等于某个实体的 name。
-- 结果通过提供的工具返回，不要输出任何解释文字。
+- 只输出**一个 JSON 对象**：不要 Markdown 代码围栏，不要解释文字，不要调用工具。
+- `edges` 键必须存在；确实没有关系时写 `"edges": []`。边的 name 只用 schema 里的关系名。
 """.strip()
 
 
@@ -100,13 +105,56 @@ def _clip(value: Any, limit: int) -> str:
     return text[:limit]
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+
+
+def parse_json_object(text: str) -> dict:
+    """从模型文本里取出那一个 JSON 对象：先剥代码围栏，再整体 json.loads，最后退到首个 ``{``
+    到末个 ``}`` 之间。拿不到对象、或对象缺 ``entities`` / ``edges`` 数组（空观测允许只有
+    ``entities: []``）都抛 ValueError，由调用方按形状错误处理。"""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("model returned no text")
+    m = _FENCE_RE.search(raw)
+    if m:
+        raw = m.group(1).strip()
+    candidates = [raw]
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end + 1])
+    data = None
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            break
+        except ValueError:
+            continue
+    if not isinstance(data, dict):
+        raise ValueError("no JSON object in model text")
+    if "entities" not in data and isinstance(data.get("items"), list) and len(data["items"]) == 1 \
+            and isinstance(data["items"][0], dict):
+        data = data["items"][0]
+    entities = data.get("entities")
+    if not isinstance(entities, list):
+        raise ValueError("JSON object lacks entities array")
+    if "edges" not in data:
+        if entities:
+            raise ValueError("JSON object lacks edges array")
+        data = {**data, "edges": []}
+    elif not isinstance(data["edges"], list):
+        raise ValueError("edges is not an array")
+    return data
+
+
 class SinglePassExtraction(BaseModel):
     """一条观测抽出的实体与关系，字段与 kg-hub schema v0.2 的预抽取入库请求一致。"""
 
     # entities 必填：没有这个键的答案是形状错误（要报 ValidationError 走 reject），不是「空观测」；
     # 空观测按提示词规则 8 是显式的 entities: []。
     entities: list[ExtractedEntity]
-    edges: list[ExtractedEdge] = Field(default_factory=list)
+    # edges 也必填：2026-10-19 首批实测，键可省略时 deepseek 11 次里 11 次不写它，边全丢。
+    # 只有空观测（entities 为空）允许省略 edges。
+    edges: list[ExtractedEdge]
 
     @model_validator(mode="before")
     @classmethod
@@ -121,7 +169,9 @@ class SinglePassExtraction(BaseModel):
                 and isinstance(data["items"][0], dict):
             data = data["items"][0]
         entities = data.get("entities")
-        edges = data.get("edges", [])
+        if "edges" not in data and isinstance(entities, list) and not entities:
+            data = {**data, "edges": []}          # 空观测：规则 8 只要求 entities: []
+        edges = data.get("edges")
         if not isinstance(entities, list) or not isinstance(edges, list):
             return data
         out_entities = []
@@ -168,15 +218,28 @@ async def extract_single_pass(llm, *, name: str, episode_body: str, source_descr
     验证失败时标记账本里的答案不可用再抛出，这里不捕获、不追问。stage 由本函数绑定为
     ``single_pass``，所以账本按阶段统计时能把它与 graphiti 的五个阶段分开。
     """
-    from model_gateway_client import model_stage
+    from model_gateway_client import model_stage, reject_model_result
 
     prompt_text, prompt_version = prompt or load_prompt()
     messages = build_messages(prompt_text, name=name, episode_body=episode_body,
                               source_description=source_description, reference_time=reference_time)
     with model_stage(MODEL_STAGE):
-        response = await llm.generate_response(
-            messages, response_model=SinglePassExtraction, max_tokens=max_tokens,
-            prompt_name=PROMPT_NAME)
-    parsed = SinglePassExtraction.model_validate(response)
+        if hasattr(llm, "generate_text"):
+            # 文本 JSON 路径（线上）：不挂工具，自己解析；解析失败先把账本里的答案标记不可用再抛出
+            text, sink = await llm.generate_text(messages, max_tokens=max_tokens, prompt_name=PROMPT_NAME)
+            try:
+                response = parse_json_object(text)
+                parsed = SinglePassExtraction.model_validate(response)
+            except (ValueError, ValidationError) as exc:
+                if await reject_model_result(sink):
+                    logger.warning("[model_result:rejected] stage=%s reason=%s; the next retry re-asks",
+                                   MODEL_STAGE, type(exc).__name__)
+                raise
+        else:
+            # 工具调用路径（只给没有 generate_text 的客户端替身）：形状错误由客户端按 reject 处理
+            response = await llm.generate_response(
+                messages, response_model=SinglePassExtraction, max_tokens=max_tokens,
+                prompt_name=PROMPT_NAME)
+            parsed = SinglePassExtraction.model_validate(response)
     return SinglePassResult(entities=parsed.entities, edges=parsed.edges,
                             prompt_version=prompt_version, raw=dict(response))
