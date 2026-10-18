@@ -78,6 +78,12 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(tag["label"], "gateway:deepseek")
         rename = [p for c, p in d.calls if c.startswith("UNWIND $items")][0]
         self.assertEqual(rename["items"], [{"uuid": "e1", "name": "relates_to", "raw": "BINDS"}])
+        # 新建的边与实体也带来源标记（脏命名被删的实体除外）
+        tag_e = [p for c, p in d.calls if "r.extractor_model IS NULL" in c][0]
+        self.assertEqual((sorted(tag_e["ids"]), tag_e["label"]), (["e1", "e2"], "gateway:deepseek"))
+        tag_n = [p for c, p in d.calls if "n.extractor_model IS NULL" in c][0]
+        self.assertEqual(tag_n["ids"], ["n2"])
+        self.assertEqual((st["tagged_edges"], st["tagged_nodes"]), (2, 1))
 
     def test_marks_instead_of_removing_when_shared(self):
         d, st = self._run(others=2)
