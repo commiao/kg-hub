@@ -107,5 +107,26 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual((code, d["code"], d["message"]), (500, "ingest_failed", "boom"))
 
 
+
+@unittest.skipUnless(HAVE, "需要 graphiti_core（容器或 venv）")
+class ProvenanceFieldsHandlerTest(HandlerTest):
+    def test_optional_tool_and_run_id_pass_through(self):
+        code, d = self._run(dict(GOOD, extractor_tool="codex", run_id="20261019-codex-s50"))
+        self.assertEqual(code, 200, d)
+        self.assertEqual((d["extractor_tool"], d["run_id"]), ("codex", "20261019-codex-s50"))
+        body, _ = self.captured
+        self.assertEqual((body.extractor_tool, body.run_id), ("codex", "20261019-codex-s50"))
+        # 旧客户端不带这两个字段：仍然成功，响应里为 null
+        code, d = self._run(GOOD)
+        self.assertEqual((code, d["extractor_tool"], d["run_id"]), (200, None, None))
+        self.assertEqual((self.captured[0].extractor_tool, self.captured[0].run_id), (None, None))
+
+    def test_bad_tool_or_run_id_rejected(self):
+        code, d = self._run(dict(GOOD, extractor_tool="bad tool!"))
+        self.assertEqual((code, d["code"]), (400, "bad_extractor_tool"))
+        code, d = self._run(dict(GOOD, run_id="has space"))
+        self.assertEqual((code, d["code"]), (400, "bad_run_id"))
+
+
 if __name__ == "__main__":
     unittest.main()
