@@ -9,6 +9,8 @@
 
 1. 抽取只用 `config/agent_extract_prompt.md` 里的 schema，不自创实体类型和边名；观测里没有知识就提交空 `entities`，不凑数。
 2. 每批先 `submit --dry-run`，看 `reuse_mismatch` 里明显并错的，在 results 里改名或在 lessons 记下，再正式提交。
+   这条由工具自己执行：`--dry-run` 成功后在状态目录记 `dryrun-<batch_id>.json`，正式提交时逐 id 核对，没预览过的 id
+   直接拒绝；确需跳过要加 `--skip-dryrun-check` 并写进 lessons。钩子可调 `agent_extract dryrun-check --batch --file`（rc 1 = 有没预览的）。
 3. 不碰断路器、不直连 FalkorDB、不把观测正文（batch / results 文件）提交进仓库。
 4. 每批把执行器自报的 token 与耗时记下来，run 结束时写进运行清单（会话型执行器的成本账本里没有，只能自报）。
 

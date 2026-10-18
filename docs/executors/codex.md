@@ -15,9 +15,9 @@
   而不是让模型从对话里「记得」规则；规则版本以 `tools/agent_extract.PROMPT_VERSION` 为准。
 - **模型**：`--model` 填 codex 实际使用的模型 id（如 gpt-5-codex）；codex 的工具与模型绑定，
   要单独比「模型」请用脚本执行器（框架 §1），要单独比「工具」请让 qoder 配同一模型跑同一样本。
-- **提交前必须 dry-run 可做成钩子**：仓库里的 `tools/codex_hooks.py` 读的是 codex 原生钩子清单，
-  可以在 pre-command 钩子里检查「`submit` 不带 `--dry-run` 时，同一 batch 必须已经有过一次 dry-run」。
-  钩子只做检查，不改 results。
+- **提交前必须 dry-run 由工具自己把关**：`agent_extract submit` 正式提交时会核对本批是否 dry-run 过，没预览过的 id
+  直接拒绝。要在 codex 的 pre-command 钩子里提前拦，就调 `python -m tools.agent_extract dryrun-check --batch <b> --file <r>`
+  （rc 1 = 有没预览的）；仓库里的 `tools/codex_hooks.py` 读的是 codex 原生钩子清单，可用来确认钩子装没装。钩子只做检查，不改 results。
 - **自报成本**：codex 会话的 token 看其用量面板；每批记一行，run 结束时汇总进 `run end`。
 
 ## 完成标准
