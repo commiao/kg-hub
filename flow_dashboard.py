@@ -360,7 +360,7 @@ def refinery_stage(status: dict, now: datetime) -> dict:
     metrics = {k: status.get(k) for k in (
         "backlog_remaining", "backlog_window_open", "per_cycle", "live_per_cycle",
         "backoff_pending", "recovery_reason", "recovery_retry_at", "disk_temp",
-        "heartbeat_at", "ts", "boundary_id", "live_cursor")}
+        "heartbeat_at", "ts", "boundary_id", "live_cursor", "blackout_active", "blackout")}
     metrics["watermark"] = status.get("watermark") or {}
     remaining = status.get("backlog_remaining")
     sub = activity["label"][:40]
@@ -801,6 +801,11 @@ def find_bottlenecks(*, status: dict, stages: dict[str, dict], digest: dict,
         add("refinery", "stop", "工作窗口外，积压暂停",
             "refinery 只在工作窗口内消化；窗口外只写心跳",
             "若要提速，评估扩大工作窗口（refinery_window 配置）", deliberate=True)
+    if status.get("blackout_active"):
+        add("refinery", "stop", "空档内，暂停送新任务",
+            f"空档 {status.get('blackout')}（北京时间）：家里路由器约 02:00 重启，NAS 出网中断；"
+            "在途任务照常跑完",
+            "无需处理，空档结束自动恢复；调整用 KG_HUB_REFINERY_BLACKOUT", deliberate=True)
     reason = status.get("recovery_reason")
     if gateway_route_disabled(status):
         add("gateway", "stop", "网关侧已断路：kg_hub.entity_extract 路由被禁用",

@@ -437,7 +437,8 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
             for node in snap.get("nodes", []):
                 if node.get("id") == "refinery" and node.get("state") != "red":
                     node["state"] = activity["state"]
-                    node["sub"] = ("计划暂停" if refinery_status.get("idle_outside_window")
+                    node["sub"] = ("计划暂停" if (refinery_status.get("idle_outside_window")
+                                                  or refinery_status.get("blackout_active"))
                                    and activity["state"] == "amber" else activity["label"])
                     node["idle_human"] = None
                     node["detail"] = (activity["label"] + "\n心跳："

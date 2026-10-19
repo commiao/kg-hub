@@ -245,10 +245,10 @@ class PerCycleFreshnessTests(unittest.TestCase):
 
         2026-09-20 实测:把 8 改成 50 发布后,窗口关着 → 状态文件里 per_cycle 停在
         重启前的 8,而 heartbeat_at 是新鲜的。新鲜时间戳盖着陈旧数字,看的人会
-        判定"配置没生效"。所以三条路径必须都带上。
+        判定"配置没生效"。所以每条路径都必须带上(2026-10-19 加了空档,四条)。
         """
-        self.assertEqual(SOURCE.count("**cycle_budget_fields()"), 3,
-                         "窗口内/窗口外/温度歇工,三条写状态的路径都要带")
+        self.assertEqual(SOURCE.count("**cycle_budget_fields()"), 4,
+                         "窗口内/窗口外/温度歇工/空档,四条写状态的路径都要带")
         self.assertNotIn("per_cycle=BACKLOG_PER_CYCLE", SOURCE,
                          "不许再有分支自己拼这个字段——那正是漏写的来源")
 

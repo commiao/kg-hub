@@ -270,6 +270,12 @@ BACKLOG_ENABLED = os.environ.get("KG_HUB_REFINERY_BACKLOG", "1").lower() in ("1"
 BACKLOG_START = int(os.environ.get("KG_HUB_REFINERY_WINDOW_START", "22"))
 BACKLOG_END = int(os.environ.get("KG_HUB_REFINERY_WINDOW_END", "8"))
 WINDOW_CONFIG = STATE_DIR / "refinery-window.json"
+# 不送任务的空档(北京时间，左闭右开，可跨午夜;空串关闭)。家里路由器每天约 02:00
+# 重启，NAS 出网断几分钟 —— 这段时间送出的任务会落成 URLError/超时的「结果未知」,
+# 进账本后要人工对账。它不是供应商故障(之前的交接里误归过一次)。空档内 live 与
+# backlog 都不提交新任务，已在飞的照常跑完;叠加在工作窗口之上，只收窄不放宽。
+BLACKOUT_RAW = os.environ.get("KG_HUB_REFINERY_BLACKOUT", "01:55-02:10").strip()
+BLACKOUT = refinery_window.parse_blackout(BLACKOUT_RAW)
 # 旧直连线水印(526 ingested + 2471 rejected)。repo 的 data/ 被 .dockerignore 排除,
 # 容器里拿不到 → 部署时必须把该 json 预置到 refinery-state 卷(见 REFINERY-DESIGN
 # 部署步骤);这里两个位置都找:先 STATE 卷(生产),再 repo(Mac 本地调试)。
@@ -896,6 +902,9 @@ def write_status(*, heartbeat_only: bool = False, **kw) -> None:
         # 2026-09-21 刚因为"每条路径各带一部分"修过一次(见 _MOMENTARY_DEFAULTS)。
         cur["envelope_repairs"] = dict(_envelope_repairs)
         cur["offscript_responses"] = _offscript[0]
+        # 空档同样在这里注入:心跳也刷新它，看板不必等主循环睡完一整轮才看到。
+        cur["blackout_active"] = in_blackout()
+        cur["blackout"] = BLACKOUT_RAW or None
         tmp = STATUS.with_suffix(".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False))
         tmp.replace(STATUS)
@@ -936,6 +945,17 @@ def in_backlog_window() -> bool:
     """Read the persistent schedule each time; old env hours are the fallback."""
     return refinery_window.is_open(
         datetime.now(tz=CST).hour, WINDOW_CONFIG, BACKLOG_START, BACKLOG_END)
+
+
+def in_blackout() -> bool:
+    """与工作窗口同一时区(北京时间)，按分钟判。"""
+    now = datetime.now(tz=CST)
+    return refinery_window.in_blackout(now.hour * 60 + now.minute, BLACKOUT)
+
+
+def submission_open() -> bool:
+    """工作窗口开着且不在空档里，才允许送新任务。"""
+    return in_backlog_window() and not in_blackout()
 
 
 async def heartbeat_loop() -> None:
@@ -1271,8 +1291,9 @@ async def main() -> int:
             saved_backoff["text"] = text
 
     def can_submit():
-        return in_backlog_window() and not breakers.is_tripped(BREAKER_KEY)[0]
+        return submission_open() and not breakers.is_tripped(BREAKER_KEY)[0]
     breaker_held = False                 # 只在状态翻转时打日志,不每轮刷屏
+    blackout_held = False
     cycle = 0
 
     while True:
@@ -1349,6 +1370,20 @@ async def main() -> int:
                              **cycle_budget_fields())
                 await asyncio.sleep(INTERVAL)
                 continue
+            # —— 空档门控(默认北京时间 01:55-02:10,路由器重启):本轮不选不送,
+            # 池内由 can_submit 拦住新任务、在飞的跑完。blackout_active 由 write_status 注入。
+            if in_blackout():
+                if not blackout_held:
+                    log.warning("[blackout] 进入空档 %s(北京时间),暂停送新任务", BLACKOUT_RAW)
+                    blackout_held = True
+                write_status(disk_temp=dtemp, thermal_hold=False, thermal=thermal,
+                             backlog_window_open=True, last_error=None,
+                             **cycle_budget_fields())
+                await asyncio.sleep(INTERVAL)
+                continue
+            if blackout_held:
+                log.info("[blackout] 空档结束,继续送任务")
+                blackout_held = False
             cfg = load_config()  # 每轮重读(容器内烤的文件;换 bind-mount 后即热改)
             if quota_pause.get("reason"):
                 if recovery.probe_due(quota_pause):
