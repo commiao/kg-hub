@@ -54,6 +54,9 @@ _VERSION_RE = re.compile(r"prompt_version\s*=\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 # 提示词是给会话执行者写的（多条 items、lookahead、names 文件、dry-run）；网关一次只给一条观测，
 # 这段补充把那些不适用的约定关掉，并把输出形状钉死为工具入参。
+# 单次调用补充约定的版本，拼在 prompt_version 后面（agent-v3+sp2），让同为 gateway_single 的批次可按规则版本分开比。
+# sp1：#190/#195 首版；sp2：2026-10-19 fact 改英文完整句 60–200 字符（按条可检索率 29% → 复测）。
+ADDENDUM_VERSION = "sp2"
 SINGLE_CALL_ADDENDUM = """
 ## 本次调用的补充约定（网关单次抽取）
 
@@ -62,6 +65,10 @@ SINGLE_CALL_ADDENDUM = """
 - 实体与关系**一次给全**：先列实体，再给关系，关系的 source/target 必须逐字等于某个实体的 name。
 - 只输出**一个 JSON 对象**：不要 Markdown 代码围栏，不要解释文字，不要调用工具。
 - `edges` 键必须存在；确实没有关系时写 `"edges": []`。边的 name 只用 schema 里的关系名。
+- **fact 用英文写成完整句**（检索用的嵌入模型只认英文）：主语和宾语直接写两端实体的 name，
+  带上关键细节（原因、数值、文件、时间），长度 60–200 字符；专有名词、中文术语、文件名、配置键、报错原文照原样保留，不要翻译。
+  例：`kg-hub-server depends_on FalkorDB because every /api/ingest write goes through the writer.lock on the kg_hub graph`。
+- summary 写 1–3 句（语言不限），说清这个实体是什么、在本条观测里起什么作用。
 """.strip()
 
 
@@ -79,12 +86,13 @@ def ingest_mode_from_env() -> str:
 
 
 def load_prompt(path: Path = PROMPT_PATH) -> tuple[str, str]:
-    """返回 (提示词正文, prompt_version)。版本号取自文件首行的 ``prompt_version = agent-vN``。"""
+    """返回 (提示词正文, prompt_version)。版本号取自文件首行的 ``prompt_version = agent-vN``，
+    再拼上单次调用补充约定的版本（``agent-vN+spM``）。"""
     text = path.read_text(encoding="utf-8").strip()
     match = _VERSION_RE.search(text[:500])
     if match is None:
         raise RuntimeError(f"{path} 首部没有 prompt_version = ... 标记")
-    return text, match.group(1)
+    return text, f"{match.group(1)}+{ADDENDUM_VERSION}"
 
 
 def build_messages(prompt_text: str, *, name: str, episode_body: str,

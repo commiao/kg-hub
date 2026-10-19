@@ -42,6 +42,21 @@ LEXICAL_MIN_RATIO = 0.85
 CONTAIN_MIN_SHARE = 0.8
 # 标识符/路径一类的名字：ASCII 字母数字加 . / _ - : ( ) 组成，没有空格和非 ASCII
 _CODE_LIKE = re.compile(r"^[A-Za-z0-9_./:\-()~@]+$")
+# 后缀合并只给「像文件」的名字：最后一段带扩展名（或是 Dockerfile/Makefile 这类无扩展名的文件）。
+# 2026-10-19 单次模式误并抽查：`edge_similarity_search/node_similarity_search` 被当成路径并进了
+# `node_similarity_search`——它是两个标识符的复合名，不是目录加文件。
+_FILE_TAIL = re.compile(r"(?:^|/)(?:[^/]+\.[A-Za-z0-9]{1,8}|Dockerfile|Makefile|Procfile)$")
+# 太泛的文件名：很多仓库都有，只凭「是某个全路径的后缀」不能认定是同一个文件
+# （同次抽查：`push/config.go` → `config.go`、`deploy/docker-compose.yml` → `docker-compose.yml`）。
+GENERIC_BASENAMES = frozenset({
+    "config.go", "main.go", "server.go", "client.go", "router.go", "handler.go", "service.go", "task.go",
+    "www.go", "util.go", "utils.go", "types.go", "go.mod", "main.py", "app.py", "server.py", "client.py",
+    "utils.py", "util.py", "config.py", "settings.py", "models.py", "views.py", "__init__.py", "setup.py",
+    "conftest.py", "index.ts", "index.js", "index.tsx", "types.ts", "index.html", "readme.md",
+    "changelog.md", "dockerfile", "makefile", "package.json", "tsconfig.json", "docker-compose.yml",
+    "docker-compose.yaml", "compose.yml", "compose.yaml", "config.yml", "config.yaml", "config.json",
+    "requirements.txt", "pom.xml", "build.gradle", ".env", ".gitignore",
+})
 MAX_ENTITIES = 60
 MAX_EDGES = 120
 MAX_NAME_LEN = 200
@@ -123,7 +138,10 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
         if la == lb:
             return True
         short, long_ = (la, lb) if len(la) <= len(lb) else (lb, la)
-        return long_.endswith("/" + short)
+        if not long_.endswith("/" + short) or not _FILE_TAIL.search(short):
+            return False
+        # 短名只有一段且是泛用文件名 → 不认（宁可多一个节点）
+        return "/" in short or short not in GENERIC_BASENAMES
     x, y = _lex(a), _lex(b)
     if not x or not y:
         return False

@@ -83,6 +83,27 @@ class LexicalTest(unittest.TestCase):
         self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))   # 占比 ≥0.8 的包含仍算同物
         self.assertTrue(same("Writer Lock", "writer_lock"))
 
+    def test_path_suffix_only_for_file_like_non_generic_names(self):
+        """2026-10-19 单次模式误并抽查（报告 §4.4）：23 对非精确复用里 7 对可疑/并错，其中 3 对由本规则挡住。"""
+        same = xi._lexically_same
+        # 挡住：复合标识符不是路径；泛用文件名不能只凭后缀认定
+        self.assertFalse(same("edge_similarity_search/node_similarity_search", "node_similarity_search", "Concept"))
+        self.assertFalse(same("push/config.go", "config.go", "File"))
+        self.assertFalse(same("deploy/docker-compose.yml", "docker-compose.yml", "File"))
+        self.assertFalse(same("svc/Dockerfile", "Dockerfile", "File"))
+        # 保留：同次抽查判为正确的路径长短写法
+        for long_, short in (("bin/check-name-vs-behaviour.py", "check-name-vs-behaviour.py"),
+                             ("fleet-ops/lib/fleetops_gate.py", "fleetops_gate.py"),
+                             ("tests/test_deployment_standard.py", "test_deployment_standard.py"),
+                             ("src/main/java/com/liblibai/sd/web/ai/createx/CreateXIntervalPolicy.java",
+                              "CreateXIntervalPolicy.java"),
+                             ("libtv/api/handler/tv/mcp/tool_task.go", "api/handler/tv/mcp/tool_task.go"),
+                             ("libtv/domain/task/service/node_audio_loudness_hook.go", "node_audio_loudness_hook.go")):
+            with self.subTest(long_=long_):
+                self.assertTrue(same(long_, short, "File"))
+        # 泛用文件名带上目录后就够具体了，仍可做后缀合并
+        self.assertTrue(same("libtv/api/router/proxy/task.go", "api/router/proxy/task.go", "File"))
+
     def test_dry_run_resolves_without_writing(self):
         n = xi.normalize_extraction(ents(("kg-hub", "Project", ""), ("Brand New Thing", "Concept", "")), [],
                                     ENTITY_TYPES, EDGE_TYPES)
