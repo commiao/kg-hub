@@ -29,17 +29,49 @@ try:
 except Exception:
     pass
 
+import sys  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.agent_extract import api_token  # noqa: E402
+
 GOLDEN = Path(__file__).resolve().parent.parent / "docs" / "golden-queries.json"
+# FalkorDB 直连凭据的真值在 ~/.claude-mem/.env（Mac 侧 kg-hub/.env 没有）。与 agent_extract.api_token
+# 同款：环境变量优先，文件里只认这几个键，不整文件加载（契约测试 test_no_python_or_shell_loads_claude_mem_env）。
+_FALKOR_KEYS = ("KG_HUB_FALKORDB_HOST", "KG_HUB_FALKORDB_PORT",
+                "KG_HUB_FALKORDB_PASSWORD", "KG_HUB_FALKORDB_DATABASE")
+_FALKOR_ENV_FILE = "~/.claude-mem/.env"
+
+
+def falkor_env(env: dict | None = None, path: str = _FALKOR_ENV_FILE) -> dict[str, str]:
+    env = os.environ if env is None else env
+    out = {k: env[k].strip() for k in _FALKOR_KEYS if env.get(k)}
+    missing = [k for k in _FALKOR_KEYS if k not in out]
+    if missing:
+        try:
+            lines = Path(path).expanduser().read_text().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):]
+            for k in missing:
+                if line.startswith(k + "="):
+                    val = line[len(k) + 1:].strip().strip('"').strip("'")
+                    if val:
+                        out[k] = val
+    return out
 
 
 def _graph():
     from falkordb import FalkorDB
+    fe = falkor_env()
     db = FalkorDB(
-        host=os.environ.get("KG_HUB_FALKORDB_HOST", "127.0.0.1"),
-        port=int(os.environ.get("KG_HUB_FALKORDB_PORT", "6379")),
-        password=os.environ.get("KG_HUB_FALKORDB_PASSWORD") or None,
+        host=fe.get("KG_HUB_FALKORDB_HOST", "127.0.0.1"),
+        port=int(fe.get("KG_HUB_FALKORDB_PORT", "6379")),
+        password=fe.get("KG_HUB_FALKORDB_PASSWORD") or None,
     )
-    return db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
+    return db.select_graph(fe.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
 
 
 def gold_uuids(g, kw: str, cap: int = 60, name_prefix: str | None = None) -> set[str]:
@@ -93,7 +125,7 @@ def main() -> int:
     ap.add_argument("--by-name", action="store_true",
                     help="黄金条目带 gold_name 时按 episode 名前缀取 gold（推入后的口径）；默认仍按 gold_kw 子串")
     args = ap.parse_args()
-    tok = os.environ.get("KG_HUB_TOKEN") or os.environ.get("KG_HUB_API_TOKEN") or ""
+    tok = api_token() or ""
 
     g = _graph()
     queries = json.loads(GOLDEN.read_text())["queries"]
