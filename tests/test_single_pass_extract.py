@@ -39,7 +39,25 @@ GOOD = {"entities": [{"name": "kg-hub", "type": "Project", "summary": "中央知
 
 
 class FakeLLM:
-    """只记录调用、按脚本回答的网关客户端替身（generate_response 契约同 graphiti LLMClient）。"""
+    """文本 JSON 路径的网关客户端替身（线上 SingleAttemptAnthropicClient.generate_text 的契约）：
+    只记录调用，按脚本回答；answer 是 dict 时按 JSON 文本返回，text 给定时原样返回。"""
+
+    def __init__(self, answer=None, error=None, text=None):
+        self.answer = answer if answer is not None else GOOD
+        self.error = error
+        self.text = text
+        self.calls = []
+
+    async def generate_text(self, messages, max_tokens=None, prompt_name=None):
+        self.calls.append({"messages": messages, "prompt_name": prompt_name, "max_tokens": max_tokens,
+                           "stage": mgc._model_stage.get()})
+        if self.error is not None:
+            raise self.error
+        return (self.text if self.text is not None else json.dumps(self.answer, ensure_ascii=False)), {"fake": True}
+
+
+class FakeToolLLM:
+    """没有 generate_text 的旧式客户端替身：extract_single_pass 退回工具调用路径。"""
 
     def __init__(self, answer=None, error=None):
         self.answer = answer if answer is not None else GOOD
@@ -90,23 +108,74 @@ class PromptTest(unittest.TestCase):
 
 
 class ExtractTest(unittest.TestCase):
-    def test_one_call_with_tool_schema_and_single_pass_stage(self):
+    def test_text_path_one_call_parses_json_and_single_pass_stage(self):
         llm = FakeLLM()
         r = _extract(llm)
         self.assertEqual(len(llm.calls), 1)
         call = llm.calls[0]
-        self.assertIs(call["response_model"], sp.SinglePassExtraction)
         self.assertEqual(call["prompt_name"], "single_pass.extract")
         self.assertEqual(call["stage"], "single_pass")     # 账本里与 graphiti 的五个阶段分开
         self.assertEqual(call["messages"][0].role, "system")
+        self.assertIn("`edges` 键必须存在", call["messages"][0].content)
         self.assertIn("正文 body", call["messages"][1].content)
-        schema = sp.SinglePassExtraction.model_json_schema()
-        self.assertEqual(set(schema["properties"]), {"entities", "edges"})
-        self.assertEqual(schema["required"], ["entities"])
         self.assertEqual([e.name for e in r.entities], ["kg-hub", "FalkorDB"])
         self.assertEqual((r.edges[0].source, r.edges[0].name, r.edges[0].target), ("kg-hub", "depends_on", "FalkorDB"))
         self.assertEqual(r.prompt_version, sp.load_prompt()[1])
         self.assertIsNone(mgc._model_stage.get())          # stage 不外泄到调用方
+
+    def test_text_path_tolerates_fence_and_prose(self):
+        text = "好的，结果如下：\n```json\n" + json.dumps(GOOD, ensure_ascii=False) + "\n```\n以上。"
+        r = _extract(FakeLLM(text=text))
+        self.assertEqual(len(r.edges), 1)
+        r2 = _extract(FakeLLM(text="前言 " + json.dumps(GOOD, ensure_ascii=False) + " 尾注"))
+        self.assertEqual(len(r2.entities), 2)
+
+    def test_text_path_missing_edges_key_rejects_and_raises(self):
+        """2026-10-19 首批实测形态：只有 entities、没有 edges 键 —— 形状错误，标记账本答案不可用再抛出。"""
+        rejected = []
+
+        async def fake_reject(sink):
+            rejected.append(sink)
+            return True
+
+        llm = FakeLLM(text=json.dumps({"entities": GOOD["entities"]}, ensure_ascii=False))
+        with mock.patch.object(mgc, "reject_model_result", fake_reject), \
+                self.assertRaisesRegex(ValueError, "lacks edges"):
+            _extract(llm)
+        self.assertEqual((len(llm.calls), rejected), (1, [{"fake": True}]))
+
+    def test_text_path_garbage_rejects_and_raises(self):
+        rejected = []
+
+        async def fake_reject(sink):
+            rejected.append(sink)
+            return True
+
+        with mock.patch.object(mgc, "reject_model_result", fake_reject), \
+                self.assertRaisesRegex(ValueError, "no JSON object"):
+            _extract(FakeLLM(text="抱歉，这段观测我无法处理。"))
+        self.assertEqual(len(rejected), 1)
+
+    def test_text_path_empty_observation_may_omit_edges(self):
+        r = _extract(FakeLLM(text='{"entities": []}'))
+        self.assertEqual((r.entities, r.edges), ([], []))
+
+    def test_parse_json_object_shapes(self):
+        self.assertEqual(sp.parse_json_object('{"items": [{"id": 1, "entities": [], "edges": []}]}')["entities"], [])
+        for bad in ("", "[]", '{"edges": []}', '{"entities": "x", "edges": []}', '{"entities": [{"name": "a"}], "edges": 3}'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                sp.parse_json_object(bad)
+
+    def test_tool_path_kept_for_clients_without_generate_text(self):
+        llm = FakeToolLLM()
+        r = _extract(llm)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIs(llm.calls[0]["response_model"], sp.SinglePassExtraction)
+        self.assertEqual(llm.calls[0]["stage"], "single_pass")
+        schema = sp.SinglePassExtraction.model_json_schema()
+        self.assertEqual(set(schema["properties"]), {"entities", "edges"})
+        self.assertEqual(schema["required"], ["entities", "edges"])   # edges 不再可省略
+        self.assertEqual(len(r.edges), 1)
 
     def test_coercion_keeps_paid_answer_usable(self):
         raw = {"items": [{"id": 29995, "entities": [
@@ -128,7 +197,8 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(sp.SinglePassExtraction.model_validate({"entities": []}).entities, [])
 
     def test_shape_errors_still_fail_validation(self):
-        for bad in ({"edges": []}, {"entities": "kg-hub"}, {"items": []}, {"result": {"entities": []}}):
+        for bad in ({"edges": []}, {"entities": "kg-hub"}, {"items": []}, {"result": {"entities": []}},
+                    {"entities": [{"name": "kg-hub", "type": "Project"}]}):   # 有实体却没有 edges 键
             with self.subTest(bad=bad), self.assertRaises(ValidationError):
                 sp.SinglePassExtraction.model_validate(bad)
 
@@ -139,13 +209,16 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(len(llm.calls), 1)
 
     @unittest.skipUnless(HAVE, "需要 graphiti_core（容器或 venv）")
-    def test_real_client_rejects_unusable_answer_once(self):
-        """走真正的 SingleAttemptAnthropicClient：形状错误 → reject_model_result → 抛出，不追问。"""
+    def test_real_client_text_path_rejects_unusable_answer_once(self):
+        """走真正的 SingleAttemptAnthropicClient.generate_text：不挂工具、一次调用；
+        文本不是 JSON → reject_model_result → 抛出，不追问。"""
+        from types import SimpleNamespace
         calls, rejected = [], []
 
-        async def answers_garbage(*args):
-            calls.append(args)
-            return {"result": "not the schema"}, 11, 5
+        async def fake_create(**kw):
+            calls.append(kw)
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text="这不是 JSON")],
+                                   usage=SimpleNamespace(input_tokens=11, output_tokens=5))
 
         async def fake_reject(sink):
             rejected.append(sink)
@@ -153,14 +226,18 @@ class ExtractTest(unittest.TestCase):
 
         client = object.__new__(SingleAttemptAnthropicClient)
         client.max_tokens = 123
-        client._generate_response = answers_garbage
+        client.model = "kg_hub.entity_extract"
+        client.temperature = 0
+        client.client = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
         client.token_tracker = mock.Mock()
-        with mock.patch("graphiti_client.reject_model_result", fake_reject), \
-                self.assertRaises(ValidationError):
+        with mock.patch.object(mgc, "reject_model_result", fake_reject), \
+                self.assertRaisesRegex(ValueError, "no JSON object"):
             _extract(client)
         self.assertEqual(len(calls), 1)
+        self.assertNotIn("tools", calls[0])                 # 不挂工具
+        self.assertEqual((calls[0]["max_tokens"], calls[0]["model"]), (123, "kg_hub.entity_extract"))
         self.assertEqual(len(rejected), 1)
-        self.assertIs(calls[0][1], sp.SinglePassExtraction)
+        client.token_tracker.record.assert_called_once_with("single_pass.extract", 11, 5)
 
 
 class WriteProvenanceTest(unittest.TestCase):
