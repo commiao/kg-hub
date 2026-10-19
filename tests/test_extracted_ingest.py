@@ -123,8 +123,12 @@ class FakeDriver:
                     return [{"uuid": u, "name": name, "labels": ["Entity", "Tool"], "score": 0.97}], None, None
             return [], None, None
         if cypher.startswith("MATCH (a:Entity {uuid: $src})-[e:RELATES_TO"):
-            u = self.existing_edges.get((params["src"], params["name"], params["dst"]))
-            return ([{"uuid": u, "episodes": ["old-ep"]}] if u else []), None, None
+            assert "fact" in params, "边复用必须带 fact 条件"
+            hit = self.existing_edges.get((params["src"], params["name"], params["dst"]))
+            # 预置值可为 uuid（任意 fact 都算同一条）或 (uuid, fact)（只有 fact 原文相同才命中）
+            if isinstance(hit, tuple):
+                hit = hit[0] if hit[1] == params["fact"] else None
+            return ([{"uuid": hit, "episodes": ["old-ep"]}] if hit else []), None, None
         return [{"uuid": params.get("uuid") or "x"}], None, None
 
 
@@ -168,6 +172,27 @@ class WriteTest(unittest.TestCase):
         self.assertTrue(all("vecf32" in c for c, _ in d.calls if c.startswith("MERGE (n:Entity") or c.startswith("MATCH (source:Entity")))
         link = [p for c, p in d.calls if c.startswith("MATCH (e:Episodic {uuid: $uuid}) SET e.entity_edges")][0]
         self.assertEqual(set(link["entity_edges"]), {"e-old", new_edge["uuid"]})
+
+    def test_same_triple_different_fact_makes_new_edge(self):
+        """同 (源, 边名, 目标) 但 fact 不同 → 新边；fact 相同 → 复用并追加 episode。
+        否则记忆改版的新 fact 永远写不进图（T-0332）。"""
+        def extraction(fact):
+            return xi.normalize_extraction(
+                ents(("kg-hub", "Project", ""), ("Lesson A", "Lesson", "")),
+                edges(("Lesson A", "belongs_to", "kg-hub", fact)), ENTITY_TYPES, EDGE_TYPES)
+        preset = {("u-lesson", "belongs_to", "u-kghub"): ("e-old", "旧写法：slug：结论")}
+        d = FakeDriver(existing_names={"kg-hub": "u-kghub", "Lesson A": "u-lesson"}, existing_edges=preset)
+        r = self._write(d, extraction("结论"))
+        self.assertEqual((r.edges_new, r.edges_reused), (1, 0))
+        self.assertEqual([p for c, p in d.calls if c.startswith("MATCH ()-[e:RELATES_TO {uuid: $uuid}]->()")], [])
+        find = [p for c, p in d.calls if c.startswith("MATCH (a:Entity {uuid: $src})-[e:RELATES_TO")][0]
+        self.assertEqual(find["fact"], "结论")
+        self.assertIn("e.fact = $fact", xi._FIND_EDGE)
+        d2 = FakeDriver(existing_names={"kg-hub": "u-kghub", "Lesson A": "u-lesson"}, existing_edges=preset)
+        r2 = self._write(d2, extraction("旧写法：slug：结论"))
+        self.assertEqual((r2.edges_new, r2.edges_reused), (0, 1))
+        self.assertEqual([p for c, p in d2.calls if c.startswith("MATCH ()-[e:RELATES_TO {uuid: $uuid}]->()")],
+                         [{"uuid": "e-old", "ep": "ep-1"}])
 
     def test_type_guard_blocks_cross_type_vector_reuse(self):
         n = xi.normalize_extraction(ents(("connection-status 监控", "Tool", "探针")), [], ENTITY_TYPES, EDGE_TYPES)

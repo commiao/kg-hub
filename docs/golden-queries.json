@@ -1,5 +1,5 @@
 {
-  "_doc": "黄金查询集 v1(北极星③召回度量基线)。ground-truth 用内容级关键词(gold_kw)定义相关 episode 集,独立于 /api/search 的 edge.fact 子串,以诚实暴露召回差距。mode=literal 查询词是内容里的字面词(子串检索应能命中);mode=nl 是自然语言/同义/跨语言表述(子串检索预期漏,语义检索应命中)——两类的差值就是③要补的空间。gold_kw 会做 toLower 子串匹配 episode.content。",
+  "_doc": "黄金查询集 v1(北极星③召回度量基线)。ground-truth 用内容级关键词(gold_kw)定义相关 episode 集,独立于 /api/search 的 edge.fact 子串,以诚实暴露召回差距。mode=literal 查询词是内容里的字面词(子串检索应能命中);mode=nl 是自然语言/同义/跨语言表述(子串检索预期漏,语义检索应命中)——两类的差值就是③要补的空间。gold_kw 会做 toLower 子串匹配 episode.content。s1-mem-* 段（T-0332，人写记忆推入前后对比）另带 gold_name：推入后用 eval_recall --by-name 按 episode 名前缀取 gold。",
   "queries": [
     {"id": "s1-migration-lit",  "scenario": "S1", "mode": "literal", "query": "接口迁移", "gold_kw": "接口迁移", "note": "字面:迁移三层验收"},
     {"id": "s1-migration-nl",   "scenario": "S1", "mode": "nl",      "query": "怎么确认接口迁移真的完成了而不只是旧代码清零", "gold_kw": "接口迁移", "note": "自然语言,同一主题"},
@@ -17,6 +17,27 @@
 
     {"id": "s3-kghub-design",   "scenario": "S3", "mode": "literal", "query": "canonical 胶囊 注入", "gold_kw": "canonical", "note": "kg-hub 设计/生命周期"},
     {"id": "s3-ranking-nl",     "scenario": "S3", "mode": "nl",      "query": "知识胶囊的排序机制是怎么演进的", "gold_kw": "排序", "note": "项目演进"},
-    {"id": "s3-finance-nl",     "scenario": "S3", "mode": "nl",      "query": "财务分析遵循什么原则", "gold_kw": "财务", "note": "跨域项目知识"}
+    {"id": "s3-finance-nl",     "scenario": "S3", "mode": "nl",      "query": "财务分析遵循什么原则", "gold_kw": "财务", "note": "跨域项目知识"},
+
+    {"id": "s1-mem-alert-thresholds-need-real-distribution-a", "scenario": "S1", "mode": "nl", "query": "给监控定告警阈值应该怎么取值才不会误报", "gold_kw": "阈值", "gold_name": "agent-memory-claude-code-alert-thresholds-need-real-distribution", "note": "人写记忆 alert-thresholds-need-real-distribution（T-0332）"},
+    {"id": "s1-mem-alert-thresholds-need-real-distribution-b", "scenario": "S1", "mode": "nl", "query": "mcp-guard 的 swap 内存告警一直红但没有真故障是怎么回事", "gold_kw": "mcp-guard", "gold_name": "agent-memory-claude-code-alert-thresholds-need-real-distribution", "note": "人写记忆 alert-thresholds-need-real-distribution（T-0332）"},
+    {"id": "s1-mem-launchctl-bootout-is-async-a", "scenario": "S1", "mode": "literal", "query": "launchctl bootout 之后马上 bootstrap 报 Input/output error", "gold_kw": "bootout", "gold_name": "agent-memory-claude-code-launchctl-bootout-is-async", "note": "人写记忆 launchctl-bootout-is-async（T-0332）"},
+    {"id": "s1-mem-launchctl-bootout-is-async-b", "scenario": "S1", "mode": "nl", "query": "批量重装几个 launchd 常驻服务时怎么避免它们全停掉", "gold_kw": "bootout", "gold_name": "agent-memory-claude-code-launchctl-bootout-is-async", "note": "人写记忆 launchctl-bootout-is-async（T-0332）"},
+    {"id": "s1-mem-mac-nas-tailscale-flaky-a", "scenario": "S1", "mode": "nl", "query": "为什么 Mac 连 NAS 的 Tailscale 直连几分钟就掉回 DERP 中继", "gold_kw": "symmetric", "gold_name": "agent-memory-claude-code-mac-nas-tailscale-flaky", "note": "人写记忆 mac-nas-tailscale-flaky（T-0332）"},
+    {"id": "s1-mem-mac-nas-tailscale-flaky-b", "scenario": "S1", "mode": "nl", "query": "Mac 上 ping 和 ssh 都到不了 NAS 但 tailscale ping 是通的，是什么原因", "gold_kw": "atrust", "gold_name": "agent-memory-claude-code-mac-nas-tailscale-flaky", "note": "人写记忆 mac-nas-tailscale-flaky（T-0332）"},
+    {"id": "s1-mem-hard-logic-over-model-discretion-a", "scenario": "S1", "mode": "nl", "query": "agent 参与的系统里能不能让模型负责维护状态", "gold_kw": "硬逻辑", "gold_name": "agent-memory-claude-code-hard-logic-over-model-discretion", "note": "人写记忆 hard-logic-over-model-discretion（T-0332）"},
+    {"id": "s1-mem-hard-logic-over-model-discretion-b", "scenario": "S1", "mode": "nl", "query": "task-hub 为什么不能靠模型自觉去维护租约和状态", "gold_kw": "控制面", "gold_name": "agent-memory-claude-code-hard-logic-over-model-discretion", "note": "人写记忆 hard-logic-over-model-discretion（T-0332）"},
+    {"id": "s1-mem-kg-hub-test-runner-false-green-a", "scenario": "S1", "mode": "nl", "query": "kg-hub 应该怎么跑测试", "gold_kw": "run_all.sh", "gold_name": "agent-memory-claude-code-kg-hub-test-runner-false-green", "note": "人写记忆 kg-hub-test-runner-false-green（T-0332）"},
+    {"id": "s1-mem-kg-hub-test-runner-false-green-b", "scenario": "S1", "mode": "literal", "query": "unittest discover 跑出 0 个用例但退出码是 0 算不算通过", "gold_kw": "run_all.sh", "gold_name": "agent-memory-claude-code-kg-hub-test-runner-false-green", "note": "人写记忆 kg-hub-test-runner-false-green（T-0332）"},
+    {"id": "s1-mem-nas-journal-heavy-io-a", "scenario": "S1", "mode": "nl", "query": "在 NAS 线上账本库上跑统计或清理要注意什么", "gold_kw": "低峰", "gold_name": "agent-memory-claude-code-nas-journal-heavy-io", "note": "人写记忆 nas-journal-heavy-io（T-0332）"},
+    {"id": "s1-mem-nas-journal-heavy-io-b", "scenario": "S1", "mode": "literal", "query": "model-attempts.sqlite3 全表扫描会不会影响入库任务", "gold_kw": "model-attempts", "gold_name": "agent-memory-claude-code-nas-journal-heavy-io", "note": "人写记忆 nas-journal-heavy-io（T-0332）"},
+    {"id": "s1-mem-shell-cjk-expansion-utf8-not-c-a", "scenario": "S1", "mode": "nl", "query": "shell 脚本里变量后面紧跟中文标点为什么报 unbound variable", "gold_kw": "lc_ctype", "gold_name": "agent-memory-claude-code-shell-cjk-expansion-utf8-not-c", "note": "人写记忆 shell-cjk-expansion-utf8-not-c（T-0332）"},
+    {"id": "s1-mem-shell-cjk-expansion-utf8-not-c-b", "scenario": "S1", "mode": "literal", "query": "deploy-standard 准则 31 说的是什么", "gold_kw": "准则 31", "gold_name": "agent-memory-claude-code-shell-cjk-expansion-utf8-not-c", "note": "人写记忆 shell-cjk-expansion-utf8-not-c（T-0332）"},
+    {"id": "s1-mem-plutil-array-replace-inserts-a", "scenario": "S1", "mode": "literal", "query": "plutil -replace 改 ProgramArguments 数组后为什么多出一个旧参数", "gold_kw": "plutil", "gold_name": "agent-memory-claude-code-plutil-array-replace-inserts", "note": "人写记忆 plutil-array-replace-inserts（T-0332）"},
+    {"id": "s1-mem-plutil-array-replace-inserts-b", "scenario": "S1", "mode": "nl", "query": "怎么安全地修改 launchd plist 的启动参数", "gold_kw": "plutil", "gold_name": "agent-memory-claude-code-plutil-array-replace-inserts", "note": "人写记忆 plutil-array-replace-inserts（T-0332）"},
+    {"id": "s1-mem-cerberus-redis-no-xautoclaim-a", "scenario": "S1", "mode": "literal", "query": "cerberus Redis Stream 认领滞留消息报 unknown command XAUTOCLAIM", "gold_kw": "xautoclaim", "gold_name": "agent-memory-claude-code-cerberus-redis-no-xautoclaim", "note": "人写记忆 cerberus-redis-no-xautoclaim（T-0332）"},
+    {"id": "s1-mem-cerberus-redis-no-xautoclaim-b", "scenario": "S1", "mode": "nl", "query": "阿里云 Redis 版本低于 6.2 时 Stream 消费者怎么认领孤儿消息", "gold_kw": "xautoclaim", "gold_name": "agent-memory-claude-code-cerberus-redis-no-xautoclaim", "note": "人写记忆 cerberus-redis-no-xautoclaim（T-0332）"},
+    {"id": "s1-mem-claude-mem-503-local-forwarder-cap-a", "scenario": "S1", "mode": "literal", "query": "claude-mem 转发出现一簇 503 overloaded 但网关 readiness 正常", "gold_kw": "max-concurrency", "gold_name": "agent-memory-claude-code-claude-mem-503-local-forwarder-cap", "note": "人写记忆 claude-mem-503-local-forwarder-cap（T-0332）"},
+    {"id": "s1-mem-claude-mem-503-local-forwarder-cap-b", "scenario": "S1", "mode": "nl", "query": "让 claude-mem 对 503 自动重试能不能兜底", "gold_kw": "overloaded", "gold_name": "agent-memory-claude-code-claude-mem-503-local-forwarder-cap", "note": "人写记忆 claude-mem-503-local-forwarder-cap（T-0332）"}
   ]
 }
