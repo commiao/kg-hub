@@ -83,7 +83,8 @@ def _extract(llm, **kw):
 class PromptTest(unittest.TestCase):
     def test_prompt_file_has_version_and_rules(self):
         text, version = sp.load_prompt()
-        self.assertRegex(version, r"^agent-v\d+$")
+        self.assertRegex(version, r"^agent-v\d+\+sp\d+$")   # 文件版本 + 单次补充约定版本
+        self.assertTrue(version.endswith("+" + sp.ADDENDUM_VERSION))
         self.assertIn("实体类型", text)
         self.assertIn("relates_to", text)
 
@@ -117,6 +118,8 @@ class ExtractTest(unittest.TestCase):
         self.assertEqual(call["stage"], "single_pass")     # 账本里与 graphiti 的五个阶段分开
         self.assertEqual(call["messages"][0].role, "system")
         self.assertIn("`edges` 键必须存在", call["messages"][0].content)
+        self.assertIn("fact 用英文写成完整句", call["messages"][0].content)
+        self.assertIn("60–200 字符", call["messages"][0].content)
         self.assertIn("正文 body", call["messages"][1].content)
         self.assertEqual([e.name for e in r.entities], ["kg-hub", "FalkorDB"])
         self.assertEqual((r.edges[0].source, r.edges[0].name, r.edges[0].target), ("kg-hub", "depends_on", "FalkorDB"))
