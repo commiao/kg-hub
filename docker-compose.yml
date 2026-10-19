@@ -356,6 +356,9 @@ services:
       # 回退到这两个启动环境变量(默认北京时间 22:00-08:00)。
       - KG_HUB_REFINERY_WINDOW_START=${KG_HUB_REFINERY_WINDOW_START:-22}
       - KG_HUB_REFINERY_WINDOW_END=${KG_HUB_REFINERY_WINDOW_END:-8}
+      # 不送任务的空档(北京时间)：家里路由器每天约 02:00 重启，NAS 出网中断几分钟，
+      # 不是供应商故障。用 "-" 而非 ":-"：在 .env 里显式设成空串即关闭空档。
+      - KG_HUB_REFINERY_BLACKOUT=${KG_HUB_REFINERY_BLACKOUT-01:55-02:10}
       # 温度门控:盘温≥此值整轮歇工(2026-08 过热事件后加,保硬件优先于吞吐)
       # 59 是用户 2026-09-17 明确拍板上调的温控阈值（DSM 约 61°C 强制关机）。
       # 此前它只存在于 NAS 的 .env 里，git 一直说 52 —— 2026-09-20 排查

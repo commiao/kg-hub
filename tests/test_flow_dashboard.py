@@ -63,6 +63,14 @@ class BottleneckTests(unittest.TestCase):
         refinery = next(s for s in flow["stages"] if s["id"] == "refinery")
         self.assertNotEqual(refinery["state"], "red")
 
+    def test_blackout_is_a_planned_stop_with_its_reason(self):
+        flow = build(status=status(blackout_active=True, blackout="01:55-02:10"))
+        self.assertEqual(flow["primary"]["title"], "空档内，暂停送新任务")
+        self.assertTrue(flow["primary"]["deliberate"])
+        self.assertIn("路由器", flow["primary"]["evidence"])
+        refinery = next(s for s in flow["stages"] if s["id"] == "refinery")
+        self.assertEqual(refinery["state"], "amber")
+
     def test_missing_heartbeat_outranks_a_planned_pause(self):
         flow = build(status=status(heartbeat_at=(NOW - timedelta(hours=1)).isoformat(),
                                    idle_outside_window=True))

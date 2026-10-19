@@ -1172,6 +1172,9 @@ def probe_nas_chain(nas_host: str | None, local_max: int | None) -> list[dict]:
         elif js.get("idle_outside_window"):
             rf["state"] = AMBER
             rf["detail"] = f"工作窗口外待命（按实时配置）· {base}"
+        elif js.get("blackout_active"):
+            rf["state"] = AMBER
+            rf["detail"] = f"空档内不送任务（{js.get('blackout')}，路由器重启时段）· {base}"
         else:
             rf["state"] = GREEN
             rf["detail"] = f"[home-nas] 处理中 · {base}"

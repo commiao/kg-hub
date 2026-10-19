@@ -235,6 +235,8 @@ def refinery_activity(status: dict, now: datetime) -> dict:
         return {"state": "amber", "label": "温度保护暂停"}
     if status.get("idle_outside_window"):
         return {"state": "amber", "label": "计划暂停：等待工作窗口"}
+    if status.get("blackout_active"):
+        return {"state": "amber", "label": "计划空档：路由器重启时段不送任务"}
     if status.get("quota_paused"):
         return {"state": "red", "label": "配额耗尽，暂停提交"}
     return {"state": "green", "label": "工作窗口内；以入图完成量判断进展"}

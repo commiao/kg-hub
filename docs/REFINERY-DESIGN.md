@@ -70,6 +70,8 @@ Mac 工具(Claude Code/Cursor/Codex/Qoder)          OpenClaw(oc-vps)            
   ssh -o BatchMode=yes -o ProxyJump=none commiao@100.123.208.32 'cd /volume1/docker/kg-hub-src && python3 -m refinery_window apply /tmp/refinery-window-approved.json /volume2/4T/kg-hub-data/refinery-state/refinery-window.json && rm /tmp/refinery-window-approved.json'
   ```
 
+- **不送任务的空档**：默认北京时间 01:55–02:10（与工作窗口同一时区，左闭右开，可跨午夜），由启动环境变量 `KG_HUB_REFINERY_BLACKOUT`（如 `01:55-02:10`，空串关闭）配置，改它要重建 kg-refinery 容器。原因：家里路由器每天约 02:00 重启，NAS 出网中断几分钟，这段时间送出的任务会落成 URLError/超时的「结果未知」、进账本后要人工对账——**这不是供应商故障**，该时段的失败不要按供应商问题排查。空档内 live 与 backlog 都不提交新任务，已在飞的照常跑完；它叠加在工作窗口之上，只收窄不放宽。`status.json` 的 `blackout_active` / `blackout` 字段与看板（计划空档，琥珀色，不触发停工告警）能看出当前是否处于空档。
+
 ### 3. Level-0 原始会话摄入(新工具 + OpenClaw)
 - **契约**(刻意最小,两个端点):
   - `POST /refinery/sessions/events`:`{session_id, tool, project?, seq, events:[{role, content, ts, tool_name?}]}` — 增量追加,幂等键 `(session_id, seq)`

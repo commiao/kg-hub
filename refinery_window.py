@@ -45,6 +45,40 @@ def is_open(hour: int, path: Path, fallback_start: int, fallback_end: int) -> bo
     return hour >= start or hour < end
 
 
+def parse_blackout(raw: str | None) -> tuple[int, int] | None:
+    """"HH:MM-HH:MM" → (起始分钟, 结束分钟)，左闭右开；空串或 None 表示关闭。
+
+    起始晚于结束即跨午夜(如 "23:50-00:10")。写错直接抛 ValueError:配错的空档
+    若静默当成关闭，就又回到「半夜送出去的任务结果未知、要人工对账」。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        start_text, end_text = text.split("-")
+        minutes = []
+        for part in (start_text, end_text):
+            hour_text, minute_text = part.strip().split(":")
+            hour, minute = int(hour_text), int(minute_text)
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                raise ValueError
+            minutes.append(hour * 60 + minute)
+    except ValueError:
+        raise ValueError(f"blackout must look like HH:MM-HH:MM, got {raw!r}") from None
+    if minutes[0] == minutes[1]:
+        raise ValueError(f"blackout start and end must differ, got {raw!r}")
+    return minutes[0], minutes[1]
+
+
+def in_blackout(minute_of_day: int, span: tuple[int, int] | None) -> bool:
+    if span is None:
+        return False
+    start, end = span
+    if start < end:
+        return start <= minute_of_day < end
+    return minute_of_day >= start or minute_of_day < end
+
+
 def apply(source: Path, target: Path) -> None:
     data = source.read_bytes()
     parse(json.loads(data))
