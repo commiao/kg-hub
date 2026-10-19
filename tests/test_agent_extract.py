@@ -182,5 +182,172 @@ class SubmitTest(unittest.TestCase):
             self.assertEqual(summary["claude-haiku-5-5"]["offschema_edge_share"], 1.0)
 
 
+
+class ProvenanceAndRunTest(unittest.TestCase):
+    """框架 §8-1/§8-2：executor / run_id 随 payload 入图并记进 log；运行清单 run start/end。"""
+
+    def test_submit_carries_executor_and_run_id_and_status_groups_by_them(self):
+        batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS)]}
+        results = {"items": [{"id": 29995, "entities": [{"name": "model-gateway", "type": "Tool"}], "edges": []}]}
+        posted = []
+
+        def fake_post(method, url, body, token):
+            posted.append(body)
+            return 200, {"status": "ok", "episode_uuid": "u", "stats": {"entities_in": 1, "edges_in": 0},
+                         "resolved": {"model-gateway": {"reused": True, "matched_name": "model gateway"}}}
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "log.jsonl"
+            recs = ax.submit_results(batch, results, model="m", session="s", url="http://x", token="t",
+                                     post=fake_post, log_path=log, executor="codex", run_id="r1")
+            self.assertEqual((posted[0]["extractor_tool"], posted[0]["run_id"]), ("codex", "r1"))
+            self.assertEqual((recs[0]["executor"], recs[0]["run_id"], recs[0]["reuse_mismatch"]),
+                             ("codex", "r1", ["model-gateway → model gateway"]))
+            line = json.loads(log.read_text().splitlines()[0])
+            self.assertEqual((line["executor"], line["run_id"]), ("codex", "r1"))
+            # 不给就不打：服务端把 None 当未打标
+            ax.submit_results(batch, results, model="m", session="s", url="http://x", token="t",
+                              post=fake_post, log_path=log)
+            self.assertIsNone(posted[1]["extractor_tool"])
+            self.assertIsNone(posted[1]["run_id"])
+            lines = [json.loads(l) for l in log.read_text().splitlines()]
+        by_run = ax.summarize_log(lines, "run_id")
+        self.assertEqual(sorted(by_run), ["?", "r1"])
+        self.assertEqual((by_run["r1"]["ok"], by_run["r1"]["reuse_mismatch_per_obs"]), (1, 1.0))
+        by_exec = ax.summarize_log(lines, "executor")
+        self.assertEqual(by_exec["codex"]["n"], 1)
+        with self.assertRaises(ValueError):
+            ax.summarize_log(lines, "batch")
+
+    def test_cli_defaults_executor_and_run_id_from_env(self):
+        seen = {}
+
+        def fake_submit(batch, results, **kw):
+            seen.update(kw)
+            return []
+        with tempfile.TemporaryDirectory() as d:
+            b, r = Path(d) / "b.json", Path(d) / "r.json"
+            b.write_text(json.dumps({"batch_id": "b1", "items": []}))
+            r.write_text(json.dumps({"items": []}))
+            env = {"KG_HUB_EXECUTOR": "qoder", "KG_HUB_RUN_ID": "run-env", "KG_HUB_AGENT_EXTRACT_DIR": d}
+            with unittest.mock.patch.dict(_os.environ, env), \
+                    unittest.mock.patch.object(ax, "submit_results", fake_submit):
+                ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
+                self.assertEqual((seen["executor"], seen["run_id"]), ("qoder", "run-env"))
+                ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m",
+                         "--executor", "codex", "--run-id", "run-cli"])
+                self.assertEqual((seen["executor"], seen["run_id"]), ("codex", "run-cli"))
+
+    def test_run_start_end_manifest(self):
+        known = {"type_guard_on_resolution", "resolution_strictness", "submit_dry_run", "gateway.post_normalize",
+                 "gateway.custom_extraction", "gateway.max_tokens", "gateway.edge_empty_retry", "batch_size"}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "runs" / "r1.json"
+            m = ax.run_start("r1", executor="claude-code", model="claude-fable-5-1", sample="ab-sample-20261017",
+                             server_commit="30049c9", executor_version="2.1.x", knobs={"batch_size": 20},
+                             now="2026-10-19T01:00:00+00:00", path=p, known_knobs=known)
+            self.assertEqual(set(m), {"run_id", "executor", "executor_version", "model", "prompt_version",
+                                      "server_commit", "knobs", "sample", "started_at", "ended_at", "self_reported"})
+            self.assertEqual(m["prompt_version"], ax.PROMPT_VERSION)
+            self.assertEqual(m["knobs"]["gateway.max_tokens"], 8192)
+            self.assertEqual(m["knobs"]["batch_size"], 20)
+            self.assertIsNone(m["ended_at"])
+            self.assertEqual(json.loads(p.read_text())["self_reported"], {"input_tokens": 0, "output_tokens": 0, "wall_s": 0})
+            with self.assertRaises(FileExistsError):
+                ax.run_start("r1", executor="x", model="y", path=p, known_knobs=known)
+            with self.assertRaises(ValueError):   # 没登记的旋钮：与 checkpoint 同一道闸
+                ax.run_start("r2", executor="x", model="y", knobs={"made_up": 1}, path=Path(d) / "r2.json", known_knobs=known)
+            with self.assertRaises(ValueError):
+                ax.run_start("bad run!", executor="x", model="y", path=Path(d) / "r3.json", known_knobs=known)
+            e = ax.run_end("r1", input_tokens=1000, output_tokens=200, now="2026-10-19T01:10:00+00:00", path=p)
+            self.assertEqual(e["self_reported"], {"input_tokens": 1000, "output_tokens": 200, "wall_s": 600.0})
+            self.assertEqual(e["ended_at"], "2026-10-19T01:10:00+00:00")
+            e = ax.run_end("r1", wall_s=42.5, path=p)
+            self.assertEqual(e["self_reported"]["wall_s"], 42.5)
+            self.assertEqual(e["self_reported"]["input_tokens"], 1000)   # 不给的字段不动
+            with self.assertRaises(FileNotFoundError):
+                ax.run_end("nope", path=Path(d) / "nope.json")
+            self.assertIsNone(ax.load_run("nope", Path(d) / "nope.json"))
+
+    def test_cli_run_start_end_uses_state_dir_and_real_knobs(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"KG_HUB_AGENT_EXTRACT_DIR": d, "KG_HUB_EXECUTOR": "codex"}
+            with unittest.mock.patch.dict(_os.environ, env):
+                rc = ax.main(["run", "start", "--run-id", "r-cli", "--model", "gpt-5-codex",
+                              "--knob", "gateway.max_tokens=4096"])
+                self.assertEqual(rc, 0)
+                m = json.loads((Path(d) / "runs" / "r-cli.json").read_text())
+                self.assertEqual((m["executor"], m["knobs"]["gateway.max_tokens"]), ("codex", 4096))
+                with self.assertRaises(SystemExit):   # 未登记旋钮
+                    ax.main(["run", "start", "--run-id", "r-cli2", "--model", "m", "--knob", "nope=1"])
+                rc = ax.main(["run", "end", "--run-id", "r-cli", "--input-tokens", "5", "--output-tokens", "6"])
+                self.assertEqual(rc, 0)
+                m = json.loads((Path(d) / "runs" / "r-cli.json").read_text())
+                self.assertIsNotNone(m["ended_at"])
+                self.assertEqual(m["self_reported"]["input_tokens"], 5)
+                with self.assertRaises(SystemExit):
+                    ax.main(["run", "bogus", "--run-id", "x"])
+
+
+
+class DryRunGateTest(unittest.TestCase):
+    """四条红线之 2「每批先 dry-run」由工具自己执行：--dry-run 记标记，正式提交逐 id 核对，没预览过的拒绝。"""
+
+    def _files(self, d):
+        b, r = Path(d) / "b.json", Path(d) / "r.json"
+        b.write_text(json.dumps({"batch_id": "b0009", "items": [ax.to_identity(OBS),
+                                                                  ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}))
+        r.write_text(json.dumps({"items": [
+            {"id": 29995, "entities": [{"name": "x", "type": "Tool"}], "edges": []},
+            {"id": 2, "entities": []}]}))
+        return b, r
+
+    def test_marker_and_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d)
+            results = {"items": [{"id": 1, "entities": [{"name": "a", "type": "Tool"}]},
+                                 {"id": 2, "entities": []},
+                                 {"id": 3, "entities": [{"name": "c", "type": "Tool"}]}]}
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [1, 3])   # 空 entities 的 2 不要求
+            ax.record_dryrun(sd, "b1", [{"id": 1, "status": "dry_run"}, {"id": 9, "status": "http_500"}],
+                             now="2026-10-19T00:00:00+00:00")
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [3])      # 失败的 9 不算预览过
+            ax.record_dryrun(sd, "b1", [{"id": 3, "status": "dry_run"}])        # 分两次 dry-run 取并集
+            self.assertEqual(ax.dryrun_missing(sd, "b1", results), [])
+            self.assertEqual(json.loads(ax.dryrun_marker_path(sd, "b1").read_text())["ids"], [1, 3])
+            self.assertEqual(ax.dryrun_missing(sd, "b2", results), [1, 3])   # 别的批不沾光
+
+    def test_submit_refuses_until_dry_run_then_allows(self):
+        posted = []
+
+        def fake_post(method, url, body, token):
+            posted.append(body.get("dry_run", False))
+            return 200, {"status": "dry_run" if body.get("dry_run") else "ok", "episode_uuid": "u",
+                         "stats": {"entities_in": 1, "edges_in": 0}, "resolved": {}}
+        with tempfile.TemporaryDirectory() as d:
+            b, r = self._files(d)
+            env = {"KG_HUB_AGENT_EXTRACT_DIR": d}
+            real = ax.submit_results
+            # submit_results 的 post 参数在定义时就绑定了 _http，patch 模块属性不生效；包一层把假 post 塞进去，
+            # 测试绝不能真的打到 NAS
+            with unittest.mock.patch.dict(_os.environ, env), \
+                    unittest.mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": fake_post})):
+                with self.assertRaises(SystemExit) as cm:              # 没 dry-run 过：拒绝，且一条都没发
+                    ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
+                self.assertIn("还没 dry-run", str(cm.exception))
+                self.assertEqual(posted, [])
+                self.assertEqual(ax.main(["dryrun-check", "--batch", str(b), "--file", str(r)]), 1)
+                self.assertEqual(ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m", "--dry-run"]), 0)
+                self.assertEqual(posted, [True])
+                self.assertTrue((Path(d) / "dryrun-b0009.json").exists())
+                self.assertEqual(ax.main(["dryrun-check", "--batch", str(b), "--file", str(r)]), 0)
+                self.assertEqual(ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"]), 0)
+                self.assertEqual(posted, [True, False])
+                # 明确跳过：另一批没 dry-run 也放行
+                b2 = Path(d) / "b2.json"
+                b2.write_text(json.dumps({"batch_id": "b0010", "items": [ax.to_identity(OBS)]}))
+                self.assertEqual(ax.main(["submit", "--batch", str(b2), "--file", str(r), "--model", "m",
+                                          "--skip-dryrun-check"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

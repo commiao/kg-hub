@@ -499,5 +499,218 @@ class TrunkVerdictReachesTheStatusFileTests(unittest.TestCase):
         self.assertEqual(out.split(), ["ghost.py"])
 
 
+# 假 ssh：最后一个参数是远端命令。FAKE_SSH=down 时像连不上一样退 255（stderr 故意两行，
+# 真实的 ssh 常先打一句 Warning）；否则在本地 sh 里执行那条远端命令，src 指向临时目录。
+FAKE_SSH = """#!/bin/sh
+if [ "$FAKE_SSH" = down ]; then
+    echo "Warning: Permanently added 'x' to the list of known hosts." >&2
+    echo "ssh: connect to host x port 22: Operation timed out" >&2
+    exit 255
+fi
+for arg; do cmd=$arg; done
+exec sh -c "$cmd"
+"""
+
+
+class UnreachableNasTests(unittest.TestCase):
+    """NAS 读不到时必须判 error —— 不许判 drift，也不许不写判决。
+
+    2026-10-18 实测两种错法：NAS 不可达期间，`--ref` 跑法把每个跟踪文件都判成
+    「NAS 上没有」，以 drift 写进状态文件（「380 处实质不一致」）；默认跑法（定时作业
+    就是这么跑的）在 live_commit 处 SystemExit，状态文件不写，留着上一条 ok。
+
+    上面那些用例全在函数层面 mock 掉了 remote_listing / remote_hashes / live_commit，
+    所以从来没有一条走过真实的 ssh 失败路径 —— 夹具里缺的正是生产唯一有的那个条件
+    （准则 30）。这里走真函数，只把 PATH 上的 ssh 换成假的。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="drift-unreachable-"))
+        self.addCleanup(self._cleanup)
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "ssh"
+        fake.write_text(FAKE_SSH)
+        fake.chmod(0o755)
+        self.src = self.tmp / "nas-src"
+        self.status = self.tmp / "status"
+        self.status.write_text("base\tok\tSENTINEL 上一条判决\n")
+        for patcher in (
+                mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                                             "FAKE_SSH": "down"}),
+                mock.patch.object(D, "release_config",
+                                  return_value={"ssh": "x@y", "src": str(self.src)})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _cleanup(self):
+        for path in self.tmp.rglob("*"):          # 恢复被故意设成不可读的目录，好删
+            if path.is_dir():
+                path.chmod(0o755)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def reachable(self):
+        os.environ["FAKE_SSH"] = "up"
+
+    def main(self, *argv):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = D.main([*argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    def verdict(self):
+        lines = self.status.read_text().splitlines()
+        self.assertEqual(len(lines), 1, f"状态文件必须是一行一条：{lines}")
+        _, verdict, detail = lines[0].split("\t", 2)
+        return verdict, detail
+
+    def test_default_run_writes_error_instead_of_keeping_the_last_ok(self):
+        rc, out, _ = self.main("--status-file", str(self.status))
+        verdict, detail = self.verdict()
+        self.assertEqual((rc, verdict), (2, "error"), out)
+        self.assertIn("连不上 NAS", detail)
+        self.assertNotIn("SENTINEL", detail, "上一条 ok 原样留着 —— 就是要防的那条陈旧绿灯")
+
+    def test_explicit_ref_does_not_turn_unreachable_into_drift(self):
+        rc, out, _ = self.main("--ref", "HEAD", "--skip-trunk", "--status-file", str(self.status))
+        verdict, detail = self.verdict()
+        self.assertEqual((rc, verdict), (2, "error"), out)
+        self.assertIn("NAS 文件清单没取到", detail)
+        self.assertNotIn("NAS 上没有", out, "连不上被报成了「NAS 上没有」")
+
+    def test_list_modes_print_nothing_on_stdout_and_exit_nonzero(self):
+        for flag in ("--list-extra", "--list-prunable"):
+            with self.subTest(flag=flag):
+                rc, out, err = self.main(flag, "--ref", "HEAD", "--status-file", str(self.status))
+                self.assertEqual(rc, 2, "退出 0 会让 release.sh 以为「查了，什么都没有」")
+                self.assertEqual(out, "", "stdout 是给 release.sh 读的机器清单，不能混进原因")
+                self.assertIn("连不上 NAS", err)
+                self.assertIn("SENTINEL", self.status.read_text(), "清单模式不出判决")
+
+    def test_missing_source_dir_is_named_as_such(self):
+        self.reachable()                           # 连得上，但源码目录不在
+        rc, out, _ = self.main("--ref", "HEAD", "--skip-trunk", "--status-file", str(self.status))
+        verdict, detail = self.verdict()
+        self.assertEqual((rc, verdict), (2, "error"), out)
+        self.assertIn("没有源码目录", detail)
+
+    def test_missing_source_dir_makes_the_listing_itself_raise(self):
+        """只靠 compare 随后再取摘要时撞上同一个目录来兜底不够：清单函数自己的契约就是
+        「取不到就抛，绝不返回空清单」。变异验证时这一格曾存活 —— 被摘要那一步盖住了。"""
+        self.reachable()
+        with self.assertRaises(D.RemoteUnavailable) as caught:
+            D.remote_listing("x@y", str(self.src))
+        self.assertIn("没有源码目录", str(caught.exception))
+
+    def test_a_reachable_nas_still_lists_files_despite_find_noise(self):
+        """find 碰到读不了的子目录会以 1 结束；那不是「没查成」，清单照旧要拿回来。"""
+        self.reachable()
+        (self.src / "sub").mkdir(parents=True)
+        (self.src / "a.py").write_text("a")
+        (self.src / "sub" / "b.py").write_text("b")
+        locked = self.src / "locked"
+        locked.mkdir()
+        (locked / "c.py").write_text("c")
+        locked.chmod(0)
+        self.assertEqual(sorted(D.remote_listing("x@y", str(self.src))), ["a.py", "sub/b.py"])
+
+    def test_an_absent_file_is_a_normal_hash_result_not_a_failure(self):
+        """循环最后一轮 [ -f ] 为假时整条命令会以 1 结束；「这个文件不在」是正常结果。"""
+        self.reachable()
+        self.src.mkdir()
+        self.assertEqual(D.remote_hashes("x@y", str(self.src), ["nope.py"]), {})
+
+    def test_unreachable_hashes_raise_instead_of_returning_nothing(self):
+        with self.assertRaises(D.RemoteUnavailable):
+            D.remote_hashes("x@y", str(self.src), ["a.py"])
+
+
+# 假检查器：按 FAKE_VERDICT 往 --status-file 写一行（none 表示什么都不写），按 FAKE_RC 退出。
+FAKE_CHECKER = """import os, sys
+from datetime import datetime, timezone
+verdict, rc = os.environ["FAKE_VERDICT"], int(os.environ["FAKE_RC"])
+if verdict != "none":
+    path = sys.argv[sys.argv.index("--status-file") + 1]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"{datetime.now(timezone.utc).isoformat()}\\t{verdict}\\tdetail\\n")
+sys.exit(rc)
+"""
+
+
+class RefreshVerdictBehaviourTests(unittest.TestCase):
+    """发布后刷新判决：说不说「已刷新」，以状态文件这次有没有被写为准。
+
+    上面 PostReleaseRefreshTests 只断言源码文本，从没执行过这个函数。原来它按退出码
+    分档，而退出码两头都有歧义 —— 1 既是 drift 也是未捕获异常，2 既是 error 也是参数
+    解析失败。2026-10-18 实测：检查器崩掉、状态文件根本不存在，它照样报「已刷新：
+    有待处理项」。
+
+    这里把函数从 release.sh 原样摘出来，旁边放一个假检查器，在 `set -euo pipefail`
+    和 UTF-8 locale 下真跑（发布脚本本身就是这么跑的；准则 31）。HOME 指进沙箱。
+    """
+
+    def setUp(self):
+        import re
+        import shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="refresh-verdict-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        nas = self.tmp / "deploy" / "nas"
+        nas.mkdir(parents=True)
+        source = (ROOT / "deploy" / "nas" / "release.sh").read_text("utf-8")
+        body = re.search(r"^refresh_drift_verdict\(\) \{\n.*?^\}\n", source, re.M | re.S)
+        self.assertIsNotNone(body, "release.sh 里找不到 refresh_drift_verdict")
+        (nas / "fn.sh").write_text(body.group(0))
+        (nas / "check_source_drift.py").write_text(FAKE_CHECKER)
+        self.home = self.tmp / "home"
+        self.status = self.home / ".cache" / "kg-hub" / "source-drift.status"
+        self.fn = nas / "fn.sh"
+
+    def refresh(self, verdict: str, rc: int, previous: str | None = "base\tok\tSENTINEL\n"):
+        if previous is not None:
+            self.status.parent.mkdir(parents=True, exist_ok=True)
+            self.status.write_text(previous)
+        done = subprocess.run(
+            ["bash", "-c", 'set -euo pipefail; say() { printf "%s\\n" "$*" >&2; }; '
+                           'source "$1"; refresh_drift_verdict', "_", str(self.fn)],
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "LC_ALL": "en_US.UTF-8",
+                 "FAKE_VERDICT": verdict, "FAKE_RC": str(rc)},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, f"刷新失败不该让发布失败：{done.stderr}")
+        return done.stderr
+
+    def test_written_verdicts_are_reported_as_written(self):
+        for verdict, rc, says in (("ok", 0, "巡检判决已刷新：一致"),
+                                  ("drift", 1, "巡检判决已刷新：有待处理项"),
+                                  ("error", 2, "巡检判决已刷新：这次没查成（error）")):
+            with self.subTest(verdict=verdict):
+                self.assertIn(says, self.refresh(verdict, rc))
+
+    def test_a_crashed_checker_is_not_reported_as_pending_items(self):
+        """未捕获异常退出 1、什么都没写 —— 原来正好顺着 1 的分支报成「有待处理项」。"""
+        out = self.refresh("none", 1)
+        self.assertIn("没有**刷新", out)
+        self.assertNotIn("已刷新", out)
+        self.assertIn("SENTINEL", self.status.read_text())
+
+    def test_an_unwritten_exit_two_is_not_reported_as_refreshed(self):
+        """参数解析失败也退出 2，同样什么都没写。"""
+        out = self.refresh("none", 2)
+        self.assertIn("没有**刷新", out)
+        self.assertNotIn("已刷新", out)
+
+    def test_exit_zero_without_a_status_file_is_not_refreshed_either(self):
+        out = self.refresh("none", 0, previous=None)
+        self.assertIn("没有**刷新", out)
+
+    def test_an_unknown_verdict_is_named_not_guessed(self):
+        out = self.refresh("maybe", 0)
+        self.assertIn("不认识的「maybe」", out)
+        self.assertNotIn("已刷新：一致", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -138,17 +138,23 @@ def time_range(key: str, now: datetime) -> dict:
 
 
 def _model_attempt_rows(since: datetime) -> list[tuple]:
-    """Read the existing journal without its schema setup or write transaction."""
-    backup = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
-    if not backup:
-        raise FileNotFoundError("KG_HUB_INGEST_BACKUP_PATH 未配置")
-    path = Path(backup).with_name("model-attempts.sqlite3")
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2) as db:
-        return db.execute(
-            "SELECT http_started_at, updated_at, phase FROM model_attempts "
-            "WHERE http_started_at >= ?", (since.isoformat(),)).fetchall()
+    """Gateway witness attempts are the shared source for quota and call counts.
+
+    The former local SDK journal excludes requests executed by the public queue.
+    Exported events contain timestamps and business keys only. Missing coverage
+    is unavailable, never a fabricated zero. Durations are not in this source.
+    """
+    from topology import GATEWAY_USAGE_PATH, _read_json
+    data = _read_json(GATEWAY_USAGE_PATH)
+    window = data.get("attempt_window", {})
+    floor, end = _parse_ts(window.get("start")), _parse_ts(window.get("end"))
+    if not floor or not end or floor > since or not isinstance(data.get("attempt_events"), list):
+        raise ValueError("网关调用明细未覆盖所选区间")
+    if (datetime.now(timezone.utc) - end).total_seconds() > 1200:
+        raise ValueError("网关调用明细已过期")
+    return [(event["at"], None, "gateway_attempt") for event in data["attempt_events"]
+            if event.get("business_key") == "kg_hub.entity_extract"
+            and _parse_ts(event.get("at")) and _parse_ts(event["at"]) >= since]
 
 
 def key_metric_trends(*, now: datetime, commits: list[dict],
@@ -234,6 +240,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                 if phase == "completed" and ended and started <= ended <= now:
                     duration_by_hour.setdefault(b["hour"], []).append(
                         (ended-started).total_seconds())
+            if phase == "gateway_attempt":
+                continue
             # Integrate call-seconds over each hour, including calls spanning boundaries.
             # An interrupted, unresolved call has no known end. Cap its
             # interval so a stale journal row cannot look in flight for days.
@@ -256,7 +264,8 @@ def key_metric_trends(*, now: datetime, commits: list[dict],
                 b["call_duration_avg"] = round(sum(values) / len(values), 1)
             bucket_at = _parse_ts(b["hour"] + ":00:00+00:00")
             elapsed = max(0, (min(now, bucket_at + timedelta(hours=1)) - max(start, bucket_at)).total_seconds())
-            b["model_inflight_avg"] = round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None
+            b["model_inflight_avg"] = (None if any(row[2] == "gateway_attempt" for row in attempts)
+                                       else round((b["model_inflight_avg"] or 0) / elapsed, 2) if elapsed else None)
             if b["ingested"] and b["model_calls"] is not None:
                 b["calls_per_ingested"] = round(b["model_calls"] / b["ingested"], 1)
     return buckets
@@ -710,7 +719,7 @@ def merge_graph_increments(created: dict | None, graph: list[dict] | None) -> No
     """把同一时间桶的 kg-hub 入图数并进 claude-mem 新增那一行，供同图对比。
 
     两边按同一规则分桶（北京时间小时，超过 2 天按自然日），按标签对齐。
-    只计 claude-mem 来源（积压线 + live 线 + 会话自抽取），其他源不是 claude-mem 产出的。
+    只计 claude-mem 来源（积压线 + live 线 + 会话自抽取 + 网关单次），其他源不是 claude-mem 产出的。
     图查询失败时整列为 None（未知），查询成功而桶里没有 Episode 才是 0。"""
     if not created:
         return
@@ -724,7 +733,9 @@ def merge_graph_increments(created: dict | None, graph: list[dict] | None) -> No
         row["kg_backlog"] = g.get("积压线", 0)
         row["kg_live"] = g.get("live 线", 0)
         row["kg_agent"] = g.get("会话自抽取", 0)   # 会话自抽取路径（/api/ingest_extracted）入库的 claude-mem 观测
-        row["kg_ingested"] = row["kg_backlog"] + row["kg_live"] + row["kg_agent"]
+        # 网关单次抽取（KG_HUB_INGEST_MODE=single_pass）：经 /api/ingest 但一次调用出实体+关系，单列便于与 graphiti 模式对比
+        row["kg_gateway_single"] = g.get("网关单次", 0)
+        row["kg_ingested"] = row["kg_backlog"] + row["kg_live"] + row["kg_agent"] + row["kg_gateway_single"]
         known.append(row["kg_ingested"])
     created["kg_total"] = sum(known) if graph is not None else None
 
@@ -1223,6 +1234,7 @@ async def _graph_daily(driver, boundary: object, now: datetime) -> list[dict]:
         "WITH bucket, CASE "
         "  WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
         "  WHEN n.extraction_mode = 'agent' THEN '会话自抽取' "
+        "  WHEN n.extraction_mode = 'gateway_single' THEN '网关单次' "
         "  WHEN toInteger(substring(n.name, 15)) <= $boundary THEN '积压线' "
         "  ELSE 'live 线' END AS lane "
         "RETURN bucket, lane, count(*) AS c ORDER BY bucket",
@@ -1248,6 +1260,7 @@ async def _graph_period(driver, boundary: object, start: datetime, end: datetime
         "WITH n, substring(n.created_at,0,13) AS hour "
         "WITH hour, CASE WHEN NOT n.name STARTS WITH 'claude-mem-obs-' THEN '其他源' "
         "WHEN n.extraction_mode = 'agent' THEN '会话自抽取' "
+        "WHEN n.extraction_mode = 'gateway_single' THEN '网关单次' "
         "WHEN toInteger(substring(n.name,15)) <= $boundary THEN '积压线' "
         "ELSE 'live 线' END AS lane RETURN hour, lane, count(*) AS c ORDER BY hour",
         since=start.isoformat(), until=end.isoformat(), boundary=int(boundary or 0))
@@ -1334,7 +1347,7 @@ async def collect_flow(range_key: str = "today") -> dict:
         errors.append(f"小时入图状态不可读：{type(exc).__name__}")
     attempts = None
     try:
-        attempts = await asyncio.to_thread(_model_attempt_rows, start - timedelta(hours=24))
+        attempts = await asyncio.to_thread(_model_attempt_rows, start)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"模型调用账本不可读：{type(exc).__name__}")
     since = start.timestamp()
@@ -1348,6 +1361,10 @@ async def collect_flow(range_key: str = "today") -> dict:
         errors.append(f"提交遥测历史快照不可读：{type(exc).__name__}")
     trends = key_metric_trends(now=end, window_start=start, commits=commits, attempts=attempts,
                                outcomes=outcomes, archived_commits=archived_commits)
+    # Witness exports counts only, not provider completion times or slot occupancy.
+    for row in trends:
+        row["model_inflight_avg"] = None
+        row["call_duration_avg"] = None
     try:
         remaining_history = await asyncio.to_thread(backlog_remaining_history, status, now)
     except (OSError, sqlite3.Error) as exc:
@@ -1481,7 +1498,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <div class=cards id=kgqueuecards></div>
 <div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。单个采样间隔内源库增减 ≥200 条记为同步补灌（橙色虚线），不计入速度；极端值贴边显示，光标仍读出原值。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
-<div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#D97706"></i>会话自抽取<i style="background:#B79CED"></i>其他源</div>
+<div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#D97706"></i>会话自抽取<i style="background:#0E7490"></i>网关单次<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
 
 </section>
@@ -1575,7 +1592,7 @@ function stack(target,rows,label,parts){const box=$(target);
   +parts.map(p=>{const v=p[1](r)||0;return v?'<i title="'+p[0]+' '+v+'" style="width:'+(v*100/peak)+'%;background:'+p[2]+'"></i>':''}).join('')
   +'</span><span class=c>'+parts.map(p=>p[0]+' '+(p[1](r)||0)).join(' · ')+'</span></div>'}).join('')}
 stack('daily',(Pd.graph||[]).slice().reverse(),r=>r.label.slice(5),[
- ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['会话自抽取',r=>r['会话自抽取'],'#D97706'],['其他源',r=>r['其他源'],'#B79CED']]);
+ ['积压线',r=>r['积压线'],'#1D9E75'],['live',r=>r['live 线'],'#5B8FF9'],['会话自抽取',r=>r['会话自抽取'],'#D97706'],['网关单次',r=>r['网关单次'],'#0E7490'],['其他源',r=>r['其他源'],'#B79CED']]);
 
 const CC=D.claude_mem_created;
 if(!CC){$('cmcreated').innerHTML='<div class=note>暂无数据：refinery 尚未写入新增计数</div>'}
@@ -1631,7 +1648,7 @@ if(CC)backlogData.push({title:'claude-mem 新增 vs kg-hub 入图（每'+(CC.gra
   gapMinutes:CC.granularity==='day'?36*60:90,
   rows:CC.rows.map(r=>({...r,label:r.label+' 北京时间'+(r.partial&&r.count!==null?' · 仅部分覆盖':'')})),
   series:[['claude-mem 新增','count','#D97706'],['kg-hub 入图','kg_ingested','#1D9E75']],
-  extra:r=>Number.isFinite(r.kg_ingested)?['<span>入图其中 积压线 '+r.kg_backlog+' · live '+r.kg_live+' · 会话自抽取 '+(r.kg_agent||0)+'</span>']:[]});
+  extra:r=>Number.isFinite(r.kg_ingested)?['<span>入图其中 积压线 '+r.kg_backlog+' · live '+r.kg_live+' · 会话自抽取 '+(r.kg_agent||0)+' · 网关单次 '+(r.kg_gateway_single||0)+'</span>']:[]});
 const backlogX=(spec,at)=>rangeX(at);
 // A single outlier (e.g. a delayed sync from before bursts were flagged) must not
 // flatten every normal point onto the zero line: robust charts scale to P2–P98

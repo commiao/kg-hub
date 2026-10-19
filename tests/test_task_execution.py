@@ -52,7 +52,9 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
                    "model_business_task": model_business_task,
                    "journal_from_backup_env": lambda: self.journal,
                    "_persisted_business_result": AsyncMock(return_value=False),
-                   "MIN_CLIENT_TIMEOUT_SEC": 180, "PREDIGEST_ENABLED": False}
+                   "MIN_CLIENT_TIMEOUT_SEC": 180, "PREDIGEST_ENABLED": False,
+                   # 单次抽取开关（KG_HUB_INGEST_MODE）：这里固定 graphiti 路径，单次路径见 test_single_pass_extract
+                   "_use_single_pass": lambda body: False}
         exec(compile(ast.Module(body=funcs, type_ignores=[]), str(SERVER), "exec"), self.ns)
 
     def started(self):

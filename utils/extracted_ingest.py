@@ -216,8 +216,11 @@ _SAVE_EPISODE = (
     "MERGE (e:Episodic {uuid: $uuid}) SET e = {uuid: $uuid, name: $name, group_id: $group_id, "
     "source_description: $source_description, source: $source, content: $content, "
     "entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at, "
-    "extractor_model: $extractor_model, extraction_mode: 'agent', "
-    "extractor_session: $extractor_session, prompt_version: $prompt_version} "
+    "extractor_model: $extractor_model, extraction_mode: $extraction_mode, "
+    "extractor_session: $extractor_session, prompt_version: $prompt_version, "
+    # 2026-10-19 框架 §1：执行工具与实验 run 是独立于模型的两个变量。旧 episode 没有这两个字段，
+    # 读侧一律 coalesce 成 null/未知，不回填。
+    "extractor_tool: $extractor_tool, run_id: $run_id} "
     "RETURN e.uuid AS uuid")
 _SAVE_MENTIONS = (
     "MATCH (episode:Episodic {uuid: $episode_uuid}) MATCH (node:Entity {uuid: $entity_uuid}) "
@@ -256,10 +259,17 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
                            prompt_version: str | None = None,
                            episode_uuid: str | None = None,
                            node_match_min: float = NODE_MATCH_MIN,
-                           type_guard: bool = True, dry_run: bool = False) -> WriteResult:
+                           type_guard: bool = True, dry_run: bool = False,
+                           extraction_mode: str = "agent",
+                           extractor_tool: str | None = None,
+                           run_id: str | None = None) -> WriteResult:
     """把归一后的抽取写进图。driver 只需 execute_query；embedder 只需 create_batch。
 
-    dry_run=True：只做嵌入与消解，不写任何东西（第 2 轮复盘：让抽取者在写入前看到会并到哪个旧实体）。"""
+    dry_run=True：只做嵌入与消解，不写任何东西（第 2 轮复盘：让抽取者在写入前看到会并到哪个旧实体）。
+    extraction_mode：episode 与新建节点/边上的来源方式标记——'agent'（会话自抽取）或
+    'gateway_single'（网关单次抽取，utils/single_pass_extract）；看板与 extractor_compare 按它分组。
+    extractor_tool / run_id：来源标记的另外两个维度（执行工具、实验 run），随 episode / 新实体 / 新边落图；
+    缺省 None，与旧内容一样在读侧按「未知」处理。"""
     now = datetime.now(tz=timezone.utc)
     now_iso = now.isoformat()
     ep_uuid = episode_uuid or str(uuidlib.uuid4())
@@ -290,7 +300,8 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         entity_data = {
             "uuid": new_uuid, "name": ent.name, "name_embedding": [float(x) for x in vec],
             "group_id": group_id, "summary": ent.summary, "created_at": now_iso,
-            "extractor_model": extractor_model,
+            "extractor_model": extractor_model, "extraction_mode": extraction_mode,
+            "extractor_tool": extractor_tool, "run_id": run_id,
         }
         await driver.execute_query(_SAVE_NODE.replace("{labels}", f"{ent.type}:Entity"),
                                    entity_data=entity_data)
@@ -304,8 +315,9 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         _SAVE_EPISODE, uuid=ep_uuid, name=name, group_id=group_id,
         source_description=source_description, source="text", content=episode_body,
         entity_edges=[], created_at=now_iso, valid_at=reference_time.isoformat(),
-        extractor_model=extractor_model, extractor_session=extractor_session,
-        prompt_version=prompt_version)
+        extractor_model=extractor_model, extraction_mode=extraction_mode,
+        extractor_session=extractor_session, prompt_version=prompt_version,
+        extractor_tool=extractor_tool, run_id=run_id)
     for ent in extraction.entities:
         await driver.execute_query(
             _SAVE_MENTIONS, episode_uuid=ep_uuid, entity_uuid=resolved[ent.key]["uuid"],
@@ -331,7 +343,8 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
             "episodes": [ep_uuid], "created_at": now_iso, "expired_at": None,
             "valid_at": reference_time.isoformat(), "invalid_at": None,
             "reference_time": reference_time.isoformat(),
-            "extractor_model": extractor_model, "raw_name": ed.raw_name,
+            "extractor_model": extractor_model, "extraction_mode": extraction_mode,
+            "raw_name": ed.raw_name, "extractor_tool": extractor_tool, "run_id": run_id,
         }
         await driver.execute_query(_SAVE_EDGE, edge_data=edge_data)
         edge_uuids.append(edge_uuid)

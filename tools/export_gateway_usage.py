@@ -271,7 +271,7 @@ def collect(witness: Path, *, gateway_url: str | None = None) -> dict:
             # 会让导出开销随历史线性增长——而本报表只画最近 HOURLY_HOURS 小时。
             # at 是 ISO8601,字典序与时序一致,可直接比较。
             hourly_floor_iso = (
-                now - timedelta(hours=HOURLY_HOURS)).isoformat()
+                now - timedelta(days=30)).isoformat()
             attempts_raw = _rows(
                 database,
                 "SELECT at,business_key FROM attempts "
@@ -311,6 +311,9 @@ def collect(witness: Path, *, gateway_url: str | None = None) -> dict:
         "generated_at": now.isoformat(),
         "witness_deployment_id": (str(deployment[0][0]) if deployment else None),
         "daily": daily,
+        # Timestamp + business identity only: no prompts, responses or credentials.
+        "attempt_events": [{"at": str(at), "business_key": str(key)} for at, key in attempts_raw],
+        "attempt_window": {"start": hourly_floor_iso, "end": now.isoformat()},
         "monthly": [
             {"month": month, "business_key": key, "count": count}
             for (month, key), count in sorted(monthly_acc.items())

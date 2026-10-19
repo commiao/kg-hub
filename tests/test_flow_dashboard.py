@@ -800,5 +800,30 @@ class ServerModuleIdentityTests(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "7", out.stderr)
 
 
+
+class GatewayAttemptSourceTests(unittest.TestCase):
+    def test_gateway_calls_count_exact_bounds_without_inventing_duration(self):
+        start = NOW - timedelta(hours=1)
+        rows = [(t.isoformat(), None, 'gateway_attempt') for t in
+                [start-timedelta(seconds=1), start, NOW-timedelta(seconds=1), NOW]]
+        trends = F.key_metric_trends(now=NOW, window_start=start, commits=[],
+                                    attempts=rows, outcomes=[])
+        self.assertEqual(sum(r['model_calls'] for r in trends), 2)
+        self.assertTrue(all(r['call_duration_avg'] is None for r in trends))
+        self.assertTrue(all(r['model_inflight_avg'] is None for r in trends))
+
+    def test_gateway_source_filters_business_and_rejects_missing_coverage(self):
+        now = datetime.now(timezone.utc)
+        data = {'attempt_window': {'start': (now-timedelta(days=30)).isoformat(), 'end': now.isoformat()},
+                'attempt_events': [{'at': now.isoformat(), 'business_key': key} for key in
+                                   ['kg_hub.entity_extract', 'claude_mem.observation']]}
+        with patch('topology._read_json', return_value=data):
+            self.assertEqual(len(F._model_attempt_rows(now-timedelta(hours=1))), 1)
+            with self.assertRaises(ValueError):
+                F._model_attempt_rows(now-timedelta(days=31))
+        with patch('topology._read_json', return_value={}):
+            with self.assertRaises(ValueError):
+                F._model_attempt_rows(now)
+
 if __name__ == "__main__":
     unittest.main()

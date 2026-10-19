@@ -101,6 +101,10 @@ from utils.extracted_ingest import (  # noqa: E402
     write_extraction, check_keys, check_names,
 )
 from utils.gateway_post_normalize import post_ingest_normalize  # noqa: E402
+from utils.single_pass_extract import (  # noqa: E402
+    EXTRACTION_MODE as SINGLE_PASS_EXTRACTION_MODE, INGEST_MODE_SINGLE_PASS,
+    extract_single_pass, ingest_mode_from_env, load_prompt as load_single_pass_prompt,
+)
 from model_gateway_client import (  # noqa: E402
     MIN_CLIENT_TIMEOUT_SEC, envelope_repairs_total, gateway_base_url, gateway_token,
     model_business_task, model_operation, model_usage_scenario, model_manual_resume,
@@ -737,6 +741,8 @@ async def health(request: Request) -> JSONResponse:
     # **必须对外可见**:那两条修正规则会连带把「模型真的少答了」也放过去,看不见
     # 次数的话,它就是一个静默修补(本项目反复消灭的东西)。只有计数,没有内容。
     return JSONResponse({"status": "ok", "service": "kg_hub_server",
+                         # 当前 /api/ingest 抽取方式（graphiti | single_pass），切换后发布方据此确认生效。
+                         "ingest_mode": INGEST_MODE,
                          "active_extractions": active_extractions(),
                          # 发布方要能看出「计数不降是因为还有人在写」还是「真的在排空」。
                          "draining": left > 0,
@@ -971,6 +977,13 @@ def _load_custom_extraction_instructions() -> str:
 
 CUSTOM_EXTRACTION_INSTRUCTIONS = _load_custom_extraction_instructions()
 GATEWAY_MODEL_LABEL = os.environ.get("KG_HUB_GATEWAY_MODEL_LABEL", "gateway:kg_hub.entity_extract").strip()
+# /api/ingest 的抽取方式（docs/GATEWAY-EXTRACTION-OPTIMIZATION.md §6）：
+#   graphiti     —— graphiti 0.29 add_episode 多阶段抽取（默认，线上现状，随时可切回）
+#   single_pass  —— utils/single_pass_extract：agent 提示词一次调用出实体+关系，走 extracted_ingest 落图
+# 非法值在这里就报错起不来，而不是静默回到某一种。切换只改这一个环境变量并重启服务端。
+INGEST_MODE = ingest_mode_from_env()
+# 单次模式下提示词与版本号在启动时读一次（文件缺失要在启动时暴露，不能等到第一条观测）。
+SINGLE_PASS_PROMPT = load_single_pass_prompt() if INGEST_MODE == INGEST_MODE_SINGLE_PASS else None
 
 
 async def _bare_episode_node(graphiti, body: IngestBody, ref_time: datetime,
@@ -1269,6 +1282,136 @@ def _record_ingest_timing(started: datetime, lock_acquired: datetime | None,
         pass
 
 
+async def _post_ingest_tags(graphiti, body: IngestBody, episode_uuid: str | None) -> None:
+    """抽取写图之后的两道打标，graphiti 与 single_pass 两种模式共用；每道失败都不阻塞入图。"""
+    # openclaw 知识胶囊:进图即打 provenance(直推链路的 NAS 侧自动打标,
+    # 取代原 Mac 侧 tools/tag_provenance 的每轮补标)。覆写优先,失败不阻塞。
+    if body.name.startswith("openclaw-capsule-") and episode_uuid:
+        try:
+            prov = body.provenance or classify_provenance(body.episode_body)
+            cy = "MATCH (e:Episodic {uuid: $u}) SET e.provenance = $p"
+            if prov.startswith("external"):
+                cy += ", e.verified = coalesce(e.verified, false)"
+            await graphiti.driver.execute_query(cy, u=episode_uuid, p=prov)
+        except Exception:
+            logger.exception("[ingest:provenance_tag_failed] uuid=%s (non-fatal)", episode_uuid)
+    # 一等来源/内容元数据(北极星 §9):覆写优先,否则确定性派生;
+    # kind 派生不出(unclassified/低置信)且是胶囊时,走 LLM 分类器 pass。失败不阻塞。
+    if episode_uuid:
+        try:
+            await _tag_schema_fields(graphiti, episode_uuid, body)
+        except Exception:
+            logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", episode_uuid)
+
+
+def _use_single_pass(body: IngestBody) -> bool:
+    """这条观测是否走单次抽取。开关为 single_pass 且不属于 predigest 分流（catalog 仅存 /
+    长文预拆）的整篇观测才走；预拆与 catalog 路由处理的是胶囊和长文档，与 refinery 的
+    claude-mem 观测不是一回事，保持原逻辑。"""
+    if INGEST_MODE != INGEST_MODE_SINGLE_PASS:
+        return False
+    return not (PREDIGEST_ENABLED and predigest_route(body.name, body.episode_body))
+
+
+async def _single_pass_extract_inner(
+    graphiti,
+    body: IngestBody,
+    ref_time: datetime,
+    attempt_epoch: str | None = None,
+) -> None:
+    """KG_HUB_INGEST_MODE=single_pass 时的抽取主体，契约与 _do_extract_inner 一致（never raise，
+    终态落在 IngestedKey）。差别只在中间那一段：
+
+    - 模型只调一次（utils/single_pass_extract，stage=single_pass，同一业务键与幂等账本），
+      而且在**拿写锁之前**调——它不读图，没必要让别的写入方等一次 30 s 的模型调用；
+    - 结果经 normalize_extraction 归一后由 write_extraction 落图（与 /api/ingest_extracted 同一段
+      消解/写图逻辑），episode 带 extraction_mode='gateway_single'、extractor_model=GATEWAY_MODEL_LABEL、
+      prompt_version=提示词文件版本号；
+    - 不走 predigest 与 stage checkpoint：一次调用没有可断点续跑的中间态，重试靠账本按幂等钥匙重放。
+    断路器（网关出口 assert_closed）、needs_reconciliation + held 守卫、error_kind 分类、
+    nodes/edges 计数与状态写法都与 graphiti 模式同一套。
+    """
+    sd = body.source_description
+    sid = body.source_obs_id
+    started = datetime.now(tz=timezone.utc)
+    epoch = attempt_epoch or started.isoformat()
+    logger.info("[ingest:start] mode=single_pass source=%s sobsid=%s body_len=%d",
+                sd, sid, len(body.episode_body))
+    model_tally: dict[str, int] = {}
+    lock_acquired: datetime | None = None
+    try:
+        operation_id = stable_operation_id(sd, sid, body.name, body.episode_body, epoch)
+        with model_usage_scenario(body.model_usage_scenario):
+            with model_operation("ingest.episode", operation_id) as op_tally:
+                model_tally = op_tally
+                extracted = await extract_single_pass(
+                    graphiti.llm_client, name=body.name, episode_body=body.episode_body,
+                    source_description=sd, reference_time=ref_time,
+                    prompt=SINGLE_PASS_PROMPT or load_single_pass_prompt())
+        extraction = normalize_extraction(extracted.entities, extracted.edges,
+                                          set(ENTITY_TYPES), set(EDGE_TYPES))
+        attempt = 0
+        while True:
+            try:
+                async with _ingest_execution_lock(
+                    owner=f"api_ingest({sd})", timeout_seconds=INGEST_LOCK_TIMEOUT_SEC
+                ):
+                    lock_acquired = datetime.now(tz=timezone.utc)
+                    result = await write_extraction(
+                        graphiti.driver, graphiti.embedder, extraction,
+                        name=body.name, episode_body=body.episode_body, source_description=sd,
+                        reference_time=ref_time, extractor_model=GATEWAY_MODEL_LABEL,
+                        group_id=GROUP_ID, prompt_version=extracted.prompt_version,
+                        extraction_mode=SINGLE_PASS_EXTRACTION_MODE)
+                break
+            except WriterLockBusy:
+                attempt += 1
+                if attempt > INGEST_LOCK_RETRIES:
+                    await update_ingested_key_status(
+                        graphiti, sd, sid, "error",
+                        error_message=(
+                            f"writer.lock busy after {INGEST_LOCK_RETRIES} retries "
+                            f"(~{int(ingest_budget.lock_wait_ceiling_sec())}s) — "
+                            "contention too high"))
+                    logger.error("[ingest:error] mode=single_pass sd=%s sid=%s "
+                                 "reason=lock_timeout_exhausted attempts=%d", sd, sid, attempt)
+                    _record_ingest_timing(started, None, None, "lock_timeout")
+                    return
+                backoff = INGEST_LOCK_BACKOFF_SEC * attempt
+                logger.warning("[ingest:lock_retry] mode=single_pass sd=%s sid=%s attempt=%d/%d backoff=%.1fs",
+                               sd, sid, attempt, INGEST_LOCK_RETRIES, backoff)
+                await asyncio.sleep(backoff)
+        finished = datetime.now(tz=timezone.utc)
+        episode_uuid = result.episode_uuid
+        nodes = result.nodes_new + result.nodes_reused
+        edges = result.edges_new + result.edges_reused
+        await _post_ingest_tags(graphiti, body, episode_uuid)
+        await update_ingested_key_status(
+            graphiti, sd, sid, "ok", episode_uuid=episode_uuid, nodes=nodes, edges=edges)
+        # 计时口径：模型调用在锁外，所以「抽取耗时」记整段（模型 + 消解 + 写图），等待记 0。
+        _record_ingest_timing(started, started, finished, "ok")
+        logger.info(
+            "[ingest:done] mode=single_pass sd=%s sid=%s uuid=%s elapsed=%.1fs "
+            "nodes=%d+%d edges=%d+%d stats=%s",
+            sd, sid, episode_uuid, (finished - started).total_seconds(),
+            result.nodes_new, result.nodes_reused, result.edges_new, result.edges_reused,
+            extraction.stats)
+    except Exception as exc:  # noqa: BLE001
+        _record_ingest_timing(started, lock_acquired, None, "error")
+        try:
+            await update_ingested_key_status(
+                graphiti, sd, sid,
+                "needs_reconciliation" if isinstance(exc, NeedsReconciliation) else "error",
+                error_message=f"{type(exc).__name__}: {exc}",
+                error_kind=classify_extract_error(
+                    exc, offscript=bool(model_tally.get("offscript"))),
+            )
+        except Exception:
+            pass
+        elapsed = (datetime.now(tz=timezone.utc) - started).total_seconds()
+        logger.exception("[ingest:error] mode=single_pass sd=%s sid=%s elapsed=%.1fs", sd, sid, elapsed)
+
+
 async def _do_extract_inner(
     graphiti,
     body: IngestBody,
@@ -1288,6 +1431,9 @@ async def _do_extract_inner(
     attempt_epoch: the IngestedKey row's created_at for this claim. It scopes
     every paid model call's Idempotency-Key to *this* attempt (see below).
     """
+    if _use_single_pass(body):
+        await _single_pass_extract_inner(graphiti, body, ref_time, attempt_epoch)
+        return
     sd = body.source_description
     sid = body.source_obs_id
     started = datetime.now(tz=timezone.utc)
@@ -1404,24 +1550,7 @@ async def _do_extract_inner(
                 logger.info("[ingest:normalize] sd=%s sid=%s %s", sd, sid, norm)
             except Exception:  # noqa: BLE001
                 logger.exception("[ingest:normalize_failed] uuid=%s (non-fatal)", episode_uuid)
-        # openclaw 知识胶囊:进图即打 provenance(直推链路的 NAS 侧自动打标,
-        # 取代原 Mac 侧 tools/tag_provenance 的每轮补标)。覆写优先,失败不阻塞。
-        if body.name.startswith("openclaw-capsule-") and episode_uuid:
-            try:
-                prov = body.provenance or classify_provenance(body.episode_body)
-                cy = "MATCH (e:Episodic {uuid: $u}) SET e.provenance = $p"
-                if prov.startswith("external"):
-                    cy += ", e.verified = coalesce(e.verified, false)"
-                await graphiti.driver.execute_query(cy, u=episode_uuid, p=prov)
-            except Exception:
-                logger.exception("[ingest:provenance_tag_failed] uuid=%s (non-fatal)", episode_uuid)
-        # 一等来源/内容元数据(北极星 §9):覆写优先,否则确定性派生;
-        # kind 派生不出(unclassified/低置信)且是胶囊时,走 LLM 分类器 pass。失败不阻塞。
-        if episode_uuid:
-            try:
-                await _tag_schema_fields(graphiti, episode_uuid, body)
-            except Exception:
-                logger.exception("[ingest:schema_tag_failed] uuid=%s (non-fatal)", episode_uuid)
+        await _post_ingest_tags(graphiti, body, episode_uuid)
         await update_ingested_key_status(
             graphiti, sd, sid, "ok",
             episode_uuid=episode_uuid, nodes=nodes, edges=edges,
@@ -1471,6 +1600,12 @@ async def _run_recorded_extract(*args, **kwargs):
         route = (predigest_route(body.name, body.episode_body)
                  if PREDIGEST_ENABLED else None) or "episode"
         with model_business_task(body.source_description, body.source_obs_id):
+            if _use_single_pass(body):
+                # 单次抽取没有 stage checkpoint，也就不登记 task_plan：业务结果校验
+                # （_persisted_business_result）走「episode 按 uuid+name+sd 存在」那条老口径；
+                # 同时 current_workflow() 为 None，写图阶段拿的是真正的 writer.lock 而不是并行槽位。
+                with bind_workflow(None):
+                    return await _do_extract_inner(*args, **kwargs)
             workflow = await asyncio.to_thread(
                 open_workflow, body, ref_time, epoch, route, journal_from_backup_env)
             with bind_workflow(workflow):
@@ -1739,6 +1874,10 @@ class ExtractedIngestBody(IngestBody):
     extractor_model: str
     extractor_session: str | None = None
     prompt_version: str | None = None
+    # 2026-10-19 框架 §1：执行工具（claude-code / codex / qoder / script）与实验 run 是独立于模型的两个变量，
+    # 都是可选来源标记；缺省 null，与已入图的旧 episode 一致（读侧 coalesce）。
+    extractor_tool: str | None = None
+    run_id: str | None = None
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge] = []
     # 只做消解不写图：返回每个实体会复用到哪个旧实体（第 2 轮复盘要求的写入前预览）
@@ -1768,7 +1907,8 @@ async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extractio
                     name=body.name, episode_body=body.episode_body, source_description=sd,
                     reference_time=ref_time, extractor_model=body.extractor_model,
                     group_id=GROUP_ID, extractor_session=body.extractor_session,
-                    prompt_version=body.prompt_version)
+                    prompt_version=body.prompt_version, extractor_tool=body.extractor_tool,
+                    run_id=body.run_id)
             try:
                 await _tag_schema_fields(graphiti, result.episode_uuid, body)
             except Exception:  # noqa: BLE001 — 元数据打标失败不影响入图
@@ -1832,6 +1972,11 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "bad_schema", "message": exc.errors()}, status_code=400)
     if not EXTRACTOR_MODEL_PATTERN.fullmatch(body.extractor_model):
         return JSONResponse({"status": "error", "code": "bad_extractor_model"}, status_code=400)
+    # 两个可选来源标记与 extractor_model 同一字符集：它们会作为分组键出现在报表与 Cypher 参数里
+    if body.extractor_tool is not None and not EXTRACTOR_MODEL_PATTERN.fullmatch(body.extractor_tool):
+        return JSONResponse({"status": "error", "code": "bad_extractor_tool"}, status_code=400)
+    if body.run_id is not None and not EXTRACTOR_MODEL_PATTERN.fullmatch(body.run_id):
+        return JSONResponse({"status": "error", "code": "bad_run_id"}, status_code=400)
     try:
         ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001
@@ -1910,6 +2055,7 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"]}
                      for k, v in result.resolved.items()},
         "stats": extraction.stats, "extractor_model": body.extractor_model,
+        "extractor_tool": body.extractor_tool, "run_id": body.run_id,
         "source_description": sd, "source_obs_id": sid})
 
 

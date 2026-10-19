@@ -88,6 +88,22 @@ python3 ~/work-ai/fleet-ops/bin/mac-release.py kg-hub \
     --repo ~/work-ai/kg-hub --check    # current 对应哪个 commit
 ```
 
+### 让本机的 kg_hub MCP 用上新代码
+
+本机会话里的 `kg_hub` 工具不跑仓库代码：共享 muxcp（launchd `com.local.muxcp-shared`，
+监听 `127.0.0.1:8899`，配置 `~/.config/muxcp/shared.yaml`）通过 `~/.config/muxcp/bin/run-kg-hub.sh`
+拉起 `~/.local/share/kg-hub/venv/bin/python ~/.local/share/kg-hub/current/mcp_server.py`。
+Qoder IDE 另有自己拉起的一份 muxcp，归 Qoder 管，不在这里。
+
+改了 `mcp_server.py`（或它导入的模块）要三步才生效：
+
+1. **发布**：用上面的 `mac-release.py kg-hub --repo ~/work-ai/kg-hub --ref <main 上的 sha>`。只重启不发布没用，跑的是 `current/`。
+2. **整体重启共享 muxcp**：`launchctl kickstart -k gui/$(id -u)/com.local.muxcp-shared`。
+   muxcp 的子进程死了不会被单独拉起（只会报 transport closed），只能整体重启。
+   **这会让本机所有会话的 muxcp 工具短暂断开**，playwright 的浏览器状态也会丢 —— 先问用户。
+3. **直接对 8899 验证**：发 `initialize` 再发 `tools/list`，看新工具或新参数在不在。
+   不要拿会话里看到的工具清单当证据：那是连接时缓存的，重启后不会刷新。
+
 2026-09-20 之前，这 8 个作业的 plist 直接指向开发工作树 —— 于是"改完即生效"，
 而那不是优点，是**没有发布这一步**的另一种说法：在分支里改不生效、所有会话被迫
 在同一棵树上直接改生产、脚本还可能正被执行时被原地改写（sh 边读边执行、字节偏移

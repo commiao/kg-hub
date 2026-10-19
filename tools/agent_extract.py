@@ -9,14 +9,24 @@
   next    取下一批待处理观测：从 NAS 的 claude-mem.db 副本按 id 游标读、过 utils/ingest_filter 质量闸
           （与 refinery 同一份 config）、再问 /api/ingest_extracted/check 跳过已入库的；写 batch 文件
   submit  把会话写好的抽取结果（按 id 对应 batch 里的观测）逐条 POST；每条的终态、纪律指标、耗时
-          追加到 log.jsonl；游标推进到本批最大 id
-  status  按 extractor_model 汇总 log.jsonl：条数、纪律指标均值、每条耗时
+          追加到 log.jsonl；游标推进到本批最大 id。**正式提交前必须对同一批做过 --dry-run**（四条红线之 2，
+          docs/EXTRACTION-EVAL-FRAMEWORK.md §2）：--dry-run 成功后在状态目录记 dryrun-<batch_id>.json，
+          正式提交时逐 id 核对，没预览过的 id 拒绝提交；确需跳过用 --skip-dryrun-check 明确表态
+  dryrun-check  只做上面那个核对（rc 0 = 全部预览过，1 = 有没预览的），给 codex / qoder 的钩子用--executor / --run-id 是来源标记的另外两个维度
+          （执行工具、实验 run；docs/EXTRACTION-EVAL-FRAMEWORK.md §1），缺省从 KG_HUB_EXECUTOR /
+          KG_HUB_RUN_ID 取，都没有就不打
+  status  按 extractor_model（或 --group-by run_id / executor）汇总 log.jsonl：条数、纪律指标均值、每条耗时、
+          reuse_mismatch/条
+  run     运行清单（框架 §3）：run start 建 ~/.kg-hub/agent-extract/runs/<run_id>.json（执行器、模型、
+          规则版本、服务端 commit、旋钮快照、样本）；run end 写 ended_at 与自报成本（token、wall）。
+          旋钮名必须在 tools/digest_retro.KNOBS 登记过
   prompt  打印抽取规则（给会话重读）
 
 环境：KG_HUB_URL（默认 http://100.123.208.32:17171）、KG_HUB_API_TOKEN（submit/check 必需）、
       KG_HUB_NAS_SSH（默认 commiao@100.123.208.32）、KG_HUB_NAS_CLAUDE_MEM_DB
       （默认 /volume2/4T/kg-hub-data/claude-mem/claude-mem.db）、KG_HUB_AGENT_EXTRACT_DIR
-      （状态与日志目录，默认 ~/.kg-hub/agent-extract）。token 只从环境变量读，不打印、不落日志。
+      （状态与日志目录，默认 ~/.kg-hub/agent-extract）、KG_HUB_EXECUTOR / KG_HUB_RUN_ID
+      （submit / run 的缺省来源标记）。token 只从环境变量读，不打印、不落日志。
 
 只读 claude-mem 副本；写入只经 kg-hub 的治理接口；不调模型、不动断路器。
 """
@@ -252,13 +262,16 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
 
 
 def build_payload(item: dict, result: dict, *, model: str, session: str | None,
-                  prompt_version: str = PROMPT_VERSION, dry_run: bool = False) -> dict:
+                  prompt_version: str = PROMPT_VERSION, dry_run: bool = False,
+                  executor: str | None = None, run_id: str | None = None) -> dict:
     return {
         **({"dry_run": True} if dry_run else {}),
         "name": item["name"], "episode_body": item["episode_body"],
         "source_description": item["source_description"], "source_obs_id": item["source_obs_id"],
         "reference_time": item["reference_time"], "sync": True,
         "extractor_model": model, "extractor_session": session, "prompt_version": prompt_version,
+        # 服务端把 None 当「未打标」，与旧 episode 一致；只在给了值时才有分组意义
+        "extractor_tool": executor, "run_id": run_id,
         "entities": [{"name": e["name"], "type": e["type"], "summary": e.get("summary", "")}
                      for e in result.get("entities", [])],
         "edges": [{"source": e["source"], "target": e["target"], "name": e["name"], "fact": e["fact"]}
@@ -268,9 +281,11 @@ def build_payload(item: dict, result: dict, *, model: str, session: str | None,
 
 def submit_results(batch: dict, results: dict, *, model: str, session: str | None, url: str,
                    token: str | None, post=_http, log_path: Path | None = None,
-                   dry_run: bool = False, names_path: Path | None = None) -> list[dict]:
+                   dry_run: bool = False, names_path: Path | None = None,
+                   executor: str | None = None, run_id: str | None = None) -> list[dict]:
     """dry_run：只让服务端做消解不写图，返回每个实体会并到谁；不记 log。
-    names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。"""
+    names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。
+    executor / run_id：随 payload 入图，也记进 log.jsonl，status / eval_report 按它们分组。"""
     by_id = {int(i["id"]): i for i in batch["items"]}
     out = []
     for res in results.get("items", [results] if "entities" in results else []):
@@ -282,7 +297,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
         if not res.get("entities"):
             rec = {"id": oid, "status": "empty", "model": model}
         else:
-            payload = build_payload(item, res, model=model, session=session, dry_run=dry_run)
+            payload = build_payload(item, res, model=model, session=session, dry_run=dry_run,
+                                    executor=executor, run_id=run_id)
             t0 = time.monotonic()
             code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
             # 消解到了不同名字的旧实体：这是误并的高发区，必须让执行者看见
@@ -295,7 +311,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    "reuse_mismatch": mismatch,
                    "stats": d.get("stats"), "error": d.get("code") if code >= 400 else None}
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
-                    "project": item.get("project"), "type": item.get("type")})
+                    "project": item.get("project"), "type": item.get("type"),
+                    "executor": executor, "run_id": run_id})
         out.append(rec)
         if dry_run:
             continue
@@ -309,17 +326,53 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
     return out
 
 
-def summarize_log(records: list[dict]) -> dict:
+# ---------- 提交前必须 dry-run：由工具自己执行，不靠执行器记得 ----------
+
+def dryrun_marker_path(sd: Path, batch_id: str) -> Path:
+    return sd / f"dryrun-{batch_id}.json"
+
+
+def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = None) -> Path:
+    """把这次 dry-run 预览过的 id（服务端真的回了 dry_run 的那些）追加进标记文件。
+    同一批可以分几次 dry-run，取并集。"""
+    p = dryrun_marker_path(sd, batch_id)
+    seen: set[int] = set()
+    if p.exists():
+        seen.update(int(x) for x in json.loads(p.read_text()).get("ids", []))
+    seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
+                             "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
+    return p
+
+
+def dryrun_missing(sd: Path, batch_id: str, results: dict) -> list[int]:
+    """results 里带实体的 id 中，哪些还没在这一批的 dry-run 标记里。空 entities 的 id 不要求（它不会提交）。"""
+    p = dryrun_marker_path(sd, batch_id)
+    seen = {int(x) for x in json.loads(p.read_text()).get("ids", [])} if p.exists() else set()
+    items = results.get("items", [results] if "entities" in results else [])
+    return sorted({int(r["id"]) for r in items if r.get("entities")} - seen)
+
+
+SUMMARY_KEYS = ("model", "run_id", "executor")
+
+
+def summarize_log(records: list[dict], key: str = "model") -> dict:
+    """按 key（model / run_id / executor）汇总提交口径。旧记录没有 run_id / executor 字段时归入 '?'。"""
+    if key not in SUMMARY_KEYS:
+        raise ValueError(f"key 只能是 {SUMMARY_KEYS}")
     by_model: dict[str, dict] = {}
     for r in records:
-        m = by_model.setdefault(r.get("model") or "?", {"n": 0, "ok": 0, "empty": 0, "error": 0,
-                                                       "latency": [], "offschema": [], "dirty": [],
-                                                       "unknown_type": [], "entities": [], "edges": []})
+        m = by_model.setdefault(r.get(key) or "?", {"n": 0, "ok": 0, "empty": 0, "error": 0,
+                                                   "latency": [], "offschema": [], "dirty": [],
+                                                   "unknown_type": [], "entities": [], "edges": [],
+                                                   "mismatch": 0})
         m["n"] += 1
         st = r.get("status")
         if st == "ok":
             m["ok"] += 1
             m["latency"].append(r.get("latency_s") or 0)
+            m["mismatch"] += len(r.get("reuse_mismatch") or [])
             s = r.get("stats") or {}
             if s.get("entities_in"):
                 m["offschema"].append(s.get("offschema_edge", 0) / max(1, s.get("edges_in", 1)))
@@ -338,8 +391,109 @@ def summarize_log(records: list[dict]) -> dict:
                   "latency_med_s": round(statistics.median(m["latency"]), 2) if m["latency"] else None,
                   "offschema_edge_share": avg(m["offschema"]), "dirty_name_share": avg(m["dirty"]),
                   "unknown_type_share": avg(m["unknown_type"]),
-                  "entities_per_obs": avg(m["entities"]), "edges_per_obs": avg(m["edges"])}
+                  "entities_per_obs": avg(m["entities"]), "edges_per_obs": avg(m["edges"]),
+                  # 消解口径：每条 ok 提交里「抽出的名字 → 复用到的不同名旧实体」的对数（框架 §4 表「消解」列）
+                  "reuse_mismatch_per_obs": round(m["mismatch"] / m["ok"], 3) if m["ok"] else None}
     return out
+
+
+# ---------- 运行清单（框架 §3）：一次实验一个 run_id，本地 runs/<run_id>.json ----------
+
+# 执行器侧旋钮的当前快照：run start 时写进清单，之后改任何一项都该开新 run_id。
+# 网关侧四个旋钮（gateway.*）是服务端环境变量，这里只记「本次实验假定的值」，真值以发布时的 compose 为准。
+DEFAULT_KNOBS = {
+    "type_guard_on_resolution": True, "resolution_strictness": "v3", "submit_dry_run": True,
+    "gateway.post_normalize": True, "gateway.custom_extraction": True, "gateway.max_tokens": 8192,
+    "gateway.edge_empty_retry": False,
+}
+RUN_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}"
+
+
+def runs_dir() -> Path:
+    return state_dir() / "runs"
+
+
+def run_path(run_id: str) -> Path:
+    return runs_dir() / f"{run_id}.json"
+
+
+def _known_knobs() -> set[str]:
+    from tools.digest_retro import KNOBS  # 只依赖标准库，容器外也能 import
+    return set(KNOBS)
+
+
+def _parse_knobs(items: list[str]) -> dict:
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            raise ValueError(f"--knob 需要 key=value：{it}")
+        k, v = it.split("=", 1)
+        try:
+            out[k.strip()] = json.loads(v)
+        except json.JSONDecodeError:
+            out[k.strip()] = v
+    return out
+
+
+def run_start(run_id: str, *, executor: str, model: str, sample: str | None = None,
+              server_commit: str | None = None, executor_version: str | None = None,
+              knobs: dict | None = None, prompt_version: str = PROMPT_VERSION,
+              now: str | None = None, path: Path | None = None, known_knobs: set[str] | None = None) -> dict:
+    """新建运行清单。旋钮名必须已在 digest_retro.KNOBS 登记（与 checkpoint 同一道闸：改了没登记的不算）。
+    已存在同名 run 直接拒绝——一个 run_id 只对应一次实验。"""
+    import re
+    if not re.fullmatch(RUN_ID_PATTERN, run_id):
+        raise ValueError(f"run_id 只能用字母数字 . _ : / -，最长 80：{run_id}")
+    if not executor or not model:
+        raise ValueError("run start 需要 --executor 与 --model")
+    known = _known_knobs() if known_knobs is None else known_knobs
+    merged = {**DEFAULT_KNOBS, **(knobs or {})}
+    unknown = [k for k in merged if k not in known]
+    if unknown:
+        raise ValueError(f"未登记的旋钮：{unknown}（先在 tools/digest_retro.KNOBS 登记）")
+    p = path or run_path(run_id)
+    if p.exists():
+        raise FileExistsError(f"run 已存在：{p}（一个 run_id 只对应一次实验，改动请开新 run_id）")
+    manifest = {
+        "run_id": run_id, "executor": executor, "executor_version": executor_version,
+        "model": model, "prompt_version": prompt_version, "server_commit": server_commit,
+        "knobs": merged, "sample": sample,
+        "started_at": now or datetime.now(tz=timezone.utc).isoformat(), "ended_at": None,
+        "self_reported": {"input_tokens": 0, "output_tokens": 0, "wall_s": 0},
+    }
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return manifest
+
+
+def run_end(run_id: str, *, input_tokens: int | None = None, output_tokens: int | None = None,
+            wall_s: float | None = None, now: str | None = None, path: Path | None = None) -> dict:
+    """收尾：写 ended_at 与自报成本。wall_s 不给就按 started_at → ended_at 算。
+    会话型执行器的成本账本里没有，只能自报（框架 §9）；报表里单列，不与账本口径相加。"""
+    p = path or run_path(run_id)
+    if not p.exists():
+        raise FileNotFoundError(f"run 不存在：{p}（先 run start）")
+    manifest = json.loads(p.read_text())
+    ended = now or datetime.now(tz=timezone.utc).isoformat()
+    manifest["ended_at"] = ended
+    sr = manifest.setdefault("self_reported", {"input_tokens": 0, "output_tokens": 0, "wall_s": 0})
+    if input_tokens is not None:
+        sr["input_tokens"] = int(input_tokens)
+    if output_tokens is not None:
+        sr["output_tokens"] = int(output_tokens)
+    if wall_s is not None:
+        sr["wall_s"] = float(wall_s)
+    elif manifest.get("started_at"):
+        a = datetime.fromisoformat(manifest["started_at"].replace("Z", "+00:00"))
+        b = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+        sr["wall_s"] = round((b - a).total_seconds(), 1)
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return manifest
+
+
+def load_run(run_id: str, path: Path | None = None) -> dict | None:
+    p = path or run_path(run_id)
+    return json.loads(p.read_text()) if p.exists() else None
 
 
 # ---------- CLI ----------
@@ -355,11 +509,25 @@ def _save_state(p: Path, st: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro"])
+    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check"])
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
-                    "（gate / status / final / checkpoint --adjust k=v --applied ...）")
+                    "（gate / status / final / checkpoint --adjust k=v --applied ...）；run：start / end")
+    ap.add_argument("--executor", default=os.environ.get("KG_HUB_EXECUTOR") or None,
+                    help="submit/run：执行工具名（claude-code / codex / qoder / script），缺省 KG_HUB_EXECUTOR")
+    ap.add_argument("--run-id", default=os.environ.get("KG_HUB_RUN_ID") or None,
+                    help="submit/run：实验 run_id，缺省 KG_HUB_RUN_ID")
+    ap.add_argument("--group-by", choices=list(SUMMARY_KEYS), default="model", help="status：汇总键")
+    ap.add_argument("--executor-version", help="run start：执行器版本（如 claude-code 2.1.x）")
+    ap.add_argument("--sample", help="run start：冻结样本 id（如 ab-sample-20261017）或 id 区间")
+    ap.add_argument("--server-commit", help="run start：服务端 kg-hub-server 的 commit")
+    ap.add_argument("--knob", action="append", default=[], help="run start：key=value 旋钮快照，可多次；名字须在 KNOBS 登记")
+    ap.add_argument("--input-tokens", type=int, help="run end：执行器自报输入 token")
+    ap.add_argument("--output-tokens", type=int, help="run end：执行器自报输出 token")
+    ap.add_argument("--wall-s", type=float, help="run end：执行器自报总耗时（秒），缺省按 started_at→ended_at")
     ap.add_argument("--lessons-file", help="retro checkpoint：经验教训 markdown（本机路径）")
     ap.add_argument("--dry-run", action="store_true", help="submit：只让服务端消解不写图，看每个实体会并到谁")
+    ap.add_argument("--skip-dryrun-check", action="store_true",
+                    help="submit：跳过「本批必须先 dry-run」的核对（默认拒绝没预览过的 id；跳过要写进 lessons）")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--after-id", type=int, help="next：覆盖游标起点")
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
@@ -384,9 +552,29 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "prompt":
         sys.stdout.write(PROMPT_PATH.read_text())
         return 0
+    if a.cmd == "run":
+        action = a.retro_args[0] if a.retro_args else None
+        if action not in ("start", "end") or len(a.retro_args) != 1:
+            ap.error("run 需要 start 或 end")
+        if not a.run_id:
+            ap.error("run 需要 --run-id（或 KG_HUB_RUN_ID）")
+        try:
+            if action == "start":
+                if not (a.executor and a.model):
+                    ap.error("run start 需要 --executor（或 KG_HUB_EXECUTOR）与 --model")
+                m = run_start(a.run_id, executor=a.executor, model=a.model, sample=a.sample,
+                              server_commit=a.server_commit, executor_version=a.executor_version,
+                              knobs=_parse_knobs(a.knob))
+            else:
+                m = run_end(a.run_id, input_tokens=a.input_tokens, output_tokens=a.output_tokens, wall_s=a.wall_s)
+        except (ValueError, FileExistsError, FileNotFoundError) as exc:
+            raise SystemExit(str(exc))
+        print(json.dumps({"run": str(run_path(a.run_id)), **m}, ensure_ascii=False, indent=2))
+        return 0
     if a.cmd == "status":
         recs = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()] if log_path.exists() else []
-        print(json.dumps({"state": _load_state(state_path), "by_model": summarize_log(recs)},
+        print(json.dumps({"state": _load_state(state_path), "group_by": a.group_by,
+                          "by_model": summarize_log(recs, a.group_by)},
                          ensure_ascii=False, indent=2))
         return 0
     if a.cmd == "next":
@@ -423,18 +611,36 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"batch": str(out), "picked": len(picked), "cursor": last_considered,
                           **stats}, ensure_ascii=False))
         return 0
+    if a.cmd == "dryrun-check":
+        if not (a.batch and a.file):
+            raise SystemExit("dryrun-check 需要 --batch --file")
+        batch = json.loads(Path(a.batch).read_text())
+        results = json.loads(Path(a.file).read_text())
+        missing = dryrun_missing(sd, batch.get("batch_id") or "?", results)
+        print(json.dumps({"batch": batch.get("batch_id"), "missing": missing, "ok": not missing}))
+        return 1 if missing else 0
     # submit
     if not (a.batch and a.file and a.model):
         raise SystemExit("submit 需要 --batch --file --model")
     batch = json.loads(Path(a.batch).read_text())
     results = json.loads(Path(a.file).read_text())
+    batch_id = batch.get("batch_id") or "?"
+    if not a.dry_run and not a.skip_dryrun_check:
+        missing = dryrun_missing(sd, batch_id, results)
+        if missing:
+            raise SystemExit(f"本批 {batch_id} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}{'…' if len(missing) > 10 else ''}）；"
+                             f"先 submit --dry-run，确需跳过加 --skip-dryrun-check 并写进 lessons")
     recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
                           token=token, log_path=log_path, dry_run=a.dry_run,
-                          names_path=sd / f"names-{a.model}.tsv")
+                          names_path=sd / f"names-{a.model}.tsv",
+                          executor=a.executor, run_id=a.run_id)
+    if a.dry_run:
+        record_dryrun(sd, batch_id, recs)
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print(json.dumps({"submitted": len(recs), "by_status": counts, "dry_run": a.dry_run,
+                      "executor": a.executor, "run_id": a.run_id,
                       "items": [{k: r.get(k) for k in ("id", "status", "nodes_new", "nodes_reused",
                                                         "edges_new", "edges_reused", "reuse_mismatch", "error")}
                                 for r in recs]},

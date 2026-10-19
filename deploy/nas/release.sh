@@ -520,6 +520,33 @@ else
   say "当前线上标签：$PREV"
 fi
 
+# 准则 43：发布的单位是提交，不是 PR —— 线上标签到目标之间别人合并的改动会一起上线。
+# 这里只把它们摆到眼前、不拦：作者想不想现在上线，要人看 PR 说明或任务来判断。
+# 2026-10-14 发 #147 时夹带了作者注明「no NAS deployment」的 #145，靠人记得去查才发现。
+list_unreleased_merges() {
+  local prev="$1" target="$2" repo="$3" lines n
+  if [ -z "$prev" ]; then
+    say "  本次会上线的提交：线上没有标签（首次发布），无从比对"
+    return 0
+  fi
+  if ! git -C "$repo" rev-parse --verify --quiet "${prev}^{commit}" >/dev/null; then
+    say "  ⚠ 线上标签 ${prev} 在本地仓库里找不到对应提交，列不出会一起上线的改动 —— 先 git fetch 或人工核对"
+    return 0
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "$prev" "$target"; then
+    say "  ⚠ 目标 ${target} 不包含线上的 ${prev}：这是回退或分叉，线上有、目标没有的改动会被撤下"
+    return 0
+  fi
+  lines=$(git -C "$repo" log --oneline --first-parent "${prev}..${target}")
+  n=$(printf '%s\n' "$lines" | grep -c . || true)
+  say "  本次会一起上线的提交（线上 ${prev} → 目标 ${target}，first-parent 共 ${n} 笔）："
+  [ -n "$lines" ] && printf '%s\n' "$lines" | sed 's/^/    /' >&2
+  say "  别人合并的先确认作者的发布意图（deploy-standard 准则 43）"
+}
+if [ "$mode" = release ]; then
+  list_unreleased_merges "$PREV" "$SHA" "$REPO"
+fi
+
 if [ "$mode" = rollback ]; then
   PRIOR=$(on_nas "grep '^KG_HUB_IMAGE_TAG_PREV=' $SRC/.env 2>/dev/null | cut -d= -f2-" || true)
   [ -n "$PRIOR" ] || die "没有记录上一次的标签，无法自动回滚"
@@ -786,20 +813,31 @@ refresh_drift_verdict() {
   [ "${DRY_RUN:-0}" != 1 ] || return 0
   checker="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_source_drift.py"
   [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 || return 0
+  local status_file="$HOME/.cache/kg-hub/source-drift.status" before after verdict
+  before=$(cat "$status_file" 2>/dev/null || true)
   set +e
-  python3 "$checker" --status-file "$HOME/.cache/kg-hub/source-drift.status" \
-    >/dev/null 2>&1
+  python3 "$checker" --status-file "$status_file" >/dev/null 2>&1
   local rc=$?
   set -e
-  # 三档，不能并成两档。原来写的是「非零一律算刷新成功，因为非零也可能只是确实
-  # 有漂移」—— 那句把「有漂移」和「检测压根没跑成」混成了一句，而后者状态文件
-  # **根本没写**，此时说「已刷新」是假话。准则 10 的要害正是「能改变判决的动作
-  # 要对判决负责」。
-  case "$rc" in
-    0) say "  巡检判决已刷新：一致" ;;
-    1) say "  巡检判决已刷新：有待处理项，见 $HOME/.cache/kg-hub/source-drift.status" ;;
-    *) say "  ⚠ 巡检判决**没有**刷新（检测退出 ${rc}）；状态文件可能还是发布前那条"
-       say "    以 $HOME/.cache/kg-hub/source-drift.status 里的时间戳为准" ;;
+  after=$(cat "$status_file" 2>/dev/null || true)
+  # 说不说「已刷新」，看状态文件这次有没有被写、写的是什么，不看退出码。原来按退出码
+  # 分三档（0 一致 / 1 有待处理项 / 其他没刷新），而退出码两头都有歧义：
+  #   1 = 写了 drift，也 = 未捕获异常、什么都没写
+  #   2 = 写了 error（连不上 NAS、主干判不了），也 = 参数解析失败、什么都没写
+  # 2026-10-18 实测：检查器崩掉、状态文件根本不存在，这里照样报「已刷新：有待处理项」。
+  # 准则 10 的要害是「能改变判决的动作要对判决负责」，说「已刷新」之前得先确认它
+  # 真被刷新了。
+  if [ -z "$after" ] || [ "$after" = "$before" ]; then
+    say "  ⚠ 巡检判决**没有**刷新（检测退出 ${rc}）；状态文件还是发布前那条"
+    say "    手动补一次：python3 ${checker} --status-file ${status_file}"
+    return 0
+  fi
+  verdict=$(printf '%s\n' "$after" | cut -f2)
+  case "$verdict" in
+    ok)    say "  巡检判决已刷新：一致" ;;
+    drift) say "  巡检判决已刷新：有待处理项，见 ${status_file}" ;;
+    error) say "  巡检判决已刷新：这次没查成（error），原因见 ${status_file}" ;;
+    *)     say "  ⚠ 巡检判决写成了不认识的「${verdict}」（检测退出 ${rc}），见 ${status_file}" ;;
   esac
 }
 

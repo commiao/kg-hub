@@ -196,5 +196,32 @@ class JournalLoaderTest(unittest.TestCase):
             self.assertIsNone(data)
 
 
+
+class GatewayKnobsTest(unittest.TestCase):
+    """框架 §8-2：网关侧四个旋钮登记在 KNOBS，写明服务端环境变量与「需发布」；空边守卫未实现不能记为已应用。"""
+
+    def test_gateway_knobs_registered_with_env_and_release_note(self):
+        expect = {"gateway.post_normalize": "KG_HUB_POST_NORMALIZE",
+                  "gateway.custom_extraction": "KG_HUB_CUSTOM_EXTRACTION",
+                  "gateway.max_tokens": "KG_HUB_LLM_MAX_TOKENS"}
+        for knob, env in expect.items():
+            self.assertIn(knob, dr.KNOBS)
+            self.assertTrue(dr.KNOBS[knob]["implemented"], knob)
+            self.assertIn(env, dr.KNOBS[knob]["applies"], knob)
+            self.assertIn("发布", dr.KNOBS[knob]["applies"], knob)
+        self.assertIn("gateway.edge_empty_retry", dr.KNOBS)
+        self.assertFalse(dr.KNOBS["gateway.edge_empty_retry"]["implemented"])
+        self.assertEqual(dr.KNOBS["gateway.edge_empty_retry"]["metric"], "zero_edge_share")
+
+    def test_checkpoint_accepts_implemented_gateway_knob_and_rejects_unimplemented(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = dr.RetroState(Path(d) / "s.json", every=1)
+            r = st.checkpoint(succeeded_since=1, metrics={}, lessons="x",
+                              adjustments={"gateway.max_tokens": 4096, "gateway.post_normalize": False})
+            self.assertEqual(r["adjustments"]["gateway.max_tokens"], {"from": None, "to": 4096})
+            with self.assertRaises(ValueError):
+                st.checkpoint(succeeded_since=1, metrics={}, lessons="x", adjustments={"gateway.edge_empty_retry": True})
+
+
 if __name__ == "__main__":
     unittest.main()
