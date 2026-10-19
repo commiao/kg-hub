@@ -131,6 +131,22 @@ def gateway_monitor_projection(body: object, http_status: int, sampled: str) -> 
     return result
 
 
+def business_routes_projection(body: object) -> dict:
+    """网关就绪接口里的按业务 key 断路状态（credvault 0253208 起，T-0323）。
+
+    返回 ``{"status": "ok"|"unknown", "disabled_business_keys": [...]}``。
+    **缺字段、形状不对、status 不是 ok，一律 unknown**：旧版网关没有这个字段；
+    网关读不出路由表时列表为空也不代表放行。unknown 时调用方既不能判为断路，
+    也不能据此判为畅通——只能退回「真实请求撞到的证据」（topology.gateway_route_disabled）。
+    """
+    raw = body.get("business_routes") if isinstance(body, dict) else None
+    if (not isinstance(raw, dict) or raw.get("status") != "ok"
+            or not isinstance(raw.get("disabled_business_keys"), list)
+            or not all(isinstance(k, str) for k in raw["disabled_business_keys"])):
+        return {"status": "unknown", "disabled_business_keys": []}
+    return {"status": "ok", "disabled_business_keys": sorted(raw["disabled_business_keys"])}
+
+
 async def gateway_health() -> dict:
     global _health_cache
     async with _health_lock:
@@ -165,7 +181,8 @@ async def gateway_health() -> dict:
                       "quarantined_count": quarantined,
                       "historical_outcomes": historical,
                       "quarantined": recovery.get("quarantined", []),
-                      "provider_last_results": checks.get("passive_provider", {}).get("business_keys", {})}
+                      "provider_last_results": checks.get("passive_provider", {}).get("business_keys", {}),
+                      "business_routes": business_routes_projection(body)}
         except Exception as exc:
             result = {"state": "grey", "http_status": None,
                       "checked_at": sampled, "issues": [type(exc).__name__]}
