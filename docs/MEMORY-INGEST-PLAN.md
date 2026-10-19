@@ -171,10 +171,19 @@ Codex 没有命令钩子，回流只能靠 AGENTS.md 里的 pull 指令，这一
 | B0 度量（推后，by-name，k=10） | hybrid 命中 5/20；已推 16 条里 literal 5/7、**nl 2/11**，未达验收线 |
 | 根因 ① | fact 的英文 slug 前缀在 bge-small-en 下压过中文语义：用 fact 原文检索三条都排第 1，但纯中文 description 当查询召不回自己（alert-thresholds / hard-logic）；description 含 ASCII 词的都能召回。→ **memory-v2**：主 fact 去前缀，规则版本进幂等键（`sha:版本`），旧水位线自动判 changed；代码与测试已就绪 |
 | 根因 ② | `utils/extracted_ingest.py` 的 `_FIND_EDGE` 只按 (源, 边名, 目标) 复用边、不比较 fact → 重推的新 fact 写不进去，旧 fact 还被新 episode 背书续命；今后记忆改版也刷新不了。→ 复用条件加 `e.fact = $fact`（同一对实体允许多条不同 fact 的边，与 graphiti 一致），`test_extracted_ingest` 新增用例 |
-| v2 重推与复测 | **待 NAS 发布后**：`memory_push.py push`（重推 49 并归档 49 个 v1 episode）→ `eval_recall --grep s1-mem --by-name` |
+| v2 重推 | **已完成**（2026-10-19 11:44 CST，线上 079308c 已含 #196）：`push` 计划 新 0 · 改 49 · 不变 0 · 删 0；结果 推送 49 · 失败 0 · 归档 49。FalkorDB 核对：`agent-memory-*` 未归档 49 条全为 memory-v2、已归档 49 条全为 memory-v1；v2 主 fact 无 slug 前缀、有 `fact_embedding`；同一对实体 v1/v2 两条不同 fact 的边并存（根因 ② 修复生效） |
+| v2 复测（by-name，k=10，两端点串行） | `/api/search` 与 `/api/search_semantic` 结果完全一致：literal 4/7、nl 2/13、全部 6/20，平均 recall@10 30%。扣掉 4 条 gold=0（kg-hub-test-runner-false-green、claude-mem-503 属 B 档未推）：**literal 4/5、nl 2/11**，与 v1 基线持平，**未达验收线 nl ≥10/13** |
+| 复测定位 | 用 v2 fact 原文查 `/api/search` 排第 1，入图与检索链路正常；中文改述查询（如「给监控定告警阈值应该怎么取值才不会误报」「能不能让模型维护状态」）top-10 全是无关短句；命中的两条 nl（tailscale）和带 `mcp-guard`/`swap` 的查询都靠 ASCII 词。结论：去前缀只消除了干扰项，**瓶颈是 bge-small-en 对中文语义的能力**（北极星长尾「muxcp-nl embedding 鸿沟」）；fulltext 腿无 CJK 分词，中文 nl 查询实际只剩向量腿 |
+| 独立复测（上游会话，服务恢复后串行重跑同一命令） | 与本轮一致：已推 16 条里 literal 5/5、nl 2/11（本轮 literal 4/5，差在「deploy-standard 准则 31 说的是什么」一条）。判别：8 条已推记忆用自己的 description 当查询全部排第 1（v1 时 alert-thresholds、hard-logic 召不回自己）——去前缀修复生效；nl 改写查询在 top-30 里 tailscale 3/5、cerberus 12、shell-cjk 21、nas-journal 24，其余不在。图内核对同上，另确认 v2 每 slug 唯一、旧前缀边未被 v2 背书 |
+| 度量窗口提醒 | 03:47Z 前后另一会话发布 #197（f7c0fcf，含 #196），kg-hub 容器重建，期间 `/api/search` 大面积 502；那一轮数据作废需重跑。本轮两次复测无 search-fail、每条返回 10 个 fact，数据有效 |
 | 度量方法坑 | 度量脚本只能串行打线上（并行时 `/api/search` 大面积 502）；FalkorDB 直连凭据在 `~/.claude-mem/.env` |
 
-B1 与 Phase 2 等 v2 复测结果再定。若去前缀后 nl 仍不达标，剩下的就是 embedding 模型本身对中文的能力（北极星长尾「muxcp-nl embedding 鸿沟」），不在本任务范围。
+### 复测后的下一步（待用户定）
+
+- **B1 回流可以先做**：按 `agent-memory-*` 名前缀在 SessionStart 注入（canonical_context 前缀列表 + `ExtractedIngestBody` 加 scope），不经向量检索，不受 embedding 瓶颈影响；「Qoder / Codex 看到 Claude Code 的教训」这个目标能先达成。
+- **nl 召回要靠换 embedding 模型**：多语种模型（bge-m3 / multilingual-e5 一类）才能让中文改述命中；需全图重算 `fact_embedding` 并改 NAS 容器，是独立任务，不在本任务范围。换模型后用同一黄金集复测：`eval_recall --grep s1-mem --by-name`（两端点串行），验收线不变 nl ≥10/13。
+- Phase 2（Qoder 202 条）在 embedding 未换之前只有 literal 与 B1 回流两条路可用，建议与 B1 一起评估，不单独推。
+- 不建议再在 fact 文本上加英文关键词之类的补丁：v1 的 slug 前缀实验已证明这类改动只影响 literal 命中，对 nl 无益。
 
 ## 附：第一轮 10 条样本与查询
 
