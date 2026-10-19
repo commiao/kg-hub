@@ -230,7 +230,7 @@ class TopologyTests(unittest.TestCase):
         src = (ROOT / "topology.py").read_text("utf-8")
         load = src[src.index("async def _load_snapshots"):]
         load = load[:load.index("async def breakers_state")]
-        self.assertLess(load.index("annotate_gateway_route(snap"),
+        self.assertLess(load.index("annotate_ready_routes(snap"),
                         load.index("annotate_breakers(snap"))
 
     def test_halt_verdict_names_it_and_calls_it_deliberate(self):
@@ -251,6 +251,95 @@ class TopologyTests(unittest.TestCase):
         self.assertEqual(len(gateway), 1)
         self.assertIn("网关侧已断路", gateway[0]["title"])
         self.assertTrue(gateway[0]["deliberate"])
+
+
+
+class ReadyBusinessRoutesTests(unittest.TestCase):
+    """credvault 0253208 起 /health/ready 顶层有 business_routes（T-0323）：提交前就能看见断路。"""
+
+    def setUp(self):
+        import dashboard_status
+        self.D = dashboard_status
+
+    def health(self, routes):
+        return {"business_routes": routes}
+
+    def test_projection_reads_the_disabled_keys(self):
+        got = self.D.business_routes_projection(
+            {"business_routes": {"status": "ok", "disabled_business_keys": ["b", "a"]}})
+        self.assertEqual(got, {"status": "ok", "disabled_business_keys": ["a", "b"]})
+
+    def test_old_gateway_or_bad_shape_is_unknown_not_open(self):
+        for body in ({}, {"business_routes": None},
+                     {"business_routes": {"status": "unknown", "disabled_business_keys": []}},
+                     {"business_routes": {"status": "ok", "disabled_business_keys": "x"}},
+                     {"business_routes": {"status": "ok", "disabled_business_keys": [1]}},
+                     None):
+            self.assertEqual(self.D.business_routes_projection(body)["status"], "unknown", body)
+
+    def test_ready_alone_marks_gateway_and_kghub(self):
+        snap = _snap()
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "ok", "disabled_business_keys": ["kg_hub.entity_extract"]}), {})
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        for node_id in ("gateway", "kghub"):
+            self.assertEqual(by_id[node_id]["state"], "amber")
+            self.assertEqual(by_id[node_id]["sub"], "网关侧已断路")
+            self.assertNotIn("breaker", by_id[node_id])  # 开关归 credvault 看板
+        self.assertEqual(by_id["worker"]["state"], "green")
+        self.assertIn("就绪接口", by_id["kghub"]["detail"])
+
+    def test_claude_mem_key_marks_the_worker_node(self):
+        snap = _snap()
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "ok", "disabled_business_keys": ["claude_mem.observation"]}), {})
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        self.assertEqual(by_id["worker"]["state"], "amber")
+        self.assertEqual(by_id["worker"]["sub"], "网关侧已断路")
+        self.assertEqual(by_id["kghub"]["state"], "green")
+        self.assertIn("claude_mem.observation", by_id["gateway"]["detail"])
+
+    def test_other_keys_only_listed_on_the_gateway(self):
+        snap = _snap()
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "ok", "disabled_business_keys": ["dsh_nas.default"]}), {})
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        self.assertTrue(all(n["state"] == "green" for n in snap["nodes"]))
+        self.assertIn("dsh_nas.default", by_id["gateway"]["detail"])
+
+    def test_unknown_does_not_mark_but_says_so(self):
+        snap = _snap()
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "unknown", "disabled_business_keys": []}), {})
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        self.assertTrue(all(n["state"] == "green" for n in snap["nodes"]))
+        self.assertIn("未知", by_id["gateway"]["detail"])
+
+    def test_unknown_still_falls_back_to_hit_evidence(self):
+        snap = _snap()
+        topology.annotate_ready_routes(snap, None, TopologyTests.QUEUE_HOLD)
+        by_id = {n["id"]: n for n in snap["nodes"]}
+        self.assertEqual(by_id["kghub"]["state"], "amber")
+
+    def test_nothing_disabled_changes_no_colour(self):
+        snap = _snap()
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "ok", "disabled_business_keys": []}), {})
+        self.assertTrue(all(n["state"] == "green" for n in snap["nodes"]))
+
+    def test_a_real_fault_stays_red(self):
+        snap = _snap()
+        snap["nodes"][3]["state"] = "red"
+        topology.annotate_ready_routes(
+            snap, self.health({"status": "ok", "disabled_business_keys": ["kg_hub.entity_extract"]}), {})
+        self.assertEqual(snap["nodes"][3]["state"], "red")
+
+    def test_load_snapshots_wires_the_ready_path(self):
+        body = Path(topology.__file__).read_text("utf-8")
+        load = body[body.index("async def _load_snapshots"):body.index("async def breakers_state")]
+        self.assertIn("annotate_ready_routes(snap, gw_health", load)
+        health_src = Path(self.D.__file__).read_text("utf-8")
+        self.assertIn('"business_routes": business_routes_projection(body)', health_src)
 
 
 if __name__ == "__main__":

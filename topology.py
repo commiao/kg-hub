@@ -301,6 +301,58 @@ def gateway_route_disabled(status: dict | None) -> str | None:
     return None
 
 
+# 就绪接口报出的被禁用业务 key → 拓扑上受它影响的节点。只列这张图上有节点的业务；
+# 其余 key（dsh、WeChat 等）只写进模型网关节点的详情，不改颜色。
+GATEWAY_ROUTE_NODES: dict[str, tuple[str, ...]] = {
+    "kg_hub.entity_extract": ("gateway", "kghub"),
+    "claude_mem.observation": ("worker",),
+}
+
+
+def ready_route_evidence(health: dict | None, key: str) -> str | None:
+    """就绪接口直接给出的「这个 key 已被网关断开」，没有或状态未知则 None。"""
+    routes = (health or {}).get("business_routes") if isinstance(health, dict) else None
+    if not isinstance(routes, dict) or routes.get("status") != "ok":
+        return None
+    if key in (routes.get("disabled_business_keys") or []):
+        return (f"网关就绪接口报告 {key} 已被禁用（路由 enabled=false）：提交前即可停流，"
+                "已提交的作业留在网关队列，恢复后自动执行，不计费、不算失败")
+    return None
+
+
+def annotate_ready_routes(snap: dict, health: dict | None, refinery_status: dict | None) -> None:
+    """按就绪接口的 business_routes 标注网关侧断路（T-0323 后续）。
+
+    kg_hub.entity_extract 的证据与 refinery 撞到的证据二选一（任一成立即标，优先用撞到的，
+    因为它说明了在途作业的去向）；其余 key 只看就绪接口。状态未知时只在网关节点详情里说明。
+    """
+    routes = (health or {}).get("business_routes") if isinstance(health, dict) else None
+    by_id = {n.get("id"): n for n in snap.get("nodes", []) or [] if isinstance(n, dict)}
+    gateway = by_id.get("gateway")
+    if not isinstance(routes, dict) or routes.get("status") != "ok":
+        if gateway is not None:
+            gateway["detail"] = ("网关按业务 key 断路状态：未知（就绪接口未给出或读不出路由表，"
+                                 "不据此判为断路或畅通）\n" + (gateway.get("detail") or ""))
+        annotate_gateway_route(snap, gateway_route_disabled(refinery_status))
+        return
+    disabled = list(routes.get("disabled_business_keys") or [])
+    if gateway is not None:
+        gateway["detail"] = ("网关按业务 key 断路：" + ("、".join(disabled) if disabled else "无")
+                             + "\n" + (gateway.get("detail") or ""))
+    kg_key = "kg_hub.entity_extract"
+    annotate_gateway_route(snap, gateway_route_disabled(refinery_status)
+                           or ready_route_evidence(health, kg_key))
+    for key in disabled:
+        if key == kg_key:
+            continue
+        line = ("⛔ 网关侧已断路：" + (ready_route_evidence(health, key) or key)
+                + "\n开关在 credvault 看板（路由 enabled），恢复请在那里操作")
+        for node_id in GATEWAY_ROUTE_NODES.get(key, ()):
+            node = by_id.get(node_id)
+            if node is not None:
+                _mark_breaker(snap, node, "网关侧已断路", line)
+
+
 def annotate_gateway_route(snap: dict, evidence: str | None) -> None:
     """网关侧已断路：模型网关与 kg-hub 两个节点标 amber（有意停流，不是故障）。
 
@@ -413,9 +465,10 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         refinery_status = _read_json(REFINERY_STATUS_PATH) or {}
         gw_node, gw_edge = gateway_quota_node(
             _read_json(GATEWAY_USAGE_PATH), refinery_status, now=now)
-        apply_gateway_health(gw_node, gw_edge, await gateway_health())
+        gw_health = await gateway_health()
+        apply_gateway_health(gw_node, gw_edge, gw_health)
     except Exception:  # noqa: BLE001 — 配额格算不出来不能拖垮整张图
-        gw_node = gw_edge = None
+        gw_node = gw_edge = gw_health = None
     for r in rows:
         try:
             snap = json.loads(r.get("payload") or "{}")
@@ -450,7 +503,7 @@ async def _load_snapshots(device_cfg: dict | None = None) -> list[dict]:
         # 断路最后挂：它是有意的停流，必须盖过上面的活跃度/网关着色。网关侧在前，
         # kg-hub 自己的断路器在后——两边都断时 kg-hub 节点显示自己的开关。
         if gw_node is not None:
-            annotate_gateway_route(snap, gateway_route_disabled(refinery_status))
+            annotate_ready_routes(snap, gw_health, refinery_status)
         annotate_breakers(snap, breaker_state)
         snaps.append(snap)
     return snaps
