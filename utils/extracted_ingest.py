@@ -16,7 +16,8 @@ kg_search / episode_search / normalize_edge_names / quality 画像都把它当�
 消解策略（不调模型，只用本地 bge-small 向量）：
   实体  先按同 group 内名字大小写不敏感精确匹配；再按 name_embedding 余弦 ≥ NODE_MATCH_MIN
         取最相似一个；都没有才建新节点。复用的旧节点**不改**其 summary/labels。
-  边    同 (源, 目标, 边名) 已有 RELATES_TO → 只把本 episode 追加进 e.episodes；否则建新边。
+  边    同 (源, 目标, 边名) 且 fact 原文相同的 RELATES_TO 已有 → 只把本 episode 追加进 e.episodes；
+        否则建新边（同一对实体之间允许多条不同 fact 的边，与 graphiti 自身一致）。
 纪律度量在归一阶段就记下来（schema 外边名、未知实体类型、悬空边、重复三元组），
 随响应返回，供每 500 条复盘用；schema 外边名映射为 relates_to 并把原名保留在 raw_name。
 """
@@ -226,9 +227,11 @@ _SAVE_MENTIONS = (
     "MATCH (episode:Episodic {uuid: $episode_uuid}) MATCH (node:Entity {uuid: $entity_uuid}) "
     "MERGE (episode)-[e:MENTIONS {uuid: $uuid}]->(node) "
     "SET e.group_id = $group_id, e.created_at = $created_at RETURN e.uuid AS uuid")
+# 复用条件含 fact 相等：fact 才是被检索的那句话。只按 (源, 边名, 目标) 复用会把新写法的 fact
+# 丢掉、还让旧 fact 被新 episode 背书续命——2026-10-19 人写记忆改版（T-0332）实测踩中。
 _FIND_EDGE = (
     "MATCH (a:Entity {uuid: $src})-[e:RELATES_TO {name: $name}]->(b:Entity {uuid: $dst}) "
-    "WHERE e.group_id = $g RETURN e.uuid AS uuid, e.episodes AS episodes LIMIT 1")
+    "WHERE e.group_id = $g AND e.fact = $fact RETURN e.uuid AS uuid, e.episodes AS episodes LIMIT 1")
 _APPEND_EPISODE = (
     "MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() "
     "SET e.episodes = CASE WHEN $ep IN coalesce(e.episodes, []) THEN e.episodes "
@@ -330,7 +333,8 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
     for ed, vec in zip(extraction.edges, fact_vecs):
         src = resolved[ed.source_key]["uuid"]
         dst = resolved[ed.target_key]["uuid"]
-        rows, _, _ = await driver.execute_query(_FIND_EDGE, src=src, dst=dst, name=ed.name, g=group_id)
+        rows, _, _ = await driver.execute_query(_FIND_EDGE, src=src, dst=dst, name=ed.name, g=group_id,
+                                                fact=ed.fact)
         if rows:
             await driver.execute_query(_APPEND_EPISODE, uuid=rows[0]["uuid"], ep=ep_uuid)
             edge_uuids.append(rows[0]["uuid"])

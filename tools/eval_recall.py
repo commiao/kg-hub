@@ -42,7 +42,14 @@ def _graph():
     return db.select_graph(os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"))
 
 
-def gold_uuids(g, kw: str, cap: int = 60) -> set[str]:
+def gold_uuids(g, kw: str, cap: int = 60, name_prefix: str | None = None) -> set[str]:
+    """gold 集。默认按正文子串（gold_kw）；黄金条目带 gold_name 时按 episode 名前缀
+    （agent-memory-* 推入后 name 带 @sha8 后缀，前缀匹配才跟得上改版），且排除已归档。"""
+    if name_prefix:
+        rows = g.query(
+            "MATCH (n:Episodic) WHERE n.name STARTS WITH $p AND NOT coalesce(n.archived, false) "
+            "RETURN n.uuid LIMIT $cap", params={"p": name_prefix, "cap": cap}).result_set
+        return {r[0] for r in rows}
     rows = g.query(
         "MATCH (n:Episodic) WHERE toLower(coalesce(n.content,'')) CONTAINS toLower($k) "
         "RETURN n.uuid LIMIT $cap", params={"k": kw, "cap": cap}).result_set
@@ -82,15 +89,21 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--endpoint", default="/api/search")
     ap.add_argument("--base", default=os.environ.get("KG_HUB_URL", "http://100.123.208.32:17171"))
+    ap.add_argument("--grep", default="", help="只跑 id 含此子串的黄金条目（如 s1-mem）")
+    ap.add_argument("--by-name", action="store_true",
+                    help="黄金条目带 gold_name 时按 episode 名前缀取 gold（推入后的口径）；默认仍按 gold_kw 子串")
     args = ap.parse_args()
     tok = os.environ.get("KG_HUB_TOKEN") or os.environ.get("KG_HUB_API_TOKEN") or ""
 
     g = _graph()
     queries = json.loads(GOLDEN.read_text())["queries"]
-    print(f"评测 {args.endpoint} k={args.k} · {len(queries)} 条黄金查询\n")
+    if args.grep:
+        queries = [q for q in queries if args.grep in q["id"]]
+    print(f"评测 {args.endpoint} k={args.k} · {len(queries)} 条黄金查询"
+          + (" · gold 按 name 前缀" if args.by_name else "") + "\n")
     by_mode: dict[str, list[float]] = {}
     for q in queries:
-        gold = gold_uuids(g, q["gold_kw"])
+        gold = gold_uuids(g, q["gold_kw"], name_prefix=(q.get("gold_name") if args.by_name else None))
         facts = search(args.base, tok, args.endpoint, q["query"], args.k)
         hit = recalled_gold(g, facts, gold)
         recall = len(hit) / len(gold) if gold else 0.0
