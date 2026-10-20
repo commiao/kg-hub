@@ -33,7 +33,10 @@ from pydantic import BaseModel, Field
 # 2026-10-17 冒烟实测：bge-small-en 对中文短名的余弦普遍偏高，0.92 把「实际额度来源修正发布」
 # 并到了「反思改进项落实专项」、把「…本机测试 FileNotFoundError」并到了「docs/effective-quota」。
 # 所以向量只负责召回候选，复用还要过词面校验（_lexically_same）。
-NODE_MATCH_MIN = 0.95
+# 门槛随向量模型走：每个模型的分数分布不同，值登记在 utils/embedding_profile.PROFILES（T-0339）。
+# bge-small-en 仍是 0.95；换模型时在那里按校准结果改，不在这里改。
+from utils.embedding_profile import active_profile as _active_embed_profile  # noqa: E402
+NODE_MATCH_MIN = _active_embed_profile().node_match_min
 # 第 2 轮（opus）复盘：同类型近名仍误并 17 对——只差一个字符/数字/日期（test_phase1m→1p、准则 19–22→26–28）、
 # 跨仓库同名文件（kg-hub 与 credvault 的 release.sh）、描述性名字被泛名吸进（max_tokens 路由上限裁剪→max_tokens）。
 # 所以：代码类名字（标识符/路径）只认完全相等；只在数字上不同的一律不是同一对象；包含规则占比提到 0.8；

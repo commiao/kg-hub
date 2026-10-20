@@ -183,11 +183,14 @@ class SearchOnly(unittest.TestCase):
         import graphiti_client as GC
         llm = GC.SearchOnlyLLM()
         with patch.object(GC, 'build_llm', side_effect=AssertionError('不应构造网关客户端')), \
-             patch.object(GC, 'FalkorDriver'), patch.object(GC, 'FastembedEmbedder'), \
+             patch.object(GC, 'FalkorDriver') as D, patch.object(GC, 'FastembedEmbedder'), \
              patch.object(GC, 'Graphiti') as G:
+            # build_graphiti 建客户端前先查图里向量的来源模型（T-0339）；无标记 = 缺省模型，放行
+            D.return_value.execute_query = AsyncMock(return_value=([], None, None))
             G.return_value.build_indices_and_constraints = AsyncMock()
             asyncio.run(GC.build_graphiti(llm_client=llm))
         self.assertIs(G.call_args.kwargs['llm_client'], llm)
+        self.assertIn('EmbeddingProfile', D.return_value.execute_query.call_args.args[0])
 
     def test_kg_eval_builds_search_only(self):
         import tools.kg_eval as K

@@ -3,11 +3,11 @@ Shared Graphiti client factory.
 
 Extracted from spike-graphiti/spike.py so ingesters reuse identical wiring:
 - LLM: logical ``kg_hub.entity_extract`` route via the NAS model gateway
-- Embedder: fastembed BAAI/bge-small-en-v1.5 (384-dim, local)
+- Embedder: fastembed，模型由 KG_HUB_EMBED_MODEL 决定（utils/embedding_profile；缺省 BAAI/bge-small-en-v1.5，384 维，本地）
 - Cross encoder: noop pass-through (we don't use reranking yet)
 - Graph: FalkorDB (Redis-protocol, runs in Docker container `kg-hub-falkordb`)
 
-Sets EMBEDDING_DIM=384 before any graphiti_core import.
+Sets EMBEDDING_DIM from the embedding profile before any graphiti_core import.
 
 Migrated 2026-05-15 from KuzuDriver → FalkorDriver to escape Kuzu's single-writer
 lock (Phase 1 → Phase 2 requires concurrent ingest + MCP read).
@@ -22,7 +22,12 @@ import typing
 from pathlib import Path
 
 # MUST be set before graphiti_core imports (EMBEDDING_DIM is a frozen pydantic field).
-os.environ.setdefault("EMBEDDING_DIM", "384")
+# 维度取自向量模型档案（utils/embedding_profile，T-0339）：模型由 KG_HUB_EMBED_MODEL 决定，
+# 显式给了 EMBEDDING_DIM 却与模型维度不符时当场报错，不让错维度的向量写进图。
+from utils.embedding_profile import active_profile as _active_embed_profile, check_dim as _check_embed_dim  # noqa: E402
+_EMBED_PROFILE = _active_embed_profile()
+_check_embed_dim(_EMBED_PROFILE)
+os.environ.setdefault("EMBEDDING_DIM", str(_EMBED_PROFILE.dim))
 
 # Force fully-sequential LLM calls inside Graphiti (per-episode entity/edge
 # extraction otherwise fans out up to SEMAPHORE_LIMIT=20 concurrent paid calls).
@@ -274,7 +279,7 @@ def build_llm() -> AnthropicClient:
 
 
 class FastembedEmbedder(EmbedderClient):
-    """Local 384-dim embeddings, loaded lazily so status endpoints stay responsive."""
+    """Local embeddings (model from utils.embedding_profile), loaded lazily so status endpoints stay responsive."""
 
     def __init__(self):
         self.model = None
@@ -288,7 +293,7 @@ class FastembedEmbedder(EmbedderClient):
                 from fastembed import TextEmbedding
                 cache_dir = os.environ.get("FASTEMBED_CACHE_PATH")
                 local_only = os.environ.get("FASTEMBED_LOCAL_FILES_ONLY", "").lower() == "true"
-                kwargs = {"model_name": "BAAI/bge-small-en-v1.5"}
+                kwargs = {"model_name": _EMBED_PROFILE.model}
                 if cache_dir:
                     kwargs["cache_dir"] = cache_dir
                 if local_only:
@@ -371,6 +376,9 @@ async def build_graphiti(
         password=password,
         database=database,
     )
+    # 查询向量与库向量必须同源：配置的模型与图里向量的来源模型不一致就拒绝建客户端（T-0339）。
+    from utils.embedding_profile import assert_graph_profile
+    await assert_graph_profile(driver)
     g = Graphiti(
         graph_driver=driver,
         llm_client=llm_client if llm_client is not None else build_llm(),

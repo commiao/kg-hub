@@ -139,6 +139,9 @@ services:
       - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kg_hub.entity_extract}
       - EMBEDDING_DIM=384
+      # 向量模型（utils/embedding_profile）；与图里向量的来源模型不一致时服务拒绝启动。
+      # 切换必须与 tools/reembed.py 全量写回配套，见 docs/EMBEDDING-MODEL-SWITCH-PLAN.md。
+      - KG_HUB_EMBED_MODEL=${KG_HUB_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
       - FASTEMBED_CACHE_PATH=/models
       # HF unreachable from NAS container; model pre-seeded in /models, force offline.
       - FASTEMBED_LOCAL_FILES_ONLY=true
@@ -292,6 +295,9 @@ services:
       - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-http://model-gateway:39000}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-kg_hub.entity_extract}
       - EMBEDDING_DIM=384
+      # 向量模型（utils/embedding_profile）；与图里向量的来源模型不一致时服务拒绝启动。
+      # 切换必须与 tools/reembed.py 全量写回配套，见 docs/EMBEDDING-MODEL-SWITCH-PLAN.md。
+      - KG_HUB_EMBED_MODEL=${KG_HUB_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
       - FASTEMBED_CACHE_PATH=/models
       # HF is unreachable from the NAS container (EADDRNOTAVAIL). Model is pre-seeded
       # into /models; force fully-offline so fastembed never contacts HuggingFace.
@@ -446,6 +452,9 @@ services:
       - KG_HUB_FALKORDB_DATABASE=kg_hub
       - KG_HUB_DECISIONS_LOG=/refinery-state/ingest_decisions.jsonl
       - EMBEDDING_DIM=384
+      # 向量模型（utils/embedding_profile）；与图里向量的来源模型不一致时服务拒绝启动。
+      # 切换必须与 tools/reembed.py 全量写回配套，见 docs/EMBEDDING-MODEL-SWITCH-PLAN.md。
+      - KG_HUB_EMBED_MODEL=${KG_HUB_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
       - FASTEMBED_CACHE_PATH=/models
       - FASTEMBED_LOCAL_FILES_ONLY=true
       - HF_HUB_OFFLINE=1
