@@ -733,6 +733,14 @@ def active_extractions() -> int:
         return _active_extractions
 
 
+def _embed_model_name() -> str:
+    try:
+        from utils.embedding_profile import active_model
+        return active_model()
+    except Exception as exc:  # noqa: BLE001 —— 配置坏了也要让 /health 说出来，而不是 500
+        return f"invalid: {exc}"
+
+
 async def health(request: Request) -> JSONResponse:
     left = drain_seconds_left()
     # envelope_repairs:模型结构化输出的外壳被就地修正过多少次(按形态)。
@@ -743,6 +751,9 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "kg_hub_server",
                          # 当前 /api/ingest 抽取方式（graphiti | single_pass），切换后发布方据此确认生效。
                          "ingest_mode": INGEST_MODE,
+                         # 本进程算向量用的模型（utils/embedding_profile）；换模型发布后据此确认生效。
+                         # 与图里向量来源不一致的进程起不来（build_graphiti 里拦），所以这里不再查图。
+                         "embed_model": _embed_model_name(),
                          "active_extractions": active_extractions(),
                          # 发布方要能看出「计数不降是因为还有人在写」还是「真的在排空」。
                          "draining": left > 0,
