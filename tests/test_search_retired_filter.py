@@ -209,12 +209,16 @@ class SearchEndpointExpiry(unittest.TestCase):
         self.assertIsNone(out["substring current"]["expired_at"])
 
     def test_substring_queries_return_expiry_columns(self):
-        """三条子串查询（原句、全词、别名）都要取 invalid_at/expired_at，否则对应结果恒为 null。"""
+        """三条子串查询（原句、全词、别名）和标识符腿都要取 invalid_at/expired_at，否则对应结果恒为 null。"""
         import inspect
         import kg_hub_server
         src = inspect.getsource(kg_hub_server.search)
         self.assertEqual(src.count("e.created_at AS ca, e.episodes AS eps"), 3)
         self.assertEqual(src.count("e.invalid_at AS ia, e.expired_at AS xa"), 3)
+        # 标识符腿的候选查询在 helper 里，同样要带
+        ident = inspect.getsource(kg_hub_server._ident_leg)
+        self.assertEqual(ident.count("e.created_at AS ca, e.episodes AS eps"), 1)
+        self.assertEqual(ident.count("e.invalid_at AS ia, e.expired_at AS xa"), 1)
 
 
 if __name__ == "__main__":
