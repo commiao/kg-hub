@@ -183,9 +183,10 @@ retired-edge filter and refetch rounds are unchanged. **The Compose default is
 ### Evidence
 
 - Production, read-only: one indexed query takes 11–17 ms (k=1024) against
-  0.6–1.1 s for Graphiti's exact scan over 172,188 edges. Serial samples of
-  `/api/search` (search run locally against the live graph, bump=0): 885 → 98,
-  888 → 133, 638 → 104 ms; semantic leg 0.6–0.87 s → 82–87 ms.
+  0.6–1.1 s for Graphiti's exact scan over 172,188 edges. Eight serial
+  `/api/search` samples (search run locally against the live graph, bump=0,
+  NAS below 85 °C before each): p50 777 → 129 ms, max 968 → 194 ms; semantic
+  leg p50 729 → 87 ms. All eight top-10 lists were identical.
 - A local FalkorDB 4.18.10 (same version as production) loaded with the same
   MiniLM vectors and index options: for all 235 evaluation queries (golden 35,
   cross-language 100 Chinese + 100 English) the semantic leg's deduplicated
