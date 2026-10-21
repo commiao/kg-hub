@@ -123,6 +123,17 @@ def _lex(name: str) -> str:
     return _LEX_STRIP.sub("", (name or "").lower())
 
 
+_REPO_PREFIX = re.compile(r"^([a-z0-9][a-z0-9._\-]*):(?!//)(?=[^/:\s])")
+
+
+def _repo_prefix(name: str) -> str | None:
+    """`仓库名:路径`（规则 16）的仓库名；`https://`、Windows 盘符这类不算。"""
+    m = _REPO_PREFIX.match(name)
+    if not m or len(m.group(1)) < 2:
+        return None
+    return m.group(1)
+
+
 def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     """向量召回的候选必须在词面上也站得住。
 
@@ -140,6 +151,16 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
         la, lb = " ".join(a.split()).lower(), " ".join(b.split()).lower()
         if la == lb:
             return True
+        # 2026-10-22 三模型对比第 1 轮：`report-portal:tests/test_deployment_standard.py` 并进了不带仓库前缀的
+        # `test_deployment_standard.py`（kg-hub 也有同名文件）——冒号后的路径里有 `/`，后缀照样成立。
+        # 规则 16 写了仓库前缀的名字，只与同一仓库前缀的名字比较；不带前缀的名字分不清是哪个仓库，不认。
+        pa, pb = _repo_prefix(la), _repo_prefix(lb)
+        if (pa or pb) and pa != pb:
+            return False
+        if pa:   # 同一仓库：去掉前缀再按路径比较
+            la, lb = la[len(pa) + 1:], lb[len(pb) + 1:]
+            if la == lb:
+                return True
         short, long_ = (la, lb) if len(la) <= len(lb) else (lb, la)
         if not long_.endswith("/" + short) or not _FILE_TAIL.search(short):
             return False

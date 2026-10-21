@@ -83,6 +83,19 @@ class LexicalTest(unittest.TestCase):
         self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))   # 占比 ≥0.8 的包含仍算同物
         self.assertTrue(same("Writer Lock", "writer_lock"))
 
+    def test_repo_prefixed_names_only_match_same_repo(self):
+        """2026-10-22 三模型对比第 1 轮：仓库:路径 被后缀规则并进不带前缀的同名文件。"""
+        same = xi._lexically_same
+        self.assertFalse(same("report-portal:tests/test_deployment_standard.py", "test_deployment_standard.py", "File"))
+        self.assertFalse(same("task-hub:tests/test_release_marker.py", "tests/test_release_marker.py", "File"))
+        self.assertFalse(same("credvault:deploy/nas-release.sh", "kg-hub:deploy/nas-release.sh", "File"))
+        self.assertTrue(same("task-hub:tests/test_release_marker.py", "TASK-HUB:tests/test_release_marker.py", "File"))
+        self.assertTrue(same("fleet-ops:bin/check-cjk-expansion.py", "fleet-ops:check-cjk-expansion.py", "File"))
+        # 不带前缀的两边照旧按后缀规则；URL 与盘符不算仓库前缀
+        self.assertTrue(same("bin/check-cjk-expansion.py", "check-cjk-expansion.py", "File"))
+        self.assertIsNone(xi._repo_prefix("https://example.com/x.py"))
+        self.assertIsNone(xi._repo_prefix("c:/work/x.py"))
+
     def test_path_suffix_only_for_file_like_non_generic_names(self):
         """2026-10-19 单次模式误并抽查（报告 §4.4）：23 对非精确复用里 7 对可疑/并错，其中 3 对由本规则挡住。"""
         same = xi._lexically_same
