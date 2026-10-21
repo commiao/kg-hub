@@ -92,7 +92,10 @@ from utils.provenance import classify_provenance, has_recognizable_source  # noq
 from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
 )
-from tools.search_terms import all_terms_clause, bounded_terms  # noqa: E402
+from tools.search_terms import (  # noqa: E402
+    IDENT_DF_MAX, IDENT_MIN_COVERAGE, all_terms_clause, bounded_terms, ident_coverage,
+    ident_fulltext_query, ident_units, ident_weights,
+)
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
 from utils.batch_answer import batch_fallbacks_total  # noqa: E402
@@ -2983,6 +2986,65 @@ async def queue_stats(request: Request) -> JSONResponse:
     })
 
 
+# 标识符腿的提权：与语义分（排名换算，0~1）同量级。离线网格（T-0339 子任务）：
+# 0.8 中文问英文 +5，1.0 与 1.2 都是 +8；取 1.0，不让关键词腿压过语义主序太多。
+IDENT_WEIGHT = 1.0
+# 每个稀有片段从全文索引取的候选数。与离线评测同口径。
+IDENT_PER_UNIT = 200
+
+
+async def _ident_leg(driver, query: str, limit: int) -> list[tuple[dict, float]]:
+    """查询里的英文标识符走 RELATES_TO.fact 全文索引，返回 [(行, 覆盖度)]。
+
+    子串腿要求整句或所有词都出现在事实里，「launchctl bootout 之后马上 bootstrap」这类
+    中英夹杂的问法因为中文虚词永远不中。这里只用 ASCII 片段：先查每个片段的 df，泛词
+    （df > IDENT_DF_MAX）不拿来召回、只进覆盖度分母；稀有片段各取索引分最高的
+    IDENT_PER_UNIT 条，按命中片段的 idf 之和排出前 limit 条再取行。不用一次 OR 查询：
+    索引自己的分数不看覆盖了几个片段，2026-10-21 线上实测全覆盖的事实排不进 OR 的前 100。
+    全走倒排索引，线上抽样每次 p50 27 ms、最大 52 ms（同一次检索里整句 CONTAINS 扫描约 300–600 ms）。
+    """
+    units = ident_units(query)
+    if not units:
+        return []
+    unit_queries = {unit: ident_fulltext_query(unit) for unit in units}
+    df_rows, _, _ = await driver.execute_query(
+        "UNWIND $qs AS s CALL db.idx.fulltext.queryRelationships('RELATES_TO', s) "
+        "YIELD relationship RETURN s AS s, count(relationship) AS n",
+        qs=list(unit_queries.values()))
+    df_by_query = {r.get("s"): int(r.get("n") or 0) for r in df_rows}
+    dfs = {unit: df_by_query.get(q, 0) for unit, q in unit_queries.items()}
+    distinctive = [unit for unit in units if 0 < dfs[unit] <= IDENT_DF_MAX]
+    if not distinctive:
+        return []
+    total_rows, _, _ = await driver.execute_query(
+        "MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS n")
+    weights = ident_weights(units, dfs, total_rows[0].get("n") if total_rows else 0)
+    by_uuid: dict[str, float] = {}
+    for unit in distinctive:
+        id_rows, _, _ = await driver.execute_query(
+            "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $ftq) YIELD relationship AS e, score "
+            "RETURN e.uuid AS u ORDER BY score DESC LIMIT $lim",
+            ftq=unit_queries[unit], lim=IDENT_PER_UNIT)
+        for r in id_rows:
+            if r.get("u"):
+                by_uuid[r["u"]] = by_uuid.get(r["u"], 0.0) + weights[unit]
+    if not by_uuid:
+        return []
+    ids = sorted(by_uuid, key=lambda u: -by_uuid[u])[:limit]
+    rows, _, _ = await driver.execute_query(
+        "MATCH (s)-[e:RELATES_TO]->(t) WHERE e.uuid IN $ids AND e.fact IS NOT NULL "
+        "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
+        "e.invalid_at AS ia, e.expired_at AS xa, "
+        "e.created_at AS ca, e.episodes AS eps",
+        ids=ids)
+    out = []
+    for r in rows:
+        cov = ident_coverage(r.get("fact") or "", weights)
+        if cov >= IDENT_MIN_COVERAGE:
+            out.append((r, cov))
+    return out
+
+
 async def search(request: Request) -> JSONResponse:
     query = (request.query_params.get("q") or "").strip()
     if not query:
@@ -3084,6 +3146,24 @@ async def search(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001
         logger.exception("[search] substring leg failed for q=%r", query)
 
+    # —— 标识符腿：中文问句里夹的英文标识符单独命中，按覆盖度提权 / 补入新候选。
+    try:
+        for r, cov in await _ident_leg(driver, query, 100):
+            fact = r.get("fact")
+            if fact in cand:
+                cand[fact]["ident"] = max(cand[fact].get("ident", 0.0), cov)
+            else:
+                cand[fact] = {
+                    "fact": fact, "source_node_uuid": str(r.get("su")),
+                    "target_node_uuid": str(r.get("tu")), "valid_at": r.get("va"),
+                    "invalid_at": r.get("ia"), "expired_at": r.get("xa"),
+                    "created_at": r.get("ca"),
+                    "episodes": [str(u) for u in (r.get("eps") or [])],
+                    "sem": 0.0, "exact": False, "ident": cov,
+                }
+    except Exception:  # noqa: BLE001 — 失败只少一条腿，不影响语义/子串结果
+        logger.exception("[search] ident leg failed for q=%r", query)
+
     if not cand:
         return JSONResponse({"status": "ok", "query": query,
                              "mode": "hybrid" if sem_ok else "substring_fallback",
@@ -3153,6 +3233,7 @@ async def search(request: Request) -> JSONResponse:
         # 相关性(语义)为主;来源/时效/验证/使用是**次级加减 nudge**,不做大乘子——
         # 否则把相关但 external 的结果踢出 top-k,反伤召回(实测 ×0.35 会掉召回)。
         score = c["sem"] + (0.15 if c["exact"] else 0.0)      # 语义分 + 精确命中小提权
+        score += IDENT_WEIGHT * c.get("ident", 0.0)           # 标识符覆盖度（0 或 ≥ 门槛）
         if external:
             score -= 0.12                                     # external 温和沉底(不吃相关性)
         if stale:
@@ -3177,7 +3258,7 @@ async def search(request: Request) -> JSONResponse:
         # 保留活背书 uuid,供命中后 bump + verbose 报告用(返回前再剥掉)
         c["_eps_live"] = [u for u in c["episodes"] if u in attr and not attr[u]["arch"]] \
             or c["episodes"]
-        c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None)
+        c.pop("episodes", None); c.pop("sem", None); c.pop("exact", None); c.pop("ident", None)
         scored.append(c)
 
     scored.sort(key=lambda r: -r["score"])
