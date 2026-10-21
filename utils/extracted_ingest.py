@@ -134,6 +134,30 @@ def _repo_prefix(name: str) -> str | None:
     return m.group(1)
 
 
+# 只差一组对立词的名字是不同的东西（2026-10-22 三模型对比第 6 轮：`prepare 阶段边组相似度` 被并进
+# `prepare 阶段节点组相似度`，difflib 0.9 放行）。与「只差数字」同级：在包含/相似度判断之前拦下。
+_CONTRAST_PAIRS = (
+    ("边", "节点"), ("edge", "node"), ("读", "写"), ("read", "write"), ("新", "旧"), ("new", "old"),
+    ("启用", "禁用"), ("enable", "disable"), ("输入", "输出"), ("input", "output"), ("请求", "响应"),
+    ("request", "response"), ("源", "目标"), ("source", "target"), ("上限", "下限"), ("min", "max"),
+    ("前", "后"), ("before", "after"), ("成功", "失败"), ("success", "failure"), ("开", "关"),
+    ("open", "close"), ("入", "出"), ("in", "out"), ("加", "减"), ("增", "删"), ("主", "备"),
+    ("primary", "replica"), ("本地", "远端"), ("local", "remote"),
+)
+
+
+def _differ_by_contrast(x: str, y: str) -> bool:
+    """x、y 已去分隔符小写化；把 x 里的某个对立词换成另一半能得到 y → 只差一组对立词。"""
+    for p, q in _CONTRAST_PAIRS:
+        for u, v in ((p, q), (q, p)):
+            start = x.find(u)
+            while start != -1:
+                if x[:start] + v + x[start + len(u):] == y:
+                    return True
+                start = x.find(u, start + 1)
+    return False
+
+
 def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     """向量召回的候选必须在词面上也站得住。
 
@@ -172,6 +196,8 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     if x == y:
         return True
     if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y):
+        return False
+    if _differ_by_contrast(x, y):
         return False
     short, long_ = (x, y) if len(x) <= len(y) else (y, x)
     if len(short) >= 4 and short in long_ and len(short) / len(long_) >= CONTAIN_MIN_SHARE:

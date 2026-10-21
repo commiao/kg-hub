@@ -83,6 +83,17 @@ class LexicalTest(unittest.TestCase):
         self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))   # 占比 ≥0.8 的包含仍算同物
         self.assertTrue(same("Writer Lock", "writer_lock"))
 
+    def test_names_differing_by_one_contrast_word_are_different(self):
+        """2026-10-22 三模型对比第 6 轮：边组 ↔ 节点组只差一组对立词，difflib 0.9 被放行。"""
+        same = xi._lexically_same
+        self.assertFalse(same("prepare 阶段边组相似度", "prepare 阶段节点组相似度", "Concept"))
+        self.assertFalse(same("向量索引启用开关", "向量索引禁用开关", "Concept"))
+        self.assertFalse(same("Edge group latency", "Node group latency", "Concept"))
+        self.assertFalse(same("读路径超时", "写路径超时", "Issue"))
+        # 不是对立词替换的近名照旧：只多修饰语、同义写法仍可复用
+        self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))
+        self.assertTrue(same("Writer Lock", "writer_lock"))
+
     def test_repo_prefixed_names_only_match_same_repo(self):
         """2026-10-22 三模型对比第 1 轮：仓库:路径 被后缀规则并进不带前缀的同名文件。"""
         same = xi._lexically_same
