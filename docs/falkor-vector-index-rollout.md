@@ -177,8 +177,9 @@ under the existing refinery policy.
 `/api/search_semantic`, `tools/kg_eval`) can use the same index:
 `KG_HUB_SEARCH_VECTOR_INDEX=1` takes `max(2048, 20 × limit)` index
 candidates and reranks them with Graphiti's formula and `min_score`; the
-retired-edge filter and refetch rounds are unchanged. **The Compose default is
-0** until the production index is rebuilt and accepted (below).
+retired-edge filter and refetch rounds are unchanged. The code default is 0;
+Compose turns it on for `kg_hub_server` only, after the production rebuild and
+acceptance of 2026-10-22 (below).
 
 ### Evidence
 
@@ -248,6 +249,11 @@ partial index.** Keep everything off the index during the rebuild: search
 switch at 0, and ingest's broad-edge lookup either stopped (circuit breaker
 open) or `KG_HUB_EDGE_VECTOR_INDEX_PERCENT=0`. `/api/ingest_extracted` does not
 read this index. Range and point lookups (`e.uuid`) kept working throughout.
+On production (2026-10-22) dropping the vector field rebuilt the **whole**
+`RELATES_TO` index — the `fact` full-text and the range fields too
+(`[Indexing] 1518/174828` right after `DROP`) — so `/api/search`'s
+identifier and literal legs, which use the full-text index, can return
+partial results until it is operational again. Do it when nobody searches.
 After the rebuild `maxDocId` was 172,360 for 172,188 documents, the semantic
 leg matched the exact scan on all 235 queries at 2048 candidates, and the
 acceptance check passed 35/35 (26/35 before).
@@ -259,6 +265,17 @@ It passes when no result has duplicates and no edge from the exact top 30 is
 missed; on the local fresh index all 35 golden queries pass, on the replayed
 degraded one 26 of 35 fail. Only then set `KG_HUB_SEARCH_VECTOR_INDEX=1`.
 Rewriting all vectors again (any future model switch) needs the same rebuild.
+
+**Done on production, 2026-10-22 02:21 CST** (ingest paused by the circuit
+breaker and by T-0346 holding its rounds): `DROP` returned at once, `CREATE`
+after 6.5 s, and the whole `RELATES_TO` index was operational again in under
+2.5 minutes (NAS 79 °C at the start, up to 95–100 °C during and right after).
+Before: 174,828 documents, `maxDocId` 395,389. After: 174,828 / 174,828,
+0 indexing failures, same vector options. Acceptance (8 golden queries, NAS
+below 85 °C before each): 8/8 passed with no edge of the exact top 50 missed;
+the three earlier worst queries (one had lost ranks 2 and 3) were rechecked
+against the production scan and passed. Indexed query 17–20 ms, exact scan
+about 0.4 s.
 
 ### Tombstones also come from ordinary edge updates
 

@@ -221,6 +221,25 @@ class VectorIndexSearch(unittest.TestCase):
             self.assertEqual(asyncio.run(run()), [("ingest-done", 0), ("search-done", 1)])
 
 
+class ComposeSwitch(unittest.TestCase):
+    """开关只给 kg_hub_server 打开：向量读锁是进程内的，别的容器（weekly_report 里的
+    kg_eval）若也走索引，会与本进程的 ingest 向量读跨进程并发、拿到损坏的候选。"""
+
+    def test_only_server_turns_it_on(self):
+        import re
+        compose = (_Path(__file__).resolve().parent.parent / "docker-compose.yml").read_text("utf-8")
+        services = re.split(r"\n  (?=[a-z_]+:\n)", compose)
+        holders = [blk.split(":", 1)[0] for blk in services if "KG_HUB_SEARCH_VECTOR_INDEX" in blk]
+        self.assertEqual(holders, ["kg_hub_server"])
+        self.assertIn("KG_HUB_SEARCH_VECTOR_INDEX=${KG_HUB_SEARCH_VECTOR_INDEX:-1}", compose)
+
+    def test_code_default_is_off(self):
+        import inspect
+        import graphiti_client
+        self.assertIn('os.environ.get("KG_HUB_SEARCH_VECTOR_INDEX", "0") == "1"',
+                      inspect.getsource(graphiti_client.search_edges_semantic))
+
+
 class IndexCheckCompare(unittest.TestCase):
     """tools/vector_index_check 的判定：重复即坏；并列分截断不同不算漏；只卡前 30 名。"""
 

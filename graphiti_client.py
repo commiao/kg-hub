@@ -162,9 +162,10 @@ async def _drop_retired(driver, edges: list) -> list:
 # FalkorDB 4.18 两条向量查询并发时会返回重复的边、挤掉正确候选（实测 1000 次并发：
 # 坏的 715 次全部带重复，无重复的 285 次全部正确；与非向量查询并发不受影响）。
 # 进程内与 ingest 共用一把锁串行；跨进程撞上时按「候选有重复」判坏，重试仍坏退回全扫。
-# 默认关（KG_HUB_SEARCH_VECTOR_INDEX=1 才走索引）：线上索引在 10-21 换模型重写全部向量后
-# 退化，抽样 24 条有 4 条漏掉全扫的前 50 名（含第 2、3 名），加大候选也找不回；
-# 重建索引并按 docs/falkor-vector-index-rollout.md 验收后再开。
+# 代码缺省关（KG_HUB_SEARCH_VECTOR_INDEX=1 才走索引），docker-compose 只给 kg_hub_server 打开：
+# 别的进程不共享上面那把锁。索引被大量重写后会漏边（10-21 换模型后抽样 24 条有 4 条漏掉全扫
+# 前 50 名，含第 2、3 名，加大候选也找不回），10-22 重建后验收通过才打开；
+# 怎么查、怎么重建见 docs/falkor-vector-index-rollout.md。
 SEMANTIC_CANDIDATES = 2048
 _INDEX_TRIES = 3
 _INDEXED_EDGE_QUERY = (
