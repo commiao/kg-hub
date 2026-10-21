@@ -122,14 +122,18 @@ class ExtractTest(unittest.TestCase):
         self.assertIn("60–200 字符", call["messages"][0].content)
         self.assertIn("正文 body", call["messages"][1].content)
         self.assertEqual([e.name for e in r.entities], ["kg-hub", "FalkorDB"])
-        self.assertEqual((r.edges[0].source, r.edges[0].name, r.edges[0].target), ("kg-hub", "depends_on", "FalkorDB"))
+        # sp3：模型没给标题原文边，服务端在最前面确定性补一条（两端沿用模型第一条边）
+        self.assertTrue(r.headline_injected)
+        self.assertEqual((r.edges[0].source, r.edges[0].name, r.edges[0].target, r.edges[0].fact),
+                         ("kg-hub", "relates_to", "FalkorDB", "正文 body"))
+        self.assertEqual((r.edges[1].source, r.edges[1].name, r.edges[1].target), ("kg-hub", "depends_on", "FalkorDB"))
         self.assertEqual(r.prompt_version, sp.load_prompt()[1])
         self.assertIsNone(mgc._model_stage.get())          # stage 不外泄到调用方
 
     def test_text_path_tolerates_fence_and_prose(self):
         text = "好的，结果如下：\n```json\n" + json.dumps(GOOD, ensure_ascii=False) + "\n```\n以上。"
         r = _extract(FakeLLM(text=text))
-        self.assertEqual(len(r.edges), 1)
+        self.assertEqual(len(r.edges), 2)   # 模型 1 条 + 补齐的标题边
         r2 = _extract(FakeLLM(text="前言 " + json.dumps(GOOD, ensure_ascii=False) + " 尾注"))
         self.assertEqual(len(r2.entities), 2)
 
@@ -163,6 +167,32 @@ class ExtractTest(unittest.TestCase):
         r = _extract(FakeLLM(text='{"entities": []}'))
         self.assertEqual((r.entities, r.edges), ([], []))
 
+    def test_headline_edge_kept_when_model_wrote_it(self):
+        answer = {"entities": GOOD["entities"],
+                  "edges": [{"source": "kg-hub", "name": "relates_to", "target": "FalkorDB", "fact": "正文 body（后被推翻：x）"}]
+                 + GOOD["edges"]}
+        r = _extract(FakeLLM(answer=answer))
+        self.assertFalse(r.headline_injected)
+        self.assertEqual(len(r.edges), 2)
+
+    def test_headline_not_injected_without_two_entities_or_title(self):
+        one = {"entities": [GOOD["entities"][0]], "edges": []}
+        r = _extract(FakeLLM(answer=one))
+        self.assertEqual((r.edges, r.headline_injected), ([], False))
+        r2 = _extract(FakeLLM(answer={"entities": GOOD["entities"], "edges": []}), body="")
+        self.assertEqual((r2.edges, r2.headline_injected), ([], False))
+
+    def test_observation_title_strips_type_and_title_markers(self):
+        self.assertEqual(sp.observation_title("[DISCOVERY] 网关 503 根因：账本饱和\n正文"), "网关 503 根因：账本饱和")
+        self.assertEqual(sp.observation_title("[**title**: Added BEIJING timezone constant\nx"), "Added BEIJING timezone constant")
+        self.assertEqual(sp.observation_title(""), "")
+        self.assertEqual(sp.observation_title("[[DECISION]] [T-0015 选题刷新验收延后]\nx"), "T-0015 选题刷新验收延后")
+        self.assertEqual(sp.observation_title("[[ DISCOVERY ]] [ Live refinery status ]\nx"), "Live refinery status")
+        self.assertEqual(sp.observation_title("[[ DISCOVERY ]] Poll 35: histogram\nx"), "Poll 35: histogram")
+        r = _extract(FakeLLM(answer={"entities": GOOD["entities"], "edges": []}), body="[FEATURE] 标题 A\n正文")
+        self.assertEqual([(e.name, e.fact) for e in r.edges], [("relates_to", "标题 A")])   # 无边时取前两个实体
+        self.assertEqual((r.edges[0].source, r.edges[0].target), ("kg-hub", "FalkorDB"))
+
     def test_parse_json_object_shapes(self):
         self.assertEqual(sp.parse_json_object('{"items": [{"id": 1, "entities": [], "edges": []}]}')["entities"], [])
         for bad in ("", "[]", '{"edges": []}', '{"entities": "x", "edges": []}', '{"entities": [{"name": "a"}], "edges": 3}'):
@@ -178,7 +208,7 @@ class ExtractTest(unittest.TestCase):
         schema = sp.SinglePassExtraction.model_json_schema()
         self.assertEqual(set(schema["properties"]), {"entities", "edges"})
         self.assertEqual(schema["required"], ["entities", "edges"])   # edges 不再可省略
-        self.assertEqual(len(r.edges), 1)
+        self.assertEqual(len(r.edges), 2)   # 工具路径同样补齐标题边
 
     def test_coercion_keeps_paid_answer_usable(self):
         raw = {"items": [{"id": 29995, "entities": [
@@ -346,7 +376,7 @@ class ServerModeTest(unittest.TestCase):
         self.assertEqual(len(self.write_calls), 1)
         extraction, kw = self.write_calls[0]
         self.assertEqual([e.name for e in extraction.entities], ["kg-hub", "FalkorDB"])
-        self.assertEqual([e.name for e in extraction.edges], ["depends_on"])
+        self.assertEqual([e.name for e in extraction.edges], ["relates_to", "depends_on"])   # 补齐的标题边在前
         self.assertEqual(kw["extraction_mode"], "gateway_single")
         self.assertEqual(kw["extractor_model"], srv.GATEWAY_MODEL_LABEL)
         self.assertEqual(kw["prompt_version"], sp.load_prompt()[1])

@@ -55,20 +55,27 @@ _VERSION_RE = re.compile(r"prompt_version\s*=\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 # 提示词是给会话执行者写的（多条 items、lookahead、names 文件、dry-run）；网关一次只给一条观测，
 # 这段补充把那些不适用的约定关掉，并把输出形状钉死为工具入参。
 # 单次调用补充约定的版本，拼在 prompt_version 后面（agent-v3+sp2），让同为 gateway_single 的批次可按规则版本分开比。
-# sp1：#190/#195 首版；sp2：2026-10-19 fact 改英文完整句 60–200 字符（按条可检索率 29% → 复测）。
-ADDENDUM_VERSION = "sp2"
+# sp1：#190/#195 首版；sp2：2026-10-19 fact 改英文完整句 60–200 字符（按条可检索率 29% → 复测）；
+# sp3：2026-10-22 三模型 2000 条对比（T-0346）的链路结论移植：标题原文 + 另一语言译文两条标题结论边、增量观测、推断标注。
+ADDENDUM_VERSION = "sp3"
 SINGLE_CALL_ADDENDUM = """
-## 本次调用的补充约定（网关单次抽取）
+## 本次调用的补充约定（网关单次抽取，sp3）
 
 - 本次只有**一条**观测，直接返回 `{"entities": [...], "edges": [...]}`：不要 `items` 包装，不要 `id` 字段。
 - 没有 `lookahead`、`names-<model>.tsv`、`submit --dry-run`，规则 19、20 不适用；其余规则照常。
 - 实体与关系**一次给全**：先列实体，再给关系，关系的 source/target 必须逐字等于某个实体的 name。
 - 只输出**一个 JSON 对象**：不要 Markdown 代码围栏，不要解释文字，不要调用工具。
 - `edges` 键必须存在；确实没有关系时写 `"edges": []`。边的 name 只用 schema 里的关系名。
-- **fact 用英文写成完整句**（检索用的嵌入模型只认英文）：主语和宾语直接写两端实体的 name，
-  带上关键细节（原因、数值、文件、时间），长度 60–200 字符；专有名词、中文术语、文件名、配置键、报错原文照原样保留，不要翻译。
+- **第一条边 = 标题原文**：fact 一字不改照抄观测正文第一行（去掉开头的 `[TYPE]`），source/target 选本条最核心的两个实体；
+  若正文说明这个结论后来被推翻，在原文后加「（后被推翻：……）」。服务端会核对，缺了会自动补上。
+- **第二条边 = 标题的另一语言译文**：标题是英文就逐句译成中文，是中文就译成英文；保留全部专有名词与数字，不要概括。
+- **其余 fact 用英文写成完整句**：主语和宾语直接写两端实体的 name，带上关键细节（原因、数值、文件、时间），长度 60–200 字符；
+  专有名词、中文术语、文件名、配置键、报错原文照原样保留，不要翻译。
   例：`kg-hub-server depends_on FalkorDB because every /api/ingest write goes through the writer.lock on the kg_hub graph`。
-- summary 写 1–3 句（语言不限），说清这个实体是什么、在本条观测里起什么作用。
+- **增量观测**（提交、合并、推送、复跑测试、同一指标的第 N 次采样）只抽本条新增的事实，边数不设下限；
+  连续采样类的标题结论要带区分信息（第几次、关键数值、时间点）。
+- 根据正文其他证据修正了数字或单位时，fact 里写明「（推断）」，不要静默改数。
+- summary 写 1–3 句完整句（语言不限，至少 30 字），说清这个实体是什么、在本条观测里起什么作用。
 """.strip()
 
 
@@ -208,12 +215,47 @@ class SinglePassExtraction(BaseModel):
         return {"entities": out_entities, "edges": out_edges}
 
 
+_TITLE_PREFIX = re.compile(r"^\s*(?:\[\[?\s*[A-Z][A-Z_ -]*\s*\]\]?\s*|\[?\*\*title\*\*:\s*)+")   # 类型只认大写
+
+
+def observation_title(episode_body: str) -> str:
+    """观测正文第一行去掉 [TYPE] / **title**: 前缀后的标题；没有就返回空串。"""
+    first = (episode_body or "").split("\n", 1)[0]
+    title = _TITLE_PREFIX.sub("", first).strip()
+    if (first.lstrip().startswith("[**title**") or title.startswith("[")) and title.endswith("]"):
+        title = title[:-1].rstrip()                 # 「[**title**: …]」「[[DECISION]] [ … ]」的配对括号
+    if title.startswith("["):
+        title = title[1:].lstrip()
+    return title[:MAX_FACT_LEN]
+
+
+def _norm_fact(text: str) -> str:
+    return " ".join((text or "").split()).lower()
+
+
+def ensure_headline_edge(entities: list, edges: list, title: str) -> tuple[list, bool]:
+    """确定性补齐「标题原文」这条边（三模型对比实验：照抄标题后三模型可检索率都到 96–100%，
+    与模型改写能力无关）。已有一条 fact 以标题原文开头的边就不动；否则在最前面补一条 relates_to，
+    两端取模型第一条边的两端，没有边就取前两个实体；实体少于 2 个时无法成边，不补。返回 (edges, 是否补了)。"""
+    t = _norm_fact(title)
+    if not t or any(_norm_fact(e.fact).startswith(t) for e in edges):
+        return edges, False
+    if edges:
+        src, dst = edges[0].source, edges[0].target
+    elif len(entities) >= 2:
+        src, dst = entities[0].name, entities[1].name
+    else:
+        return edges, False
+    return [ExtractedEdge(source=src, target=dst, name="relates_to", fact=title)] + list(edges), True
+
+
 @dataclass
 class SinglePassResult:
     entities: list[ExtractedEntity]
     edges: list[ExtractedEdge]
     prompt_version: str
     raw: dict = field(default_factory=dict)
+    headline_injected: bool = False
 
 
 async def extract_single_pass(llm, *, name: str, episode_body: str, source_description: str,
@@ -249,5 +291,6 @@ async def extract_single_pass(llm, *, name: str, episode_body: str, source_descr
                 messages, response_model=SinglePassExtraction, max_tokens=max_tokens,
                 prompt_name=PROMPT_NAME)
             parsed = SinglePassExtraction.model_validate(response)
-    return SinglePassResult(entities=parsed.entities, edges=parsed.edges,
-                            prompt_version=prompt_version, raw=dict(response))
+    edges, injected = ensure_headline_edge(parsed.entities, parsed.edges, observation_title(episode_body))
+    return SinglePassResult(entities=parsed.entities, edges=edges, prompt_version=prompt_version,
+                            raw=dict(response), headline_injected=injected)
