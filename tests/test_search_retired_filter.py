@@ -183,7 +183,7 @@ class SearchEndpointExpiry(unittest.TestCase):
 
         class StatusDriver:
             async def execute_query(self, cypher, **params):
-                if "CONTAINS $q" in cypher:
+                if "startNode(e)" in cypher:   # 子串腿经全文索引取行
                     return substring_rows, None, None
                 return [], None, None
 
@@ -196,25 +196,26 @@ class SearchEndpointExpiry(unittest.TestCase):
 
     def test_both_legs_expose_expiry(self):
         ranked = [edge("semantic superseded", ["live"], invalid=True), edge("semantic current", ["live"])]
-        rows = [{"fact": "substring superseded", "su": "s", "tu": "t", "va": None,
+        rows = [{"fact": "substring superseded falkordb", "su": "s", "tu": "t", "va": None,
                  "ia": self.SUB_IA, "xa": self.SUB_XA, "ca": None, "eps": []},
-                {"fact": "substring current", "su": "s", "tu": "t", "va": None,
+                {"fact": "substring current falkordb", "su": "s", "tu": "t", "va": None,
                  "ia": None, "xa": None, "ca": None, "eps": []}]
         out = self.run_search(ranked, rows)
         self.assertEqual(out["semantic superseded"]["invalid_at"], T.isoformat())
         self.assertEqual(out["semantic superseded"]["expired_at"], T.isoformat())
         self.assertIsNone(out["semantic current"]["invalid_at"])
-        self.assertEqual(out["substring superseded"]["invalid_at"], self.SUB_IA)
-        self.assertEqual(out["substring superseded"]["expired_at"], self.SUB_XA)
-        self.assertIsNone(out["substring current"]["expired_at"])
+        self.assertEqual(out["substring superseded falkordb"]["invalid_at"], self.SUB_IA)
+        self.assertEqual(out["substring superseded falkordb"]["expired_at"], self.SUB_XA)
+        self.assertIsNone(out["substring current falkordb"]["expired_at"])
 
     def test_substring_queries_return_expiry_columns(self):
-        """三条子串查询（原句、全词、别名）和标识符腿都要取 invalid_at/expired_at，否则对应结果恒为 null。"""
+        """子串腿（原句、全词、别名共用一条索引查询）和标识符腿都要取 invalid_at/expired_at，
+        否则对应结果恒为 null。"""
         import inspect
         import kg_hub_server
-        src = inspect.getsource(kg_hub_server.search)
-        self.assertEqual(src.count("e.created_at AS ca, e.episodes AS eps"), 3)
-        self.assertEqual(src.count("e.invalid_at AS ia, e.expired_at AS xa"), 3)
+        src = inspect.getsource(kg_hub_server._literal_leg)
+        self.assertEqual(src.count("e.created_at AS ca, e.episodes AS eps"), 1)
+        self.assertEqual(src.count("e.invalid_at AS ia, e.expired_at AS xa"), 1)
         # 标识符腿的候选查询在 helper 里，同样要带
         ident = inspect.getsource(kg_hub_server._ident_leg)
         self.assertEqual(ident.count("e.created_at AS ca, e.episodes AS eps"), 1)

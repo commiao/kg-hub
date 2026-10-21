@@ -119,6 +119,44 @@ def ident_coverage(fact: str, weights: dict) -> float:
     return hit / total
 
 
+# /api/search 的子串腿不再扫全图（原来整句、全词各一次 toLower(e.fact) CONTAINS，17 万条边
+# 每次约 1.1 s）。补入新候选改走 RELATES_TO.fact 全文索引：把要求出现的词切成与索引同样的
+# 「词」，AND 起来查，取回后再按子串核一遍。这版 FalkorDB 全文索引只支持前缀（2026-10-21
+# 实测 *x*、*x 都是 0 行），又不在汉字与中文标点处断词，所以只能查到「以该片段开头的索引词」：
+# 「公众号 阅读量」这种落在一串汉字中间的词这里查不到，靠已有候选上的字面判断兜住。
+_LITERAL_PIECE = re.compile(r"\w+")
+_MAX_LITERAL_PIECES = 6
+
+
+def _literal_piece_query(piece: str) -> str:
+    # ASCII 与标识符腿同规则（短词、纯数字精确）；含汉字的片段是长词的开头，一律前缀。
+    return _ident_token_query(piece) if piece.isascii() else piece + "*"
+
+
+def literal_fulltext_query(terms: Iterable[str]) -> str:
+    """Fulltext prefilter over ``RELATES_TO.fact`` for facts that may contain every term.
+
+    Pieces are ``\\w`` runs, which never contain RediSearch syntax characters.  Only the
+    longest pieces are kept: dropping a piece widens the prefilter, and every returned
+    row is verified with :func:`contains_all_terms` afterwards.
+    """
+    pieces: list[str] = []
+    for term in terms:
+        for piece in _LITERAL_PIECE.findall(term.lower()):
+            if len(piece) >= 2 and piece not in pieces:
+                pieces.append(piece)
+    if not pieces:
+        return ""
+    pieces = sorted(pieces, key=len, reverse=True)[:_MAX_LITERAL_PIECES]
+    return "@fact:(" + " ".join(_literal_piece_query(p) for p in pieces) + ")"
+
+
+def contains_all_terms(text: str, terms: Iterable[str]) -> bool:
+    """Case-insensitive substring check, the same test the old CONTAINS scan made."""
+    low = (text or "").lower()
+    return all(term in low for term in terms)
+
+
 def all_terms_clause(terms: Iterable[str], fields: tuple[str, ...]) -> tuple[str, dict[str, str]]:
     """Build ``AND``-joined CONTAINS predicates for a trusted static field list."""
     clauses: list[str] = []

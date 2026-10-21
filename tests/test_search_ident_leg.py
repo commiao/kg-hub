@@ -139,6 +139,8 @@ class StatusDriver:
     async def execute_query(self, cypher, **params):
         if "queryRelationships" in cypher and self.fail_ident:
             raise RuntimeError("fulltext down")
+        if "startNode(e)" in cypher:   # 子串腿（tests/test_search_literal_leg.py 单独测）
+            return [], None, None
         if "UNWIND $qs" in cypher:
             return [{"s": s, "n": self.dfs.get(s, 0)} for s in params["qs"]], None, None
         if "count(e) AS n" in cypher:

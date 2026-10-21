@@ -93,8 +93,8 @@ from utils.predigest import (  # noqa: E402
     predigest_route, PREDIGEST_PROMPT, parse_observations, obs_to_episode_body, MAX_OBS,
 )
 from tools.search_terms import (  # noqa: E402
-    IDENT_DF_MAX, IDENT_MIN_COVERAGE, all_terms_clause, bounded_terms, ident_coverage,
-    ident_fulltext_query, ident_units, ident_weights,
+    IDENT_DF_MAX, IDENT_MIN_COVERAGE, all_terms_clause, bounded_terms, contains_all_terms,
+    ident_coverage, ident_fulltext_query, ident_units, ident_weights, literal_fulltext_query,
 )
 from tools.retrieval_aliases import query_aliases  # noqa: E402
 from utils import token_auth  # noqa: E402
@@ -3045,6 +3045,67 @@ async def _ident_leg(driver, query: str, limit: int) -> list[tuple[dict, float]]
     return out
 
 
+# 子串腿每一步从全文索引取回、再按子串核对的行数上限。与标识符腿每片段的取数同量级。
+LITERAL_INDEX_LIMIT = 200
+
+
+async def _literal_leg(driver, query: str, known: list[str],
+                       limit: int) -> tuple[set[str], list[dict], list[str]]:
+    """字面命中，返回 (known 里字面命中的 fact, 补入的新行, 用上的别名规则)。
+
+    步骤与原来一样：整句 → bounded_terms 全词 → 别名扩展，前一步有命中就不往下走（别名逐条累加）。
+    原来每一步都是 toLower(e.fact) CONTAINS 扫全部 17 万条边，单步约 1.1 s，一次检索一到两步，
+    是 /api/search 最慢、最让 NAS 发热的地方。现在「有没有命中」只看两处，都不扫图：
+    known（语义池 + 标识符腿的候选）在 Python 里判；新候选走全文索引取 LITERAL_INDEX_LIMIT 行再核。
+    索引只能前缀匹配（见 literal_fulltext_query），落在汉字串中间的中文词补不进新候选，只能给
+    known 提权。离线 231 条评测（T-0343）：补入对 top-10 零贡献，起作用的只有给语义候选提权。
+    """
+    async def check(terms: tuple[str, ...], taken: set[str]) -> tuple[set[str], list[dict]]:
+        hits = {fact for fact in known if contains_all_terms(fact, terms)}
+        rows: list[dict] = []
+        ftq = literal_fulltext_query(terms)
+        if not ftq:
+            return hits, rows
+        index_rows, _, _ = await driver.execute_query(
+            "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $ftq) "
+            "YIELD relationship AS e, score WITH e, score ORDER BY score DESC LIMIT $lim "
+            "RETURN e.fact AS fact, startNode(e).uuid AS su, endNode(e).uuid AS tu, "
+            "e.valid_at AS va, e.invalid_at AS ia, e.expired_at AS xa, "
+            "e.created_at AS ca, e.episodes AS eps",
+            ftq=ftq, lim=LITERAL_INDEX_LIMIT)
+        for r in index_rows:
+            fact = r.get("fact")
+            if not fact or not contains_all_terms(fact, terms):
+                continue
+            if fact in known_set:
+                hits.add(fact)
+            elif fact not in taken and len(rows) < limit:
+                taken.add(fact)
+                rows.append(r)
+        return hits, rows
+
+    known_set = set(known)
+    steps = [(query.lower(),)]
+    terms = bounded_terms(query)
+    if terms:
+        steps.append(terms)
+    for step_terms in steps:
+        hits, rows = await check(step_terms, set())
+        if hits or rows:
+            return hits, rows, []
+    hit_known: set[str] = set()
+    new_rows: list[dict] = []
+    applied: list[str] = []
+    taken: set[str] = set()
+    for alias in query_aliases(query):
+        hits, rows = await check(alias.expand_terms, taken)
+        if hits or rows:
+            hit_known |= hits
+            new_rows.extend(rows)
+            applied.append(alias.rule_id)
+    return hit_known, new_rows, applied
+
+
 async def search(request: Request) -> JSONResponse:
     query = (request.query_params.get("q") or "").strip()
     if not query:
@@ -3085,66 +3146,15 @@ async def search(request: Request) -> JSONResponse:
                 "invalid_at": e.invalid_at.isoformat() if e.invalid_at else None,
                 "expired_at": e.expired_at.isoformat() if e.expired_at else None,
                 "created_at": e.created_at.isoformat() if e.created_at else None,
-                "episodes": [],   # 统一在合并后按 fact 批量补,不依赖 EntityEdge.episodes
+                # 边自己的背书。原来合并后按 fact 再查一次（e.fact IN $facts 没有索引，
+                # 每次检索扫全图 0.3–0.4 s）；语义腿返回的边本来就带 episodes。
+                "episodes": [str(u) for u in (getattr(e, "episodes", None) or [])],
                 "sem": 1.0 - rank / max(len(sem_edges), 1),   # 排名转分
                 "exact": False,
             }
         sem_ok = True
     except Exception:  # noqa: BLE001 — 语义腿失败不致命,靠子串腿兜底(保探针可用)
         logger.exception("[search] semantic leg failed for q=%r; falling back to substring", query)
-
-    # —— 子串腿:精确关键词命中(高精度),给已有候选提权 / 补入新候选。
-    # CJK fulltext 不分词：短的多词查询在完整短语无命中时，改为所有词均命中。
-    # 只允许最多 4 个受限词项，不能扩大成任意词的宽松 OR 检索。
-    exact_rows = []
-    applied_aliases: list[str] = []
-    try:
-        exact_rows, _, _ = await driver.execute_query(
-            "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND toLower(e.fact) CONTAINS $q "
-            "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
-            "e.invalid_at AS ia, e.expired_at AS xa, "
-            "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
-            q=query.lower(), lim=pool)
-        if not exact_rows:
-            terms = bounded_terms(query)
-            if terms:
-                clause, term_params = all_terms_clause(terms, ("e.fact",))
-                exact_rows, _, _ = await driver.execute_query(
-                    "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
-                    "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
-                    "e.invalid_at AS ia, e.expired_at AS xa, "
-                    "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
-                    lim=pool, **term_params,
-                )
-        if not exact_rows:
-            for alias in query_aliases(query):
-                clause, term_params = all_terms_clause(alias.expand_terms, ("e.fact",))
-                alias_rows, _, _ = await driver.execute_query(
-                    "MATCH (s)-[e]->(t) WHERE e.fact IS NOT NULL AND " + clause + " "
-                    "RETURN e.fact AS fact, s.uuid AS su, t.uuid AS tu, e.valid_at AS va, "
-                    "e.invalid_at AS ia, e.expired_at AS xa, "
-                    "e.created_at AS ca, e.episodes AS eps LIMIT $lim",
-                    lim=pool,
-                    **term_params,
-                )
-                if alias_rows:
-                    exact_rows.extend(alias_rows)
-                    applied_aliases.append(alias.rule_id)
-        for r in exact_rows:
-            fact = r.get("fact")
-            if fact in cand:
-                cand[fact]["exact"] = True
-            else:
-                cand[fact] = {
-                    "fact": fact, "source_node_uuid": str(r.get("su")),
-                    "target_node_uuid": str(r.get("tu")), "valid_at": r.get("va"),
-                    "invalid_at": r.get("ia"), "expired_at": r.get("xa"),
-                    "created_at": r.get("ca"),
-                    "episodes": [str(u) for u in (r.get("eps") or [])],
-                    "sem": 0.0, "exact": True,
-                }
-    except Exception:  # noqa: BLE001
-        logger.exception("[search] substring leg failed for q=%r", query)
 
     # —— 标识符腿：中文问句里夹的英文标识符单独命中，按覆盖度提权 / 补入新候选。
     try:
@@ -3164,22 +3174,29 @@ async def search(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001 — 失败只少一条腿，不影响语义/子串结果
         logger.exception("[search] ident leg failed for q=%r", query)
 
+    # —— 子串腿：字面命中（高精度），给已有候选提权 / 经全文索引补入新候选。不扫全图，见 _literal_leg。
+    applied_aliases: list[str] = []
+    try:
+        exact_facts, exact_rows, applied_aliases = await _literal_leg(
+            driver, query, list(cand), pool)
+        for fact in exact_facts:
+            cand[fact]["exact"] = True
+        for r in exact_rows:
+            cand[r["fact"]] = {
+                "fact": r["fact"], "source_node_uuid": str(r.get("su")),
+                "target_node_uuid": str(r.get("tu")), "valid_at": r.get("va"),
+                "invalid_at": r.get("ia"), "expired_at": r.get("xa"),
+                "created_at": r.get("ca"),
+                "episodes": [str(u) for u in (r.get("eps") or [])],
+                "sem": 0.0, "exact": True,
+            }
+    except Exception:  # noqa: BLE001
+        logger.exception("[search] substring leg failed for q=%r", query)
+
     if not cand:
         return JSONResponse({"status": "ok", "query": query,
                              "mode": "hybrid" if sem_ok else "substring_fallback",
                              "query_expansions": applied_aliases, "results": []})
-
-    # —— 按 fact 批量补 episodes(语义腿候选没带,统一补齐才好排序/facet)——
-    try:
-        frows, _, _ = await driver.execute_query(
-            "MATCH ()-[e:RELATES_TO]->() WHERE e.fact IN $facts AND e.episodes IS NOT NULL "
-            "RETURN e.fact AS fact, e.episodes AS eps", facts=list(cand.keys()))
-        for r in frows:
-            c = cand.get(r.get("fact"))
-            if c is not None and not c["episodes"]:
-                c["episodes"] = [str(u) for u in (r.get("eps") or [])]
-    except Exception:  # noqa: BLE001 — 补不到就按无背书处理(不加 provenance 权)
-        pass
 
     # —— 拉候选涉及的 episode 属性,供多因子排序 + facet 过滤 ——
     all_eps = sorted({u for c in cand.values() for u in c["episodes"]})
