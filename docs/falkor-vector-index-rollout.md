@@ -170,3 +170,75 @@ eight recent `GraphReadConflict` error keys remained: each had one failed
 execution, no persisted episode UUID, no in-flight work, and no unknown model
 outcome. This check did not clear or replay those keys; their recovery remains
 under the existing refinery policy.
+
+## Semantic search (T-0345, 2026-10-22)
+
+`graphiti_client.search_edges_semantic` (the `/api/search` semantic leg,
+`/api/search_semantic`, `tools/kg_eval`) can use the same index:
+`KG_HUB_SEARCH_VECTOR_INDEX=1` takes `max(1024, 20 × limit)` index
+candidates and reranks them with Graphiti's formula and `min_score`; the
+retired-edge filter and refetch rounds are unchanged. **The Compose default is
+0** until the production index is rebuilt and accepted (below).
+
+### Evidence
+
+- Production, read-only: one indexed query takes 11–17 ms (k=1024) against
+  0.6–1.1 s for Graphiti's exact scan over 172,188 edges. Serial samples of
+  `/api/search` (search run locally against the live graph, bump=0): 885 → 98,
+  888 → 133, 638 → 104 ms; semantic leg 0.6–0.87 s → 82–87 ms.
+- A local FalkorDB 4.18.10 (same version as production) loaded with the same
+  MiniLM vectors and index options: for all 235 evaluation queries (golden 35,
+  cross-language 100 Chinese + 100 English) the semantic leg's deduplicated
+  fact list equals the exact scan's at limit 10, 30 and 40. With 512
+  candidates 18 of 235 differ, hence the 1024 floor. The six evaluation groups'
+  top-3/5/10/20 hits are therefore unchanged.
+
+### Concurrent vector queries return corrupted results
+
+On an unchanged graph, two `db.idx.vector.queryRelationships` calls running at
+the same time (separate connections included) return duplicated
+relationships that push correct candidates out: of 1,000 concurrent queries,
+715 were wrong and every one contained duplicates; the 285 without
+duplicates were all correct. Concurrent non-vector reads (scans, point
+lookups) do not cause it. This is the instability the ingest canary above
+ran into.
+
+The search path therefore takes the same per-event-loop lock as ingest
+vector reads (`utils.graphiti_parallel._vector_read_lock`), treats a candidate
+list with duplicates as corrupted, retries up to three times, and then falls
+back to the exact scan. Other processes (e.g. `tools/kg_eval` in the weekly
+report container) are not covered by the lock; if one overlaps with ingest,
+the ingest read has no duplicate check. Keep `kg_eval` on the exact path
+unless that overlap is ruled out.
+
+### The production index is degraded; rebuild before enabling
+
+After the 2026-10-21 model switch rewrote every `fact_embedding` in place, the
+index reports `numDocuments` 172,188 but `maxDocId` 390,109. In a serial
+production sample of 24 queries, 4 missed edges from the exact top 50 —
+including ranks 2 and 3 for one query — and 4096 candidates did not recover
+them; the missed edges' stored vectors equal the recomputed ones. Replaying
+the history locally (index built on the old bge vectors, then all vectors SET
+to MiniLM) reproduces it: 23 of 235 semantic legs differ and larger candidate
+counts do not help, while a freshly built index differs on none. In that
+replay the six groups' top-10 hits still did not change, but the production
+sample shows misses at the very top, so enable search only on a rebuilt index.
+Ingest's indexed broad-edge lookup (100% above) reads the same degraded index
+whenever the circuit breaker is closed.
+
+Rebuild (a graph write; off-peak, NAS temperature watched, decision is the
+operator's):
+
+```cypher
+DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)
+CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)
+OPTIONS {dimension:384, similarityFunction:'cosine', M:16, efConstruction:200, efRuntime:10}
+```
+
+Wait until `CALL db.indexes()` shows the index operational, then run the
+read-only acceptance check `python -m tools.vector_index_check` (8 golden
+queries by default; each runs one exact scan, so it pauses between queries).
+It passes when no result has duplicates and no edge from the exact top 30 is
+missed; on the local fresh index all 35 golden queries pass, on the replayed
+degraded one 26 of 35 fail. Only then set `KG_HUB_SEARCH_VECTOR_INDEX=1`.
+Rewriting all vectors again (any future model switch) needs the same rebuild.

@@ -109,6 +109,10 @@ if _cosine_methods:
 from graphiti_core.search.search_config_recipes import (  # noqa: E402
     EDGE_HYBRID_SEARCH_RRF as _EDGE_RRF_RECIPE,
 )
+from graphiti_core.driver.driver import GraphProvider  # noqa: E402
+from graphiti_core.edges import get_entity_edge_from_record  # noqa: E402
+from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query  # noqa: E402
+from utils.graphiti_parallel import _vector_read_lock  # noqa: E402
 
 EDGE_VEC_ONLY_SEARCH = _copy.deepcopy(_EDGE_RRF_RECIPE)
 EDGE_VEC_ONLY_SEARCH.edge_config.search_methods = [
@@ -149,16 +153,75 @@ async def _drop_retired(driver, edges: list) -> list:
     return [e for e in edges if not retired(e)]
 
 
+# 语义腿走 RELATES_TO.fact_embedding 的 HNSW 索引（T-0345）。graphiti 的 cosine 腿是
+# MATCH 全部边逐条算 vec.cosineDistance：17 万条边每次 0.6–1.1 s，NAS 升温约 10°C。
+# 索引取候选、再用 graphiti 同一公式与 min_score 精确重排，线上单次十几毫秒。
+# 2026-10-22 本机同版本 FalkorDB 灌同一份向量：235 条评测查询在 limit 10/30/40 下
+# 去重后的 fact 列表与全扫逐条相同；候选 512 时有 18 条不同，所以下限取 1024。
+# FalkorDB 4.18 两条向量查询并发时会返回重复的边、挤掉正确候选（实测 1000 次并发：
+# 坏的 715 次全部带重复，无重复的 285 次全部正确；与非向量查询并发不受影响）。
+# 进程内与 ingest 共用一把锁串行；跨进程撞上时按「候选有重复」判坏，重试仍坏退回全扫。
+# 默认关（KG_HUB_SEARCH_VECTOR_INDEX=1 才走索引）：线上索引在 10-21 换模型重写全部向量后
+# 退化，抽样 24 条有 4 条漏掉全扫的前 50 名（含第 2、3 名），加大候选也找不回；
+# 重建索引并按 docs/falkor-vector-index-rollout.md 验收后再开。
+SEMANTIC_CANDIDATES = 1024
+_INDEX_TRIES = 3
+_INDEXED_EDGE_QUERY = (
+    "CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', "
+    "$candidates, vecf32($search_vector)) YIELD relationship AS e "
+    "WITH count(e) AS hits, collect(DISTINCT e) AS uniq "
+    "UNWIND uniq AS e "
+    "WITH hits, size(uniq) AS distinct_hits, e, startNode(e) AS n, endNode(e) AS m, "
+    "(2 - vec.cosineDistance(e.fact_embedding, vecf32($search_vector)))/2 AS score "
+    "WHERE score > $min_score RETURN hits, distinct_hits, "
+    + get_entity_edge_return_query(GraphProvider.FALKORDB)
+    + " ORDER BY score DESC LIMIT $limit"
+)
+
+
+async def _indexed_edges(driver, vector: list, limit: int) -> list | None:
+    """索引取候选、精确重排后的前 limit 条；索引不可用或结果一直损坏时返回 None。"""
+    for attempt in range(1, _INDEX_TRIES + 1):
+        try:
+            async with _vector_read_lock():
+                rows, _, _ = await driver.execute_query(
+                    _INDEXED_EDGE_QUERY, search_vector=vector, limit=limit,
+                    candidates=max(SEMANTIC_CANDIDATES, 20 * limit),
+                    min_score=EDGE_VEC_ONLY_SEARCH.edge_config.sim_min_score, routing_="r")
+        except Exception as exc:  # noqa: BLE001
+            # 与 ingest 侧一致：只有索引本身的问题才退回全扫，其他图错误照常抛出。
+            if not any(word in str(exc).lower() for word in ("index", "vector")):
+                raise
+            _search_log.warning("[search] vector index query failed, exact scan: %s", exc)
+            return None
+        if not rows or rows[0]["hits"] == rows[0]["distinct_hits"]:
+            return [get_entity_edge_from_record(r, GraphProvider.FALKORDB) for r in rows]
+        _search_log.warning("[search] vector index returned duplicates (%s of %s distinct), try %d/%d",
+                            rows[0]["distinct_hits"], rows[0]["hits"], attempt, _INDEX_TRIES)
+    return None
+
+
 async def search_edges_semantic(g: "Graphiti", query: str, limit: int) -> list:
     """仅 cosine 的语义边检索，返回 EntityEdge 列表（顺序即相关度排名）。
 
     已退休（背书 episode 全部 archived）的边被剔除，并补取到 limit 条。
+    FalkorDB 上走向量索引，索引不可用时退回 graphiti 的全扫。
     """
+    indexed = (os.environ.get("KG_HUB_SEARCH_VECTOR_INDEX", "0") == "1"
+               and getattr(g.driver, "provider", None) == GraphProvider.FALKORDB)
+    vector = None
     fetch = limit + RETIRED_HEADROOM
     for _ in range(_RETIRED_ROUNDS):
-        cfg = _copy.deepcopy(EDGE_VEC_ONLY_SEARCH)
-        cfg.limit = fetch
-        edges = (await g._search(query=query, config=cfg)).edges
+        edges = None
+        if indexed:
+            if vector is None:
+                vector = await g.embedder.create(input_data=[query.replace("\n", " ")])
+            edges = await _indexed_edges(g.driver, vector, fetch)
+            indexed = edges is not None
+        if edges is None:
+            cfg = _copy.deepcopy(EDGE_VEC_ONLY_SEARCH)
+            cfg.limit = fetch
+            edges = (await g._search(query=query, config=cfg)).edges
         live = await _drop_retired(g.driver, edges)
         if len(live) >= limit or len(edges) < fetch:
             break
