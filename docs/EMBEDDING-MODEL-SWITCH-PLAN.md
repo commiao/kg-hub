@@ -41,7 +41,7 @@ fact 平均 128 字、实体名平均 26 字；合计约 23 万条要重算。Co
 | `graphiti_client.FastembedEmbedder` | 写死 `BAAI/bge-small-en-v1.5` | 模型名改成配置项（环境变量），查询前缀按模型配 |
 | `EMBEDDING_DIM=384` | `graphiti_client.py`、`deploy/nas/Dockerfile`、`docker-compose.yml` 三处服务 | 改成新维度；graphiti 的 `EMBEDDING_DIM` 是冻结字段，必须在 import 前设 |
 | NAS `/models`（`${KG_HUB_DATA_ROOT}/models`） | 只预置了 bge-small-en；容器强制离线（`HF_HUB_OFFLINE=1`） | 预先把新模型放进去（NAS 容器连不上 HF） |
-| `RELATES_TO.fact_embedding` HNSW 索引 | 384 维 | 维度变了就必须新建索引；同维可复用 |
+| `RELATES_TO.fact_embedding` HNSW 索引 | 384 维 | 维度变了就必须新建索引；**同维也要在全量重写向量后重建**：原地 SET 全部向量后 HNSW 留下大量墓碑、部分边不可达，加大候选数也找不回（2026-10-22 T-0345 线上与本机复现均证实，见 `docs/falkor-vector-index-rollout.md`「Semantic search」） |
 | `utils/extracted_ingest.NODE_MATCH_MIN = 0.95` | 按 bge-small-en「中文短名余弦普遍偏高」校准 | 新模型分布不同，必须重新校准（错了会误并实体） |
 | graphiti `DEFAULT_MIN_SCORE = 0.6`（边/节点相似度下限） | 第三方默认值 | 新模型余弦分布若整体偏低，要按实测调 `sim_min_score` |
 | `utils/indexed_edge_search` | 用索引取候选再精确重排，`min_score=0.6` | 同上 |

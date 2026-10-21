@@ -156,6 +156,10 @@ services:
       - KG_HUB_PARALLEL_TASKS=${KG_HUB_PARALLEL_TASKS:-6}
       # Stable per-observation canary for indexed broad edge search; 0 retains exact search.
       - KG_HUB_EDGE_VECTOR_INDEX_PERCENT=${KG_HUB_EDGE_VECTOR_INDEX_PERCENT:-100}
+      # 语义检索（/api/search 语义腿、/api/search_semantic）走向量索引；0 = graphiti 全扫。
+      # 2026-10-22 线上索引重建后验收 8/8 通过才打开（docs/falkor-vector-index-rollout.md「Semantic search」）。
+      # 只开在本服务：别的容器（weekly_report 里的 kg_eval）与本进程的向量读锁不共享，保持代码缺省 0。
+      - KG_HUB_SEARCH_VECTOR_INDEX=${KG_HUB_SEARCH_VECTOR_INDEX:-1}
       # 保持原值；Graphiti 的 max_coroutines=1 仍决定每条观测内的调用并发。
       - SEMAPHORE_LIMIT=${KG_HUB_SEMAPHORE_LIMIT:-2}
       # 时间抽取合批对所有 episode 启用，每次最多 12 条；3 个线上样本成功提交，持续观察入图质量和任务耗时。
