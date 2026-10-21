@@ -133,9 +133,9 @@ class VectorIndexSearch(unittest.TestCase):
         ranked = [record(f"r{i}", eps=["dead"]) for i in range(RETIRED_HEADROOM + 5)] + \
                  [record(f"f{i}") for i in range(100)]
         g = FakeGraphiti(FakeDriver(ranked, archived={"dead"}))
-        self.assertEqual(facts(self.search(g, 40)), [f"f{i}" for i in range(40)])
+        self.assertEqual(facts(self.search(g, 60)), [f"f{i}" for i in range(60)])
         limits = [p["limit"] for p in g.driver.index_calls]
-        self.assertEqual(limits, [40 + RETIRED_HEADROOM, 2 * (40 + RETIRED_HEADROOM)])
+        self.assertEqual(limits, [60 + RETIRED_HEADROOM, 2 * (60 + RETIRED_HEADROOM)])
         cands = [p["candidates"] for p in g.driver.index_calls]
         self.assertEqual(cands[0], SEMANTIC_CANDIDATES)
         self.assertGreater(cands[1], cands[0])          # 补取放大了 limit，候选也跟着放大
@@ -227,6 +227,12 @@ class IndexCheckCompare(unittest.TestCase):
     def compare(self, got, ref, hits=1024, distinct=1024):
         from tools.vector_index_check import compare
         return compare([(u, s, hits, distinct) for u, s in got], ref)
+
+    def test_candidates_match_search(self):
+        """验收用的候选数必须等于线上检索用的，否则验收的不是会被执行的那条路径。"""
+        from graphiti_client import SEMANTIC_CANDIDATES
+        from tools.vector_index_check import CANDIDATES
+        self.assertEqual(CANDIDATES, SEMANTIC_CANDIDATES)
 
     def test_identical_passes(self):
         rows = [(f"u{i}", 0.9 - i / 1000) for i in range(50)]

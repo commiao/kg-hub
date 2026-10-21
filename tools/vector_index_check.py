@@ -1,7 +1,7 @@
 """tools/vector_index_check.py — RELATES_TO.fact_embedding 向量索引验收（T-0345）。
 
 对 docs/golden-queries.json 的前 N 条查询，串行比较两种取法的前 50 条边：
-  索引：db.idx.vector.queryRelationships 取 1024 个候选，再按 graphiti 同一公式精确重排
+  索引：db.idx.vector.queryRelationships 取 2048 个候选，再按 graphiti 同一公式精确重排
   全扫：graphiti 原来的做法，MATCH 全部 RELATES_TO 逐条算 vec.cosineDistance
 索引结果不重复、且没漏掉全扫前 30 名才算该条通过（31–50 名只报告）。另报索引的 numDocuments / maxDocId：maxDocId 远大于
 numDocuments 说明向量被大量重写过（换模型重算），2026-10-22 实测这种索引会漏边，要重建。
@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 GOLDEN = Path(__file__).resolve().parent.parent / "docs" / "golden-queries.json"
 TOP = 50
-CANDIDATES = 1024
+CANDIDATES = 2048            # 与 graphiti_client.SEMANTIC_CANDIDATES 一致（测试对账）
 TIE = 1e-6
-# 新建的索引在 1024 候选下偶尔漏第 40 名之后的边（HNSW 是近似的），语义腿去重后只取 40 条、
+# 新建的索引偶尔漏第 40 名之后的边（HNSW 是近似的），语义腿去重后只取 40 条、
 # 235 条评测查询输出与全扫逐条相同；被重写过的索引会漏到前几名。所以门槛只管前 30 名。
 GATE = 30
 _SCORE = "(2 - vec.cosineDistance(e.fact_embedding, vecf32($v)))/2"

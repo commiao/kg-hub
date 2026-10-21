@@ -157,14 +157,15 @@ async def _drop_retired(driver, edges: list) -> list:
 # MATCH 全部边逐条算 vec.cosineDistance：17 万条边每次 0.6–1.1 s，NAS 升温约 10°C。
 # 索引取候选、再用 graphiti 同一公式与 min_score 精确重排，线上单次十几毫秒。
 # 2026-10-22 本机同版本 FalkorDB 灌同一份向量：235 条评测查询在 limit 10/30/40 下
-# 去重后的 fact 列表与全扫逐条相同；候选 512 时有 18 条不同，所以下限取 1024。
+# 去重后的 fact 列表与全扫逐条相同。HNSW 每次建图有随机性：边灌边建的索引候选 1024
+# 就全同，DROP 后重建的那份 1024 有 3 条不同、2048 全同，所以下限取 2048（线上单次约 20 ms）。
 # FalkorDB 4.18 两条向量查询并发时会返回重复的边、挤掉正确候选（实测 1000 次并发：
 # 坏的 715 次全部带重复，无重复的 285 次全部正确；与非向量查询并发不受影响）。
 # 进程内与 ingest 共用一把锁串行；跨进程撞上时按「候选有重复」判坏，重试仍坏退回全扫。
 # 默认关（KG_HUB_SEARCH_VECTOR_INDEX=1 才走索引）：线上索引在 10-21 换模型重写全部向量后
 # 退化，抽样 24 条有 4 条漏掉全扫的前 50 名（含第 2、3 名），加大候选也找不回；
 # 重建索引并按 docs/falkor-vector-index-rollout.md 验收后再开。
-SEMANTIC_CANDIDATES = 1024
+SEMANTIC_CANDIDATES = 2048
 _INDEX_TRIES = 3
 _INDEXED_EDGE_QUERY = (
     "CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', "

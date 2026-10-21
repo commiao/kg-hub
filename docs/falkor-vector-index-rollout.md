@@ -175,14 +175,15 @@ under the existing refinery policy.
 
 `graphiti_client.search_edges_semantic` (the `/api/search` semantic leg,
 `/api/search_semantic`, `tools/kg_eval`) can use the same index:
-`KG_HUB_SEARCH_VECTOR_INDEX=1` takes `max(1024, 20 × limit)` index
+`KG_HUB_SEARCH_VECTOR_INDEX=1` takes `max(2048, 20 × limit)` index
 candidates and reranks them with Graphiti's formula and `min_score`; the
 retired-edge filter and refetch rounds are unchanged. **The Compose default is
 0** until the production index is rebuilt and accepted (below).
 
 ### Evidence
 
-- Production, read-only: one indexed query takes 11–17 ms (k=1024) against
+- Production, read-only: one indexed query takes 11–17 ms at k=1024 and 17–20 ms
+  at k=2048, against
   0.6–1.1 s for Graphiti's exact scan over 172,188 edges. Eight serial
   `/api/search` samples (search run locally against the live graph, bump=0,
   NAS below 85 °C before each): p50 777 → 129 ms, max 968 → 194 ms; semantic
@@ -191,7 +192,10 @@ retired-edge filter and refetch rounds are unchanged. **The Compose default is
   MiniLM vectors and index options: for all 235 evaluation queries (golden 35,
   cross-language 100 Chinese + 100 English) the semantic leg's deduplicated
   fact list equals the exact scan's at limit 10, 30 and 40. With 512
-  candidates 18 of 235 differ, hence the 1024 floor. The six evaluation groups'
+  candidates 18 of 235 differ. HNSW construction is randomised: the index
+  built while loading matched at 1024, but the same data re-indexed after
+  `DROP` differed on 3 of 235 at 1024 and on none at 2048, hence the 2048
+  floor. The six evaluation groups'
   top-3/5/10/20 hits are therefore unchanged.
 
 ### Concurrent vector queries return corrupted results
@@ -236,6 +240,18 @@ CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)
 OPTIONS {dimension:384, similarityFunction:'cosine', M:16, efConstruction:200, efRuntime:10}
 ```
 
+Rehearsed locally on the replayed degraded index (2026-10-22): `DROP` and
+`CREATE` return at once, the index is then built in the background
+(`[Indexing] n/172188: UNDER CONSTRUCTION`, about four minutes on the Mac).
+**While it is under construction, vector queries still answer — from the
+partial index.** Keep everything off the index during the rebuild: search
+switch at 0, and ingest's broad-edge lookup either stopped (circuit breaker
+open) or `KG_HUB_EDGE_VECTOR_INDEX_PERCENT=0`. `/api/ingest_extracted` does not
+read this index. Range and point lookups (`e.uuid`) kept working throughout.
+After the rebuild `maxDocId` was 172,360 for 172,188 documents, the semantic
+leg matched the exact scan on all 235 queries at 2048 candidates, and the
+acceptance check passed 35/35 (26/35 before).
+
 Wait until `CALL db.indexes()` shows the index operational, then run the
 read-only acceptance check `python -m tools.vector_index_check` (8 golden
 queries by default; each runs one exact scan, so it pauses between queries).
@@ -243,3 +259,14 @@ It passes when no result has duplicates and no edge from the exact top 30 is
 missed; on the local fresh index all 35 golden queries pass, on the replayed
 degraded one 26 of 35 fail. Only then set `KG_HUB_SEARCH_VECTOR_INDEX=1`.
 Rewriting all vectors again (any future model switch) needs the same rebuild.
+
+### Tombstones also come from ordinary edge updates
+
+Setting **any** property of an edge (not only `fact_embedding`) re-indexes
+it under a new document id: locally, 2,000 `SET e.invalid_at` and 2,000
+`SET e.episodes` raised `maxDocId` by exactly 2,000 each. Ingest updates
+edges all the time (episodes appended, invalidation), so once ingest resumes
+the index accumulates tombstones again. Whether gradual churn degrades recall
+the way the mass rewrite did has not been measured. Until it has, watch
+`maxDocId / numDocuments` and rerun `tools.vector_index_check`; rebuild when
+it fails.
