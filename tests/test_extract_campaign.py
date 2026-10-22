@@ -156,12 +156,30 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual(defs["kg-extract-deepseek-flash"]["prompt"], ec.brief(c, "DeepSeek-Flash"))
         md = ec.agent_markdown("kg-extract-deepseek-flash", defs["kg-extract-deepseek-flash"])
         self.assertTrue(md.startswith("---\nname: kg-extract-deepseek-flash\n"))
-        self.assertIn("\nmodel: DeepSeek-Flash\n", md.split("---", 2)[1])
+        self.assertEqual(md.split("---", 2)[1],
+                         "\nname: kg-extract-deepseek-flash\ndescription: " + defs["kg-extract-deepseek-flash"]["description"]
+                         + "\nmodel: DeepSeek-Flash\n")                       # qoder 与 cursor 共用的三个字段
         out = _Path(self.tmp.name) / "agents"
         with mock.patch("sys.stdout"):
             ec.main(["agents", "--id", "t1", "--format", "md", "--dir", str(out)])
         self.assertEqual(sorted(x.name for x in out.iterdir()),
                          ["kg-extract-deepseek-flash.md", "kg-extract-qwen3.8-max.md"])
+
+    def test_launch_commands_per_tool(self):
+        st = _Path(self.tmp.name)
+        codex = ec.launch_command("codex", "t1", "gpt-6-luna", repo=_Path("/r"), state=st)
+        self.assertIn("codex exec -m gpt-6-luna -C /r", codex)
+        self.assertIn(f"--add-dir {st}", codex)                               # 能写战役状态目录
+        self.assertIn("network_access=true", codex)                           # 要连 NAS 与服务端
+        self.assertTrue(codex.endswith("< /dev/null"))                        # 不关标准输入会一直等
+        self.assertIn("brief --id t1 --model gpt-6-luna", codex)
+        cur = ec.launch_command("cursor", "t1", "gemini-3.7-flash-high", repo=_Path("/r"), state=st)
+        self.assertIn("cursor-agent -p --model gemini-3.7-flash-high", cur)
+        self.assertIn(f"--add-dir {st}", cur)
+        q = ec.launch_command("qodercli", "t1", "DeepSeek-Flash", repo=_Path("/r"), state=st)
+        self.assertIn("qodercli -p -m DeepSeek-Flash -w /r", q)
+        with self.assertRaises(SystemExit):
+            ec.launch_command("vim", "t1", "m")
 
     def test_merge_rows_weights_by_items(self):
         a = {"_n": 10, "_cost": {"credits": 10}, "items": 10, "headline_verbatim_pct": 100.0, "ok": 10}
