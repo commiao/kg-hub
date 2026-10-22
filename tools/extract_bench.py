@@ -309,7 +309,7 @@ COLS = [("items", "条数"), ("missing", "未交"), ("empty", "空"), ("ent_per_
         ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"), ("dirty_name", "脏命名"),
         ("headline_verbatim_pct", "照抄标题%"), ("second_other_lang_pct", "译文边%"), ("rest_fact_en_pct", "其余英文%"),
         ("rest_fact_len", "其余均长"), ("hit_zh_pct", "中文问句命中%"), ("hit_en_pct", "英文问句命中%"),
-        ("tokens_per_obs", "token/条"), ("sec_per_obs", "秒/条")]
+        ("tokens_per_obs", "token/条"), ("credits_per_obs", "credits/条"), ("sec_per_obs", "秒/条")]
 
 
 def render(rows: list[dict]) -> str:
@@ -318,33 +318,55 @@ def render(rows: list[dict]) -> str:
     return "\n".join([head, *body])
 
 
-def score(p: Path, m: dict, results: dict[int, dict], label: str, *, tokens=None, wall_s=None, cache_dir=None) -> list[dict]:
-    from schema import EDGE_TYPES, ENTITY_TYPES
-    rows, base = _bench_items(p, m)
-    ids = [r[0] for r in rows]
-    titles = {r[0]: r[1] for r in rows}
-    cm = {i: item_metrics(results.get(i), titles[i], ENTITY_TYPES, EDGE_TYPES) for i in ids}
-    bm = {i: item_metrics(base.get(i), titles[i], ENTITY_TYPES, EDGE_TYPES) for i in ids}
-    ch, bh = retrieval(p, m, results, ids, cache_dir), retrieval(p, m, base, ids, cache_dir)
+def score(p: Path, m: dict, results: dict[int, dict], label: str, *, tokens=None, wall_s=None, cache_dir=None,
+          ids=None) -> list[dict]:
+    """单个候选的评分；多个候选用 score_many。"""
+    n = len(ids) if ids else m["items"]
     cost = {}
     if tokens:
-        cost["tokens_per_obs"] = round(tokens / len(ids))
+        cost["tokens_per_obs"] = round(tokens / n)
     if wall_s:
-        cost["sec_per_obs"] = round(wall_s / len(ids), 1)
-    out = [_row(f"{label}（全样本）", [cm[i] for i in ids], ch, ids, cost),
-           _row("基线：三模型各自那部分", [bm[i] for i in ids], bh, ids)]
+        cost["sec_per_obs"] = round(wall_s / n, 1)
+    return score_many(p, m, [(label, results, cost)], ids=ids, cache_dir=cache_dir)
+
+
+def score_many(p: Path, m: dict, cands: list[tuple[str, dict, dict]], *, ids=None, cache_dir=None) -> list[dict]:
+    """cands: [(标签, 结果, 成本列)]。ids 给定时只评这些观测（冒烟子集），候选与基线用同一组。
+    行序：各候选全样本 → 基线合计 → 按基线模型分组，每组里各候选 → 该模型基线。"""
+    from schema import EDGE_TYPES, ENTITY_TYPES
+    rows, base = _bench_items(p, m)
+    if ids is not None:
+        keep = set(ids)
+        rows = [r for r in rows if r[0] in keep]
+    ids = [r[0] for r in rows]
+    titles = {r[0]: r[1] for r in rows}
+    bm = {i: item_metrics(base.get(i), titles[i], ENTITY_TYPES, EDGE_TYPES) for i in ids}
+    bh = retrieval(p, m, base, ids, cache_dir)
+    scored = []
+    for label, results, cost in cands:
+        cm = {i: item_metrics(results.get(i), titles[i], ENTITY_TYPES, EDGE_TYPES) for i in ids}
+        scored.append((label, cm, retrieval(p, m, results, ids, cache_dir), cost))
+    out = [_row(f"{label}（全样本）", [cm[i] for i in ids], ch, ids, cost) for label, cm, ch, cost in scored]
+    out.append(_row("基线：三模型各自那部分", [bm[i] for i in ids], bh, ids))
     for model in sorted({r[3] for r in rows}):
         sub = [r[0] for r in rows if r[3] == model]
-        out.append(_row(f"{label}｜{model} 那部分", [cm[i] for i in sub], ch, sub))
+        out += [_row(f"{label}｜{model} 那部分", [cm[i] for i in sub], ch, sub) for label, cm, ch, _ in scored]
         out.append(_row(f"{model}（基线）", [bm[i] for i in sub], bh, sub))
     return out
 
 
-def lint(p: Path, m: dict, results: dict[int, dict]) -> list[str]:
-    from schema import EDGE_TYPES, ENTITY_TYPES
+def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
     rows, _ = _bench_items(p, m)
+    if ids is not None:
+        rows = [r for r in rows if r[0] in set(ids)]
+    return lint_items([(r[0], r[1], r[2]) for r in rows], results)
+
+
+def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict]) -> list[str]:
+    """rows: [(观测 id, 标题, 批次)]。对比样本与生产战役（tools/extract_campaign）共用这一份自检。"""
+    from schema import EDGE_TYPES, ENTITY_TYPES
     probs = []
-    for i, title, part, _ in rows:
+    for i, title, part in rows:
         it = results.get(i)
         if it is None:
             probs.append(f"{part} {i}: 没有结果")
@@ -371,6 +393,206 @@ def lint(p: Path, m: dict, results: dict[int, dict]) -> list[str]:
     return probs
 
 
+# ---------- 多模型运行器：会话型 CLI 只当模型通道用 ----------
+# 运行器拼规则 + 观测发给 CLI、解析回复、写结果；CLI 不开任何工具。这样不同模型在同一套外壳下比，
+# 差异只来自模型（工具会不会用不在比较范围里，要比工具就在工具里按说明手动跑）。
+
+BENCH_ADDENDUM_VERSION = "bench1"
+BENCH_ADDENDUM = """
+## 本次调用的补充约定（离线对比，bench1）
+
+- 本次给你若干条观测（JSON 数组），只输出**一个** JSON 对象 `{"items": [...]}`：每条观测一个 item，带原样的 `id`；
+  不要 Markdown 代码围栏，不要解释文字。
+- 没有 `names-<model>.tsv`、`submit --dry-run`，规则 20、28 不适用；`lookahead` 随请求给出（规则 19）。
+- 每条都读全文再抽；没有可抽取知识的观测给 `"entities": []`，仍要列出它的 id。
+""".strip()
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
+
+
+def bench_system_prompt(path: Path = PROMPT_PATH) -> tuple[str, str]:
+    text = path.read_text(encoding="utf-8").strip()
+    mt = re.search(r"prompt_version\s*=\s*(agent-v\d+)", text[:500])
+    if not mt:
+        raise SystemExit(f"{path} 首部没有 prompt_version 标记")
+    return text + "\n\n" + BENCH_ADDENDUM, f"{mt.group(1)}+{BENCH_ADDENDUM_VERSION}"
+
+
+def select_ids(rows: list[tuple], limit: int | None) -> list[int]:
+    """冒烟子集：按基线模型轮流取，各模型那部分都覆盖到；同一个 limit 每次取到同一组。limit 为空取全部。"""
+    if not limit:
+        return [r[0] for r in rows]
+    queues: dict[str, list[int]] = {}
+    for r in rows:
+        queues.setdefault(r[3], []).append(r[0])
+    order, out, k = sorted(queues), [], 0
+    while len(out) < limit and any(queues.values()):
+        q = queues[order[k % len(order)]]
+        if q:
+            out.append(q.pop(0))
+        k += 1
+    return out
+
+
+def build_query(items: list[dict], lookahead: list) -> str:
+    obs = [{"id": i["id"], "name": i.get("name"), "source_description": i.get("source_description"),
+            "episode_body": i["episode_body"]} for i in items]
+    return ("按系统提示里的规则抽取下面每一条观测，只输出一个 JSON 对象 {\"items\": [...]}，每条带原样的 id。\n\n"
+            f"lookahead（之后观测的标题，用于规则 19）：{json.dumps(lookahead, ensure_ascii=False)}\n\n"
+            f"观测：{json.dumps(obs, ensure_ascii=False)}")
+
+
+def parse_items(text: str, want: list[int]) -> dict[int, dict]:
+    """模型回复 → {id: item}，只收 want 里的 id；容忍代码围栏与前后杂字。没有可用 JSON 抛 ValueError。"""
+    t = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", (text or "").strip())
+    starts = [x for x in (t.find("{"), t.find("[")) if x != -1]
+    if not starts:
+        raise ValueError("回复里没有 JSON")
+    obj, _ = json.JSONDecoder().raw_decode(t[min(starts):])
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict) and isinstance(obj.get("items"), list):
+        items = obj["items"]
+    elif isinstance(obj, dict) and "entities" in obj:
+        items = [obj]
+    else:
+        raise ValueError("JSON 里没有 items 数组")
+    out, want_set = {}, set(want)
+    for it in items:
+        try:
+            i = int(it.get("id"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if i in want_set:
+            out[i] = {**it, "id": i}
+    return out
+
+
+def qodercli_call(model: str, system: str, query: str, *, cwd: Path, timeout: int = 900) -> dict:
+    """qodercli 非交互单轮调用。--setting-sources local：不加载用户级设置——那里挂着 claude-mem 钩子，
+    会把评测请求记成观测、在会话开始注入无关上下文；--tools ""：不给工具，只当模型用。"""
+    import subprocess
+    cmd = ["qodercli", "-p", "-m", model, "-o", "json", "--no-session-persistence", "--setting-sources", "local",
+           "--tools", "", "--system-prompt", system, "--", query]
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"text": "", "error": "timeout", "stop": None, "credits": 0.0, "ms": timeout * 1000}
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return {"text": r.stdout[-2000:], "error": f"rc={r.returncode} 非 JSON 输出：{r.stderr[-300:]}",
+                "stop": None, "credits": 0.0, "ms": 0}
+    return {"text": d.get("result") or "", "error": d.get("is_error") and (d.get("result") or "is_error"),
+            "stop": d.get("stop_reason"), "credits": float(d.get("total_credits") or 0),
+            "ms": int(d.get("duration_ms") or 0)}
+
+
+ADAPTERS = {"qodercli": qodercli_call}
+
+
+def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> tuple[dict, dict]:
+    """一组观测调一次；漏掉或解析失败的再拆半重试（最多两层），仍拿不到的记 failed。"""
+    want = [i["id"] for i in items]
+    res = call(build_query(items, lookahead))
+    got, err = {}, res["error"]
+    if not err:
+        try:
+            got = parse_items(res["text"], want)
+        except ValueError as exc:
+            err = str(exc)
+    log(want, res, err)
+    st = {"calls": 1, "credits": res["credits"], "ms": res["ms"], "failed": []}
+    missing = [i for i in items if i["id"] not in got]
+    if missing and depth < 2:
+        halves = [missing[:len(missing) // 2], missing[len(missing) // 2:]] if len(missing) > 1 else [missing]
+        for h in (x for x in halves if x):
+            g2, s2 = run_chunk(call, h, lookahead, log, depth + 1)
+            got.update(g2)
+            for k in ("calls", "credits", "ms"):
+                st[k] += s2[k]
+            st["failed"] += s2["failed"]
+    elif missing:
+        st["failed"] = [i["id"] for i in missing]
+    return got, st
+
+
+def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: Path, tag: str,
+               limit: int | None, chunk: int, parallel: int, call_factory=None) -> list[Path]:
+    """每个模型一个目录 <out_root>/<tag>-<executor>-<模型>/：results-<批次>.json、run.json、work/（原始回复）。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Lock
+    rows, _ = _bench_items(p, m)
+    ids = select_ids(rows, limit)
+    keep = set(ids)
+    system, version = bench_system_prompt()
+    parts = {}
+    for part in m["parts"]:
+        b = part["part"]
+        batch = json.loads((p / f"batch-{b}.json").read_text())
+        its = [i for i in batch["items"] if int(i["id"]) in keep]
+        if its:
+            parts[b] = (its, batch.get("lookahead") or [])
+    dirs, tasks, lock = {}, [], Lock()
+    for model in models:
+        d = out_root / f"{tag}-{executor}-{re.sub(r'[^\w.-]+', '_', model)}"
+        if d.exists():
+            raise SystemExit(f"{d} 已存在：换个 --tag，不覆盖已有结果")
+        (d / "work").mkdir(parents=True)
+        dirs[model] = d
+        for b, (its, la) in parts.items():
+            for k in range(0, len(its), chunk):
+                tasks.append((model, b, k // chunk, its[k:k + chunk], la))
+    adapter = ADAPTERS[executor]
+
+    def make_call(model, d):
+        if call_factory:
+            return call_factory(model, system)
+        return lambda q: adapter(model, system, q, cwd=d / "work")
+
+    def do(task):
+        model, b, k, its, la = task
+        d, n = dirs[model], [0]
+
+        def log(want, res, err):
+            n[0] += 1
+            (d / "work" / f"{b}.c{k}.a{n[0]}.json").write_text(json.dumps(
+                {"ids": want, "error": err, "stop": res["stop"], "credits": res["credits"], "ms": res["ms"],
+                 "text": res["text"]}, ensure_ascii=False))
+        got, st = run_chunk(make_call(model, d), its, la, log)
+        with lock:
+            print(f"  {model} {b} 第 {k + 1} 组：{len(got)}/{len(its)} 条，调用 {st['calls']} 次，"
+                  f"{st['credits']:.2f} credits，{st['ms'] / 1000:.0f}s", flush=True)
+        return model, b, its, got, st
+
+    started = datetime.now(timezone.utc).isoformat()
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+        done = list(ex.map(do, tasks))
+    for model, d in dirs.items():
+        mine = [x for x in done if x[0] == model]
+        by_part = {}
+        for _, b, its, got, _ in mine:
+            by_part.setdefault(b, []).extend(got[i["id"]] for i in its if i["id"] in got)
+        for b, items in by_part.items():
+            (d / f"results-{b}.json").write_text(json.dumps({"items": items}, ensure_ascii=False, indent=1))
+        tot = {k: sum(x[4][k] for x in mine) for k in ("calls", "credits", "ms")}
+        (d / "run.json").write_text(json.dumps({
+            "tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": tag,
+            "bench": m["bench_id"], "prompt_version": version, "ids": ids, "chunk": chunk,
+            "failed": [i for x in mine for i in x[4]["failed"]], **tot,
+            "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=1))
+    return [dirs[x] for x in models]
+
+
+def load_run(d: Path) -> dict:
+    r = json.loads((d / "run.json").read_text())
+    if r.get("tool") != TOOL:
+        raise SystemExit(f"{d} 不是 {TOOL} 的运行目录")
+    n = max(1, len(r["ids"]))
+    r["results"] = load_results([str(d)])
+    r["cost"] = {"credits_per_obs": round(r["credits"] / n, 2), "sec_per_obs": round(r["ms"] / 1000 / n, 1)}
+    return r
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比套件：冻结样本上的离线评分")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -380,19 +602,29 @@ def main(argv=None) -> int:
     f.add_argument("--bench-id", required=True)
     f.add_argument("--corpus", required=True)
     f.add_argument("--root", default=str(DEFAULT_ROOT))
-    for name in ("parts", "lint", "score"):
+    for name in ("parts", "lint", "score", "run"):
         s = sub.add_parser(name)
         s.add_argument("--bench", required=True)
-        if name != "parts":
-            s.add_argument("--results", nargs="+", required=True)
+        if name in ("lint", "score"):
+            s.add_argument("--results", nargs="+", help="结果文件或目录（单个候选）")
+            s.add_argument("--run", nargs="+", help="run 子命令产出的运行目录（可多个，合成一张表）")
+        if name in ("score", "run"):
+            s.add_argument("--json", help="另存 JSON")
+            s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
         if name == "score":
-            s.add_argument("--label", required=True)
+            s.add_argument("--label")
             s.add_argument("--model")
             s.add_argument("--executor")
             s.add_argument("--tokens", type=int, help="执行器自报的总 token（输入 + 输出）")
             s.add_argument("--wall-s", type=float, help="执行器总耗时（秒）")
-            s.add_argument("--json", help="另存 JSON")
-            s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
+        if name == "run":
+            s.add_argument("--executor", default="qodercli", choices=sorted(ADAPTERS))
+            s.add_argument("--models", nargs="+", required=True)
+            s.add_argument("--tag", required=True, help="运行标签，如 smoke10 / full")
+            s.add_argument("--limit", type=int, help="冒烟：只取这么多条（按基线模型轮流取）")
+            s.add_argument("--chunk", type=int, default=10, help="每次调用的观测数")
+            s.add_argument("--parallel", type=int, default=3, help="同时在跑的调用数")
+            s.add_argument("--out-root", default=str(DEFAULT_ROOT / "runs"))
     a = ap.parse_args(argv)
     if a.cmd == "freeze":
         out = freeze(Path(a.src).expanduser(), a.chain, a.bench_id, Path(a.corpus).expanduser(),
@@ -400,6 +632,7 @@ def main(argv=None) -> int:
         print(json.dumps(json.loads((out / "manifest.json").read_text()), ensure_ascii=False, indent=1))
         return 0
     p, m = _bench(a.bench)
+    cache = Path(a.cache_dir) if getattr(a, "cache_dir", None) else None
     if a.cmd == "parts":
         print(f"样本 {m['bench_id']}：{m['items']} 条，{len(m['parts'])} 批（基线约定 {m['chain']}）")
         for part in m["parts"]:
@@ -407,20 +640,46 @@ def main(argv=None) -> int:
         print("每批写一个 results-<批次>.json（格式同 agent_extract），全部写完后：")
         print(f"  python -m tools.extract_bench lint  --bench {p} --results <结果目录>")
         print(f"  python -m tools.extract_bench score --bench {p} --results <结果目录> --label <工具-模型>")
+        print("或一次跑多个模型：python -m tools.extract_bench run --bench <样本> --models <模型...> --tag <标签> [--limit 10]")
         return 0
-    results = load_results(a.results)
-    if a.cmd == "lint":
-        probs = lint(p, m, results)
-        print("\n".join(probs) if probs else "自检通过")
-        return 1 if probs else 0
-    rows = score(p, m, results, a.label, tokens=a.tokens, wall_s=a.wall_s,
-                 cache_dir=Path(a.cache_dir) if a.cache_dir else None)
-    print(f"样本 {m['bench_id']}（{m['items']} 条，问句 {m['questions']} 条）；被评：{a.label}"
-          + (f"，模型 {a.model}" if a.model else "") + (f"，执行器 {a.executor}" if a.executor else ""))
+    if a.cmd == "run":
+        dirs = run_models(p, m, a.models, executor=a.executor, out_root=Path(a.out_root).expanduser(), tag=a.tag,
+                          limit=a.limit, chunk=a.chunk, parallel=a.parallel)
+        runs = [load_run(d) for d in dirs]
+    elif a.run:
+        runs = [load_run(Path(d).expanduser()) for d in a.run]
+    else:
+        runs = None
+        if not a.results:
+            raise SystemExit("要给 --results 或 --run")
+    if a.cmd == "lint" or a.cmd == "run":
+        bad = 0
+        for r in runs or [{"label": "结果", "results": load_results(a.results), "ids": None}]:
+            probs = lint(p, m, r["results"], ids=r["ids"])
+            bad += len(probs)
+            print(f"[{r['label']}] " + (f"{len(probs)} 处问题" if probs else "自检通过"))
+            for x in probs[:40]:
+                print("  " + x)
+        if a.cmd == "lint":
+            return 1 if bad else 0
+    if runs:
+        ids = sorted(set.intersection(*(set(r["ids"]) for r in runs)))
+        rows = score_many(p, m, [(r["label"], r["results"], r["cost"]) for r in runs], ids=ids, cache_dir=cache)
+        print(f"样本 {m['bench_id']}：比较 {len(ids)} 条（问句口径同报告）；"
+              + "；".join(f"{r['label']} 调用 {r['calls']} 次、失败 {len(r['failed'])} 条" for r in runs))
+        meta = {"runs": [{k: r[k] for k in ("label", "model", "executor", "tag", "prompt_version", "calls",
+                                            "credits", "ms", "failed")} for r in runs]}
+    else:
+        if not a.label:
+            raise SystemExit("单个候选要给 --label")
+        rows = score(p, m, load_results(a.results), a.label, tokens=a.tokens, wall_s=a.wall_s, cache_dir=cache)
+        print(f"样本 {m['bench_id']}（{m['items']} 条，问句 {m['questions']} 条）；被评：{a.label}"
+              + (f"，模型 {a.model}" if a.model else "") + (f"，执行器 {a.executor}" if a.executor else ""))
+        meta = {"label": a.label, "model": a.model, "executor": a.executor}
     print(render(rows))
     if a.json:
-        Path(a.json).write_text(json.dumps({"bench": m["bench_id"], "label": a.label, "model": a.model,
-                                            "executor": a.executor, "rows": rows}, ensure_ascii=False, indent=1))
+        Path(a.json).expanduser().write_text(json.dumps({"bench": m["bench_id"], **meta, "rows": rows},
+                                                        ensure_ascii=False, indent=1))
     return 0
 
 

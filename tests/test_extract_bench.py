@@ -136,6 +136,115 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(by["qoder-x｜opus 那部分"]["hit_zh_pct"], 0.0)       # 没交的那条不命中
         self.assertIn("| qoder-x（全样本） |", xb.render(rows))
 
+    def test_run_models_writes_runs_and_scores_them_together(self):
+        p, m = xb._bench(str(self.bench))
+        titles = self.titles
+
+        def factory(model, system):
+            def call(q):
+                obs = json.loads(q.split("观测：", 1)[1])
+                good = model == "好模型"
+                body = [item([edge(titles[o["id"]] if good else "改写"), edge(f"English {o['id']}" if good else "中文")],
+                             id=o["id"]) for o in obs]
+                return {"text": json.dumps({"items": body}, ensure_ascii=False), "error": None, "stop": "end_turn",
+                        "credits": 2.0, "ms": 1000}
+            return call
+        out = _Path(self.tmp.name) / "runs"
+        dirs = xb.run_models(p, m, ["好模型", "差模型"], executor="qodercli", out_root=out, tag="t", limit=1,
+                             chunk=10, parallel=2, call_factory=factory)
+        runs = [xb.load_run(d) for d in dirs]
+        self.assertEqual([r["label"] for r in runs], ["qodercli-好模型", "qodercli-差模型"])
+        self.assertEqual(runs[0]["ids"], [1])                     # limit 1：按基线模型轮流，先取 haiku 那批
+        self.assertEqual((runs[0]["calls"], runs[0]["cost"]["credits_per_obs"]), (1, 2.0))
+        self.assertTrue(runs[0]["prompt_version"].endswith("+bench1"))
+        self.assertTrue(list((dirs[0] / "work").glob("b1.c0.a1.json")))
+        self.assertEqual(xb.lint(p, m, runs[0]["results"], ids=runs[0]["ids"]), [])
+        with self.assertRaises(SystemExit):                       # 同标签不覆盖
+            xb.run_models(p, m, ["好模型"], executor="qodercli", out_root=out, tag="t", limit=1, chunk=10,
+                          parallel=1, call_factory=factory)
+        with mock.patch.object(xb, "embed", fake_embed):
+            xb._corpus_cache.clear()
+            rows = xb.score_many(p, m, [(r["label"], r["results"], r["cost"]) for r in runs], ids=[1])
+        by = {r["label"]: r for r in rows}
+        self.assertEqual(by["qodercli-好模型（全样本）"]["headline_verbatim_pct"], 100.0)
+        self.assertEqual(by["qodercli-差模型（全样本）"]["headline_verbatim_pct"], 0.0)
+        self.assertEqual(by["基线：三模型各自那部分"]["items"], 1)       # 基线也只评同一子集
+        self.assertIn("qodercli-差模型｜haiku 那部分", by)
+
+
+
+class RunnerPureTest(unittest.TestCase):
+    def test_select_ids_round_robin_across_baseline_models(self):
+        rows = [(1, "t", "b1", "haiku"), (2, "t", "b1", "haiku"), (3, "t", "b2", "opus"), (4, "t", "b3", "sonnet"),
+                (5, "t", "b3", "sonnet")]
+        self.assertEqual(xb.select_ids(rows, 4), [1, 3, 4, 2])
+        self.assertEqual(xb.select_ids(rows, None), [1, 2, 3, 4, 5])
+        self.assertEqual(xb.select_ids(rows, 99), [1, 3, 4, 2, 5])
+
+    def test_parse_items_tolerates_fences_and_filters_ids(self):
+        txt = '好的：\n```json\n{"items": [{"id": "1", "entities": []}, {"id": 9, "entities": []}]}\n```'
+        self.assertEqual(xb.parse_items(txt, [1, 2]), {1: {"id": 1, "entities": []}})
+        self.assertEqual(set(xb.parse_items('[{"id": 2, "entities": []}]', [2])), {2})
+        self.assertEqual(set(xb.parse_items('{"id": 2, "entities": [], "edges": []}', [2])), {2})
+        for bad in ("没有 JSON", '{"foo": 1}'):
+            with self.assertRaises(ValueError):
+                xb.parse_items(bad, [1])
+
+    def test_system_prompt_carries_rules_and_bench_addendum(self):
+        system, version = xb.bench_system_prompt()
+        self.assertRegex(version, r"^agent-v\d+\+bench1$")
+        self.assertIn("21. **第一条边 = 观测标题原文**", system)
+        self.assertTrue(system.endswith(xb.BENCH_ADDENDUM))
+
+    def test_qodercli_adapter_command_and_output(self):
+        seen = {}
+
+        class R:
+            returncode, stderr = 0, ""
+            stdout = json.dumps({"result": '{"items": []}', "is_error": False, "stop_reason": "end_turn",
+                                 "total_credits": 3.5, "duration_ms": 1200})
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return R()
+        with mock.patch("subprocess.run", fake_run):
+            res = xb.qodercli_call("GLM-5.3", "SYS", "Q", cwd=_Path("/tmp"))
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[:4], ["qodercli", "-p", "-m", "GLM-5.3"])
+        # 不加载用户级设置（claude-mem 钩子在那里）、不给工具、系统提示整体替换
+        self.assertEqual(cmd[cmd.index("--setting-sources") + 1], "local")
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertEqual(cmd[cmd.index("--system-prompt") + 1], "SYS")
+        self.assertEqual(cmd[-2:], ["--", "Q"])
+        self.assertEqual(seen["kw"]["cwd"], "/tmp")
+        self.assertEqual((res["text"], res["error"], res["credits"], res["ms"]), ('{"items": []}', False, 3.5, 1200))
+        R.stdout = "not json"
+        with mock.patch("subprocess.run", fake_run):
+            self.assertTrue(xb.qodercli_call("m", "S", "Q", cwd=_Path("/tmp"))["error"])
+
+    def test_run_chunk_splits_and_retries_missing(self):
+        calls = []
+
+        def call(q):
+            ids = [o["id"] for o in json.loads(q.split("观测：", 1)[1])]
+            calls.append(ids)
+            if len(ids) > 2:                                      # 大组：漏掉 3、4
+                body = [{"id": i, "entities": []} for i in ids if i not in (3, 4)]
+            elif ids == [4]:                                      # 4 永远解析不了
+                return {"text": "坏掉的回复", "error": None, "stop": "end_turn", "credits": 1.0, "ms": 10}
+            else:
+                body = [{"id": i, "entities": []} for i in ids]
+            return {"text": json.dumps({"items": body}), "error": None, "stop": "end_turn", "credits": 1.0, "ms": 10}
+        items = [{"id": i, "episode_body": "x"} for i in (1, 2, 3, 4, 5)]
+        logs = []
+        got, st = xb.run_chunk(call, items, [], lambda w, r, e: logs.append((w, e)))
+        self.assertEqual(sorted(got), [1, 2, 3, 5])
+        self.assertEqual(st["failed"], [4])
+        self.assertEqual(calls[:3], [[1, 2, 3, 4, 5], [3], [4]])
+        self.assertEqual(st["calls"], len(calls))
+        self.assertEqual(st["credits"], float(len(calls)))
+        self.assertTrue(any(e for _, e in logs))                   # 解析失败写进日志
+
 
 if __name__ == "__main__":
     unittest.main()

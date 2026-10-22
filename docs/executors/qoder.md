@@ -2,6 +2,8 @@
 
 > 粘给 qoder（桌面版或 IDEA 插件）会话的任务说明。四条红线与五步命令见 [_common.md](_common.md)，本文只写 qoder 的接入点。
 
+> **多模型正式对比（入库、每批复盘）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
+
 ## 任务
 
 你是 kg-hub 会话自抽取路径的执行器，`KG_HUB_EXECUTOR=qoder`。按 [_common.md](_common.md) 的五步命令跑，
@@ -37,6 +39,19 @@
    --model <真实模型 id> --executor qoder --tokens <总 token> --wall-s <总秒数> --json <输出>.json`。
    输出一张表：全样本一行、三模型基线合计一行，再按基线模型各自那部分逐对比较（同一批观测上的候选 vs 基线）。
    可检索率与报告同一口径（换说法问句 top-10），基线回放实测与报告逐格一致。
+
+**一条命令跑多个模型（qodercli 当模型通道）**：不想在 qoder 界面里一个个跑，用运行器并行派发：
+
+```
+python -m tools.extract_bench run --bench ~/.kg-hub/bench/bench-20261022 \
+    --models Qwen3.8-Max GLM-5.3 Kimi-K3 DeepSeek-Flash --tag smoke10 --limit 10 --parallel 4
+```
+
+运行器把 agent-v4 规则（加一段 bench1 补充约定）与每 10 条观测拼成一次 `qodercli -p -m <模型>` 调用，qoder 不开任何工具、
+不加载用户级设置（那里挂着 claude-mem 钩子），只回 JSON；运行器解析、漏掉的拆半重试，写 `~/.kg-hub/bench/runs/<tag>-qodercli-<模型>/`
+（results、run.json 记调用次数/credits/耗时、work/ 存原始回复），跑完自动自检并出合表。`--limit` 按基线模型轮流取样做冒烟，
+去掉就是全量 200 条；已有结果的目录不覆盖，换 `--tag`。之后也可以 `score --run <目录...>` 把多次运行合成一张表。
+可用模型名用 `qodercli --list-models` 查。这条路比的是模型本身；要比 qoder 这个工具，按上面四步在 qoder 会话里手动跑。
 
 四个变量一次只动一个：比**模型**，qoder 换模型、规则与样本不动；比**工具**，qoder 选 claude-sonnet-5-5 与基线里 Claude Code
 跑的 sonnet 那部分比。评分要用本机 kg-hub venv（需要 numpy、fastembed 和本机的 MiniLM 缓存），约半分钟。
