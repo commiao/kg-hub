@@ -14,6 +14,7 @@ opus / sonnet / haiku 5.5 在 chain-v8（≈ agent-v4）下的结果（docs/thre
   parts   --bench <目录>              列出各批次文件与执行器要跑的命令。
   lint    --bench <目录> --results <文件>...   写完结果后的自检（悬空边、schema 外类型/边名、缺 edges 键、
           第一条边是否照抄标题、第二条边是否另一语言）。
+  register --bench <目录> --results <结果目录> --model <模型> --executor <工具>   把会话里手工抽取的结果登记成运行目录
   score   --bench <目录> --results <文件或目录>... --label <名字> [--model --executor --tokens --wall-s --json]
           候选与基线并排：全样本一行，再按基线模型各自那部分观测逐对比较。
 
@@ -583,6 +584,26 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
     return [dirs[x] for x in models]
 
 
+def register_run(p: Path, m: dict, results_dir: Path, *, model: str, executor: str, credits: float = 0.0,
+                 seconds: float = 0.0, prompt_version: str | None = None) -> dict:
+    """把会话里手工抽取的结果目录登记成运行目录（写 run.json），blind / admit / score --run 就能接上。
+    ids = 结果里出现、且属于样本的观测；规则版本缺省取当前 agent 规则 + manual。"""
+    from tools.agent_extract import PROMPT_VERSION
+    rows, _ = _bench_items(p, m)
+    sample = {r[0] for r in rows}
+    res = load_results([str(results_dir)])
+    ids = [r[0] for r in rows if r[0] in res]
+    if not ids:
+        raise SystemExit(f"{results_dir} 里没有属于样本 {m['bench_id']} 的结果（results*.json，items 带 id）")
+    extra = sorted(set(res) - sample)
+    run = {"tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": "manual",
+           "bench": m["bench_id"], "prompt_version": prompt_version or f"{PROMPT_VERSION}+manual", "ids": ids,
+           "chunk": None, "failed": [], "calls": None, "credits": credits, "ms": int(seconds * 1000),
+           "registered_at": datetime.now(timezone.utc).isoformat(), "ignored_ids": extra}
+    (results_dir / "run.json").write_text(json.dumps(run, ensure_ascii=False, indent=1))
+    return run
+
+
 def load_run(d: Path) -> dict:
     r = json.loads((d / "run.json").read_text())
     if r.get("tool") != TOOL:
@@ -732,7 +753,7 @@ def main(argv=None) -> int:
     f.add_argument("--bench-id", required=True)
     f.add_argument("--corpus", required=True)
     f.add_argument("--root", default=str(DEFAULT_ROOT))
-    for name in ("parts", "lint", "score", "run", "blind", "admit"):
+    for name in ("parts", "lint", "score", "run", "blind", "admit", "register"):
         s = sub.add_parser(name)
         s.add_argument("--bench", required=True)
         if name in ("lint", "score"):
@@ -742,6 +763,12 @@ def main(argv=None) -> int:
             s.add_argument("--run", nargs="+", required=True)
             s.add_argument("--n", type=int, default=BLIND_N)
             s.add_argument("--out", required=True, help="评审表（不含模型名）；对照表另存为 <out>.key.json")
+        if name == "register":
+            s.add_argument("--results", required=True, help="手工抽取的结果目录（results*.json）")
+            s.add_argument("--model", required=True)
+            s.add_argument("--executor", required=True, help="qoder / codex / cursor / claude-code / deepseek-harness ...")
+            s.add_argument("--credits", type=float, default=0.0)
+            s.add_argument("--seconds", type=float, default=0.0)
         if name == "admit":
             s.add_argument("--run", required=True, help="一个运行目录（建议 30–50 条）")
             s.add_argument("--sheet", help="填好 verdict 的盲评表；对照表默认取 <sheet>.key.json")
@@ -786,6 +813,12 @@ def main(argv=None) -> int:
         out.write_text(json.dumps(sheet, ensure_ascii=False, indent=1))
         Path(str(out) + ".key.json").write_text(json.dumps(key, ensure_ascii=False, indent=1))
         print(f"评审表 {out}（{len(sheet)} 条，不含模型名）；对照表 {out}.key.json——评完之前不要打开对照表。")
+        return 0
+    if a.cmd == "register":
+        run = register_run(p, m, Path(a.results).expanduser(), model=a.model, executor=a.executor,
+                           credits=a.credits, seconds=a.seconds)
+        print(f"已登记 {a.results}：{run['label']}，{len(run['ids'])} 条，规则 {run['prompt_version']}"
+              + (f"；忽略样本外 {len(run['ignored_ids'])} 条" if run["ignored_ids"] else ""))
         return 0
     if a.cmd == "admit":
         run = load_run(Path(a.run).expanduser())
