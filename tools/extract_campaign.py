@@ -20,7 +20,9 @@
   rules                              打印抽取规则：agent-v4 正文 + 当前补充约定（子代理第一步读它）
   brief   --model <模型 id>           打印填好的子代理说明（粘给子代理，或由 agents 写进子代理定义）
   agents  [--format qodercli|md] [--dir 目录]   按战役里的模型生成子代理定义，每个模型一个、带指定模型：
-          qodercli 格式给 `qodercli --agents '<json>'`；md 格式写成带 frontmatter 的文件（qoder 的 agents 目录）
+          qodercli 格式给 `qodercli --agents '<json>'`；md 格式写成带 frontmatter 的文件
+          （qoder 放 <仓库>/.qoder/agents，cursor 放 <仓库>/.cursor/agents）
+  launch  --tool codex|cursor|qodercli [--model ...]   打印「每个模型一个会话」的启动命令（退路 / 并行开会话）
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边），不过不许提交
   submit  --batch <批次 id> [--dry-run]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）
@@ -168,8 +170,30 @@ def agent_defs(c: dict) -> dict[str, dict]:
 
 
 def agent_markdown(name: str, d: dict) -> str:
-    return (f"---\nname: {name}\ndescription: {d['description']}\nmodel: {d['model']}\n"
-            f"permissionMode: default\n---\n\n{d['prompt']}\n")
+    """qoder（.qoder/agents）与 cursor（.cursor/agents）共用：两者的子代理定义都是这三个 frontmatter 字段 + 正文。"""
+    return f"---\nname: {name}\ndescription: {d['description']}\nmodel: {d['model']}\n---\n\n{d['prompt']}\n"
+
+
+REPO = Path(__file__).resolve().parent.parent
+LAUNCH_TOOLS = ("codex", "cursor", "qodercli")
+
+
+def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state: Path | None = None) -> str:
+    """「每个模型一个会话」的启动命令（编排工具派不了指定模型的子代理时的退路，也可用来并行开会话）。
+    子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
+    codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
+    st = state or ax.state_dir()
+    brief_cmd = f'"$($HOME/.local/share/kg-hub/venv/bin/python -m tools.extract_campaign brief --id {cid} --model {model})"'
+    if tool == "codex":
+        return (f"cd {repo} && codex exec -m {model} -C {repo} --add-dir {st} -s workspace-write "
+                f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
+    if tool == "cursor":
+        return (f"cd {repo} && cursor-agent -p --model {model} --trust --workspace {repo} --add-dir {st} "
+                f"--force {brief_cmd}")
+    if tool == "qodercli":
+        return (f"cd {repo} && qodercli -p -m {model} -w {repo} --add-dir {st} --permission-mode auto "
+                f"-o json {brief_cmd}")
+    raise SystemExit(f"不认识的工具 {tool}；可选：{', '.join(LAUNCH_TOOLS)}")
 
 
 # ---------- 子命令 ----------
@@ -408,7 +432,8 @@ def cmd_status(cid: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("start", "chain", "rules", "brief", "agents", "claim", "lint", "submit", "cost", "status", "report"):
+    for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "cost", "status",
+                 "report"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -421,6 +446,9 @@ def main(argv=None) -> int:
             s.add_argument("--file", required=True)
         if name in ("claim", "brief"):
             s.add_argument("--model", required=True)
+        if name == "launch":
+            s.add_argument("--tool", required=True, choices=LAUNCH_TOOLS)
+            s.add_argument("--model", nargs="+", help="缺省为战役里的全部模型")
         if name == "agents":
             s.add_argument("--format", choices=("qodercli", "md"), default="qodercli")
             s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
@@ -463,6 +491,13 @@ def main(argv=None) -> int:
         for n, v in defs.items():
             (out_dir / f"{n}.md").write_text(agent_markdown(n, v))
         out = {"written": sorted(str(out_dir / f"{n}.md") for n in defs)}
+    elif a.cmd == "launch":
+        c = load(campaign_dir(a.id))
+        for m in a.model or list(c["models"]):
+            if m not in c["models"]:
+                raise SystemExit(f"战役 {a.id} 没有模型 {m}")
+            print(f"# {m}\n{launch_command(a.tool, a.id, m)}\n")
+        return 0
     elif a.cmd == "claim":
         out = cmd_claim(a.id, a.model, url=a.url, token=ax.api_token())
     elif a.cmd == "lint":

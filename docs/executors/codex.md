@@ -22,6 +22,15 @@
   （rc 1 = 有没预览的）；仓库里的 `tools/codex_hooks.py` 读的是 codex 原生钩子清单，可用来确认钩子装没装。钩子只做检查，不改 results。
 - **自报成本**：codex 会话的 token 看其用量面板；每批记一行，run 结束时汇总进 `run end`。
 
+## 多模型战役（campaign.md）
+
+- **方式二未确认**（2026-10-22）：codex 的派生工具自报有 `model` 参数，但 `codex exec --json` 两次实测事件流里都没有派生记录，
+  不能确认子代理真按指定模型跑。先用「每个模型一个会话」：
+  `python -m tools.extract_campaign launch --id <战役> --tool codex` 打印
+  `codex exec -m <模型> -C <仓库> --add-dir <状态目录> -s workspace-write -c sandbox_workspace_write.network_access=true --skip-git-repo-check "<子代理说明>" < /dev/null`。
+- 要点：子代理要写战役状态目录（`--add-dir`）、要连 NAS 与 kg-hub（放开沙箱网络）；`codex exec` 不关标准输入会一直等输入。
+- 模型名用 `codex debug models` 里 `visibility=list` 的那些（如 gpt-6-astra、gpt-6-luna、gpt-5.6-sol）。
+
 ## 完成标准
 
 与 Claude Code 相同：本 run error 为 0、`reuse_mismatch_per_obs` ≤ 0.2、运行清单有 `ended_at` 与自报成本、

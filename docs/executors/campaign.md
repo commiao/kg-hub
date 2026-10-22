@@ -52,15 +52,26 @@ $PY -m tools.extract_campaign agents --id <战役> --format md --dir <目录> # 
 
 ## 各工具怎么派「指定模型的子代理」
 
-| 工具 | 方式二（一个编排会话派多个模型的子代理） | 退路（每个模型一个会话） |
+| 工具 | 方式二（一个编排会话派多个模型的子代理） | 证据（2026-10-22 实测） |
 |---|---|---|
-| **Claude Code** | 已验证：子代理工具带 `model` 参数（opus / sonnet / haiku），10-22 实验就是这样跑的 | — |
-| **qoder** | **已验证（2026-10-22）**：子代理定义里的 `model` 字段生效。命令行：`qodercli -m <编排者模型> --agents "$($PY -m tools.extract_campaign agents --id <战役>)"`，再把编排者说明作为任务；输出 `modelUsage` 按模型分开记 credits（主会话 Qwen3.8-Max、子代理分别指定 DeepSeek-Flash / Kimi-K3 两次对照，内部模型名随之变为 `dfmodel` / `kmodel_latest`）。界面：`agents --format md --dir <仓库>/.qoder/agents` 生成定义文件，界面是否读取 `model:` 以用量面板按模型的计费为准（未在界面里确认） | 每个模型开一个 qoder 会话，粘 `brief` 的输出 |
-| **codex** | 待验证：子代理能否单独指定模型 | 每个模型开一个 `codex` 会话（`-m <模型>`），粘「子代理说明」 |
-| **cursor** | 待验证：后台 agent / 子代理能否单独指定模型 | 每个模型开一个 agent 窗口并选模型，粘「子代理说明」 |
+| **Claude Code** | ✅ 子代理工具带 `model` 参数（opus / sonnet / haiku） | 10-22 三模型 2000 条实验就是这样跑的 |
+| **qoder** | ✅ 子代理定义的 `model` 字段生效。命令行：`qodercli -m <编排者模型> --agents "$($PY -m tools.extract_campaign agents --id <战役>)"`；界面：`agents --format md --dir <仓库>/.qoder/agents` | 主会话 Qwen3.8-Max，子代理分别指定 DeepSeek-Flash / Kimi-K3，输出 `modelUsage` 的内部模型名随之变为 `dfmodel` / `kmodel_latest`，credits 按模型分开记 |
+| **cursor** | ✅ 子代理定义的 `model` 字段生效，派子代理的工具本身也带 `model` 参数。`agents --format md --dir <仓库>/.cursor/agents` 生成定义，编排者在 cursor 里按名字调用 | 主会话 gpt-5.2，`taskToolCall` 参数里是 `model: gemini-3.7-flash-high`，子代理回复自报 Gemini 3.7 Flash |
+| **codex** | ⚠️ 未确认：派生工具自报有 `model` 参数，但 `codex exec --json` 的事件流里两次都没有派生记录（只有一次空的 `wait`），不能确认子代理真按指定模型跑 | 先用退路 |
+| **dskhress** | ❓ 本机未安装，接入方式待定 | — |
 
-两种方式用的是同一个战役：领批加锁、复盘表按模型分组，所以混用也没问题（比如两个模型在一个编排会话里，第三个模型另开会话）。
-`--executor` 记的是工具名，模型名用工具里的准确写法（来源标记只允许字母数字 `. _ : / -`）。
+做不到方式二（或想并行开多个会话）时，用**每个模型一个会话**，仍是同一个战役：
+
+```
+$PY -m tools.extract_campaign launch --id <战役> --tool codex|cursor|qodercli [--model <模型>...]
+```
+
+打印每个模型的启动命令：子代理说明由 `brief` 现场生成；都把战役状态目录加成可写（`--add-dir`）、放开网络
+（子代理要连 NAS 领批、连 kg-hub 提交）；codex 还要关掉标准输入（`< /dev/null`），否则会一直等输入。
+这几条命令只在参数层面核对过，还没端到端跑完一整批，第一次用先跑 1 批。
+
+注意：cursor 与 codex 会加载用户级设置里的钩子（实测 cursor 会话开头被注入了一行 kg-hub 上下文）；
+对抽取影响不大，但它们的会话会被 claude-mem 记成观测。qodercli 可以用 `--setting-sources local` 避开。
 
 ## 和其他用法的关系
 

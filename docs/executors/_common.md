@@ -2,7 +2,7 @@
 
 > 任何能跑命令行、读写 JSON 的工具都按本文接入 kg-hub 的会话自抽取路径。本文是
 > [EXTRACTION-EVAL-FRAMEWORK.md](../EXTRACTION-EVAL-FRAMEWORK.md) §2 的执行器契约，
-> 三份工具模板（[claude-code.md](claude-code.md)、[codex.md](codex.md)、[qoder.md](qoder.md)）都引用它，
+> 各工具模板（[claude-code.md](claude-code.md)、[codex.md](codex.md)、[qoder.md](qoder.md)、[cursor.md](cursor.md)）都引用它，
 > 只补各自的接入点。执行循环的细节见 [AGENT-EXTRACT-PROTOCOL.md](../AGENT-EXTRACT-PROTOCOL.md)。
 
 ## 四条红线（必须写进每个工具的任务说明）
