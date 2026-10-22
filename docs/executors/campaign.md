@@ -22,7 +22,8 @@
 
 1. 开战役（只做一次）：
    $PY -m tools.extract_campaign start --id <战役> --models <模型...> --executor <工具> --quota <配额> --batch <每批>
-2. 每一轮：给每个模型派一个子代理，**子代理必须用那个模型**，任务说明用下面「子代理说明」，填好战役 id 与模型 id。
+2. 每一轮：给每个模型派一个子代理，**子代理必须用那个模型**，任务说明用 `$PY -m tools.extract_campaign brief --id <战役> --model <模型>` 的输出
+   （或直接用 `agents` 生成的子代理定义，见下文「各工具怎么派」）。
    子代理并行跑；全部回来后：
    $PY -m tools.extract_campaign report --id <战役>
    看每批：入库数、错误、预览误并候选、照抄标题%、译文边%、边名越界、悬空边、零边、credits/条、秒/条。
@@ -36,37 +37,25 @@
    每轮改了什么、改完指标怎么变、性价比结论。
 ```
 
-## 子代理：可直接粘贴的说明
+## 子代理说明：由命令生成，不手抄
 
-```text
-你是 kg-hub 抽取对比战役的执行者，战役 <战役 id>，你的模型 id 是 <模型 id>。
-在仓库根目录执行命令，解释器用 $HOME/.local/share/kg-hub/venv/bin/python（下称 PY）。
+说明模板只有一份，在 `tools/extract_campaign.py` 的 `SUBAGENT_BRIEF`。按战役与模型填好：
 
-1. 读规则：$PY -m tools.extract_campaign rules --id <战役>（agent-v4 正文 + 战役补充约定），尤其末尾规则 21–28。
-2. 领一批：$PY -m tools.extract_campaign claim --id <战役> --model <模型 id>
-   返回 batch_file（要抽的观测）与 results_file（你要写的结果）。返回 done 就结束并汇报。
-3. 抽取：每次读 batch_file 里 10 条，**读全文再抽**；10 条一组写分片（放在 results_file 同目录、文件名带批次号），
-   全部写完用 python 合并成 results_file：{"items": [{"id", "entities": [{"name","type","summary"}],
-   "edges": [{"source","name","target","fact"}]}]}。没有知识的观测给 "entities": []。
-4. 自检：$PY -m tools.extract_campaign lint --id <战役> --batch <批次>，改到「自检通过」。
-5. 预览：$PY -m tools.extract_campaign submit --id <战役> --batch <批次> --dry-run
-   逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
-   标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
-6. 入库：$PY -m tools.extract_campaign submit --id <战役> --batch <批次>（逐条写图，可能超过 2 分钟，给足超时）。
-7. 汇报（只输出这个 JSON）：
-   {"batch": "<批次>", "model": "<模型 id>", "submitted": {"ok": 0, "empty": 0, "error": 0},
-    "dryrun_mismatch_seen": 0, "renamed_after_dryrun": 0, "credits": null, "seconds": null,
-    "lessons": ["最多 4 条：规则哪里不好用、哪类观测难抽、你做了什么取舍"]}
-
-红线：不碰断路器、不直连 FalkorDB、不改仓库文件、不 git 提交、不读或打印 .env；提交报错只重试一次，仍失败就停下汇报。
 ```
+$PY -m tools.extract_campaign brief  --id <战役> --model <模型 id>      # 打印一份，粘给子代理或某个会话
+$PY -m tools.extract_campaign agents --id <战役>                        # 每个模型一个子代理定义（JSON，给 qodercli --agents）
+$PY -m tools.extract_campaign agents --id <战役> --format md --dir <目录> # 写成带 frontmatter 的定义文件（含 model 字段）
+```
+
+子代理的流程：读 `rules` → `claim` 领一批 → 每 10 条一组读全文抽取 → `lint` 自检 → `submit --dry-run` 看误并、改名 →
+`submit` 入库 → 输出汇报 JSON（批次、入库数、误并处理、lessons）。红线同 [_common.md](_common.md)。
 
 ## 各工具怎么派「指定模型的子代理」
 
 | 工具 | 方式二（一个编排会话派多个模型的子代理） | 退路（每个模型一个会话） |
 |---|---|---|
 | **Claude Code** | 已验证：子代理工具带 `model` 参数（opus / sonnet / haiku），10-22 实验就是这样跑的 | — |
-| **qoder** | **待验证**：自定义 agent 的定义里能否写 `model:`（`~/.qoder/agents` 的示例只有 name / description / permissionMode / skills / mcpServers）。验证方法：定义一个只回「ok」的 agent 并指定模型，用 `qodercli -p -o json` 让主会话调用它，看输出 `modelUsage` 里是否出现那个模型 | 开多个 qoder 会话（或多个 `qodercli` 进程），每个选一个模型，粘「子代理说明」；编排者只做开战役、复盘、登记约定 |
+| **qoder** | **已验证（2026-10-22）**：子代理定义里的 `model` 字段生效。命令行：`qodercli -m <编排者模型> --agents "$($PY -m tools.extract_campaign agents --id <战役>)"`，再把编排者说明作为任务；输出 `modelUsage` 按模型分开记 credits（主会话 Qwen3.8-Max、子代理分别指定 DeepSeek-Flash / Kimi-K3 两次对照，内部模型名随之变为 `dfmodel` / `kmodel_latest`）。界面：`agents --format md --dir <仓库>/.qoder/agents` 生成定义文件，界面是否读取 `model:` 以用量面板按模型的计费为准（未在界面里确认） | 每个模型开一个 qoder 会话，粘 `brief` 的输出 |
 | **codex** | 待验证：子代理能否单独指定模型 | 每个模型开一个 `codex` 会话（`-m <模型>`），粘「子代理说明」 |
 | **cursor** | 待验证：后台 agent / 子代理能否单独指定模型 | 每个模型开一个 agent 窗口并选模型，粘「子代理说明」 |
 
