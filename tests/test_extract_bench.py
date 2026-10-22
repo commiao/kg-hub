@@ -204,6 +204,23 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(good["prompt_version"].split("+")[0], "agent-v4")
             self.assertIsNone(xb.latest_admission("没跑过的模型"))
 
+    def test_register_manual_results_as_a_run(self):
+        p, m = xb._bench(str(self.bench))
+        d = _Path(self.tmp.name) / "manual"
+        d.mkdir()
+        (d / "results-b1.json").write_text(json.dumps({"items": [item([edge(self.titles[1]), edge("English 1")], id=1),
+                                                                 item([edge("x"), edge("y")], id=999)]},
+                                                      ensure_ascii=False))
+        run = xb.register_run(p, m, d, model="GLM-5.3", executor="qoder", credits=4.0, seconds=60)
+        self.assertEqual((run["ids"], run["ignored_ids"], run["label"]), ([1], [999], "qoder-GLM-5.3"))
+        self.assertTrue(run["prompt_version"].endswith("+manual"))
+        loaded = xb.load_run(d)                                                # blind / admit 用的入口能读
+        self.assertEqual((loaded["cost"]["credits_per_obs"], set(loaded["results"])), (4.0, {1, 999}))
+        empty = _Path(self.tmp.name) / "empty"
+        empty.mkdir()
+        with self.assertRaises(SystemExit):
+            xb.register_run(p, m, empty, model="M", executor="qoder")
+
     def test_run_models_writes_runs_and_scores_them_together(self):
         p, m = xb._bench(str(self.bench))
         titles = self.titles

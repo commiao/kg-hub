@@ -1,0 +1,26 @@
+{
+  "protocol_version": 0,
+  "skill_id": "kg-model-eval",
+  "name": "kg-model-eval",
+  "description": "kg-hub 抽取模型对比的统一入口——冒烟、准入盲测、多模型战役。当用户说\"使用kg-hub盲测\"、\"kg-hub 盲评\"、\"使用kg-hub对比 A、B、C 模型 冒烟测试\"、\"kg-hub 准入 A、B\"、\"使用kg-hub对比 A、B、C 模型 20个一轮 共1000条\"、\"kg-hub 模型对比 / 抽取战役 / 模型准入\"时使用。在 Claude Code、qoder、codex、cursor、DSH 里都按同一套命令跑（tools/extract_bench.py、tools/extract_campaign.py），先把意图解析成计划、报预计花费、确认后再执行。",
+  "scope": "global",
+  "targets": [
+    "codex",
+    "cc-switch",
+    "skillshub",
+    "cursor",
+    "claude-code",
+    "qoder",
+    "deepseek-harness",
+    "openclaw"
+  ],
+  "exclude": [
+    "__pycache__",
+    "*.pyc",
+    ".DS_Store"
+  ],
+  "security": {
+    "contains_secrets": false,
+    "encryption": "none"
+  }
+}
