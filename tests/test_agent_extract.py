@@ -135,6 +135,34 @@ class SelectTest(unittest.TestCase):
 
 
 class SubmitTest(unittest.TestCase):
+    def test_dry_run_accumulates_entities_new_in_this_batch(self):
+        """2026-10-22 补交 b0024：dry-run 逐条把前面条目会新建的实体带给服务端，同批内误并才看得见。"""
+        batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS), ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}
+        results = {"items": [
+            {"id": 29995, "entities": [{"name": "validate 阶段计数", "type": "Concept", "summary": "s"}], "edges": []},
+            {"id": 2, "entities": [{"name": "validate阶段计数", "type": "Concept", "summary": "s"}], "edges": []},
+        ]}
+        posted = []
+
+        def fake_post(method, url, body, token):
+            posted.append(body)
+            if len(posted) == 1:
+                return 200, {"status": "dry_run", "resolved": {"validate 阶段计数": {"reused": False}},
+                             "new_entities": [{"name": "validate 阶段计数", "type": "Concept"}]}
+            return 200, {"status": "dry_run", "new_entities": [],
+                         "resolved": {"validate阶段计数": {"reused": True, "matched_name": "validate 阶段计数",
+                                                         "in_batch": True}}}
+        recs = ax.submit_results(batch, results, model="m", session="s", url="http://x", token="t",
+                                 post=fake_post, dry_run=True)
+        self.assertNotIn("dry_run_pending", posted[0])
+        self.assertEqual(posted[1]["dry_run_pending"], [{"name": "validate 阶段计数", "type": "Concept"}])
+        self.assertEqual(recs[1]["reuse_mismatch"], ["validate阶段计数 → validate 阶段计数（同批新建）"])
+        # 正式提交不带 pending
+        posted.clear()
+        ax.submit_results(batch, results, model="m", session="s", url="http://x", token="t",
+                          post=lambda m, u, b, t: (posted.append(b), (200, {"status": "ok"}))[1])
+        self.assertFalse(any("dry_run_pending" in b for b in posted))
+
     def test_submit_builds_payload_logs_and_summarizes(self):
         batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS), ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}
         results = {"items": [

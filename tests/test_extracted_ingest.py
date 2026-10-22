@@ -94,6 +94,23 @@ class LexicalTest(unittest.TestCase):
         self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))
         self.assertTrue(same("Writer Lock", "writer_lock"))
 
+    def test_names_differing_by_word_prefix_are_different(self):
+        """2026-10-22 补交 b0024：`prevalidate 阶段相似度计数` 被并进同批先建的 `validate 阶段相似度计数`（包含占比 0.81）。"""
+        same = xi._lexically_same
+        self.assertFalse(same("prevalidate 阶段相似度计数", "validate 阶段相似度计数", "Concept"))
+        self.assertFalse(same("pre-validate 阶段相似度计数", "validate 阶段相似度计数", "Concept"))
+        self.assertFalse(same("reindex 耗时统计", "index 耗时统计", "Concept"))
+        self.assertFalse(same("预校验阶段计数", "校验阶段计数", "Concept"))
+        self.assertFalse(same("未提交的工作树改动", "提交的工作树改动", "Concept"))
+        # 同次补交里判为正确的复用照旧：多修饰词、同一 PR 的两种叫法、单复数
+        for a, b in (("model_inflight_avg 时间积分", "model_inflight_avg"),
+                     ("flow-metrics-release 隔离工作树", "flow-metrics-release 工作树"),
+                     ("reconciliation-projection 修复（pr #49）", "reconciliation projection 清理（PR #49）"),
+                     ("http_request_started_at 见证字段", "http_request_started_at"),
+                     ("workers 队列", "worker 队列")):
+            with self.subTest(a=a):
+                self.assertTrue(same(a, b, "Concept"))
+
     def test_repo_prefixed_names_only_match_same_repo(self):
         """2026-10-22 三模型对比第 1 轮：仓库:路径 被后缀规则并进不带前缀的同名文件。"""
         same = xi._lexically_same
@@ -140,6 +157,41 @@ class LexicalTest(unittest.TestCase):
         self.assertIsNone(r.resolved["brand new thing"]["uuid"])
         writes = [c for c, _ in d.calls if c.startswith(("MERGE", "MATCH (source", "MATCH (e:Episodic"))]
         self.assertEqual(writes, [])
+
+
+    def test_dry_run_sees_entities_created_earlier_in_the_batch(self):
+        """2026-10-22 补交 b0024：dry-run 只查图，同批前面条目会新建的实体不在候选里，误并到正式提交才出现。"""
+        def run(extraction, pending):
+            return asyncio.run(xi.write_extraction(
+                FakeDriver(), FakeEmbedder(), extraction, name="x", episode_body="b", source_description="sd",
+                reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc), extractor_model="m",
+                group_id="kg_hub", dry_run=True, pending=pending))
+        n = xi.normalize_extraction(ents(("writer_lock", "Concept", ""), ("Brand New Thing", "Concept", "")), [],
+                                    ENTITY_TYPES, EDGE_TYPES)
+        r = run(n, [{"name": "Writer Lock", "type": "Concept"}])
+        self.assertEqual(r.resolved["writer_lock"],
+                         {"uuid": None, "reused": True, "matched_name": "Writer Lock", "in_batch": True})
+        self.assertFalse(r.resolved["brand new thing"]["reused"])
+        # 精确同名也算（与 _FIND_EXACT 一样不看类型）；向量候选的类型守卫照旧：同批的 Tool 不能被 Concept 复用
+        r = run(n, [{"name": "Writer Lock", "type": "Tool"}, {"name": "brand new thing", "type": "Issue"}])
+        self.assertEqual(r.resolved["writer_lock"]["reused"], False)
+        self.assertTrue(r.resolved["brand new thing"]["in_batch"])
+        # 本条前面新建的实体也参与（正式提交时它已经写进图）；前缀守卫在这里同样生效
+        n2 = xi.normalize_extraction(ents(("validate 阶段相似度计数", "Concept", ""),
+                                          ("prevalidate 阶段相似度计数", "Concept", ""),
+                                          ("validate 阶段相似度计数 统计", "Concept", "")), [], ENTITY_TYPES, EDGE_TYPES)
+        r = run(n2, None)
+        self.assertFalse(r.resolved["prevalidate 阶段相似度计数"]["reused"])
+        self.assertEqual(r.resolved["validate 阶段相似度计数 统计"]["matched_name"], "validate 阶段相似度计数")
+        self.assertEqual((r.nodes_new, r.nodes_reused), (2, 1))
+
+    def test_pending_is_ignored_outside_dry_run(self):
+        n = xi.normalize_extraction(ents(("writer_lock", "Concept", "")), [], ENTITY_TYPES, EDGE_TYPES)
+        r = asyncio.run(xi.write_extraction(
+            FakeDriver(), FakeEmbedder(), n, name="x", episode_body="b", source_description="sd",
+            reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc), extractor_model="m", group_id="kg_hub",
+            episode_uuid="ep", pending=[{"name": "Writer Lock", "type": "Concept"}]))
+        self.assertEqual((r.nodes_new, r.nodes_reused), (1, 0))
 
 
 class FakeEmbedder:

@@ -16,6 +16,7 @@ from unittest import mock
 try:
     import graphiti_core  # noqa: F401
     import kg_hub_server as srv
+    from utils.extracted_ingest import WriteResult
     HAVE = True
 except Exception:  # noqa: BLE001
     HAVE = False
@@ -57,7 +58,7 @@ class HandlerTest(unittest.TestCase):
 
         async def fake_merge(*a, **k):
             return merge
-        write_result = patches.pop("write_result", srv.write_extraction.__globals__["WriteResult"](
+        write_result = patches.pop("write_result", WriteResult(
             episode_uuid="ep", nodes_new=2, nodes_reused=0, edges_new=1, edges_reused=0,
             resolved={"kg-hub": {"uuid": "u1", "reused": False, "matched_name": None}}))
 
@@ -75,6 +76,25 @@ class HandlerTest(unittest.TestCase):
                 mock.patch.object(srv, "drain_seconds_left", lambda: 0):
             resp = asyncio.run(srv.ingest_extracted(_post(payload)))
         return resp.status_code, json.loads(resp.body)
+
+    def test_dry_run_passes_pending_and_reports_new_entities(self):
+        """2026-10-22 补交 b0024：dry-run 带上同批前面条目的新实体，响应给出本条会新建哪些。"""
+        seen = {}
+        async def fake_write(driver, embedder, extraction, **kw):
+            seen.update(kw)
+            return WriteResult(episode_uuid="", nodes_new=1, nodes_reused=1, edges_new=0, edges_reused=0,
+                      resolved={"kg-hub": {"uuid": None, "reused": False, "matched_name": None},
+                                "commit abc1234": {"uuid": None, "reused": True, "matched_name": "Commit ABC1234",
+                                                   "in_batch": True}})
+        payload = dict(GOOD, dry_run=True, dry_run_pending=[{"name": "Commit ABC1234", "type": "Tool"}])
+        with mock.patch.object(srv, "write_extraction", fake_write):
+            code, d = self._run(payload)
+        self.assertEqual(code, 200)
+        self.assertEqual(seen["pending"], [{"name": "Commit ABC1234", "type": "Tool"}])
+        self.assertTrue(seen["dry_run"])
+        self.assertEqual(d["new_entities"], [{"name": "kg-hub", "type": "Project"}])
+        self.assertTrue(d["resolved"]["commit abc1234"]["in_batch"])
+        self.assertNotIn("in_batch", d["resolved"]["kg-hub"])
 
     def test_ok_response_carries_stats_and_model(self):
         code, d = self._run(GOOD)

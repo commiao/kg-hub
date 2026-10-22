@@ -288,6 +288,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
     executor / run_id：随 payload 入图，也记进 log.jsonl，status / eval_report 按它们分组。"""
     by_id = {int(i["id"]): i for i in batch["items"]}
     out = []
+    # dry-run 按提交顺序累积前面条目会新建的实体，让服务端把它们算进消解候选（同批内误并，2026-10-22 补交 b0024）
+    pending: list[dict] = []
     for res in results.get("items", [results] if "entities" in results else []):
         oid = int(res["id"])
         item = by_id.get(oid)
@@ -299,10 +301,15 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
         else:
             payload = build_payload(item, res, model=model, session=session, dry_run=dry_run,
                                     executor=executor, run_id=run_id)
+            if dry_run and pending:
+                payload["dry_run_pending"] = list(pending)
             t0 = time.monotonic()
             code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
+            if dry_run:
+                pending.extend(d.get("new_entities") or [])
             # 消解到了不同名字的旧实体：这是误并的高发区，必须让执行者看见
-            mismatch = [f"{k} → {v.get('matched_name')}" for k, v in (d.get("resolved") or {}).items()
+            mismatch = [f"{k} → {v.get('matched_name')}{'（同批新建）' if v.get('in_batch') else ''}"
+                        for k, v in (d.get("resolved") or {}).items()
                         if v.get("reused") and (v.get("matched_name") or "").lower() != k]
             rec = {"id": oid, "status": d.get("status") or f"http_{code}", "http": code, "model": model,
                    "latency_s": round(time.monotonic() - t0, 2), "episode_uuid": d.get("episode_uuid"),

@@ -52,7 +52,7 @@ if __name__ == "__main__":
 from kg_hub_env import load_kg_hub_env
 load_kg_hub_env(override=True)
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1881,6 +1881,11 @@ async def ingest(request: Request) -> JSONResponse:
     )
 
 
+class PendingEntity(BaseModel):
+    name: str
+    type: str
+
+
 class ExtractedIngestBody(IngestBody):
     """预抽取入库的请求体：IngestBody 全部字段 + 调用方自带的实体/关系与来源标记。
 
@@ -1898,6 +1903,9 @@ class ExtractedIngestBody(IngestBody):
     edges: list[ExtractedEdge] = []
     # 只做消解不写图：返回每个实体会复用到哪个旧实体（第 2 轮复盘要求的写入前预览）
     dry_run: bool = False
+    # 仅 dry_run：同一批前面条目会新建的实体 [{name, type}]，由执行器按 dry-run 返回的 new_entities 累积。
+    # 正式提交时它们已在图里、参与消解；不带上就看不见同批内的误并（2026-10-22 补交 b0024）。
+    dry_run_pending: list[PendingEntity] = Field(default_factory=list, max_length=5000)
 
 
 async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extraction,
@@ -2016,15 +2024,20 @@ async def ingest_extracted(request: Request) -> JSONResponse:
             preview = await write_extraction(
                 g.driver, g.embedder, extraction, name=body.name, episode_body=body.episode_body,
                 source_description=body.source_description, reference_time=ref_time,
-                extractor_model=body.extractor_model, group_id=GROUP_ID, dry_run=True)
+                extractor_model=body.extractor_model, group_id=GROUP_ID, dry_run=True,
+                pending=[p.model_dump() for p in body.dry_run_pending])
         except Exception as exc:  # noqa: BLE001
             logger.exception("[ingest_extracted:dry_run_failed]")
             return JSONResponse({"status": "error", "code": "dry_run_failed",
                                  "diagnostic": type(exc).__name__}, status_code=500)
         return JSONResponse({
             "status": "dry_run", "nodes_new": preview.nodes_new, "nodes_reused": preview.nodes_reused,
-            "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"]}
+            "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"],
+                             **({"in_batch": True} if v.get("in_batch") else {})}
                          for k, v in preview.resolved.items()},
+            # 本条正式提交时会新建的实体：执行器累积进后续条目的 dry_run_pending
+            "new_entities": [{"name": e.name, "type": e.type} for e in extraction.entities
+                             if not preview.resolved[e.key]["reused"]],
             "stats": extraction.stats, "extractor_model": body.extractor_model,
             "source_description": body.source_description, "source_obs_id": body.source_obs_id})
     request_id = str(uuidlib.uuid4())
