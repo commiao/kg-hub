@@ -57,6 +57,11 @@ python -m tools.extract_bench run --bench ~/.kg-hub/bench/bench-20261022 \
 跑的 sonnet 那部分比。评分要用本机 kg-hub venv（需要 numpy、fastembed 和本机的 MiniLM 缓存），约半分钟。
 dry-run 在对比模式下不需要：样本观测的实体已在图里，预览出的「误并候选」大多是它自己上次写的名字，没有比较意义。
 
+## 准入：进战役前先在 bench 上过门槛
+
+冒烟（`--limit 10`）只能得到 `screen_pass`；要进战役，跑 30–50 条、做 10 条盲评，再 `extract_bench admit`。
+门槛、结论分级与记录位置见 [campaign.md 的「开战役之前：bench 准入」](campaign.md#开战役之前bench-准入每个模型一次)。
+
 ## 完成标准
 
 与 Claude Code 相同：本 run error 为 0、`reuse_mismatch_per_obs` ≤ 0.2、运行清单有 `ended_at` 与自报成本、

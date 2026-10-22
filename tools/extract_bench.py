@@ -589,8 +589,138 @@ def load_run(d: Path) -> dict:
         raise SystemExit(f"{d} 不是 {TOOL} 的运行目录")
     n = max(1, len(r["ids"]))
     r["results"] = load_results([str(d)])
+    r["dir"] = str(d)
     r["cost"] = {"credits_per_obs": round(r["credits"] / n, 2), "sec_per_obs": round(r["ms"] / 1000 / n, 1)}
     return r
+
+
+# ---------- 准入：模型进战役之前的硬门槛（bench 管准入，campaign 只看产出画像） ----------
+# 阈值写死在这里（改阈值走 PR、进 git 历史），准入记录写本机 admissions/<模型>.json，战役 start 只认 pass。
+# 10 条冒烟只能得到 screen_pass（快速筛选通过、不算准入）；正式准入至少 30 条，并有 10 条盲评。
+
+ADMISSION_MIN_ITEMS = 30
+BLIND_N = 10
+THRESHOLDS = {"headline_verbatim_pct": 95.0, "second_other_lang_pct": 95.0, "hit_zh_pct": 90.0, "hit_en_pct": 90.0,
+              "subset_drop_pts": 5.0, "blind_max_errors": 1}
+# 基线批次的约定版本 → 等价的规则正文版本：bench-20261022 的基线是 agent-v3 + chain-v8，内容即 agent-v4 规则 21–28
+BASELINE_EQUIV = {"c8": "agent-v4"}
+
+
+def bench_root() -> Path:
+    import os
+    return Path(os.environ.get("KG_HUB_BENCH_ROOT", str(DEFAULT_ROOT))).expanduser()
+
+
+def model_slug(model: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", model)
+
+
+def base_version(v: str | None) -> str:
+    return (v or "").split("+")[0]
+
+
+def blind_sheet(p: Path, m: dict, runs: list[dict], n: int = BLIND_N, seed: str = "") -> tuple[list[dict], dict]:
+    """每个候选抽 n 条做盲评：评审表不带模型名（只有随机编号），编号 → 标签的对照另存。
+    评审者对照观测原文看事实方向、数字、因果，把 verdict 填成 ok / error。"""
+    import random
+    import secrets
+    rows, _ = _bench_items(p, m)
+    titles = {r[0]: r[1] for r in rows}
+    bodies = {}
+    for part in m["parts"]:
+        for it in json.loads((p / f"batch-{part['part']}.json").read_text())["items"]:
+            bodies[int(it["id"])] = it["episode_body"]
+    sheet, key = [], {}
+    for r in runs:
+        have = sorted(i for i in r["ids"] if i in r["results"])
+        for i in random.Random(f"{m['bench_id']}|{r['label']}|{seed}").sample(have, min(n, len(have))):
+            code = secrets.token_hex(4)
+            key[code] = r["label"]
+            it = r["results"][i]
+            sheet.append({"code": code, "obs_id": i, "title": titles.get(i), "episode_body": bodies.get(i),
+                          "entities": it.get("entities"), "edges": it.get("edges"), "verdict": None, "note": ""})
+    random.Random(f"{m['bench_id']}|shuffle|{seed}").shuffle(sheet)
+    return sheet, key
+
+
+def blind_result(sheet: list[dict], key: dict, label: str) -> dict:
+    mine = [e for e in sheet if key.get(e["code"]) == label]
+    judged = [e for e in mine if e.get("verdict") in ("ok", "error")]
+    return {"sampled": len(mine), "judged": len(judged), "errors": sum(e["verdict"] == "error" for e in judged),
+            "notes": [e["note"] for e in judged if e["verdict"] == "error" and e.get("note")]}
+
+
+def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: str, baseline_prompt: str | None,
+                     lint_problems: int, blind: dict | None) -> tuple[list[dict], str]:
+    """row：候选全样本那行；pairs：[(候选在某基线模型那部分, 该基线模型)]。返回 (逐项检查, 结论)。
+    结论：fail（任一硬性/质量项不过）> screen_pass（不足 30 条，只算快速筛选）> pending_blind（缺盲评）> pass。"""
+    t = THRESHOLDS
+    checks = []
+
+    def add(name, value, want, ok):
+        checks.append({"check": name, "value": value, "want": want, "pass": bool(ok)})
+    add("规则版本与基线一致", base_version(run_prompt), baseline_prompt,
+        baseline_prompt is not None and base_version(run_prompt) == baseline_prompt)
+    add("未交 = 0", row["missing"], 0, row["missing"] == 0)
+    add("自检问题 = 0", lint_problems, 0, lint_problems == 0)
+    for k in ("headline_verbatim_pct", "second_other_lang_pct", "hit_zh_pct", "hit_en_pct"):
+        add(k, row[k], f">= {t[k]}", row[k] >= t[k])
+    for k in ("offschema_edge_pct", "dangling_edge_pct", "unknown_type"):
+        add(f"{k} = 0", row[k], 0, row[k] == 0)
+    for cand, base in pairs:
+        for k in ("hit_zh_pct", "hit_en_pct"):
+            add(f"{cand['label']} {k} 不低于基线 {t['subset_drop_pts']} 点以上", cand[k],
+                f">= {base[k] - t['subset_drop_pts']}", cand[k] >= base[k] - t["subset_drop_pts"])
+    if blind and blind["judged"] >= BLIND_N:
+        add("盲评事实错误", blind["errors"], f"<= {t['blind_max_errors']}", blind["errors"] <= t["blind_max_errors"])
+    if not all(c["pass"] for c in checks):
+        return checks, "fail"
+    if row["items"] < ADMISSION_MIN_ITEMS:
+        return checks, "screen_pass"
+    if not blind or blind["judged"] < BLIND_N:
+        return checks, "pending_blind"
+    return checks, "pass"
+
+
+def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, write: bool = True) -> dict:
+    rows = score_many(p, m, [(run["label"], run["results"], run.get("cost") or {})], ids=run["ids"], cache_dir=cache_dir)
+    full = rows[0]
+    by = {r["label"]: r for r in rows}
+    pairs = []
+    for model in sorted({part["baseline_model"] for part in m["parts"]}):
+        cand, base = by.get(f"{run['label']}｜{model} 那部分"), by.get(f"{model}（基线）")
+        if cand and base and cand["questions"]:
+            pairs.append((cand, base))
+    rows_all, _ = _bench_items(p, m)
+    lint_rows = [(r[0], r[1], r[2]) for r in rows_all if r[0] in set(run["ids"])]
+    blind = blind_result(sheet, key, run["label"]) if sheet is not None and key is not None else None
+    checks, verdict = admission_checks(full, pairs, run_prompt=run.get("prompt_version"),
+                                       baseline_prompt=BASELINE_EQUIV.get(m.get("chain")),
+                                       lint_problems=len(lint_items(lint_rows, run["results"])), blind=blind)
+    rec = {"model": run["model"], "label": run["label"], "executor": run.get("executor"), "bench": m["bench_id"],
+           "items": full["items"], "prompt_version": run.get("prompt_version"), "run_dir": run.get("dir"),
+           "verdict": verdict, "checks": checks, "blind": blind, "thresholds": THRESHOLDS,
+           "scores": {k: full.get(k) for k in ("hit_zh_pct", "hit_en_pct", "headline_verbatim_pct",
+                                                "second_other_lang_pct", "ent_per_obs", "edge_per_obs",
+                                                "credits_per_obs", "sec_per_obs")},
+           "decided_at": datetime.now(timezone.utc).isoformat()}
+    if write:
+        d = bench_root() / "admissions"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{model_slug(run['model'])}.json"
+        hist = json.loads(f.read_text()) if f.exists() else {"model": run["model"], "history": []}
+        hist["history"].append(rec)
+        f.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+        rec["record_file"] = str(f)
+    return rec
+
+
+def latest_admission(model: str) -> dict | None:
+    f = bench_root() / "admissions" / f"{model_slug(model)}.json"
+    if not f.exists():
+        return None
+    hist = json.loads(f.read_text()).get("history") or []
+    return hist[-1] if hist else None
 
 
 def main(argv=None) -> int:
@@ -602,12 +732,20 @@ def main(argv=None) -> int:
     f.add_argument("--bench-id", required=True)
     f.add_argument("--corpus", required=True)
     f.add_argument("--root", default=str(DEFAULT_ROOT))
-    for name in ("parts", "lint", "score", "run"):
+    for name in ("parts", "lint", "score", "run", "blind", "admit"):
         s = sub.add_parser(name)
         s.add_argument("--bench", required=True)
         if name in ("lint", "score"):
             s.add_argument("--results", nargs="+", help="结果文件或目录（单个候选）")
             s.add_argument("--run", nargs="+", help="run 子命令产出的运行目录（可多个，合成一张表）")
+        if name == "blind":
+            s.add_argument("--run", nargs="+", required=True)
+            s.add_argument("--n", type=int, default=BLIND_N)
+            s.add_argument("--out", required=True, help="评审表（不含模型名）；对照表另存为 <out>.key.json")
+        if name == "admit":
+            s.add_argument("--run", required=True, help="一个运行目录（建议 30–50 条）")
+            s.add_argument("--sheet", help="填好 verdict 的盲评表；对照表默认取 <sheet>.key.json")
+            s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
         if name in ("score", "run"):
             s.add_argument("--json", help="另存 JSON")
             s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
@@ -642,6 +780,25 @@ def main(argv=None) -> int:
         print(f"  python -m tools.extract_bench score --bench {p} --results <结果目录> --label <工具-模型>")
         print("或一次跑多个模型：python -m tools.extract_bench run --bench <样本> --models <模型...> --tag <标签> [--limit 10]")
         return 0
+    if a.cmd == "blind":
+        sheet, key = blind_sheet(p, m, [load_run(Path(x).expanduser()) for x in a.run], n=a.n)
+        out = Path(a.out).expanduser()
+        out.write_text(json.dumps(sheet, ensure_ascii=False, indent=1))
+        Path(str(out) + ".key.json").write_text(json.dumps(key, ensure_ascii=False, indent=1))
+        print(f"评审表 {out}（{len(sheet)} 条，不含模型名）；对照表 {out}.key.json——评完之前不要打开对照表。")
+        return 0
+    if a.cmd == "admit":
+        run = load_run(Path(a.run).expanduser())
+        sheet = key = None
+        if a.sheet:
+            sp = Path(a.sheet).expanduser()
+            sheet, key = json.loads(sp.read_text()), json.loads(Path(str(sp) + ".key.json").read_text())
+        rec = admit(p, m, run, sheet=sheet, key=key, cache_dir=Path(a.cache_dir) if a.cache_dir else None)
+        print(f"{rec['model']}：{rec['verdict']}（{rec['items']} 条，bench {rec['bench']}，规则 {rec['prompt_version']}）")
+        for c in rec["checks"]:
+            print(f"  {'✓' if c['pass'] else '✗'} {c['check']}：{c['value']}（要求 {c['want']}）")
+        print(f"准入记录：{rec['record_file']}")
+        return 0 if rec["verdict"] == "pass" else 1
     if a.cmd == "run":
         dirs = run_models(p, m, a.models, executor=a.executor, out_root=Path(a.out_root).expanduser(), tag=a.tag,
                           limit=a.limit, chunk=a.chunk, parallel=a.parallel)

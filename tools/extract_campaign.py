@@ -9,13 +9,15 @@
 后提交的那份被幂等键挡成 skipped，等于白抽。这里领批在文件锁里推进同一个游标，谁领到的就只属于谁。
 
 链路优化：编排者把本轮复盘得出的新约定写成补充文件，`chain` 登记成新版本；之后领的批次都带这个版本，
-`rules` 输出 agent-v4 正文 + 当前补充约定，复盘表按模型 × 约定版本分组。
+`rules` 输出规则正文 + 当前补充约定，复盘表按模型 × 约定版本分组。规则正文在开局时冻结成快照（prompt.md），
+战役内不随仓库变；要换正文就开新战役——战役内改链路只走 `chain`，入图的 prompt_version 记为「正文版本+约定版本」。
 
 状态目录：$KG_HUB_AGENT_EXTRACT_DIR/campaigns/<战役 id>/（默认 ~/.kg-hub/agent-extract/），
 含 campaign.json、batches/、results/（子代理写这里）、log.jsonl、dry-run 标记、chain-*.md。观测正文不进仓库。
 
 子命令（python -m tools.extract_campaign <cmd> --id <战役>）：
-  start   --models <模型 id>... --executor <工具> [--quota 200] [--batch 50] [--after-id N]
+  start   --models <模型 id>... --executor <工具> [--quota 200] [--batch 50] [--after-id N] [--skip-admission 原因]
+          每个模型要有 bench 准入记录（verdict=pass、规则正文版本一致），否则拒绝开局
   chain   --file <补充约定.md>        登记新的补充约定版本（之后领的批次生效）
   rules                              打印抽取规则：agent-v4 正文 + 当前补充约定（子代理第一步读它）
   brief   --model <模型 id>           打印填好的子代理说明（粘给子代理，或由 agents 写进子代理定义）
@@ -26,6 +28,8 @@
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边），不过不许提交
   submit  --batch <批次 id> [--dry-run]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）
+  release --batch <批次 id> --reason <原因>   回收：没提交的整批、已提交的只回收没入库的条目，放回队列并还给配额，
+          下次 claim 优先领。子代理中途挂掉想接着做，不用回收：用同一个批次号继续 lint / submit 即可
   cost    --batch <批次 id> [--credits N] [--tokens N] [--seconds N]   记执行器自报成本
   status                             各模型配额进度与每批状态
   report  [--json 路径]               复盘表：每批一行 + 每个模型 × 约定版本合计
@@ -101,8 +105,19 @@ def new_campaign(cid: str, models: list[str], *, executor: str, quota: int, batc
         if not ax_pattern().fullmatch(m):
             raise SystemExit(f"{m!r} 不能作来源标记（只允许字母数字 . _ : / -，80 字以内）")
     return {"tool": TOOL, "id": cid, "created_at": _now(), "executor": executor, "quota": quota, "batch": batch,
-            "prompt_version": ax.PROMPT_VERSION, "cursor": after_id, "chain": CHAIN_NONE, "chains": {},
+            "prompt_version": ax.PROMPT_VERSION, "prompt_sha256": prompt_sha(ax.PROMPT_PATH.read_text()),
+            "cursor": after_id, "chain": CHAIN_NONE, "chains": {}, "requeue": [],
             "models": {m: {"run_id": f"{cid}-{slug(m)}"} for m in models}, "batches": []}
+
+
+def prompt_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def episode_prompt_version(c: dict, chain: str) -> str:
+    """入图的规则版本：开局快照的正文版本，加上补充约定版本（c0 = 没有补充约定）。"""
+    return c["prompt_version"] if chain == CHAIN_NONE else f"{c['prompt_version']}+{chain}"
 
 
 def ax_pattern():
@@ -111,7 +126,8 @@ def ax_pattern():
 
 
 def claimed_items(c: dict, model: str) -> int:
-    return sum(len(b["ids"]) for b in c["batches"] if b["model"] == model and b["status"] != "released")
+    """已领、且没被回收的条数（回收的条目还给配额）。"""
+    return sum(len(b["ids"]) - len(b.get("released_ids") or []) for b in c["batches"] if b["model"] == model)
 
 
 def next_batch_id(c: dict, model: str) -> str:
@@ -127,7 +143,9 @@ def find_batch(c: dict, bid: str) -> dict:
 
 
 def rules_text(d: Path, c: dict) -> str:
-    text = ax.PROMPT_PATH.read_text().rstrip()
+    """开局快照（prompt.md）+ 当前补充约定。快照缺失时（旧战役）退回仓库当前文件。"""
+    snap = d / "prompt.md"
+    text = (snap if snap.exists() else ax.PROMPT_PATH).read_text().rstrip()
     if c["chain"] != CHAIN_NONE:
         text += "\n\n" + (d / c["chains"][c["chain"]]["file"]).read_text().rstrip()
     return text + "\n"
@@ -198,8 +216,33 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
 
 # ---------- 子命令 ----------
 
-def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None) -> dict:
+def admission_gate(models: list[str], prompt_version: str, lookup=None) -> dict[str, dict]:
+    """每个模型最新的 bench 准入记录：要 verdict=pass、且规则正文版本与本战役一致。返回 {模型: 摘要}，含不合格原因。"""
+    from tools.extract_bench import base_version, latest_admission
+    lookup = lookup or latest_admission
+    out = {}
+    for m in models:
+        rec = lookup(m)
+        why = None
+        if rec is None:
+            why = "没有准入记录（先跑 extract_bench run → blind → admit）"
+        elif rec.get("verdict") != "pass":
+            why = f"最新准入结论是 {rec.get('verdict')}"
+        elif base_version(rec.get("prompt_version")) != prompt_version:
+            why = f"准入时的规则 {base_version(rec.get('prompt_version'))} 与本战役 {prompt_version} 不一致"
+        out[m] = {"verdict": rec and rec.get("verdict"), "bench": rec and rec.get("bench"),
+                  "decided_at": rec and rec.get("decided_at"), "ok": why is None, "why": why}
+    return out
+
+
+def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
+              skip_admission: str | None = None, lookup=None) -> dict:
     d = campaign_dir(cid)
+    gate = admission_gate(models, ax.PROMPT_VERSION, lookup)
+    bad = {m: g["why"] for m, g in gate.items() if not g["ok"]}
+    if bad and not skip_admission:
+        raise SystemExit("这些模型没过 bench 准入，不能进战役（确需例外用 --skip-admission \"原因\"，会记进战役）：\n"
+                         + "\n".join(f"  {m}：{w}" for m, w in bad.items()))
     with locked(d):
         if (d / "campaign.json").exists():
             raise SystemExit(f"战役 {cid} 已存在")
@@ -207,8 +250,10 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
             st = ax._load_state(ax.state_dir() / "state.json")
             after_id = int(st.get("cursor", 0))
         c = new_campaign(cid, models, executor=executor, quota=quota, batch=batch, after_id=after_id)
+        c["admission"] = {"gate": gate, "skipped": skip_admission if bad else None}
         for sub in ("batches", "results"):
             (d / sub).mkdir(exist_ok=True)
+        (d / "prompt.md").write_text(ax.PROMPT_PATH.read_text())   # 冻结规则正文，战役内不随仓库变
         save(d, c)
     return c
 
@@ -239,19 +284,29 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
         if left <= 0:
             return {"done": True, "model": model, "message": f"{model} 已领满配额 {c['quota']} 条"}
         n = min(c["batch"], left)
-        remote = fetch(c["cursor"], max(n * 4, 40))
-        rows = remote["rows"]
-        if not rows:
-            return {"done": True, "model": model, "message": "游标之后没有待处理观测了"}
-        picked, stats = ax.select_batch(rows, ax.load_config(), n, check([ax.to_identity(r) for r in rows]))
-        last = picked[-1]["id"] if len(picked) >= n else rows[-1]["id"]
-        if not picked:   # 这一段全被质量闸拒或已入库：游标前移，让调用方再领一次
+        # 先领回收队列（release 放回来的条目），再按游标取新的
+        requeued, c["requeue"] = take_requeue(d, c.get("requeue") or [], n, check)
+        rows, stats, last, lookahead = [], {"requeued": len(requeued)}, c["cursor"], []
+        picked = list(requeued)
+        if len(picked) < n:
+            remote = fetch(c["cursor"], max((n - len(picked)) * 4, 40))
+            rows = remote["rows"]
+            if rows:
+                fresh, st = ax.select_batch(rows, ax.load_config(), n - len(picked),
+                                            check([ax.to_identity(r) for r in rows]))
+                stats.update(st)
+                picked += fresh
+                last = fresh[-1]["id"] if len(fresh) >= n - len(requeued) else rows[-1]["id"]
+                lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
+                             for r in rows if r["id"] > last][:n]
+        if not picked:
             c["cursor"] = last
             save(d, c)
+            if not rows:
+                return {"done": True, "model": model, "message": "游标之后没有待处理观测了"}
+            # 这一段全被质量闸拒或已入库：游标前移，让调用方再领一次
             return {"done": False, "batch": None, "model": model, "message": "这一段没有可抽的观测，游标已前移，再领一次",
                     "stats": stats}
-        lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
-                     for r in rows if r["id"] > last][:n]
         bid = next_batch_id(c, model)
         bpath, rpath = d / "batches" / f"{bid}.json", d / "results" / f"{bid}.json"
         bpath.write_text(json.dumps({"batch_id": bid, "created_at": _now(), "campaign": cid, "model": model,
@@ -269,6 +324,21 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
                      f"python -m tools.extract_campaign submit --id {cid} --batch {bid} --dry-run",
                      f"python -m tools.extract_campaign submit --id {cid} --batch {bid}",
                      f"python -m tools.extract_campaign cost   --id {cid} --batch {bid} --credits <N> --seconds <N>"]}
+
+
+def take_requeue(d: Path, queue: list[dict], n: int, check) -> tuple[list[dict], list[dict]]:
+    """从回收队列取至多 n 条：条目内容取自原批次文件；这期间已在别处入库的（查键为 ok）直接丢出队列。"""
+    if not queue or n <= 0:
+        return [], queue
+    head, rest = queue[:n], queue[n:]
+    items, cache = [], {}
+    for q in head:
+        src = cache.setdefault(q["from"], {int(i["id"]): i for i in
+                                           json.loads((d / "batches" / f"{q['from']}.json").read_text())["items"]})
+        if int(q["id"]) in src:
+            items.append(src[int(q["id"])])
+    existing = check(items) if items else {}
+    return [i for i in items if existing.get(i["source_obs_id"]) != "ok"], rest
 
 
 def _batch_rows(d: Path, bid: str) -> tuple[dict, list[tuple[int, str, str]]]:
@@ -303,6 +373,8 @@ def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None
         b = find_batch(c, bid)
     if b["status"] == "submitted":
         raise SystemExit(f"{bid} 已正式提交过")
+    if b["status"] == "released":
+        raise SystemExit(f"{bid} 已回收，条目已放回队列；要做就重新 claim")
     batch, results = json.loads((d / "batches" / f"{bid}.json").read_text()), _results(d, bid)
     if not dry_run:
         missing = ax.dryrun_missing(d, bid, results)
@@ -311,7 +383,8 @@ def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None
     model, run_id = b["model"], c["models"][b["model"]]["run_id"]
     recs = ax.submit_results(batch, results, model=model, session=cid, url=url, token=token,
                              post=post or ax._http, log_path=None if dry_run else d / "log.jsonl",
-                             dry_run=dry_run, executor=c["executor"], run_id=run_id)
+                             dry_run=dry_run, executor=c["executor"], run_id=run_id,
+                             prompt_version=episode_prompt_version(c, b["chain"]))
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -328,6 +401,38 @@ def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None
         save(d, c)
     return {"batch": bid, "dry_run": dry_run, "by_status": counts, "reuse_mismatch": mismatch,
             "errors": [{"id": r["id"], "error": r.get("error")} for r in recs if r.get("error")]}
+
+
+def failed_ids(d: Path, bid: str) -> list[int]:
+    """正式提交后没入库的条目（log.jsonl 里本批 ok / empty 以外的终态）。"""
+    p = d / "log.jsonl"
+    if not p.exists():
+        return []
+    recs = [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+    return sorted({int(r["id"]) for r in recs if r.get("batch") == bid and r.get("status") not in ("ok", "empty")})
+
+
+def cmd_release(cid: str, bid: str, *, reason: str) -> dict:
+    """回收一批：没正式提交的整批放回队列；已提交的只放回没入库的那几条。放回的条目还给该模型的配额，
+    下一次任何模型 claim 时优先领。子代理中途挂掉、或批次做坏了不想交，都用这个，不要手改 JSON。"""
+    d = campaign_dir(cid)
+    with locked(d):
+        c = load(d)
+        b = find_batch(c, bid)
+        if b["status"] == "released":
+            raise SystemExit(f"{bid} 已经回收过")
+        if b["status"] == "submitted":
+            ids = [i for i in failed_ids(d, bid) if i not in (b.get("released_ids") or [])]
+            if not ids:
+                raise SystemExit(f"{bid} 已全部入库，没有可回收的条目")
+        else:
+            ids = list(b["ids"])
+            b["status"] = "released"
+        b["released_ids"] = sorted(set(b.get("released_ids") or []) | set(ids))
+        b.setdefault("releases", []).append({"at": _now(), "ids": ids, "reason": reason})
+        c.setdefault("requeue", []).extend({"id": i, "from": bid} for i in ids)
+        save(d, c)
+    return {"batch": bid, "released": len(ids), "requeue_size": len(c["requeue"])}
 
 
 def cmd_cost(cid: str, bid: str, *, credits=None, tokens=None, seconds=None) -> dict:
@@ -403,7 +508,8 @@ def render(rows: list[dict]) -> str:
 def cmd_report(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
-    per = [batch_row(d, b) for b in c["batches"] if (d / "batches" / f"{b['id']}.json").exists()]
+    per = [batch_row(d, b) for b in c["batches"]
+           if b["status"] != "released" and (d / "batches" / f"{b['id']}.json").exists()]
     groups = {}
     for r in per:
         groups.setdefault((r["model"], r["chain"]), []).append(r)
@@ -413,13 +519,15 @@ def cmd_report(cid: str) -> dict:
         by_model.setdefault(r["model"], []).append(r)
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
-    return {"campaign": cid, "models": models, "by_chain": totals, "batches": clean}
+    return {"campaign": cid, "prompt_version": c["prompt_version"], "prompt_sha256": c.get("prompt_sha256"),
+            "models": models, "by_chain": totals, "batches": clean}
 
 
 def cmd_status(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
     return {"campaign": cid, "executor": c["executor"], "chain": c["chain"], "quota": c["quota"],
+            "requeue": len(c.get("requeue") or []), "prompt_sha256": c.get("prompt_sha256"),
             "batch": c["batch"], "prompt_version": c["prompt_version"],
             "models": {m: {"run_id": v["run_id"], "claimed": claimed_items(c, m),
                            "submitted": sum(len(b["ids"]) for b in c["batches"]
@@ -432,8 +540,8 @@ def cmd_status(cid: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "cost", "status",
-                 "report"):
+    for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "cost",
+                 "status", "report"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -442,6 +550,7 @@ def main(argv=None) -> int:
             s.add_argument("--quota", type=int, default=200, help="每个模型抽多少条")
             s.add_argument("--batch", type=int, default=50, help="每批条数（每批复盘一次）")
             s.add_argument("--after-id", type=int, help="游标起点；缺省接着会话自抽取的游标")
+            s.add_argument("--skip-admission", metavar="原因", help="没过 bench 准入也开战役（原因记进战役）")
         if name == "chain":
             s.add_argument("--file", required=True)
         if name in ("claim", "brief"):
@@ -452,8 +561,10 @@ def main(argv=None) -> int:
         if name == "agents":
             s.add_argument("--format", choices=("qodercli", "md"), default="qodercli")
             s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
-        if name in ("lint", "submit", "cost"):
+        if name in ("lint", "submit", "release", "cost"):
             s.add_argument("--batch", required=True)
+        if name == "release":
+            s.add_argument("--reason", required=True, help="为什么回收（记进战役，复盘时看）")
         if name == "submit":
             s.add_argument("--dry-run", action="store_true")
         if name == "cost":
@@ -466,12 +577,17 @@ def main(argv=None) -> int:
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
     if a.cmd == "start":
-        out = cmd_start(a.id, a.models, executor=a.executor, quota=a.quota, batch=a.batch, after_id=a.after_id)
+        out = cmd_start(a.id, a.models, executor=a.executor, quota=a.quota, batch=a.batch, after_id=a.after_id,
+                        skip_admission=a.skip_admission)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
     elif a.cmd == "rules":
         d = campaign_dir(a.id)
-        sys.stdout.write(rules_text(d, load(d)))
+        c = load(d)
+        if c.get("prompt_sha256") and prompt_sha(ax.PROMPT_PATH.read_text()) != c["prompt_sha256"]:
+            print(f"注意：仓库里的规则正文已不同于本战役开局快照，本战役仍用快照（{c['prompt_version']}）；"
+                  "要用新正文请开新战役。", file=sys.stderr)
+        sys.stdout.write(rules_text(d, c))
         return 0
     elif a.cmd == "brief":
         d = campaign_dir(a.id)
@@ -506,12 +622,16 @@ def main(argv=None) -> int:
         return 1 if probs else 0
     elif a.cmd == "submit":
         out = cmd_submit(a.id, a.batch, dry_run=a.dry_run, url=a.url, token=ax.api_token())
+    elif a.cmd == "release":
+        out = cmd_release(a.id, a.batch, reason=a.reason)
     elif a.cmd == "cost":
         out = cmd_cost(a.id, a.batch, credits=a.credits, tokens=a.tokens, seconds=a.seconds)
     elif a.cmd == "status":
         out = cmd_status(a.id)
     else:
         rep = cmd_report(a.id)
+        print(f"战役 {a.id}：规则正文 {rep['prompt_version']}（开局快照 {str(rep['prompt_sha256'])[:12]}），"
+              "各模型抽的是各自的新观测——本表是产出画像，模型能不能用看 bench 准入记录。\n")
         print("### 按模型\n\n" + render(rep["models"]) + "\n\n### 按模型 × 约定版本\n\n" + render(rep["by_chain"])
               + "\n\n### 每批\n\n" + render(rep["batches"]))
         if a.json:

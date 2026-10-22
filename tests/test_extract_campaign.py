@@ -38,6 +38,10 @@ def good_item(i):
                        "fact": "A depends on B because the observation says the canary path needs it to stay up"}]}
 
 
+def PASS(model):
+    return {"verdict": "pass", "prompt_version": ax.PROMPT_VERSION + "+bench1", "bench": "b", "decided_at": "t"}
+
+
 class CampaignTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -47,7 +51,7 @@ class CampaignTest(unittest.TestCase):
                         mock.patch.object(ax, "load_config", lambda: {})]
         for p in self.patches:
             p.start()
-        ec.cmd_start("t1", ["DeepSeek-Flash", "Qwen3.8-Max"], executor="qoder", quota=60, batch=25, after_id=0)
+        ec.cmd_start("t1", ["DeepSeek-Flash", "Qwen3.8-Max"], executor="qoder", quota=60, batch=25, after_id=0, lookup=PASS)
 
     def tearDown(self):
         for p in self.patches:
@@ -60,13 +64,13 @@ class CampaignTest(unittest.TestCase):
 
     def test_start_validates_and_defaults_cursor_to_agent_extract_state(self):
         with self.assertRaises(SystemExit):
-            ec.cmd_start("t1", ["X"], executor="qoder", quota=1, batch=1, after_id=0)        # 已存在
+            ec.cmd_start("t1", ["X"], executor="qoder", quota=1, batch=1, after_id=0, lookup=PASS)        # 已存在
         with self.assertRaises(SystemExit):
-            ec.cmd_start("t2", ["a b"], executor="qoder", quota=1, batch=1, after_id=0)      # 来源标记非法
+            ec.cmd_start("t2", ["a b"], executor="qoder", quota=1, batch=1, after_id=0, lookup=PASS)      # 来源标记非法
         with self.assertRaises(SystemExit):
-            ec.cmd_start("t3", ["M", "M"], executor="qoder", quota=1, batch=1, after_id=0)   # 重复
+            ec.cmd_start("t3", ["M", "M"], executor="qoder", quota=1, batch=1, after_id=0, lookup=PASS)   # 重复
         (_Path(self.tmp.name) / "state.json").write_text(json.dumps({"cursor": 123}))
-        c = ec.cmd_start("t4", ["M"], executor="codex", quota=1, batch=1, after_id=None)
+        c = ec.cmd_start("t4", ["M"], executor="codex", quota=1, batch=1, after_id=None, lookup=PASS)
         self.assertEqual((c["cursor"], c["models"]["M"]["run_id"]), (123, "t4-M"))
 
     def test_concurrent_claims_never_overlap_and_respect_quota(self):
@@ -180,6 +184,92 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("qodercli -p -m DeepSeek-Flash -w /r", q)
         with self.assertRaises(SystemExit):
             ec.launch_command("vim", "t1", "m")
+
+    def test_start_requires_bench_admission(self):
+        none = lambda m: None                                                # noqa: E731
+        with self.assertRaises(SystemExit) as cm:
+            ec.cmd_start("a1", ["M"], executor="qoder", quota=1, batch=1, after_id=0, lookup=none)
+        self.assertIn("没有准入记录", str(cm.exception))
+        for rec, why in (({"verdict": "screen_pass", "prompt_version": "agent-v4+bench1"}, "screen_pass"),
+                         ({"verdict": "pass", "prompt_version": "agent-v3+bench1"}, "不一致")):
+            with self.assertRaises(SystemExit) as cm:
+                ec.cmd_start("a2", ["M"], executor="qoder", quota=1, batch=1, after_id=0, lookup=lambda m, r=rec: r)
+            self.assertIn(why, str(cm.exception))
+        c = ec.cmd_start("a3", ["M"], executor="qoder", quota=1, batch=1, after_id=0, lookup=none,
+                         skip_admission="首轮试跑")
+        self.assertEqual(c["admission"]["skipped"], "首轮试跑")
+        self.assertFalse(c["admission"]["gate"]["M"]["ok"])
+        self.assertIsNone(ec.load(ec.campaign_dir("t1"))["admission"]["skipped"])
+
+    def test_prompt_frozen_at_start_and_versions_go_to_graph(self):
+        d = ec.campaign_dir("t1")
+        snap = (d / "prompt.md").read_text()
+        newer = _Path(self.tmp.name) / "newer.md"
+        newer.write_text("# kg-hub 预抽取：实体/关系抽取规则（prompt_version = agent-v9）\n全新的正文")
+        with mock.patch.object(ax, "PROMPT_PATH", newer):
+            self.assertEqual(ec.rules_text(d, ec.load(d)), snap.rstrip() + "\n")   # 仓库变了，战役仍用快照
+        c = ec.load(d)
+        self.assertEqual(c["prompt_sha256"], ec.prompt_sha(snap))
+        self.assertEqual((ec.episode_prompt_version(c, "c0"), ec.episode_prompt_version(c, "c2")),
+                         (ax.PROMPT_VERSION, ax.PROMPT_VERSION + "+c2"))
+        o = self.claim("DeepSeek-Flash")
+        items = json.loads(_Path(o["batch_file"]).read_text())["items"]
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}))
+        posted = []
+        post = lambda m, u, b, t: (posted.append(b), (200, {"status": "dry_run", "new_entities": []}))[1]  # noqa: E731
+        ec.cmd_submit("t1", o["batch"], dry_run=True, url="http://x", token=None, post=post)
+        self.assertEqual(posted[0]["prompt_version"], ax.PROMPT_VERSION)
+        f = _Path(self.tmp.name) / "c1.md"
+        f.write_text("## 补充约定 v1")
+        ec.cmd_chain("t1", str(f))                                            # 之后领的批次入图带「正文+约定」版本
+        o2 = self.claim("DeepSeek-Flash")
+        items2 = json.loads(_Path(o2["batch_file"]).read_text())["items"]
+        _Path(o2["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items2]}))
+        posted.clear()
+        ec.cmd_submit("t1", o2["batch"], dry_run=True, url="http://x", token=None, post=post)
+        self.assertEqual(posted[0]["prompt_version"], ax.PROMPT_VERSION + "+c1")
+
+    def test_release_requeues_and_frees_quota(self):
+        a = self.claim("DeepSeek-Flash")
+        ids_a = json.loads(_Path(a["batch_file"]).read_text())["items"]
+        _Path(a["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in ids_a]}))
+        r = ec.cmd_release("t1", a["batch"], reason="子代理中途挂了")
+        self.assertEqual((r["released"], r["requeue_size"]), (25, 25))
+        self.assertEqual(ec.cmd_status("t1")["models"]["DeepSeek-Flash"]["claimed"], 0)     # 配额还回来
+        with self.assertRaises(SystemExit):
+            ec.cmd_release("t1", a["batch"], reason="再来一次")
+        with self.assertRaises(SystemExit):                                                  # 回收的批次不能再提交
+            ec.cmd_submit("t1", a["batch"], dry_run=True, url="http://x", token=None, post=lambda *x: (200, {}))
+        # 下一次（任何模型）claim 先领回收的条目；其中已在别处入库的丢掉
+        ok_elsewhere = ids_a[0]["source_obs_id"]
+        b = ec.cmd_claim("t1", "Qwen3.8-Max", url="http://x", token=None, fetch=fake_fetch,
+                         check=lambda idents: {ok_elsewhere: "ok"})
+        got = [x["id"] for x in json.loads(_Path(b["batch_file"]).read_text())["items"]]
+        self.assertEqual(got[:24], [x["id"] for x in ids_a[1:]])
+        self.assertEqual(len(got), 25)                                                         # 第 25 条从游标补
+        self.assertEqual(ec.cmd_status("t1")["requeue"], 0)
+        self.assertNotIn(a["batch"], [x["label"].split("（")[0] for x in ec.cmd_report("t1")["batches"]])
+
+    def test_release_after_submit_only_returns_failed_items(self):
+        o = self.claim("DeepSeek-Flash")
+        items = json.loads(_Path(o["batch_file"]).read_text())["items"]
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}))
+        bad = items[3]["id"]
+
+        def post(method, url, body, token):
+            if body.get("dry_run"):
+                return 200, {"status": "dry_run", "new_entities": []}
+            if body["name"] == f"claude-mem-obs-{bad}":
+                return 503, {"code": "draining"}
+            return 200, {"status": "ok"}
+        ec.cmd_submit("t1", o["batch"], dry_run=True, url="http://x", token=None, post=post)
+        ec.cmd_submit("t1", o["batch"], dry_run=False, url="http://x", token=None, post=post)
+        r = ec.cmd_release("t1", o["batch"], reason="一条撞上排空")
+        self.assertEqual(r["released"], 1)
+        self.assertEqual(ec.load(ec.campaign_dir("t1"))["requeue"], [{"id": bad, "from": o["batch"]}])
+        self.assertEqual(ec.cmd_status("t1")["models"]["DeepSeek-Flash"]["claimed"], 24)
+        with self.assertRaises(SystemExit):                                                  # 剩下的都入库了
+            ec.cmd_release("t1", o["batch"], reason="再来")
 
     def test_merge_rows_weights_by_items(self):
         a = {"_n": 10, "_cost": {"credits": 10}, "items": 10, "headline_verbatim_pct": 100.0, "ok": 10}

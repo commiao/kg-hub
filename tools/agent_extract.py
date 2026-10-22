@@ -282,8 +282,10 @@ def build_payload(item: dict, result: dict, *, model: str, session: str | None,
 def submit_results(batch: dict, results: dict, *, model: str, session: str | None, url: str,
                    token: str | None, post=_http, log_path: Path | None = None,
                    dry_run: bool = False, names_path: Path | None = None,
-                   executor: str | None = None, run_id: str | None = None) -> list[dict]:
+                   executor: str | None = None, run_id: str | None = None,
+                   prompt_version: str = PROMPT_VERSION) -> list[dict]:
     """dry_run：只让服务端做消解不写图，返回每个实体会并到谁；不记 log。
+    prompt_version：随 episode 入图的规则版本；对比战役传开局快照的版本（+ 补充约定版本），不随仓库变。
     names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。
     executor / run_id：随 payload 入图，也记进 log.jsonl，status / eval_report 按它们分组。"""
     by_id = {int(i["id"]): i for i in batch["items"]}
@@ -300,7 +302,7 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
             rec = {"id": oid, "status": "empty", "model": model}
         else:
             payload = build_payload(item, res, model=model, session=session, dry_run=dry_run,
-                                    executor=executor, run_id=run_id)
+                                    executor=executor, run_id=run_id, prompt_version=prompt_version)
             if dry_run and pending:
                 payload["dry_run_pending"] = list(pending)
             t0 = time.monotonic()
