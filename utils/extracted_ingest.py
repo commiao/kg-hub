@@ -273,7 +273,10 @@ def normalize_extraction(entities: list[ExtractedEntity], edges: list[ExtractedE
         out_entities[key] = NormalizedEntity(key=key, name=name, type=typ,
                                              summary=e.summary.strip(), raw_type=raw_type)
     out_edges: list[NormalizedEdge] = []
-    seen_triples: set[tuple[str, str, str]] = set()
+    # 去重键带 fact：同一对实体、同一边名、不同 fact 是不同的事实，与写入侧 _FIND_EDGE
+    # （按 fact 相等才复用）和 graphiti 一致；只有逐字相同的重复边才算 dup_edge。
+    # 人写记忆 memory-v3 给同一条 Lesson→Project 挂多条段首句边，按三元组去重会只剩第一条。
+    seen_edges: set[tuple[str, str, str, str]] = set()
     for ed in edges:
         sk, tk = _norm_key(ed.source), _norm_key(ed.target)
         if sk not in out_entities or tk not in out_entities:
@@ -287,13 +290,14 @@ def normalize_extraction(entities: list[ExtractedEntity], edges: list[ExtractedE
         name = lname if lname in edge_types_lower else fallback_edge
         if lname not in edge_types_lower:
             stats["offschema_edge"] += 1
-        triple = (sk, name, tk)
-        if triple in seen_triples:
+        fact = " ".join(ed.fact.split())
+        key = (sk, name, tk, fact)
+        if key in seen_edges:
             stats["dup_edge"] += 1
             continue
-        seen_triples.add(triple)
+        seen_edges.add(key)
         out_edges.append(NormalizedEdge(source_key=sk, target_key=tk, name=name,
-                                        fact=" ".join(ed.fact.split()), raw_name=raw_name))
+                                        fact=fact, raw_name=raw_name))
     stats["entities_out"] = len(out_entities)
     stats["edges_out"] = len(out_edges)
     return NormalizedExtraction(entities=list(out_entities.values()), edges=out_edges, stats=stats)

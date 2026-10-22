@@ -37,7 +37,7 @@ class NormalizeTest(unittest.TestCase):
                  ("commit 94a9779", "tool", "a commit"), ("/Users/mac/x", "Widget", "path")),
             edges(("kg-hub", "BELONGS_TO", "commit 94a9779", "f1"),
                   ("kg-hub", "IS_ANCESTOR_OF", "/Users/mac/x", "f2"),
-                  ("kg-hub", "is_ancestor_of", "/Users/mac/x", "f2 again"),
+                  ("kg-hub", "is_ancestor_of", "/Users/mac/x", " f2 "),
                   ("kg-hub", "references", "ghost", "dangling"),
                   ("kg-hub", "relates_to", "kg-hub", "self")),
             ENTITY_TYPES, EDGE_TYPES)
@@ -49,6 +49,18 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual((s["dup_entity"], s["unknown_type"], s["dirty_name"]), (1, 1, 2))
         self.assertEqual((s["offschema_edge"], s["dup_edge"], s["dangling_edge"], s["self_edge"]), (2, 1, 1, 1))
         self.assertEqual((s["entities_out"], s["edges_out"]), (3, 2))
+
+    def test_same_triple_different_facts_are_kept(self):
+        # 同一对实体同一边名、不同 fact 是两条事实（memory-v3 段首句边）；逐字重复才去重
+        n = xi.normalize_extraction(
+            ents(("lesson-a", "Lesson", ""), ("kg-hub", "Project", "")),
+            edges(("lesson-a", "relates_to", "kg-hub", "做法首句。"),
+                  ("lesson-a", "relates_to", "kg-hub", "段首句一。"),
+                  ("lesson-a", "RELATES_TO", "kg-hub", "段首句一。"),
+                  ("lesson-a", "relates_to", "kg-hub", "段首句二。")),
+            ENTITY_TYPES, EDGE_TYPES)
+        self.assertEqual([e.fact for e in n.edges], ["做法首句。", "段首句一。", "段首句二。"])
+        self.assertEqual(n.stats["dup_edge"], 1)
 
     def test_limits(self):
         with self.assertRaises(ValueError):

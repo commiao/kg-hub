@@ -6,7 +6,7 @@
 原则：
 - 真相源留在文件（~/.local/share/agent-memory/claude-code.git 跟踪的工作树），kg-hub 只做索引与召回。
 - 不调模型：实体/边由本文件的纯函数机械生成；/api/search 只返回边的 fact，所以 fact 就是
-  记忆的 description 原文（人写的一句话结论）和 How to apply 首句。
+  记忆的 description 原文（人写的一句话结论）、How to apply 首句，以及正文前几段的段首句。
 - 幂等键沿用服务端的 (source_description, source_obs_id)，source_obs_id = 文件内容 sha256。
   文件改了 → 推新版（name 带新 sha8）并归档旧版；文件删了 → 归档。不反向回写文件。
 - 分档：A 推（type=feedback/reference）、B 搬（type=project，走 T-0302 流程搬到所属文档）、
@@ -44,12 +44,16 @@ EXTRACTOR_MODEL = "agent-memory-deterministic"   # 来源标记，不是模型�
 # 抽取规则版本。进幂等键：规则改了（fact 写法变）同一文件也要重推并归档旧版。
 # v1 → v2（2026-10-19）：主 fact 去掉 "slug：" 前缀。实测英文 slug 在 bge-small-en 下压过中文语义，
 # 纯中文 description 当查询时连自己都召不回（alert-thresholds / hard-logic），去前缀后命中。
-PROMPT_VERSION = "memory-v2"
+# v2 → v3（2026-10-22，T-0351）：每条记忆再补正文段首句（最多 MAX_LEADS 条）。离线实测（MiniLM 语义腿、
+# 全图 18 万条边）：记忆集中文问法 nl 3/11 → 6/11，原黄金集、中文问英文、英文对照 top-10 零新丢；
+# Why 首句、只补正文首句、补前 2–5 条段首句都到不了 6/11。
+PROMPT_VERSION = "memory-v3"
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_ROOT = "~/.claude/projects"
 DEFAULT_GIT_DIR = "~/.local/share/agent-memory/claude-code.git"
 MAX_FACT = 1000
 MAX_SUMMARY = 2000
+MAX_LEADS = 6
 
 KIND_BY_TYPE = {"feedback": "方法论", "reference": "手册", "project": "项目事实"}
 TIER_BY_TYPE = {"feedback": "A", "reference": "A", "project": "B"}
@@ -67,6 +71,9 @@ SECRET_PATTERNS = (
 )
 _LINK_RE = re.compile(r"\[\[([^\]|#]+)")
 _HOWTO_RE = re.compile(r"^\s*(?:\*\*|##\s*)?How to apply\s*[:：]?\s*(?:\*\*)?\s*[:：]?\s*(.*)$", re.I)
+_LIST_RE = re.compile(r"^(?:[-*]|\d+[.)])\s+")
+# 段首句不取 Why / How to apply 段：How 首句已单独成边；Why 首句离线实测对召回无增益。
+_WHY_HOW_RE = re.compile(r"^(?:Why\s*[:：]|How to apply)", re.I)
 
 
 # ---------- 纯函数：解析 ----------
@@ -119,6 +126,47 @@ def how_to_first_sentence(body: str) -> str:
     return ""
 
 
+def plain(text: str) -> str:
+    """去掉 markdown 标记（[[链接]]、[文字](url)、**、`），压成一行。"""
+    text = re.sub(r"\[\[([^\]|#]+)[^\]]*\]\]", r"\1", text or "")
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    return " ".join(text.replace("**", "").replace("`", "").split())
+
+
+def paragraphs(body: str) -> list[str]:
+    """正文段落：按空行切，列表项各算一段；跳过代码块、表格、标题、分隔线。"""
+    out: list[str] = []
+    cur: list[str] = []
+    fence = False
+
+    def flush():
+        if cur:
+            out.append(plain(" ".join(cur)))
+            cur.clear()
+
+    for line in (body or "").splitlines():
+        t = line.strip()
+        if t.startswith("```"):
+            fence = not fence
+            flush()
+            continue
+        if fence or not t or t.startswith(("|", "#")) or re.fullmatch(r"-{3,}", t):
+            flush()
+            continue
+        if _LIST_RE.match(t):
+            flush()
+            t = _LIST_RE.sub("", t)
+        cur.append(t)
+    flush()
+    return [p for p in out if p]
+
+
+def paragraph_leads(body: str, limit: int = MAX_LEADS) -> list[str]:
+    """前 limit 段（不含 Why / How to apply 段）各自的首句。去重留给 build_extraction。"""
+    paras = [p for p in paragraphs(body) if not _WHY_HOW_RE.match(p)]
+    return [plain(first_sentence(p)) for p in paras[:limit]]
+
+
 def extract_links(body: str) -> list[str]:
     seen: list[str] = []
     for l in _LINK_RE.findall(body or ""):
@@ -152,6 +200,7 @@ def parse_memory(text: str, mtime_iso: str) -> dict:
         "raw": text,
         "links": extract_links(body),
         "how_to": how_to_first_sentence(body),
+        "leads": paragraph_leads(body),
         "secret_hits": scan_secrets(text),
     }
 
@@ -241,6 +290,13 @@ def build_extraction(mem: dict, project: str | None, index: dict[str, str]) -> t
         ents.append({"name": l, "type": "Lesson", "summary": index[l][:MAX_SUMMARY]})
         edges.append({"source": slug, "target": l, "name": "relates_to",
                       "fact": _fact(f"{slug} 关联 {l}：{index[l]}")})
+    # 段首句：中文问法常问到正文里的现象/机制，而不是 description 那句结论（memory-v3）
+    seen = {_fact(desc), _fact(mem.get("how_to") or "")}
+    for lead in mem.get("leads") or []:
+        f = _fact(lead)
+        if f and f not in seen:
+            seen.add(f)
+            edges.append({"source": slug, "target": target["name"], "name": "relates_to", "fact": f})
     return ents, edges
 
 
