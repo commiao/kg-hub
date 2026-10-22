@@ -149,6 +149,8 @@ INGEST_BACKUP_PATH = os.environ.get("KG_HUB_INGEST_BACKUP_PATH", "").strip()
 # observed (rich-content add_episode ~196s + lock wait ~180s + 429 retries ~150s
 # ≈ 9 min worst). Configurable for tuning.
 STUCK_THRESHOLD_MIN = int(os.environ.get("KG_HUB_STUCK_THRESHOLD_MIN", "30"))
+# /api/queue_stats 里取边向量索引元数据的限时(秒),见 queue_stats。
+VECTOR_INDEX_STATS_TIMEOUT = 3.0
 QUALITY_SUMMARY_TTL_SECONDS = max(
     30, int(os.environ.get("KG_HUB_QUALITY_SUMMARY_TTL_SECONDS", "300"))
 )
@@ -2905,6 +2907,17 @@ async def queue_stats(request: Request) -> JSONResponse:
         quarantined_count = int(qrows[0].get("c") or 0) if qrows else 0
     except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
         pass
+    # 边向量索引的墓碑比例(T-0347):只读索引元数据,watchdog 据此提醒重建。取不到为 None。
+    # 平时几毫秒;重建时 CREATE VECTOR INDEX 执行的那几秒(本机 2.9 秒、10-22 线上 6.5 秒)它要等,
+    # 本机在 1 秒查询超时下直接报错。限时,免得把整份统计拖长。
+    edge_vector_index: dict | None = None
+    try:
+        from utils.vector_index_health import edge_vector_index_stats
+        irows, _, _ = await asyncio.wait_for(driver.execute_query("CALL db.indexes()"),
+                                             timeout=VECTOR_INDEX_STATS_TIMEOUT)
+        edge_vector_index = edge_vector_index_stats(irows)
+    except Exception:  # noqa: BLE001 — 监控字段,失败不拖垮主统计
+        pass
     pending = ok = errored = failed = needs_reconciliation = 0
     needs_reconciliation_last_1h = 0
     reconciliation_samples: list[dict] = []
@@ -2968,6 +2981,7 @@ async def queue_stats(request: Request) -> JSONResponse:
         "status": "ok",
         "openclaw_capsule_age_hours": capsule_age_hours,
         "quarantined_capsules": quarantined_count,
+        "edge_vector_index": edge_vector_index,
         "pending": pending,
         "ok_total": ok,
         "errored_total": errored,

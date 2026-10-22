@@ -277,13 +277,118 @@ the three earlier worst queries (one had lost ranks 2 and 3) were rechecked
 against the production scan and passed. Indexed query 17–20 ms, exact scan
 about 0.4 s.
 
-### Tombstones also come from ordinary edge updates
+### Tombstones also come from ordinary edge updates (T-0347)
 
 Setting **any** property of an edge (not only `fact_embedding`) re-indexes
 it under a new document id: locally, 2,000 `SET e.invalid_at` and 2,000
 `SET e.episodes` raised `maxDocId` by exactly 2,000 each. Ingest updates
-edges all the time (episodes appended, invalidation), so once ingest resumes
-the index accumulates tombstones again. Whether gradual churn degrades recall
-the way the mass rewrite did has not been measured. Until it has, watch
-`maxDocId / numDocuments` and rerun `tools.vector_index_check`; rebuild when
-it fails.
+edges all the time (episodes appended, invalidation), so `maxDocId /
+numDocuments` grows with every update and only a rebuild brings it back to
+about 1.0. On production it was 1.032 (180,689 documents, `maxDocId`
+186,550) about seven hours after the 02:21 rebuild, with T-0346 writing
+through `/api/ingest_extracted`.
+
+**Measured (2026-10-22, local FalkorDB 4.18.10, production's MiniLM vectors
+for all 172,188 edges, same index options, clean index from `DROP`/`CREATE`).**
+Edges were updated one query at a time the way ingest does it (90 % `SET
+e.episodes = e.episodes + [x]`, 10 % `SET e.invalid_at`; vectors unchanged),
+and at each ratio all 235 evaluation queries (golden 35, cross-language 100
+Chinese + 100 English) were checked with `tools.vector_index_check`'s rule
+(2,048 candidates; fail = an edge of the exact top 30 missed, or duplicates).
+The exact ranking cannot change under these updates, so it was computed once.
+Queries failing the check, out of 235 (in brackets: queries that lost an edge
+of the exact top 10):
+
+| Which edges get updated | 1.11 | 1.21 | 1.36 | 1.50 | 1.76 | 2.01 | 2.51 | 3.01 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Uniform, seed 42 | 0 | 0 | 0 | 2 | 3 (1) | 3 (1) | 6 (1) | 6 (1) |
+| Uniform, seed 7 | 0 | 0 | 0 | 0 | 2 (1) | 3 (1) | 6 (1) | 6 (1) |
+| Weighted by each edge's real episode appends (90 %), uniform (10 %) | 0 | 0 | 0 | 0 | 1 | 5 (3) | 12 (4) | 20 (7) |
+| Half within the 235 queries' exact top-50 neighbourhoods | 0 | 0 | 0 | 0 | 1 | 5 (1) | 12 (2) | 29 (8) |
+| Zipf, s = 1.1 (hottest edge 13 % of updates) | 0 | 13 (10) | 20 (13) | 34 (15) | 43 (24) | 61 (43) | 87 (60) | 105 (80) |
+
+The clean index passed all 235 every time. No result had duplicates.
+The weighted row is the closest to real ingest: it draws edges in
+proportion to how many episodes each one has actually been appended so far.
+Damage accumulates: in both uniform runs the same queries fail at every later
+step. Three runs started from a `DROP`/`CREATE` of the previous run's
+ratio-3.0 index; each of those rebuilds restored all 235.
+
+Damage depends on *which* edges are rewritten, not only on how many: spread
+over many edges it starts around 1.5; piled onto a few hot edges (Zipf) it
+starts before 1.21 and then loses ranks 1–5 outright. Real ingest is far less
+concentrated than that Zipf run — in the live graph the edge with the most
+episodes has 71 (0.3 % of all appends) and the top 1,000 edges hold 32 % —
+but the ratio alone cannot tell the two apart. Hence the alert threshold
+**1.3**, below every damaged point of the realistic runs, and a recheck with
+`tools.vector_index_check` whenever the alert fires. At the post-rebuild
+production rate above (0.032 in seven hours of backlog ingest) that is about
+two and a half days of such load; ordinary ingest is slower.
+
+### Watching the ratio
+
+`/api/queue_stats` returns `edge_vector_index` (`status`, `num_documents`,
+`max_doc_id`, `ratio`), read from `CALL db.indexes()` metadata only — no
+vector query, no scan, a few milliseconds. The NAS watchdog (every ~2 minutes)
+raises `vector_index_dirty` once when the ratio reaches the threshold
+(`vector_index_tombstone_ratio` in the hot-reloaded notify config; default
+1.3; 0 disables) and clears it when a rebuild brings the ratio back. While
+the index is being rebuilt (`db.indexes()` then lists two `RELATES_TO`
+indexes, or the status is not `OPERATIONAL`), `ratio` is null and the alert
+holds its previous state instead of announcing a premature recovery.
+`python -m tools.vector_index_check --stats` prints the same numbers from a
+workstation.
+
+The watchdog never runs the exact scan (0.4–1 s each, heats the NAS); the
+sampled acceptance check stays a manual step after a rebuild or an alert.
+
+### Rebuild runbook
+
+Rebuilding is a graph write and the operator's decision. It rebuilds the
+**whole** `RELATES_TO` index — the `fact` full-text and range fields too — so
+`/api/search`'s identifier and literal legs return partial results until it is
+operational again, and vector queries answer from the partial index meanwhile.
+
+1. **Pick the window.** Low traffic, nobody searching, not around 02:00 (the
+   home router restarts). Ingest stopped: the kg_hub circuit breaker open (or
+   `KG_HUB_EDGE_VECTOR_INDEX_PERCENT=0`) **and** no `/api/ingest_extracted`
+   rounds in flight — agree a gap with whoever holds them (task-hub).
+2. **Check temperature and record the before state** (repository root, the
+   kg-hub venv; `tools.reembed.graph()` reads the FalkorDB keys from the
+   local env file):
+
+   ```bash
+   ssh commiao@100.123.208.32 cat /sys/class/hwmon/hwmon0/temp1_input   # must be < 85000
+   python -m tools.vector_index_check --stats                          # exit 0, note ratio
+   ```
+
+3. **Drop and recreate** (options must match the live index; 384 is the
+   MiniLM dimension, check `utils/embedding_profile` after a model switch).
+   `CREATE` blocks reads of the graph while it runs (6.5 s on production,
+   2.9 s locally — a status query in that window waited 2.8 s and, under a
+   1 s query timeout, failed); the background build afterwards does not:
+
+   ```bash
+   python - <<'EOF'
+   from tools.reembed import graph
+   g = graph()
+   g.query("DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)")
+   g.query("CREATE VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding) "
+           "OPTIONS {dimension:384, similarityFunction:'cosine', M:16, efConstruction:200, efRuntime:10}")
+   EOF
+   ```
+
+4. **Wait for `OPERATIONAL`.** Repeat `python -m tools.vector_index_check
+   --stats` every 30 s: exit 2 while building, 0 when done (production
+   2026-10-22: under 2.5 minutes for 174,828 edges). Read the NAS temperature
+   alongside; it reached 95–100 °C last time. If it stays at 98 °C or above for
+   three readings, drop the index under construction and stop — ingest and
+   search fall back to the exact scan when the index is missing — and retry
+   another night.
+5. **Accept.** Once the NAS is below 85 °C, run `python -m
+   tools.vector_index_check` (8 golden queries, one exact scan each, 5 s
+   apart; it refuses to run while the index is still building). It must print
+   `8/8 条一致`; `--stats` should show a ratio near 1.0. The watchdog clears
+   `vector_index_dirty` on its next round.
+6. **Resume ingest** (restoring the breaker is the operator's call) and note
+   the before/after numbers here.

@@ -7,7 +7,9 @@
 numDocuments 说明向量被大量重写过（换模型重算），2026-10-22 实测这种索引会漏边，要重建。
 
 全扫一次约 1 秒且让 NAS 升温，所以默认只跑 8 条、每条之间停 --pause 秒；别在高峰跑。
+索引还在重建（db.indexes() 里两份并存或状态不是 OPERATIONAL）时不跑查询、退出码 2。
 用法：python -m tools.vector_index_check [--n 8] [--pause 5]
+      python -m tools.vector_index_check --stats   只看索引状态和墓碑比例（毫秒级，不跑查询）
 只读：只发 ro_query。
 """
 from __future__ import annotations
@@ -52,30 +54,36 @@ def compare(indexed_rows, scan_rows) -> dict:
 
 
 def index_stats(g) -> dict:
-    for row in g.ro_query("CALL db.indexes()").result_set:
-        if row[0] == "RELATES_TO":
-            info = row[-1] if isinstance(row[-1], dict) else {}
-            return {k: info.get(k) for k in ("numDocuments", "maxDocId")}
-    return {}
+    """与 watchdog 同一份解析（utils.vector_index_health）：重建中报 building、不给比例。"""
+    from utils.vector_index_health import edge_vector_index_stats
+    return edge_vector_index_stats(g.ro_query("CALL db.indexes()").result_set) or {}
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--n", type=int, default=8, help="跑几条黄金查询（默认 8）")
     ap.add_argument("--pause", type=float, default=5.0, help="每条之间停几秒，给 NAS 降温")
+    ap.add_argument("--stats", action="store_true", help="只看索引状态与墓碑比例，不跑查询")
     args = ap.parse_args(argv)
 
-    from fastembed import TextEmbedding
     from tools.reembed import graph
+    g = graph()
+    stats = index_stats(g)
+    print("索引:", stats, flush=True)
+    if stats.get("status") != "operational":
+        print("索引不存在或还在重建" + ("" if args.stats else "，不跑查询"), flush=True)
+        return 2
+    if args.stats:
+        return 0
+
+    from fastembed import TextEmbedding
     from utils.embedding_profile import active_profile
 
     kwargs = {"model_name": active_profile().model}
     if os.environ.get("FASTEMBED_CACHE_PATH"):
         kwargs["cache_dir"] = os.environ["FASTEMBED_CACHE_PATH"]
     model = TextEmbedding(**kwargs)
-    g = graph()
     queries = [q["query"] for q in json.load(open(GOLDEN))["queries"]][:args.n]
-    print("索引:", index_stats(g), flush=True)
     bad = 0
     for q in queries:
         v = [float(x) for x in next(iter(model.embed([q.replace("\n", " ")])))]

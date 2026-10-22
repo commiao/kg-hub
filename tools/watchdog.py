@@ -20,6 +20,7 @@ Anomalies tracked:
   extraction_failing  errored_total > 阈值（存量卡住，持续故障的诚实信号）
   capture_probe_stale  设备明确在线但采集探针超时
   capture_monitor_unhealthy  topology/Tailscale 监控证据源不可判
+  vector_index_dirty  RELATES_TO 边向量索引墓碑比例(maxDocId/numDocuments)超阈值,该重建了
 
 For each: emit one alert on OK→BAD, one on BAD→OK. No alert while BAD persists.
 
@@ -376,6 +377,47 @@ def apply_held_checks(stats: dict, cfg: dict, anomalies: dict, details: dict) ->
             f"⛔ kg_hub 模型调用已自动断开:{brk.get('reason') or '(无原因)'}"
             " → 查明原因后在 /dashboard/topology 恢复")
     details["model_breaker_auto:clear"] = "kg_hub 模型调用的自动断路已解除"
+
+
+# ── 边向量索引墓碑比例(T-0347)────────────────────────────────────────────
+# 改边上任何属性都会让它在 RELATES_TO 索引里换一个新文档号、留下墓碑,所以
+# maxDocId / numDocuments 随入图单调上涨,只有重建才回落。10-21 换模型整体重写后
+# 比例 2.26,语义检索漏掉了全扫的第 2、3 名。2026-10-22 本机同版本模拟逐条更新、235 条评测
+# 查询:更新分散时 1.5 起才有查询漏前 30 名,集中在少数热点边时 1.21 就漏到第 1 名。
+# 取 1.3:低于所有贴近现实分布的受损点,依据见
+# docs/falkor-vector-index-rollout.md「Tombstones also come from ordinary edge updates」。
+VECTOR_INDEX_RATIO_DEFAULT = 1.3
+
+
+def apply_vector_index_check(stats: dict, cfg: dict, anomalies: dict, details: dict,
+                             prev_anomalies: dict, prev_counters: dict,
+                             new_counters: dict) -> None:
+    """只读 /api/queue_stats 里 server 取好的 db.indexes() 元数据,不跑任何向量查询。"""
+    gate = float(cfg.get("vector_index_tombstone_ratio", VECTOR_INDEX_RATIO_DEFAULT))
+    if gate <= 0:
+        return
+    vi = stats.get("edge_vector_index")
+    ratio = vi.get("ratio") if isinstance(vi, dict) else None
+    if not isinstance(ratio, (int, float)):
+        # 重建中(两份索引并存)、旧 server 没有这个字段、或 db.indexes() 没取到:不可判,
+        # 沿用上一轮;重建中的数是半成品,落回 False 就是一条假的「已重建」。
+        streak = int(prev_counters.get("vector_index_dirty_unknown", 0)) + 1
+        new_counters["vector_index_dirty_unknown"] = streak
+        why = ("索引正在重建" if isinstance(vi, dict) and vi.get("status") == "building"
+               else "queue_stats 没带回 edge_vector_index")
+        anomalies["vector_index_dirty"] = _hold_or_release(
+            "vector_index_dirty", bool(prev_anomalies.get("vector_index_dirty")),
+            streak, details, "边向量索引墓碑比例", why, STATS_SLOW_HOLD_ROUNDS)
+        return
+    new_counters["vector_index_dirty_unknown"] = 0
+    counts = f"maxDocId {vi.get('max_doc_id')} / numDocuments {vi.get('num_documents')}"
+    if ratio >= gate:
+        anomalies["vector_index_dirty"] = True
+        details["vector_index_dirty"] = (
+            f"🧹 边向量索引墓碑比例 {ratio}({counts},阈值 {gate}),语义检索可能开始漏边。"
+            "→ 低峰、入图停着时按 docs/falkor-vector-index-rollout.md「Semantic search」"
+            "重建,做完跑 python -m tools.vector_index_check")
+    details["vector_index_dirty:clear"] = f"边向量索引墓碑比例回落到 {ratio}({counts}),多为已重建"
 
 
 def check_search_probe() -> tuple[str, float, str]:
@@ -775,6 +817,7 @@ STATS_ANOMALY_KINDS: tuple[tuple[str, str], ...] = (
     # 重启 server,断路一直开着,它们仍各发了一对「resolved → 再 FIRE」。
     ("held_growth", "待核验增长"),
     ("model_breaker_auto", "模型调用自动断路"),
+    ("vector_index_dirty", "边向量索引墓碑比例"),
 )
 STATS_SOURCE_HINT = "server_down（/api/queue_stats 取不到数）"
 # server 活着、只是取数失败(高负载超时)时的沿用上限。3 轮是为 server 宕机设计的:
@@ -966,6 +1009,7 @@ def main() -> int:
         "extraction_failing": False,
         "held_growth": False,
         "model_breaker_auto": False,
+        "vector_index_dirty": False,
     }
     details: dict[str, str] = {}
 
@@ -1061,6 +1105,8 @@ def main() -> int:
                         "capsule_stale", bool(prev_anomalies.get("capsule_stale")),
                         streak, details, "胶囊账龄", STATS_SOURCE_HINT)
             apply_held_checks(stats, cfg, new_anomalies, details)
+            apply_vector_index_check(stats, cfg, new_anomalies, details,
+                                     prev_anomalies, prev_counters, new_counters)
             if isinstance(oldest_age, (int, float)) and oldest_age > STUCK_SECONDS:
                 new_anomalies["stuck_jobs"] = True
                 details["stuck_jobs"] = (
