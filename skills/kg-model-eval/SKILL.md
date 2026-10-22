@@ -39,12 +39,16 @@ GLM-5.3 ≈2.35、Kimi-K3 ≈4.24 credits/条，qoder 计费；其他模型写�
 ## 2. 冒烟
 
 ```bash
-$PY -m tools.extract_bench run   --bench ~/.kg-hub/bench/bench-20261022 --models A B C --tag smoke<日期> --limit 10 --parallel 4
-$PY -m tools.extract_bench admit --bench ~/.kg-hub/bench/bench-20261022 --run ~/.kg-hub/bench/runs/smoke<日期>-qodercli-A   # 每个模型一次
+$PY -m tools.extract_bench run   --bench ~/.kg-hub/bench/bench-20261022 --executor qodercli|codex --models A B C --tag smoke<日期> --limit 10 --parallel 4
+$PY -m tools.extract_bench admit --bench ~/.kg-hub/bench/bench-20261022 --run ~/.kg-hub/bench/runs/smoke<日期>-<执行器>-A   # 每个模型一次
 ```
 
-`run` 用 qodercli 当模型通道（不开工具、不加载用户级设置），不入库；跑完自动自检并出合表。冒烟的 `admit` 不带 `--sheet`，只预览、不写准入记录，10 条最多看到 `screen_pass`（筛选通过，不算准入）。
-不在 qoder 计费体系里的模型：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
+`run` 把 qodercli 或 codex 当模型通道（不开工具、不加载用户级设置），不入库；跑完自动自检并出合表。两种执行器统一：
+同一份系统提示、每次调用按批次分组且至多 `--chunk` 条、同一推理强度（`--effort`，缺省 medium）、同一套拆半重试；
+任务按「组号 → 模型」交错排队，各模型一开始就同时在跑。codex 不报 credits，只记 token。**不要自己写运行脚本**——
+那样调用条数、推理强度、系统提示会和别的执行器不一样，结果没法放进同一张表。
+冒烟的 `admit` 不带 `--sheet`，只预览、不写准入记录，10 条最多看到 `screen_pass`（筛选通过，不算准入）。
+既不在 qoder、也不在 codex 里的模型（cursor、DSH 等）：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
 `$PY -m tools.extract_bench register --bench <样本> --results <目录> --model <模型> --executor <工具>`，之后命令一样。
 
 ## 3. 准入（含盲测）

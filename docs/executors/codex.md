@@ -22,6 +22,15 @@
   （rc 1 = 有没预览的）；仓库里的 `tools/codex_hooks.py` 读的是 codex 原生钩子清单，可用来确认钩子装没装。钩子只做检查，不改 results。
 - **自报成本**：codex 会话的 token 看其用量面板；每批记一行，run 结束时汇总进 `run end`。
 
+## 冒烟与准入（不入库）
+
+codex 的模型直接走运行器，**不要自己写脚本**：
+`python -m tools.extract_bench run --bench ~/.kg-hub/bench/bench-20261022 --executor codex --models gpt-6-luna gpt-6-sol --tag <标签> --limit 10`。
+运行器用 `codex exec --ignore-user-config --ephemeral -s read-only` 单轮调用：关 shell 工具与钩子、不读项目文档，
+系统提示经 `developer_instructions` 传入（与 qodercli 的逐字相同），观测走标准输入；推理强度用 `--effort`（缺省 medium）。
+codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex 会话自写脚本，每个模型一次发 10 条、推理强度 medium、
+系统提示多一句，和 qoder 的运行器不一致，结果不能直接和 qoder 的模型放一张表——现在统一由运行器定死。
+
 ## 多模型战役（campaign.md）
 
 - **方式二未确认**（2026-10-22）：codex 的派生工具自报有 `model` 参数，但 `codex exec --json` 两次实测事件流里都没有派生记录，

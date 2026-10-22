@@ -141,5 +141,5 @@ $PY -m tools.extract_campaign launch --id <战役> --tool codex|cursor|qodercli|
 ## 和其他用法的关系
 
 - **冒烟**（新模型进场前，不入库）：`tools/extract_bench.py` 在冻结样本上离线评分，见 [qoder.md](qoder.md) 的「对比模式」。
-- **qodercli 运行器**（`extract_bench run`）：把 qoder 当纯模型通道、无人值守地比模型本身；不入库，只用于冒烟。
+- **运行器**（`extract_bench run --executor qodercli|codex`）：把 qoder 或 codex 当纯模型通道、无人值守地比模型本身；不入库，只用于冒烟。
 - **战役**（本文）：多模型生产画像，入库，每批复盘、改链路；模型能不能用、谁更好看 bench 准入记录。
