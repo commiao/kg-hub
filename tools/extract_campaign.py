@@ -155,7 +155,7 @@ def rules_text(d: Path, c: dict) -> str:
 
 
 SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}，你的模型 id 是 {model}。
-在仓库根目录执行命令，解释器用 $HOME/.local/share/kg-hub/venv/bin/python（下称 PY）。
+在仓库根目录执行命令，解释器用 ${{KG_HUB_PYTHON:-python3}}（装好 kg-hub 依赖的那个 Python，下称 PY）。
 
 1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（agent-v4 正文 + 战役补充约定），尤其末尾规则 21–28。
 2. 领一批：$PY -m tools.extract_campaign claim --id {cid} --model {model}
@@ -199,7 +199,7 @@ def agent_markdown(name: str, d: dict) -> str:
 
 
 REPO = Path(__file__).resolve().parent.parent
-LAUNCH_TOOLS = ("codex", "cursor", "qodercli")
+LAUNCH_TOOLS = ("codex", "cursor", "qodercli", "dsh")
 
 
 def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state: Path | None = None) -> str:
@@ -207,7 +207,8 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
     子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
     codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
     st = state or ax.state_dir()
-    brief_cmd = f'"$($HOME/.local/share/kg-hub/venv/bin/python -m tools.extract_campaign brief --id {cid} --model {model})"'
+    # 解释器不写死某台机器的路径：KG_HUB_PYTHON 指向装好 kg-hub 依赖的 Python，没设就用 python3
+    brief_cmd = f'"$(${{KG_HUB_PYTHON:-python3}} -m tools.extract_campaign brief --id {cid} --model {model})"'
     if tool == "codex":
         return (f"cd {repo} && codex exec -m {model} -C {repo} --add-dir {st} -s workspace-write "
                 f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
@@ -217,6 +218,10 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
     if tool == "qodercli":
         return (f"cd {repo} && qodercli -p -m {model} -w {repo} --add-dir {st} --permission-mode auto "
                 f"-o json {brief_cmd}")
+    if tool == "dsh":
+        # DeepSeek Harness（@deepseek-ai/dsh）无界面模式一次跑完一个任务；它没有模型参数，模型在 DSH 的
+        # 模型设置里选（profile 的 agent-default-model），所以每个模型的会话开跑前先把模型切过去
+        return f"# 先在 DSH 的模型设置里切到 {model}\ncd {repo} && dsh --profile headless {brief_cmd}"
     raise SystemExit(f"不认识的工具 {tool}；可选：{', '.join(LAUNCH_TOOLS)}")
 
 

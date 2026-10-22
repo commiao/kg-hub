@@ -1,7 +1,7 @@
 # 抽取对比与链路优化框架：跨开发工具、跨模型复用
 
 > 2026-10-18。本文把 10-17～10-18 这两天在 kg-hub 上跑通的做法（Claude 会话自抽取三轮、网关路径两批 50 条验证、
-> 每 500 条复盘）抽成一套与执行工具无关的机制，供 Claude Code、codex、qoder、dskhress 等任何能跑命令行、
+> 每 500 条复盘）抽成一套与执行工具无关的机制，供 Claude Code、codex、qoder、cursor、DSH（DeepSeek Harness）等任何能跑命令行、
 > 读写 JSON 的工具复用。已有的协议不重写，只引用：
 > 执行循环见 [AGENT-EXTRACT-PROTOCOL.md](AGENT-EXTRACT-PROTOCOL.md)，复盘见 [DIGEST-RETRO-PROTOCOL.md](DIGEST-RETRO-PROTOCOL.md)，
 > 指标与基线见 [CLAUDE-EXTRACTION-REPLACEMENT-PLAN.md](CLAUDE-EXTRACTION-REPLACEMENT-PLAN.md) 第二部分，
@@ -22,7 +22,7 @@
 
 | 变量 | 取值举例 | 在哪记录 | 混杂风险 |
 |---|---|---|---|
-| 执行器 `executor` | claude-code / codex / qoder / dskhress / script（直连网关的脚本） | 来源标记 `extractor_tool`（已加，与 `run_id` 一起随 episode/实体/边入图） | 会话型执行器的模型随工具走，必须单独记模型 |
+| 执行器 `executor` | claude-code / codex / qoder / cursor / dsh / script（直连网关的脚本） | 来源标记 `extractor_tool`（已加，与 `run_id` 一起随 episode/实体/边入图） | 会话型执行器的模型随工具走，必须单独记模型 |
 | 模型 `model` | claude-fable-5-1 / claude-opus-5-5 / gpt-5-codex / deepseek-v4-flash / qwen3.6-plus | `extractor_model`（已有） | 换模型时不许同时改规则（10-17 三轮犯过） |
 | 规则 `rules` | 提示词版本 + schema + 服务端旋钮（消解阈值、归一、自定义指令、max_tokens、空边守卫） | `prompt_version`（已有）+ 运行清单里的旋钮快照 | 服务端旋钮改了要发布，记 commit |
 | 样本 `sample` | 冻结样本集 id（`ab-sample-20261017` 50 条分层）或 id 区间 | 运行清单 | 不同批观测的难度不同，跨样本不比密度 |
@@ -62,7 +62,8 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 - **codex**：同一 CLI；把 `config/agent_extract_prompt.md` 作为任务 system 内容。仓库里已有 `tools/codex_hooks.py`，
   可以把「提交前必须 dry-run」做成钩子检查。
 - **qoder**：同上，`tools/qoder_cm_hook.sh` 是现成的钩子入口；qoder 可切模型，是做「同工具不同模型」对照的最佳位置。
-- **dskhress 或其他**：只要能跑 Python CLI 并读写 JSON 就能接；不能跑 CLI 的工具退化为「只产出 results.json，由人或脚本提交」。
+- **DSH（DeepSeek Harness）**：见 `docs/executors/dsh.md`。
+- **其他工具**：只要能跑 Python CLI 并读写 JSON 就能接；不能跑 CLI 的工具退化为「只产出 results.json，由人或脚本提交」。
 - **脚本执行器 `tools/model_extract.py`（待写）**：读 batch，用同一提示词经网关的 ab 路由调指定模型，写 results。
   这是比较非 Claude 模型（deepseek、qwen、gpt）而不受工具干扰的唯一办法。
 
@@ -152,7 +153,7 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 | 3 | 脚本执行器 `tools/model_extract.py`：同一提示词经网关 ab 路由调任意模型 | 依赖 credvault#117 启用路由 + 凭据（用户侧） | 中 |
 | 4 | `tools/eval_report.py`：三面合一张表 | 新文件，复用 ab_score / extractor_compare / status | 已做（PR #188） |
 | 5 | 金标 20 条 + 评分器 `tools/gold_score.py` | docs/gold/、新文件 | 中，人工部分由用户或执行者判 |
-| 6 | 各工具的任务说明模板（claude-code / codex / qoder 各一份 + 公共部分，内容就是 §2 的四条 + 五步命令） | docs/executors/ | 已做（PR #188）；dskhress 待其接入时再补 |
+| 6 | 各工具的任务说明模板（claude-code / codex / qoder 各一份 + 公共部分，内容就是 §2 的四条 + 五步命令） | docs/executors/ | 已做（PR #188）；cursor、DSH 随战役补齐（docs/executors/cursor.md、dsh.md） |
 
 1、2、4、6 已在 PR #188 做完（其中 1 的服务端改动要发布 kg-hub-server 才会写进图；发布前 `--executor` / `--run-id`
 只记在本地 log 与运行清单里，服务端按 pydantic 默认忽略多余字段不报错）；3 依赖网关路由与凭据；5 的人工判定需要有人花半天。
