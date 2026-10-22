@@ -81,6 +81,38 @@ def fake_embed(texts, cache_dir=None):
     return np.array(out, dtype=np.float32)
 
 
+class AdmissionChecksTest(unittest.TestCase):
+    ROW = {"label": "x（全样本）", "items": 50, "missing": 0, "headline_verbatim_pct": 100.0, "second_other_lang_pct": 98.0,
+           "hit_zh_pct": 96.0, "hit_en_pct": 100.0, "offschema_edge_pct": 0.0, "dangling_edge_pct": 0.0, "unknown_type": 0}
+
+    def verdict(self, row=None, pairs=(), prompt="agent-v4+bench1", lint=0, blind=None):
+        return xb.admission_checks(dict(self.ROW, **(row or {})), list(pairs), run_prompt=prompt,
+                                   baseline_prompt="agent-v4", lint_problems=lint, blind=blind)
+
+    def test_verdict_levels(self):
+        ok_blind = {"judged": 10, "errors": 1}
+        self.assertEqual(self.verdict(blind=ok_blind)[1], "pass")
+        self.assertEqual(self.verdict()[1], "pending_blind")                        # 没盲评
+        self.assertEqual(self.verdict(row={"items": 10}, blind=ok_blind)[1], "screen_pass")   # 10 条只算筛选
+        for bad in ({"row": {"missing": 1}}, {"lint": 2}, {"row": {"headline_verbatim_pct": 94.0}},
+                    {"row": {"second_other_lang_pct": 90.0}}, {"row": {"hit_zh_pct": 89.0}},
+                    {"row": {"dangling_edge_pct": 0.5}}, {"row": {"unknown_type": 1}}, {"prompt": "agent-v3+bench1"},
+                    {"blind": {"judged": 10, "errors": 2}}):
+            with self.subTest(bad=bad):
+                kw = {"blind": ok_blind, **bad}
+                self.assertEqual(self.verdict(**kw)[1], "fail")
+
+    def test_subset_must_not_drop_more_than_five_points(self):
+        base = {"label": "haiku（基线）", "hit_zh_pct": 100.0, "hit_en_pct": 100.0}
+        ok = ({"label": "x｜haiku 那部分", "hit_zh_pct": 95.0, "hit_en_pct": 100.0}, base)
+        bad = ({"label": "x｜haiku 那部分", "hit_zh_pct": 94.9, "hit_en_pct": 100.0}, base)
+        blind = {"judged": 10, "errors": 0}
+        self.assertEqual(self.verdict(pairs=[ok], blind=blind)[1], "pass")
+        checks, v = self.verdict(pairs=[bad], blind=blind)
+        self.assertEqual(v, "fail")
+        self.assertTrue(any("haiku 那部分" in c["check"] and not c["pass"] for c in checks))
+
+
 class EndToEndTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -135,6 +167,42 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(by["haiku（基线）"]["hit_zh_pct"], 100.0)            # 问句与标题 fact 前 6 字相同
         self.assertEqual(by["qoder-x｜opus 那部分"]["hit_zh_pct"], 0.0)       # 没交的那条不命中
         self.assertIn("| qoder-x（全样本） |", xb.render(rows))
+
+    def test_blind_sheet_and_admit_writes_record(self):
+        p, m = xb._bench(str(self.bench))
+        titles = self.titles
+
+        def factory(model, system):
+            def call(q):
+                obs = json.loads(q.split("观测：", 1)[1])
+                body = [item([edge(titles[o["id"]]), edge(f"English {o['id']}")], id=o["id"]) for o in obs]
+                return {"text": json.dumps({"items": body}, ensure_ascii=False), "error": None, "stop": "end_turn",
+                        "credits": 1.0, "ms": 100}
+            return call
+        root = _Path(self.tmp.name)
+        dirs = xb.run_models(p, m, ["甲模型", "乙模型"], executor="qodercli", out_root=root / "runs", tag="adm",
+                             limit=None, chunk=10, parallel=1, call_factory=factory)
+        runs = [xb.load_run(d) for d in dirs]
+        sheet, key = xb.blind_sheet(p, m, runs, n=2)
+        self.assertEqual(len(sheet), 4)
+        self.assertNotIn("甲模型", json.dumps(sheet, ensure_ascii=False))           # 评审表里没有模型名
+        self.assertEqual(sorted(set(key.values())), ["qodercli-乙模型", "qodercli-甲模型"])
+        self.assertTrue(all(e["episode_body"] and e["title"] for e in sheet))     # 评审者能对照原文
+        for e in sheet:
+            e["verdict"] = "error" if key[e["code"]] == "qodercli-乙模型" else "ok"
+        self.assertEqual(xb.blind_result(sheet, key, "qodercli-乙模型")["errors"], 2)
+        with mock.patch.object(xb, "embed", fake_embed), mock.patch.object(xb, "BLIND_N", 2), \
+                mock.patch.object(xb, "ADMISSION_MIN_ITEMS", 2), mock.patch.dict("os.environ", {"KG_HUB_BENCH_ROOT": str(root)}):
+            xb._corpus_cache.clear()
+            good = xb.admit(p, m, runs[0], sheet=sheet, key=key)
+            bad = xb.admit(p, m, runs[1], sheet=sheet, key=key)
+            pending = xb.admit(p, m, runs[0])
+            self.assertEqual((good["verdict"], bad["verdict"], pending["verdict"]), ("pass", "fail", "pending_blind"))
+            self.assertEqual(xb.latest_admission("甲模型")["verdict"], "pending_blind")   # 最新一条为准
+            hist = json.loads((root / "admissions" / "甲模型.json").read_text())["history"]
+            self.assertEqual([h["verdict"] for h in hist], ["pass", "pending_blind"])
+            self.assertEqual(good["prompt_version"].split("+")[0], "agent-v4")
+            self.assertIsNone(xb.latest_admission("没跑过的模型"))
 
     def test_run_models_writes_runs_and_scores_them_together(self):
         p, m = xb._bench(str(self.bench))

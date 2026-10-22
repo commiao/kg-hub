@@ -109,6 +109,8 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
   自检（`lint`）与评分（`score`：纪律、密度、照抄标题率、译文边率、换说法问句 top-10 可检索率，并按基线模型逐对比较）。
   样本、基线、问句含观测正文，只在本机 `~/.kg-hub/bench/`，不进仓库。已入图的观测再提交会被挡成 skipped，
   所以换工具/换模型的对比都走这条离线路，不入主图；执行步骤见 `docs/executors/qoder.md` 的「对比模式」。
+  bench 同时是**准入**：`extract_bench blind` + `admit` 按硬性、质量、正确性门槛给出 pass / fail，记录在本机；
+  战役（`extract_campaign`）只接受 pass 的模型，见 `docs/executors/campaign.md`。
 - **金标（待建）**：从冻结样本里取 20 条，人工给出实体（名、类型）与关系（源、目标、边名）的参考答案，存
   `docs/gold/<sample>.json`。有了它才能算 **正确率**（现在只能算合规率和密度，密度高不等于对）。评分：
   实体名匹配走服务端同一套词面规则（`utils/extracted_ingest._lexically_same`），类型要相等；关系匹配要两端实体
