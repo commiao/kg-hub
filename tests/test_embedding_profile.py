@@ -7,7 +7,9 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 _os.environ.setdefault("KG_HUB_API_TOKEN", "unit-test-only-token")
 import asyncio
+import io
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 
 from utils import embedding_profile as ep
@@ -197,7 +199,8 @@ class ReembedRestoreGuardTest(unittest.TestCase):
                 mock.patch.object(rb, "_wait_idle", side_effect=fake_wait_idle), \
                 mock.patch.object(rb, "_write_vectors", side_effect=fake_write):
             try:
-                rc = rb.cmd_restore(self.args)
+                with redirect_stdout(io.StringIO()):
+                    rc = rb.cmd_restore(self.args)
                 return rc, written, drains
             except SystemExit as exc:
                 return exc.code, written, drains
