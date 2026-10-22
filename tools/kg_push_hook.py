@@ -112,6 +112,11 @@ _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 GIT_TIMEOUT_SEC = 1.0  # 本机实测 rev-parse 约 10ms；超时就当不是仓库
 
+# 临时目录里认不出仓库的，不是项目。2026-10-22 实测：Claude 会话的 scratchpad
+# /private/tmp/claude-501/<桶>/<会话 uuid>/scratchpad 取到关键词 scratchpad。
+# 只拦旧逻辑这一档：临时目录里的 git 仓库 / worktree 仍按仓库名认。
+_TEMP_ROOTS = tuple(Path(r) for r in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders"))
+
 
 def _usable_keyword(kw: str) -> bool:
     if not kw or len(kw) < _MIN_KEYWORD_CHARS:
@@ -180,7 +185,7 @@ def derive_project_keywords(cwd: str) -> list[str]:
     认不出项目时退回「目录名 + 上级目录名」，并去掉系统目录、容器目录、隐藏目录、
     日期和哈希：
       ~/workspace_codex/hello-app → ['hello-app', 'workspace_codex']
-      ~/.claude、~/Documents/Qoder/<日期>/<哈希>、/tmp → []
+      ~/.claude、~/Documents/Qoder/<日期>/<哈希>、/tmp 下的会话目录 → []
 
     宁可不注入，也不拿 .claude / 哈希 / workspace 去全文检索，把不相关的
     canonical 塞进会话。
@@ -194,6 +199,8 @@ def derive_project_keywords(cwd: str) -> list[str]:
         project = _project_from_git(p)
     if project is not None:
         return [project] if _usable_keyword(project) else []
+    if any(p.is_relative_to(root) for root in _TEMP_ROOTS):
+        return []
 
     raw_parts = [p.name]
     if p.parent and p.parent.name:

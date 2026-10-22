@@ -35,6 +35,11 @@ class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name).resolve()
+        # 沙箱本身在系统临时目录里，换成沙箱内的假临时根，其余路径才算「不在临时目录」
+        self.tmp_root = self.root / "tmp-root"
+        patcher = mock.patch.object(H, "_TEMP_ROOTS", (self.tmp_root,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -93,6 +98,11 @@ class Git(Base):
         # 旧逻辑：['libtv-m', 'workspace']，首查没命中就拿 workspace 去检索
         self.assertEqual(derive_project_keywords(str(self.repo)), ["libtv-m"])
 
+    def test_repo_inside_temp_dir_still_named(self):
+        # 临时目录只拦认不出仓库的那一档；/tmp 下的克隆、worktree 照样按仓库名认
+        with mock.patch.object(H, "_TEMP_ROOTS", (self.root,)):
+            self.assertEqual(derive_project_keywords(str(self.repo)), ["libtv-m"])
+
     def test_repo_subdir(self):
         d = self.repo / "app" / "screens"
         d.mkdir(parents=True)
@@ -140,6 +150,12 @@ class Fallback(Base):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_session_dir_under_temp_root(self):
+        # 2026-10-22 实测：scratchpad 取到关键词 scratchpad
+        d = self.mk("tmp-root/claude-501/-Users-mac-work-ai-kg-hub/e287560d-e4aa-4b74-95b4-9a93b92b76f7/scratchpad")
+        self.assertEqual(derive_project_keywords(str(d)), [])
+        self.assertEqual(derive_project_keywords(str(self.mk("tmp-root/release-check"))), [])
+
     def test_tool_config_dir(self):
         # 真实位置是 ~/.claude，上级 mac 是系统目录
         self.assertEqual(derive_project_keywords(str(self.mk("Users/mac/.claude"))), [])
@@ -168,6 +184,16 @@ class Fallback(Base):
     def test_system_dirs(self):
         self.assertEqual(derive_project_keywords("/tmp"), [])
         self.assertEqual(derive_project_keywords("/Users"), [])
+
+
+class RealTempRoots(unittest.TestCase):
+    """不替换 _TEMP_ROOTS：日志里的真实形态（目录不存在也一样，git 认不出）。"""
+
+    def test_claude_scratchpad(self):
+        cwd = ("/private/tmp/claude-501/-Users-mac-work-ai-kg-hub--claude-worktrees-gateway-x"
+               "/e287560d-e4aa-4b74-95b4-9a93b92b76f7/scratchpad")
+        self.assertEqual(derive_project_keywords(cwd), [])
+        self.assertEqual(derive_project_keywords("/tmp/oss-duration-check/notes"), [])
 
 
 if __name__ == "__main__":
