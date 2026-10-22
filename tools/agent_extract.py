@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
-PROMPT_VERSION = "agent-v3"   # v1→v2 第 1 轮（haiku）复盘；v2→v3 第 2 轮（opus）复盘，见 config/agent_extract_prompt.md 末尾
+PROMPT_VERSION = "agent-v4"   # v1→v2 第 1 轮（haiku）复盘；v2→v3 第 2 轮（opus）复盘；v3→v4 三模型 2000 条 chain-v8 定稿，见 config/agent_extract_prompt.md 末尾
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_NAS = "commiao@100.123.208.32"
 DEFAULT_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
