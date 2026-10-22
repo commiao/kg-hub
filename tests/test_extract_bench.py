@@ -96,6 +96,19 @@ class RestFactRule23Test(unittest.TestCase):
         self.assertEqual(self.agg([[en_ok, "x" * 201]])["rest_fact_len_ok_pct"], 50.0)
         self.assertEqual(self.agg([[en_ok, "y" * 200]])["rest_fact_len_ok_pct"], 100.0)
 
+    def test_english_sentence_with_chinese_entity_names_counts_as_english(self):
+        ents = [{"name": "发布前20问与37条溯源工作规则", "type": "Concept"}, {"name": "关键测试须通过真实变异验证", "type": "Lesson"}]
+        it = {"id": 1, "entities": ents, "edges": [
+            edge(TITLE, "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("English translation of the title", "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("发布前20问与37条溯源工作规则 requires 关键测试须通过真实变异验证 under Rule 17 with a fake PATH",
+                 "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("发布前20问与37条溯源工作规则 要求关键测试在临时 HOME 与假 PATH 下做变异验证并复查真实环境未被改动",
+                 "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证")]}
+        m = xb.item_metrics(it, TITLE, ENTITY_TYPES, EDGE_TYPES)
+        self.assertEqual((m["rest_facts"], m["rest_en"]), (2, 1))   # 英文谓语算英文；整句中文仍算中文
+        self.assertEqual(xb.strip_names("长名字里的短名 x", ["短名", "长名字里的短名"]), "x")
+
     def test_no_rest_facts_is_not_a_violation(self):
         r = self.agg([[], []])                     # 只有标题原文 + 译文（增量观测允许）
         self.assertEqual((r["rest_fact_en_pct"], r["rest_fact_len_ok_pct"]), (100.0, 100.0))

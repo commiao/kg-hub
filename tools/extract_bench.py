@@ -55,6 +55,13 @@ def is_cjk(s: str) -> bool:
     return cjk_share(s) >= 0.1
 
 
+def strip_names(fact: str, names: list[str]) -> str:
+    """去掉 fact 里出现的实体名（长名先去，免得短名把长名拆碎），剩下的才是需要按规则 23 写成英文的部分。"""
+    for n in sorted(names, key=len, reverse=True):
+        fact = fact.replace(n, " ")
+    return " ".join(fact.split())
+
+
 def item_metrics(item: dict | None, title: str, entity_types: set, edge_types: set) -> dict:
     """一条观测的结果 → 纪律、密度、链路遵从。item 为 None 表示候选没交这条。"""
     from utils.extracted_ingest import ExtractedEdge, ExtractedEntity, normalize_extraction
@@ -82,7 +89,10 @@ def item_metrics(item: dict | None, title: str, entity_types: set, edge_types: s
     m["second_other_lang"] = bool(t) and len(facts) > 1 and is_cjk(facts[1]) != is_cjk(t)
     rest = facts[2:]
     m["rest_facts"] = len(rest)
-    m["rest_en"] = sum(1 for f in rest if not is_cjk(f))
+    # 规则 23：主语、宾语直接写实体名，中文术语照原样保留——判语言前先去掉本条的实体名，只看谓语与细节。
+    # 2026-10-23：gpt-6.1-sol 的「发布前20问与37条溯源工作规则 requires …」整句是英文，只因实体名是中文被判成非英文
+    names = list({" ".join((e.get("name") or "").split()) for e in item["entities"]} - {""})
+    m["rest_en"] = sum(1 for f in rest if not is_cjk(strip_names(f, names)))
     m["rest_len"] = sum(len(f) for f in rest)
     m["rest_len_ok"] = sum(REST_LEN_MIN <= len(f) <= REST_LEN_MAX for f in rest)   # 规则 23：60–200 字符
     return m
