@@ -55,7 +55,7 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
 ## 编排者：可直接粘贴的说明
 
 ```text
-你是 kg-hub 抽取对比战役的编排者。在仓库根目录执行命令，解释器用 $HOME/.local/share/kg-hub/venv/bin/python（下称 PY）。
+你是 kg-hub 抽取对比战役的编排者。在仓库根目录执行命令，解释器用 ${KG_HUB_PYTHON:-python3}（装好 kg-hub 依赖的那个 Python，下称 PY）。
 战役 id：<战役 id，如 20261101-qoder-ds-qwen>；执行工具：<qoder / codex / cursor / claude-code>；
 参与模型：<模型 id 列表，用工具里的准确模型名>；每个模型配额 <200> 条，每批 <50> 条。
 
@@ -104,12 +104,12 @@ $PY -m tools.extract_campaign agents --id <战役> --format md --dir <目录> # 
 | **qoder** | ✅ 子代理定义的 `model` 字段生效。命令行：`qodercli -m <编排者模型> --agents "$($PY -m tools.extract_campaign agents --id <战役>)"`；界面：`agents --format md --dir <仓库>/.qoder/agents` | 主会话 Qwen3.8-Max，子代理分别指定 DeepSeek-Flash / Kimi-K3，输出 `modelUsage` 的内部模型名随之变为 `dfmodel` / `kmodel_latest`，credits 按模型分开记 |
 | **cursor** | ✅ 子代理定义的 `model` 字段生效，派子代理的工具本身也带 `model` 参数。`agents --format md --dir <仓库>/.cursor/agents` 生成定义，编排者在 cursor 里按名字调用 | 主会话 gpt-5.2，`taskToolCall` 参数里是 `model: gemini-3.7-flash-high`，子代理回复自报 Gemini 3.7 Flash |
 | **codex** | ⚠️ 未确认：派生工具自报有 `model` 参数，但 `codex exec --json` 的事件流里两次都没有派生记录（只有一次空的 `wait`），不能确认子代理真按指定模型跑 | 先用退路 |
-| **dskhress** | ❓ 本机未安装，接入方式待定 | — |
+| **DSH**（DeepSeek Harness） | ❓ 待验证：DSH 有子代理插件（`subagent` / `subagent_fork`），能否给子代理单独指定模型要在 DSH 里实测（让编排者派一个指定了模型的子代理，看 DSH 的用量记录按哪个模型计费） | 先用退路：`launch --tool dsh`，每个模型的会话开跑前在 DSH 模型设置里切好模型 |
 
 做不到方式二（或想并行开多个会话）时，用**每个模型一个会话**，仍是同一个战役：
 
 ```
-$PY -m tools.extract_campaign launch --id <战役> --tool codex|cursor|qodercli [--model <模型>...]
+$PY -m tools.extract_campaign launch --id <战役> --tool codex|cursor|qodercli|dsh [--model <模型>...]
 ```
 
 打印每个模型的启动命令：子代理说明由 `brief` 现场生成；都把战役状态目录加成可写（`--add-dir`）、放开网络

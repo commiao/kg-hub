@@ -150,6 +150,7 @@ class CampaignTest(unittest.TestCase):
         c = ec.load(ec.campaign_dir("t1"))
         b = ec.brief(c, "Qwen3.8-Max")
         self.assertIn("claim --id t1 --model Qwen3.8-Max", b)
+        self.assertIn("解释器用 ${KG_HUB_PYTHON:-python3}", b)                # 模板花括号转义正确
         self.assertIn('{"items": [{"id"', b)                         # 模板里的花括号渲染成 JSON 原样
         self.assertNotIn("{cid}", b)
         with self.assertRaises(SystemExit):
@@ -182,6 +183,12 @@ class CampaignTest(unittest.TestCase):
         self.assertIn(f"--add-dir {st}", cur)
         q = ec.launch_command("qodercli", "t1", "DeepSeek-Flash", repo=_Path("/r"), state=st)
         self.assertIn("qodercli -p -m DeepSeek-Flash -w /r", q)
+        dsh = ec.launch_command("dsh", "t1", "deepseek-v4-pro", repo=_Path("/r"), state=st)
+        self.assertIn("切到 deepseek-v4-pro", dsh)                            # dsh 没有模型参数，先在设置里切
+        self.assertIn("cd /r && dsh --profile headless", dsh)
+        for cmd in (codex, cur, q, dsh):                                      # 解释器不写死某台机器的路径
+            self.assertIn("${KG_HUB_PYTHON:-python3} -m tools.extract_campaign brief", cmd)
+            self.assertNotIn(".local/share", cmd)
         with self.assertRaises(SystemExit):
             ec.launch_command("vim", "t1", "m")
 
