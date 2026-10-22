@@ -3442,6 +3442,21 @@ def _log_delivery(endpoint: str, kw: str, picked: list) -> None:
         pass
 
 
+def _latest_per_name(rows) -> list:
+    """同名 Episodic 只留 created_at 最新的一个。
+
+    tools/ingest_canonical_docs.py 重新入库时 add_episode 新建节点、旧版不归档，
+    同一篇胶囊会有多个未归档版本：不去重就会同时注入新旧两版、占掉两个名额。
+    """
+    latest: dict = {}
+    for row in rows:
+        nm = row.get("name")
+        cur = latest.get(nm)
+        if cur is None or str(row.get("created_at") or "") > str(cur.get("created_at") or ""):
+            latest[nm] = row
+    return list(latest.values())
+
+
 async def canonical_context(request: Request) -> JSONResponse:
     """GET /api/canonical_context?kw=<keyword>&top_n=3&bump=1
 
@@ -3486,11 +3501,12 @@ async def canonical_context(request: Request) -> JSONResponse:
             # G3: 排除归档胶囊（如 INCIDENT-RETRO），不再进 canonical 注入候选
             "MATCH (n:Episodic) WHERE n.name STARTS WITH 'kg-hub-canonical' "
             "AND NOT coalesce(n.archived, false) "
-            "RETURN n.name AS name, n.content AS content, "
+            "RETURN n.name AS name, n.uuid AS uuid, n.content AS content, "
             "       n.source_description AS source, "
-            "       coalesce(n.usage_count, 0) AS uc, n.scope AS scope",
+            "       coalesce(n.usage_count, 0) AS uc, n.scope AS scope, "
+            "       n.created_at AS created_at",
         )
-        for row in r1:
+        for row in _latest_per_name(r1):
             nm = row.get("name")
             content = row.get("content") or ""
             scope = row.get("scope") or CANONICAL_SCOPE.get(nm, DEFAULT_SCOPE)
@@ -3506,6 +3522,7 @@ async def canonical_context(request: Request) -> JSONResponse:
                 bonus = 0.0
             cand.append({
                 "name": nm,
+                "uuid": row.get("uuid"),
                 "content": content[:EXCERPT_CAP],
                 "source": row.get("source") or "",
                 "is_canonical": True,
@@ -3542,7 +3559,7 @@ async def canonical_context(request: Request) -> JSONResponse:
             r2, _, _ = await driver.execute_query(
                 "CALL db.idx.fulltext.queryNodes('Episodic', $q) YIELD node, score "
                 "WHERE NOT node.name IN $exclude AND NOT coalesce(node.archived, false) "
-                "RETURN node.name AS name, node.content AS content, "
+                "RETURN node.name AS name, node.uuid AS uuid, node.content AS content, "
                 "       node.source_description AS source, score AS score "
                 "ORDER BY score DESC LIMIT $lim",
                 q=kw,
@@ -3551,8 +3568,12 @@ async def canonical_context(request: Request) -> JSONResponse:
             )
             for row in r2:
                 nm = row.get("name")
+                if nm in seen:  # 同名多版本只取得分最高的那个
+                    continue
+                seen.add(nm)
                 rows.append({
                     "name": nm,
+                    "uuid": row.get("uuid"),
                     "content": (row.get("content") or "")[:EXCERPT_CAP],
                     "source": row.get("source") or "",
                     "score": float(row.get("score") or 0),
@@ -3575,11 +3596,13 @@ async def canonical_context(request: Request) -> JSONResponse:
     if bump and picked:
         try:
             br, _, _ = await driver.execute_query(
-                "MATCH (n:Episodic) WHERE n.name IN $names "
+                # 按 uuid 记：按 name 会把同名的历史版本一起 +1（2026-10-22 实测
+                # 9 篇胶囊有 19 个未归档节点，一次注入 DESIGN 记 4 次）。
+                "MATCH (n:Episodic) WHERE n.uuid IN $uuids "
                 "SET n.usage_count = coalesce(n.usage_count, 0) + 1, "
                 "    n.last_used_at = $now "
                 "RETURN count(n) AS c",
-                names=[p["name"] for p in picked],
+                uuids=[p["uuid"] for p in picked if p.get("uuid")],
                 now=datetime.now(tz=timezone.utc).isoformat(),
             )
             if br:
