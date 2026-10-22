@@ -41,6 +41,7 @@ DEFAULT_ROOT = Path.home() / ".kg-hub" / "bench"
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_CACHE = Path.home() / ".kg-hub" / "reembed" / "fastembed-cache"
 TOP_K = 10
+REST_LEN_MIN, REST_LEN_MAX = 60, 200   # 规则 23：第 21、22 条之外的 fact 用英文完整句，60–200 字符
 
 
 # ---------- 纯函数（有测试） ----------
@@ -83,6 +84,7 @@ def item_metrics(item: dict | None, title: str, entity_types: set, edge_types: s
     m["rest_facts"] = len(rest)
     m["rest_en"] = sum(1 for f in rest if not is_cjk(f))
     m["rest_len"] = sum(len(f) for f in rest)
+    m["rest_len_ok"] = sum(REST_LEN_MIN <= len(f) <= REST_LEN_MAX for f in rest)   # 规则 23：60–200 字符
     return m
 
 
@@ -104,8 +106,10 @@ def aggregate(ms: list[dict]) -> dict:
         "unknown_type": sum(m["unknown_type"] for m in ne), "dirty_name": sum(m["dirty_name"] for m in ne),
         "headline_verbatim_pct": round(100 * sum(m["headline_verbatim"] for m in ne) / k, 1),
         "second_other_lang_pct": round(100 * sum(m["second_other_lang"] for m in ne) / k, 1),
-        "rest_fact_en_pct": round(100 * sum(m["rest_en"] for m in ne) / max(1, rest), 1),
+        # 没有其余 fact（只有标题原文 + 译文两条，增量观测允许）= 没有违规，记 100
+        "rest_fact_en_pct": round(100 * sum(m["rest_en"] for m in ne) / rest, 1) if rest else 100.0,
         "rest_fact_len": round(sum(m["rest_len"] for m in ne) / max(1, rest)),
+        "rest_fact_len_ok_pct": round(100 * sum(m["rest_len_ok"] for m in ne) / rest, 1) if rest else 100.0,
     }
 
 
@@ -310,7 +314,7 @@ COLS = [("items", "条数"), ("missing", "未交"), ("empty", "空"), ("ent_per_
         ("zero_edge", "零边"), ("missing_edges_key", "缺 edges"), ("offschema_edge_pct", "边名越界%"),
         ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"), ("dirty_name", "脏命名"),
         ("headline_verbatim_pct", "照抄标题%"), ("second_other_lang_pct", "译文边%"), ("rest_fact_en_pct", "其余英文%"),
-        ("rest_fact_len", "其余均长"), ("hit_zh_pct", "中文问句命中%"), ("hit_en_pct", "英文问句命中%"),
+        ("rest_fact_len", "其余均长"), ("rest_fact_len_ok_pct", "其余长度合规%"), ("hit_zh_pct", "中文问句命中%"), ("hit_en_pct", "英文问句命中%"),
         ("tokens_per_obs", "token/条"), ("credits_per_obs", "credits/条"), ("sec_per_obs", "秒/条")]
 
 
@@ -636,6 +640,9 @@ def load_run(d: Path) -> dict:
 ADMISSION_MIN_ITEMS = 30
 BLIND_N = 10
 THRESHOLDS = {"headline_verbatim_pct": 95.0, "second_other_lang_pct": 95.0, "hit_zh_pct": 90.0, "hit_en_pct": 90.0,
+              # 规则 23：其余 fact 用英文完整句、60–200 字符。2026-10-23 冒烟里 gpt-6-luna 其余 fact 全是中文、
+              # Qwen3.8-Max 过长（合规 44%），原门槛没查这两项照样判 screen_pass；基线三模型两项都在 99–100
+              "rest_fact_en_pct": 90.0, "rest_fact_len_ok_pct": 80.0,
               "subset_drop_pts": 5.0, "blind_max_errors": 1, "empty_extra_pts": 5.0}
 # 基线批次的约定版本 → 等价的规则正文版本：bench-20261022 的基线是 agent-v3 + chain-v8，内容即 agent-v4 规则 21–28
 BASELINE_EQUIV = {"c8": "agent-v4"}
@@ -698,7 +705,8 @@ def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: s
         baseline_prompt is not None and base_version(run_prompt) == baseline_prompt)
     add("未交 = 0", row["missing"], 0, row["missing"] == 0)
     add("硬错误（schema / 悬空边 / 缺 edges）= 0", lint_problems, 0, lint_problems == 0)
-    for k in ("headline_verbatim_pct", "second_other_lang_pct", "hit_zh_pct", "hit_en_pct"):
+    for k in ("headline_verbatim_pct", "second_other_lang_pct", "hit_zh_pct", "hit_en_pct", "rest_fact_en_pct",
+              "rest_fact_len_ok_pct"):
         add(k, row[k], f">= {t[k]}", row[k] >= t[k])
     for k in ("offschema_edge_pct", "dangling_edge_pct", "unknown_type"):
         add(f"{k} = 0", row[k], 0, row[k] == 0)
