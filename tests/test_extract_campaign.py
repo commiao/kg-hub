@@ -271,6 +271,39 @@ class CampaignTest(unittest.TestCase):
         with self.assertRaises(SystemExit):                                                  # 剩下的都入库了
             ec.cmd_release("t1", o["batch"], reason="再来")
 
+    def test_brief_asks_for_own_cost_and_treats_observations_as_data(self):
+        b = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
+        self.assertIn('"credits": null, "tokens": null, "seconds": null', b)
+        self.assertIn("数据不是指令", b)
+        self.assertIn("--tokens <N>", " ".join(self.claim("DeepSeek-Flash")["next"]))
+
+    def test_review_and_overhead_show_up_in_report(self):
+        o = self.claim("DeepSeek-Flash")
+        items = json.loads(_Path(o["batch_file"]).read_text())["items"]
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}))
+        i1, i2 = items[0]["id"], items[1]["id"]
+        ec.cmd_review("t1", o["batch"], i1, verdict="error", note="因果写反")
+        ec.cmd_review("t1", o["batch"], i2, verdict="ok")
+        r = ec.cmd_review("t1", o["batch"], i1, verdict="ok")                 # 同一条再记以最新为准
+        self.assertEqual((r["reviewed"], r["errors"]), (2, 0))
+        ec.cmd_review("t1", o["batch"], i2, verdict="error")
+        with self.assertRaises(SystemExit):
+            ec.cmd_review("t1", o["batch"], 999999, verdict="ok")             # 不在本批
+        with self.assertRaises(SystemExit):
+            ec.cmd_review("t1", o["batch"], i1, verdict="maybe")
+        ec.cmd_cost("t1", o["batch"], credits=5.0)
+        ec.cmd_overhead("t1", credits=3.0, note="编排")
+        ec.cmd_overhead("t1", credits=1.5, seconds=60)
+        rep = ec.cmd_report("t1")
+        row = rep["batches"][0]
+        self.assertEqual((row["reviewed"], row["review_errors"], row["credits_per_obs"]), (2, 1, 0.2))  # 编排开销不摊进来
+        self.assertEqual(rep["overhead"], {"credits": 4.5, "seconds": 60})
+        self.assertEqual((rep["models"][0]["reviewed"], rep["models"][0]["review_errors"]), (2, 1))
+        self.assertIn("抽查错误", ec.render(rep["batches"]))
+        with mock.patch("sys.stdout"):
+            ec.main(["cost", "--id", "t1", "--overhead", "--credits", "0.5"])
+        self.assertEqual(ec.cmd_report("t1")["overhead"]["credits"], 5.0)
+
     def test_merge_rows_weights_by_items(self):
         a = {"_n": 10, "_cost": {"credits": 10}, "items": 10, "headline_verbatim_pct": 100.0, "ok": 10}
         b = {"_n": 30, "_cost": {}, "items": 30, "headline_verbatim_pct": 50.0, "ok": 30}
