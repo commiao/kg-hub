@@ -126,43 +126,87 @@ def doc_reference_time(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
 
+# add_episode does NOT replace a same-name Episodic node — every re-ingest adds a
+# new one. Until 2026-10-22 old versions were never archived: 9 capsules had 19
+# live nodes. After a re-ingest the older versions are archived, but only when
+# the new extraction is at least this fraction of the best live version's
+# RELATES_TO edges. Otherwise they stay live, because search drops a fact once
+# all of its backing episodes are archived. Measured version-to-version ratios
+# on 2026-10-22: healthy re-extractions 0.8–2.8×; the runs made while the
+# extraction breaker was open got 0 (ONBOARDING / OBSERVATION-PHASE / ROADMAP)
+# and 0.21 (DESIGN 77 → 16). Archiving after those would have removed 289 facts.
+SUPERSEDE_MIN_EDGE_RATIO = 0.5
+
+
 async def read_capsule_meta(g, name: str) -> dict:
-    """Best-effort: read usage_count / last_used_at off an existing capsule node
-    BEFORE re-ingest, so we can restore them afterward. add_episode rebuilds the
-    Episodic node and would otherwise zero the PUSH-hook Lindy signal (the cause
-    of the 2026-06-14 usage_count reset). Returns {} on any failure."""
+    """Best-effort: read usage_count / last_used_at off the live capsule nodes
+    BEFORE re-ingest, so we can restore them afterward (a new Episodic node
+    starts at zero — the cause of the 2026-06-14 usage_count reset), plus the
+    largest RELATES_TO count among the live versions for the supersede check.
+    Returns {} on any failure."""
     try:
         r, _, _ = await g.driver.execute_query(
-            "MATCH (n:Episodic {name: $name}) "
-            "RETURN coalesce(n.usage_count, 0) AS uc, n.last_used_at AS last",
+            "MATCH (n:Episodic {name: $name}) WHERE NOT coalesce(n.archived, false) "
+            "OPTIONAL MATCH ()-[e:RELATES_TO]->() WHERE n.uuid IN e.episodes "
+            "RETURN n.uuid AS uuid, coalesce(n.usage_count, 0) AS uc, "
+            "       n.last_used_at AS last, count(e) AS edges",
             name=name,
         )
         if r:
-            return {"usage_count": int(r[0].get("uc") or 0), "last_used_at": r[0].get("last")}
+            return {
+                "usage_count": max(int(row.get("uc") or 0) for row in r),
+                "last_used_at": max((row.get("last") for row in r if row.get("last")),
+                                    key=str, default=None),
+                "versions": len(r),
+                "best_edges": max(int(row.get("edges") or 0) for row in r),
+            }
     except Exception as exc:  # noqa: BLE001
         print(f"      [meta] read skipped for {name}: {type(exc).__name__}: {exc}")
     return {}
 
 
-async def persist_capsule_meta(g, name: str, scope: str, prev: dict) -> None:
+def should_supersede(new_edges: int, best_edges: int | None) -> bool:
+    """Archive the older versions only when the new one carries the facts too."""
+    if new_edges <= 0:
+        return False
+    if not best_edges:
+        return True
+    return new_edges >= SUPERSEDE_MIN_EDGE_RATIO * best_edges
+
+
+async def archive_superseded(g, name: str, keep_uuid: str) -> int:
+    """Archive every other live version of this capsule (reversible: archived=false)."""
+    r, _, _ = await g.driver.execute_query(
+        "MATCH (n:Episodic {name: $name}) "
+        "WHERE n.uuid <> $keep AND NOT coalesce(n.archived, false) "
+        "SET n.archived = true, n.archived_at = $now, n.superseded_by = $keep "
+        "RETURN count(n) AS c",
+        name=name,
+        keep=keep_uuid,
+        now=datetime.now(tz=timezone.utc).isoformat(),
+    )
+    return int(r[0].get("c") or 0) if r else 0
+
+
+async def persist_capsule_meta(g, uuid: str, scope: str, prev: dict) -> None:
     """Best-effort: stamp scope and restore the preserved usage_count /
-    last_used_at after re-ingest. Guarded so it can never fail the ingest."""
+    last_used_at on the new node only. Guarded so it can never fail the ingest."""
     try:
         await g.driver.execute_query(
-            "MATCH (n:Episodic {name: $name}) "
+            "MATCH (n:Episodic {uuid: $uuid}) "
             "SET n.scope = $scope, "
             "    n.usage_count = $uc, "
             "    n.last_used_at = coalesce($last, n.last_used_at)",
-            name=name,
+            uuid=uuid,
             scope=scope,
             uc=prev.get("usage_count", 0),
             last=prev.get("last_used_at"),
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"      [meta] persist skipped for {name}: {type(exc).__name__}: {exc}")
+        print(f"      [meta] persist skipped for {uuid}: {type(exc).__name__}: {exc}")
 
 
-async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
+async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int, str]:
     path = repo_root / doc["path"]
     body = path.read_text(encoding="utf-8")
     ref = doc_reference_time(path)
@@ -184,7 +228,7 @@ async def ingest_one(g, doc: dict, repo_root: Path) -> tuple[int, int]:
             edge_types=EDGE_TYPES,
             edge_type_map=EDGE_TYPE_MAP,
         )
-    return len(result.nodes), len(result.edges)
+    return len(result.nodes), len(result.edges), result.episode.uuid
 
 
 async def _do_main(args) -> int:
@@ -239,10 +283,25 @@ async def _do_main(args) -> int:
         print(f"  [{i}/{len(todo)}] {doc['name']}  ({size_kb:.1f} KB)  — extracting...")
         try:
             prev_meta = await read_capsule_meta(g, doc["name"])
-            n, e = await ingest_one(g, doc, REPO_ROOT)
-            await persist_capsule_meta(g, doc["name"], doc.get("scope", "global"), prev_meta)
+            n, e, new_uuid = await ingest_one(g, doc, REPO_ROOT)
+            await persist_capsule_meta(g, new_uuid, doc.get("scope", "global"), prev_meta)
+            held_back = False
+            if prev_meta.get("versions"):
+                best = prev_meta.get("best_edges")
+                if should_supersede(e, best):
+                    archived = await archive_superseded(g, doc["name"], new_uuid)
+                    print(f"      [supersede] archived {archived} older version(s)")
+                else:
+                    held_back = True
+                    print(f"      ⚠ [supersede] kept {prev_meta['versions']} older version(s) live: "
+                          f"new extraction has {e} edges vs best live version {best} "
+                          f"(< {SUPERSEDE_MIN_EDGE_RATIO:.0%}) — archiving them would drop "
+                          f"their facts from search. Watermark not updated; re-run when "
+                          f"extraction is healthy.")
             total_n += n
             total_e += e
+            if held_back:
+                continue
             wm[doc["name"]] = {
                 "sha256": h,
                 "ingested_at": datetime.now(tz=timezone.utc).isoformat(),
