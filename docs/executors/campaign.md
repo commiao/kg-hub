@@ -48,6 +48,18 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
   没正式提交的整批放回队列；已提交的只放回没入库的那几条。放回的条目还给配额，下一次任何模型 `claim` 时优先领
   （这期间已在别处入库的自动丢掉）。不要手改 `campaign.json`。
 
+## 同一台设备上多个工具、多个战役同时跑
+
+- **同一个战役**：领批、提交、记成本都在战役目录的文件锁里，多个工具（Claude Code、qoder、codex、cursor、DSH）同时跑不会领到同一条。
+- **不同战役之间、战役与 `agent_extract next` 之间**：走**全设备在途领取登记**（`tools/claim_registry.py`，
+  默认 `~/.kg-hub/claims/`，不随 `KG_HUB_AGENT_EXTRACT_DIR` 变）。领批时剔除别人正领着的观测，领到的登记到自己名下
+  （每个战役一个领取方，每个 next 状态目录一个）；正式提交后入库的注销，没入库的留着等回收重领；登记 12 小时
+  （`KG_HUB_CLAIM_TTL_HOURS`）没动静自动失效。被跳过的观测领取方的游标会越过去，若占着的一方最后没入库，
+  它们留在积压里，不会丢。
+- 查看与清理：`$PY -m tools.claim_registry list`、`release --owner campaign:<战役>`、`purge`。
+- 沙箱里的工具要能写登记目录：`launch` 生成的命令已自动加上（`--add-dir`）。
+- **跨设备**不在登记范围内，同时跑仍靠服务端幂等键兜底（图里不重复，但后到的那份抽取白花）；需要时再把领取做到服务端。
+
 ## 角色
 
 | 角色 | 做什么 | 不做什么 |

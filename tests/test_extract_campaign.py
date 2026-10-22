@@ -46,7 +46,8 @@ def PASS(model):
 class CampaignTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": self.tmp.name})
+        self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": self.tmp.name,
+                                                "KG_HUB_CLAIMS_DIR": os.path.join(self.tmp.name, "claims")})
         self.env.start()
         self.patches = [mock.patch.object(ax, "select_batch", fake_select),
                         mock.patch.object(ax, "load_config", lambda: {})]
@@ -375,6 +376,92 @@ class CampaignTest(unittest.TestCase):
         b = {"_n": 30, "_cost": {}, "items": 30, "headline_verbatim_pct": 50.0, "ok": 30}
         m = ec.merge_rows("x", [a, b])
         self.assertEqual((m["items"], m["ok"], m["headline_verbatim_pct"], m["credits_per_obs"]), (40, 40, 62.5, 1.0))
+
+
+
+class DeviceWideClaimsTest(unittest.TestCase):
+    """全设备在途登记（tools/claim_registry）：跨战役、战役与 agent_extract next 之间不重复领。
+    只复用 CampaignTest 的夹具，不继承它的用例（否则那些用例会再跑一遍）。"""
+    setUp, tearDown, claim = CampaignTest.setUp, CampaignTest.tearDown, CampaignTest.claim
+
+    def claim_in(self, cid, model):
+        return ec.cmd_claim(cid, model, url="http://x", token=None, fetch=fake_fetch, check=lambda idents: {})
+
+    def ids_of(self, out):
+        return [i["id"] for i in json.loads(_Path(out["batch_file"]).read_text())["items"]]
+
+    def test_two_campaigns_running_at_once_never_claim_the_same_observation(self):
+        ec.cmd_start("t2", ["Kimi-K3"], executor="cursor", quota=60, batch=25, after_id=0, lookup=PASS)
+        jobs = [("t1", "DeepSeek-Flash"), ("t2", "Kimi-K3"), ("t1", "Qwen3.8-Max")] * 2
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            outs = list(ex.map(lambda j: self.claim_in(*j), jobs))
+        ids = [i for o in outs if o.get("batch") for i in self.ids_of(o)]
+        self.assertEqual(len(ids), len(set(ids)))                          # 两个战役同一起点开局，也没有重叠
+        t2 = ec.load(ec.campaign_dir("t2"))
+        self.assertEqual(sum(len(b["ids"]) for b in t2["batches"]), 50)
+
+    def test_submit_releases_ingested_and_keeps_failed_reserved(self):
+        from tools import claim_registry as cr
+        o = self.claim("DeepSeek-Flash")
+        bid, ids = o["batch"], self.ids_of(o)
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(i) for i in ids]}, ensure_ascii=False))
+
+        def post(method, url, body, token):
+            if body.get("dry_run"):
+                return 200, {"status": "dry_run", "resolved": {}, "new_entities": []}
+            if body["source_obs_id"] == f"h{ids[0]}":
+                return 500, {"status": "error", "code": "boom"}
+            return 200, {"status": "ok", "episode_uuid": "u"}
+        ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=post)
+        with cr.opened() as reg:                                           # dry-run 不注销
+            self.assertEqual(reg.held_by_others("campaign:other"), set(ids))
+        ec.cmd_submit("t1", bid, dry_run=False, url="http://x", token=None, post=post)
+        with cr.opened() as reg:                                           # 入库的注销，失败的留着等回收重领
+            self.assertEqual(reg.held_by_others("campaign:other"), {ids[0]})
+
+    def test_agent_extract_next_and_campaigns_avoid_each_other(self):
+        o = self.claim("DeepSeek-Flash")
+        camp = set(self.ids_of(o))
+        sd = _Path(self.tmp.name) / "next-state"
+        with mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(sd)}), \
+                mock.patch.object(ax, "fetch_remote_pending", fake_fetch), \
+                mock.patch.object(ax, "check_existing", lambda idents, url, token: {}), \
+                mock.patch.object(ax, "api_token", lambda *a, **k: "t"), \
+                mock.patch("sys.stdout"):
+            ax.main(["next", "--n", "10"])
+        nxt = [i["id"] for i in json.loads((sd / "batch-b0001.json").read_text())["items"]]
+        self.assertEqual(len(nxt), 10)
+        self.assertFalse(camp & set(nxt))                                   # next 不领战役占着的
+        b = json.loads((sd / "batch-b0001.json").read_text())
+        self.assertGreater(b["stats"]["held_elsewhere"], 0)
+        later = set(self.ids_of(self.claim("Qwen3.8-Max")))
+        self.assertFalse(later & set(nxt))                                  # 战役也不领 next 占着的
+        # next 正式提交后，入库的注销
+        (sd / "results.json").write_text(json.dumps({"items": [good_item(i) for i in nxt]}, ensure_ascii=False))
+        calls = []
+
+        def http(method, url, body, token, timeout=120):
+            calls.append(body)
+            return 200, ({"status": "dry_run", "resolved": {}, "new_entities": []} if body.get("dry_run")
+                         else {"status": "ok", "episode_uuid": "u"})
+        args = ["--batch", str(sd / "batch-b0001.json"), "--file", str(sd / "results.json"), "--model", "m",
+                "--session", "s"]
+        with mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(sd)}), \
+                mock.patch.object(ax, "api_token", lambda *a, **k: "t"), mock.patch("sys.stdout"):
+            real = ax.submit_results
+            with mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": http})):
+                ax.main(["submit", "--dry-run", *args])
+                ax.main(["submit", *args])
+        from tools import claim_registry as cr
+        with cr.opened() as reg:
+            self.assertFalse(set(nxt) & reg.held_by_others("campaign:other"))
+
+    def test_launch_makes_registry_dir_writable(self):
+        st = _Path(self.tmp.name) / "state"
+        cmd = ec.launch_command("codex", "t1", "m", repo=_Path("/r"), state=st)
+        self.assertIn(f"--add-dir {st} --add-dir {os.environ['KG_HUB_CLAIMS_DIR']}", cmd)
+        inside = ec.launch_command("codex", "t1", "m", repo=_Path("/r"), state=_Path(self.tmp.name))
+        self.assertEqual(inside.count("--add-dir"), 1)                      # 登记目录在状态目录里就不重复加
 
 
 if __name__ == "__main__":

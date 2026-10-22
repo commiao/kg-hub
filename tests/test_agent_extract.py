@@ -256,7 +256,8 @@ class ProvenanceAndRunTest(unittest.TestCase):
             b, r = Path(d) / "b.json", Path(d) / "r.json"
             b.write_text(json.dumps({"batch_id": "b1", "items": []}))
             r.write_text(json.dumps({"items": []}))
-            env = {"KG_HUB_EXECUTOR": "qoder", "KG_HUB_RUN_ID": "run-env", "KG_HUB_AGENT_EXTRACT_DIR": d}
+            env = {"KG_HUB_EXECUTOR": "qoder", "KG_HUB_RUN_ID": "run-env", "KG_HUB_AGENT_EXTRACT_DIR": d,
+                   "KG_HUB_CLAIMS_DIR": d + "/claims"}
             with unittest.mock.patch.dict(_os.environ, env), \
                     unittest.mock.patch.object(ax, "submit_results", fake_submit):
                 ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
@@ -298,7 +299,7 @@ class ProvenanceAndRunTest(unittest.TestCase):
 
     def test_cli_run_start_end_uses_state_dir_and_real_knobs(self):
         with tempfile.TemporaryDirectory() as d:
-            env = {"KG_HUB_AGENT_EXTRACT_DIR": d, "KG_HUB_EXECUTOR": "codex"}
+            env = {"KG_HUB_AGENT_EXTRACT_DIR": d, "KG_HUB_EXECUTOR": "codex", "KG_HUB_CLAIMS_DIR": d + "/claims"}
             with unittest.mock.patch.dict(_os.environ, env):
                 rc = ax.main(["run", "start", "--run-id", "r-cli", "--model", "gpt-5-codex",
                               "--knob", "gateway.max_tokens=4096"])
@@ -353,7 +354,7 @@ class DryRunGateTest(unittest.TestCase):
                          "stats": {"entities_in": 1, "edges_in": 0}, "resolved": {}}
         with tempfile.TemporaryDirectory() as d:
             b, r = self._files(d)
-            env = {"KG_HUB_AGENT_EXTRACT_DIR": d}
+            env = {"KG_HUB_AGENT_EXTRACT_DIR": d, "KG_HUB_CLAIMS_DIR": d + "/claims"}
             real = ax.submit_results
             # submit_results 的 post 参数在定义时就绑定了 _http，patch 模块属性不生效；包一层把假 post 塞进去，
             # 测试绝不能真的打到 NAS
