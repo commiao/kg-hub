@@ -8,7 +8,8 @@
   backup   只读：把现有 name_embedding / fact_embedding 原样导出到本地，用于回退
   compute  只读：用目标模型在本机算全部实体名与 fact 的向量，存检查点
   write    写图：排空 → 等在飞归零 → 补算新增/改动 → 分批写回（每批续期排空）→ 更新标记 → 解除排空
-  restore  写图：用 backup 的向量写回，并把标记改回备份时的模型
+  restore  写图：用 backup 的向量写回，并把标记改回备份时的模型。只在「备份后图里没有新增带向量的条目」时可用，
+           否则硬拒（见 _assert_restorable）——这时回退走 compute + write（目标是备份时的模型）
   verify   只读：抽样读回线上向量，与本地检查点比对
 
 写图的两个子命令默认只在 23:00–01:45（Asia/Shanghai）执行：避开白天入图与凌晨 02:00 路由器重启。
@@ -48,6 +49,10 @@ WRITE_NODES = ("UNWIND $rows AS r MATCH (n:Entity {uuid: r.u}) "
                "SET n.name_embedding = vecf32(r.v) RETURN count(n)")
 WRITE_EDGES = ("UNWIND $rows AS r MATCH ()-[e:RELATES_TO {uuid: r.u}]->() "
                "SET e.fact_embedding = vecf32(r.v) RETURN count(e)")
+READ_NODE_VEC_UUIDS = ("MATCH (n:Entity) WHERE n.name_embedding IS NOT NULL "
+                       "RETURN n.uuid SKIP $s LIMIT $l")
+READ_EDGE_VEC_UUIDS = ("MATCH ()-[e:RELATES_TO]->() WHERE e.fact_embedding IS NOT NULL "
+                       "RETURN e.uuid SKIP $s LIMIT $l")
 SAMPLE_NODE_VEC = "UNWIND $u AS id MATCH (n:Entity {uuid: id}) RETURN n.uuid, n.name_embedding"
 SAMPLE_EDGE_VEC = "UNWIND $u AS id MATCH ()-[e:RELATES_TO {uuid: id}]->() RETURN e.uuid, e.fact_embedding"
 
@@ -71,6 +76,11 @@ def plan_updates(current: dict[str, str], computed: dict[str, str]) -> tuple[lis
     redo = sorted(u for u, h in current.items() if computed.get(u) != h)
     ready = sorted(u for u, h in current.items() if computed.get(u) == h)
     return redo, ready
+
+
+def vectors_outside_backup(live_uuids, backup_uuids) -> list[str]:
+    """线上现有向量的条目里，备份里没有的 uuid。备份里有、线上已删除的不算（写回时 MATCH 不到也无害）。"""
+    return sorted(set(map(str, live_uuids)) - set(map(str, backup_uuids)))
 
 
 def batches(items: list, size: int):
@@ -286,15 +296,39 @@ def cmd_write(args) -> int:
     return 0
 
 
+def _assert_restorable(g, backups: dict, back_model: str) -> None:
+    """restore 的硬前提：线上每一条带向量的实体/边，备份里都有。
+
+    备份之后新增入图的条目只有切换后模型的向量，restore 只会覆盖备份里的条目，写完标记改回旧模型，
+    这些条目就成了「标记说是旧模型、向量其实是新模型」的静默错位——查询向量与库向量不同源，不报错只变差。
+    所以有这样的条目就拒绝，改走 compute + write（write 会为备份后新增的条目补算）。不提供越过开关。"""
+    found = {}
+    for kind, q in (("nodes", READ_NODE_VEC_UUIDS), ("edges", READ_EDGE_VEC_UUIDS)):
+        extra = vectors_outside_backup((r[0] for r in read_all(g, q)), backups[kind][0])
+        if extra:
+            found[kind] = extra
+    if not found:
+        return
+    detail = "；".join(f"{k} {len(v)} 条（如 {', '.join(v[:3])}）" for k, v in found.items())
+    raise SystemExit(
+        f"拒绝 restore：线上有备份之后新增、备份里没有的带向量条目：{detail}。\n"
+        f"restore 不会改写它们，写完它们仍是切换后模型的向量，却被标记成 {back_model}。\n"
+        f"改用：compute --model {back_model}，再 write --model {back_model} --expect-from <图里当前的模型> --yes"
+        f"（write 会为备份后新增的条目补算）。详见 docs/EMBEDDING-SWITCH-RUNBOOK.md「回退」。")
+
+
 def cmd_restore(args) -> int:
     from tools.agent_extract import api_token
     g = graph(); d = Path(args.dir).expanduser(); base = args.url.rstrip("/"); token = api_token()
     back_model = (d / "backup-model.txt").read_text().strip()
     _guard_write(args, g, expect_from=args.expect_from)
+    backups = {kind: load_ckpt(d / f"backup-{kind}.npz") for kind in ("nodes", "edges")}
+    _assert_restorable(g, backups, back_model)      # 先查一遍：没资格就别去排空线上
     try:
         _drain(base, token, DRAIN_RENEW_SEC); _wait_idle(base, token)
+        _assert_restorable(g, backups, back_model)  # 排空等静后再查：前一遍到此刻之间可能又入了图
         for kind in ("nodes", "edges"):
-            uu, _, vv = load_ckpt(d / f"backup-{kind}.npz")
+            uu, _, vv = backups[kind]
             _write_vectors(g, kind, uu, vv, base, token, args.batch, args.sleep)
         if back_model == DEFAULT_MODEL:
             g.query("MATCH (p:EmbeddingProfile {key: 'active'}) DELETE p")

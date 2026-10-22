@@ -7,7 +7,9 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 _os.environ.setdefault("KG_HUB_API_TOKEN", "unit-test-only-token")
 import asyncio
+import io
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 
 from utils import embedding_profile as ep
@@ -141,6 +143,115 @@ class ReembedPureTest(unittest.TestCase):
         if not night:
             with self.assertRaises(SystemExit):
                 rb._guard_write(args(allow_outside_window=False), G(None), ep.DEFAULT_MODEL)
+
+
+class ReembedRestoreGuardTest(unittest.TestCase):
+    """restore 只在「备份后图里没有新增带向量的条目」时可用：硬拦，不靠文档。
+    备份之后入图的条目只有切换后模型的向量，restore 改不到它们，标记却会改回旧模型。"""
+
+    BACKUP = {"nodes": ["n1", "n2", "n3"], "edges": ["e1", "e2"]}
+
+    class FakeGraph:
+        def __init__(self, live, model=MINILM):
+            self.live, self.model, self.writes = {k: list(v) for k, v in live.items()}, model, []
+
+        def ro_query(self, q, params=None):
+            class R: pass
+            r = R()
+            if q == ep.MARKER_READ:
+                r.result_set = [[self.model]]
+                return r
+            kind = {rb.READ_NODE_VEC_UUIDS: "nodes", rb.READ_EDGE_VEC_UUIDS: "edges"}[q]
+            r.result_set = [[u] for u in self.live[kind][params["s"]:params["s"] + params["l"]]]
+            return r
+
+        def query(self, q, params=None):
+            self.writes.append(q)
+
+    def setUp(self):
+        import tempfile
+        import numpy as np
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = _Path(self.tmp.name)
+        for kind, uu in self.BACKUP.items():
+            rb.save_ckpt(d / f"backup-{kind}.npz", uu, [""] * len(uu), np.ones((len(uu), 4), np.float32))
+        (d / "backup-model.txt").write_text(ep.DEFAULT_MODEL)
+        self.args = type("A", (), {"dir": str(d), "url": "http://nas", "batch": 2, "sleep": 0, "yes": True,
+                                   "allow_outside_window": True, "expect_from": MINILM})()
+
+    def run_restore(self, g, on_quiesce=None):
+        """跑 cmd_restore，返回 (退出信息或 None, 写过向量的批次种类, 排空调用的秒数序列)。"""
+        from unittest import mock
+        written, drains = [], []
+
+        def fake_write(g_, kind, uuids, vecs, *a):
+            written.append((kind, list(map(str, uuids))))
+            return len(uuids)
+
+        def fake_wait_idle(*a):
+            if on_quiesce:
+                on_quiesce()
+
+        with mock.patch.object(rb, "graph", return_value=g), \
+                mock.patch("tools.agent_extract.api_token", return_value="t"), \
+                mock.patch.object(rb, "_drain", side_effect=lambda b, t, sec: drains.append(sec) or {}), \
+                mock.patch.object(rb, "_wait_idle", side_effect=fake_wait_idle), \
+                mock.patch.object(rb, "_write_vectors", side_effect=fake_write):
+            try:
+                with redirect_stdout(io.StringIO()):
+                    rc = rb.cmd_restore(self.args)
+                return rc, written, drains
+            except SystemExit as exc:
+                return exc.code, written, drains
+
+    def test_outside_backup_is_computed_from_live_vs_backup(self):
+        self.assertEqual(rb.vectors_outside_backup(["a", "b", "c"], ["a", "b"]), ["c"])
+        self.assertEqual(rb.vectors_outside_backup(["a"], ["a", "gone"]), [])   # 线上已删的无妨
+        self.assertEqual(rb.vectors_outside_backup([], []), [])
+
+    def test_restore_runs_when_nothing_new_since_backup(self):
+        # 备份里的 n3 / e2 之后被删了：不影响
+        g = self.FakeGraph({"nodes": ["n1", "n2"], "edges": ["e1"]})
+        rc, written, drains = self.run_restore(g)
+        self.assertEqual(rc, 0)
+        self.assertEqual([k for k, _ in written], ["nodes", "edges"])
+        self.assertEqual(drains[-1], 0)                 # 排空已解除
+        self.assertTrue(any("EmbeddingProfile" in q or "DELETE" in q for q in g.writes))   # 标记改回
+
+    def test_restore_refuses_new_entity_before_touching_anything(self):
+        g = self.FakeGraph({"nodes": ["n1", "n2", "n3", "n_new"], "edges": ["e1", "e2"]})
+        rc, written, drains = self.run_restore(g)
+        self.assertIsInstance(rc, str)
+        self.assertIn("nodes 1 条", rc)
+        self.assertIn("n_new", rc)
+        self.assertIn("compute --model " + ep.DEFAULT_MODEL, rc)
+        self.assertIn("write --model " + ep.DEFAULT_MODEL, rc)
+        self.assertEqual(written, [])
+        self.assertEqual(drains, [])                    # 连线上都没去排空
+        self.assertEqual(g.writes, [])                  # 标记也没动
+
+    def test_restore_refuses_new_edge(self):
+        g = self.FakeGraph({"nodes": ["n1"], "edges": ["e1", "e_new_1", "e_new_2"]})
+        rc, written, _ = self.run_restore(g)
+        self.assertIn("edges 2 条", rc)
+        self.assertNotIn("nodes", rc)
+        self.assertEqual(written, [])
+
+    def test_restore_rechecks_after_drain_quiesces(self):
+        # 第一遍查时干净，排空等静前最后一刻又入了图：写任何一条之前都要再拦一次，并解除排空
+        g = self.FakeGraph({"nodes": ["n1"], "edges": ["e1"]})
+        rc, written, drains = self.run_restore(g, on_quiesce=lambda: g.live["edges"].append("e_late"))
+        self.assertIn("edges 1 条", rc)
+        self.assertEqual(written, [])
+        self.assertEqual(drains[-1], 0)
+        self.assertEqual(g.writes, [])
+
+    def test_restore_still_needs_expected_source(self):
+        g = self.FakeGraph({"nodes": ["n1"], "edges": ["e1"]}, model=ep.DEFAULT_MODEL)
+        rc, written, _ = self.run_restore(g)            # 图里已是备份模型，expect_from 对不上
+        self.assertIn("不符", rc)
+        self.assertEqual(written, [])
 
 
 if __name__ == "__main__":
