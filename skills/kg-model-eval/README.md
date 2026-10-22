@@ -8,6 +8,9 @@
 写到的子命令都存在、写出来的准入门槛与 `tools/extract_bench.THRESHOLDS` 一致）。各工具里的是 skill-sync-sidecar 分发的副本，
 不要在副本里改。
 
+触发词统一为「使用kg-hub对比模型」前缀（2026-10-23 用户定）：改描述时 `SKILL.md` 的 frontmatter 与 `manifest.json`
+两处一起改（测试逐字对账）；不要再往描述里加不带前缀的说法，太宽泛会在日常讨论 kg-hub 时误触发。
+
 ## 改完怎么装
 
 合并后从 sidecar 的已安装 release 安装（会备份再替换，并由 sync-daemon 推到共享库、其他设备随后拉取）：
