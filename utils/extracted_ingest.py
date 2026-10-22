@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import uuid as uuidlib
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -158,6 +159,38 @@ def _differ_by_contrast(x: str, y: str) -> bool:
     return False
 
 
+# 只差一个词头前缀的名字也是另一个东西（2026-10-22 补交 b0024：`prevalidate 阶段相似度计数` 被并进
+# `validate 阶段相似度计数`，包含占比 0.81 放行）。英文：同位置的词多了粘连的字母前缀，或多出一个独立的
+# 前缀词（pre-validate）；中文：多出一个否定/前置字（预校验 ↔ 校验、未提交 ↔ 提交）。
+_EN_PREFIX_WORDS = frozenset({"pre", "post", "re", "un", "non", "de", "dis", "sub", "anti", "semi", "multi"})
+_CJK_PREFIX_CHARS = frozenset("预非未不反无子伪逆")
+_ASCII_LETTERS = re.compile(r"^[a-z]+$")
+
+
+def _differ_by_prefix(a: str, b: str) -> bool:
+    ta, tb = _LEX_STRIP.sub(" ", a.lower()).split(), _LEX_STRIP.sub(" ", b.lower()).split()
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(short) == len(long_):
+        diff = [i for i in range(len(short)) if short[i] != long_[i]]
+        if len(diff) == 1:
+            s, t = short[diff[0]], long_[diff[0]]
+            s, t = (s, t) if len(s) <= len(t) else (t, s)
+            head = t[:len(t) - len(s)]
+            if t.endswith(s) and s[:1].isascii() and s[:1].isalpha() and len(head) >= 2 and _ASCII_LETTERS.match(head):
+                return True
+    elif len(long_) == len(short) + 1:
+        for i, w in enumerate(long_):
+            if w in _EN_PREFIX_WORDS and long_[:i] + long_[i + 1:] == short and i + 1 < len(long_):
+                return True
+    x, y = "".join(ta), "".join(tb)
+    short_s, long_s = (x, y) if len(x) <= len(y) else (y, x)
+    if len(long_s) == len(short_s) + 1:
+        for i, ch in enumerate(long_s[:-1]):
+            if ch in _CJK_PREFIX_CHARS and long_s[:i] + long_s[i + 1:] == short_s and "一" <= long_s[i + 1] <= "鿿":
+                return True
+    return False
+
+
 def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     """向量召回的候选必须在词面上也站得住。
 
@@ -197,7 +230,7 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
         return True
     if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y):
         return False
-    if _differ_by_contrast(x, y):
+    if _differ_by_contrast(x, y) or _differ_by_prefix(a, b):
         return False
     short, long_ = (x, y) if len(x) <= len(y) else (y, x)
     if len(short) >= 4 and short in long_ and len(short) / len(long_) >= CONTAIN_MIN_SHARE:
@@ -313,6 +346,33 @@ _LINK_EPISODE_EDGES = (
     "MATCH (e:Episodic {uuid: $uuid}) SET e.entity_edges = $entity_edges")
 
 
+def _cos_score(u, v) -> float:
+    """与 _FIND_SIMILAR 同一口径：(2 - cosineDistance) / 2 = (1 + cos) / 2。"""
+    dot = sum(float(a) * float(b) for a, b in zip(u, v))
+    nu = sum(float(a) ** 2 for a in u) ** 0.5
+    nv = sum(float(b) ** 2 for b in v) ** 0.5
+    return (1 + dot / (nu * nv)) / 2 if nu and nv else 0.0
+
+
+# dry-run 的 pending 名字每条请求都会带上（一批 50 条、累计几百个名字），按 embedder 实例缓存，免得反复嵌入
+_PENDING_VEC_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_PENDING_VEC_CACHE_MAX = 5000
+
+
+async def _embed_cached(embedder, names: list[str]) -> list:
+    try:
+        cache = _PENDING_VEC_CACHE.setdefault(embedder, {})
+    except TypeError:   # 不能弱引用的 embedder：不缓存
+        cache = {}
+    missing = [n for n in dict.fromkeys(names) if n and n not in cache]
+    if missing:
+        if len(cache) + len(missing) > _PENDING_VEC_CACHE_MAX:
+            cache.clear()
+        for n, v in zip(missing, await embedder.create_batch(missing)):
+            cache[n] = v
+    return [cache.get(n) for n in names]
+
+
 @dataclass
 class WriteResult:
     episode_uuid: str
@@ -333,26 +393,45 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
                            type_guard: bool = True, dry_run: bool = False,
                            extraction_mode: str = "agent",
                            extractor_tool: str | None = None,
-                           run_id: str | None = None) -> WriteResult:
+                           run_id: str | None = None,
+                           pending: list[dict] | None = None) -> WriteResult:
     """把归一后的抽取写进图。driver 只需 execute_query；embedder 只需 create_batch。
 
     dry_run=True：只做嵌入与消解，不写任何东西（第 2 轮复盘：让抽取者在写入前看到会并到哪个旧实体）。
     extraction_mode：episode 与新建节点/边上的来源方式标记——'agent'（会话自抽取）或
     'gateway_single'（网关单次抽取，utils/single_pass_extract）；看板与 extractor_compare 按它分组。
     extractor_tool / run_id：来源标记的另外两个维度（执行工具、实验 run），随 episode / 新实体 / 新边落图；
-    缺省 None，与旧内容一样在读侧按「未知」处理。"""
+    缺省 None，与旧内容一样在读侧按「未知」处理。
+    pending（仅 dry_run）：同一批里排在前面的条目会新建的实体 [{name, type}]。正式提交时它们已经在图里、
+    会参与消解，dry-run 不把它们（以及本条前面的实体）算进候选就看不见同批内的误并（2026-10-22 补交
+    b0024：同批先建的 `validate 阶段相似度计数` 吃掉了后面的 `prevalidate 阶段相似度计数`，dry-run 没显示）。
+    命中它们的实体在 resolved 里 uuid 为 None、in_batch 为 True。"""
     now = datetime.now(tz=timezone.utc)
     now_iso = now.isoformat()
     ep_uuid = episode_uuid or str(uuidlib.uuid4())
     names = [e.name for e in extraction.entities]
     name_vecs = await embedder.create_batch(names) if names else []
+    virtual: list[dict] = []   # dry-run 模拟的「已在图里」的实体：同批前面条目新建的 + 本条前面新建的
+    if dry_run and pending:
+        pnames = [" ".join(str(p.get("name") or "").split()) for p in pending]
+        pvecs = await _embed_cached(embedder, pnames)
+        virtual = [{"name": n, "key": _norm_key(n), "type": p.get("type"), "vec": v}
+                   for n, p, v in zip(pnames, pending, pvecs) if n]
     resolved: dict[str, dict] = {}
     nodes_new = nodes_reused = 0
     for ent, vec in zip(extraction.entities, name_vecs):
         rows, _, _ = await driver.execute_query(_FIND_EXACT, g=group_id, lname=ent.key)
+        if not rows and dry_run:
+            rows = [{"uuid": None, "name": v["name"], "labels": ["Entity", v["type"]], "in_batch": True}
+                    for v in virtual if v["key"] == ent.key][:1]
         if not rows:
             rows, _, _ = await driver.execute_query(
                 _FIND_SIMILAR, g=group_id, v=[float(x) for x in vec], min=node_match_min)
+            if dry_run and virtual:
+                rows = sorted(list(rows) + [
+                    {"uuid": None, "name": v["name"], "labels": ["Entity", v["type"]], "score": s, "in_batch": True}
+                    for v in virtual if (s := _cos_score(vec, v["vec"])) > node_match_min],
+                    key=lambda r: -float(r.get("score") or 0))[:5]
             # 第 1 轮（haiku）复盘：按名字近似合并不看类型，把 Issue 并进了 Config、Tool 并进了 Issue、
             # 文件并进了同名不同路径的另一个文件。向量候选还要带抽出的类型标签才复用。
             rows = [r for r in rows
@@ -361,11 +440,14 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         if rows:
             resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True,
                                  "matched_name": rows[0].get("name")}
+            if rows[0].get("in_batch"):
+                resolved[ent.key]["in_batch"] = True
             nodes_reused += 1
             continue
         new_uuid = str(uuidlib.uuid4())
         if dry_run:
             resolved[ent.key] = {"uuid": None, "reused": False, "matched_name": None}
+            virtual.append({"name": ent.name, "key": ent.key, "type": ent.type, "vec": vec})
             nodes_new += 1
             continue
         entity_data = {
