@@ -103,6 +103,11 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 
 - **冻结样本**：`docs/ab-sample-20261017.json`（50 条分层：项目 × 类型 × 长度）。新样本要同样分层并冻结 id 列表，
   跨实验只比同一样本。
+- **对比样本 bench-20261022（离线，现行）**：三模型 2000 条实验 chain-v8 那 6 批共 200 条（haiku 66 / opus 67 / sonnet 67），
+  基线就是它们当时的结果，问句是只看标题写的中英换说法各一句。`tools/extract_bench.py` 负责冻结（`freeze`）、
+  自检（`lint`）与评分（`score`：纪律、密度、照抄标题率、译文边率、换说法问句 top-10 可检索率，并按基线模型逐对比较）。
+  样本、基线、问句含观测正文，只在本机 `~/.kg-hub/bench/`，不进仓库。已入图的观测再提交会被挡成 skipped，
+  所以换工具/换模型的对比都走这条离线路，不入主图；执行步骤见 `docs/executors/qoder.md` 的「对比模式」。
 - **金标（待建）**：从冻结样本里取 20 条，人工给出实体（名、类型）与关系（源、目标、边名）的参考答案，存
   `docs/gold/<sample>.json`。有了它才能算 **正确率**（现在只能算合规率和密度，密度高不等于对）。评分：
   实体名匹配走服务端同一套词面规则（`utils/extracted_ingest._lexically_same`），类型要相等；关系匹配要两端实体

@@ -28,7 +28,7 @@
 | 批量查键 | `POST /api/ingest_extracted/check`、`POST /api/ingest/check_names` | 执行器跳过已入库；refinery 对账 |
 | 写图与消解 | `utils/extracted_ingest.py` | 与 graphiti FalkorDB save 语句一致；消解策略见 §4 |
 | 执行器 | `tools/agent_extract.py`（`next` / `submit [--dry-run]` / `status` / `prompt` / `retro`） | 按 refinery 水位取批（`tools/agent_extract_remote.py` 在 NAS 端筛）、提交、汇总、复盘转发 |
-| 抽取规则 | `config/agent_extract_prompt.md`（agent-v3） | 13 实体类型、15 边名、命名/关系/复述/前瞻规则 |
+| 抽取规则 | `config/agent_extract_prompt.md`（agent-v4） | 13 实体类型、15 边名、命名/关系/复述/前瞻规则 |
 | 复盘闭环 | `tools/digest_retro.py`（`gate` / `checkpoint` / `tune` / `final`） | 每 500 条门禁、指标、教训、调参登记、最终对比 |
 | 对比工具 | `tools/extractor_compare.py` | 按 `extractor_model` / legacy 月份并排 |
 | refinery 对账 | `kg_refinery.sync_graph_ingested` | 每 `KG_HUB_REFINERY_GRAPH_SYNC_SEC`（默认 600s）把图里已 ok 的 live 观测记为 ingested |

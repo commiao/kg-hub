@@ -41,6 +41,12 @@ python -m tools.eval_report --run-id <run_id> [--run-id <对照 run>] --graph-js
 `gateway.custom_extraction`、`gateway.max_tokens`、`gateway.edge_empty_retry`）是服务端环境变量，
 改了要发布，清单里记的是本次实验假定的值。
 
+## 只做对比、不入图
+
+换工具或换模型参与对比时，用冻结样本 + `tools/extract_bench.py` 离线评分（不提交、不写图），步骤见
+[qoder.md 的「对比模式」](qoder.md#对比模式换模型--换工具参与对比不提交不写图)，其他工具照做。规则版本是 agent-v4
+（`config/agent_extract_prompt.md` 末尾 21–28：照抄标题、另一语言译文、其余英文完整句、增量观测、dry-run 判读）。
+
 ## 环境
 
 `KG_HUB_URL`、`KG_HUB_API_TOKEN`（只从环境变量或 `~/.claude-mem/.env` 读，不打印）、`KG_HUB_NAS_SSH`、
