@@ -142,6 +142,27 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual(rep["models"][0]["credits_per_obs"], 0.2)
         self.assertIn("DeepSeek-Flash × c0（1 批）", ec.render(rep["by_chain"]))
 
+    def test_brief_and_agent_definitions_per_model(self):
+        c = ec.load(ec.campaign_dir("t1"))
+        b = ec.brief(c, "Qwen3.8-Max")
+        self.assertIn("claim --id t1 --model Qwen3.8-Max", b)
+        self.assertIn('{"items": [{"id"', b)                         # 模板里的花括号渲染成 JSON 原样
+        self.assertNotIn("{cid}", b)
+        with self.assertRaises(SystemExit):
+            ec.brief(c, "没登记的模型")
+        defs = ec.agent_defs(c)
+        self.assertEqual({k: v["model"] for k, v in defs.items()},
+                         {"kg-extract-deepseek-flash": "DeepSeek-Flash", "kg-extract-qwen3.8-max": "Qwen3.8-Max"})
+        self.assertEqual(defs["kg-extract-deepseek-flash"]["prompt"], ec.brief(c, "DeepSeek-Flash"))
+        md = ec.agent_markdown("kg-extract-deepseek-flash", defs["kg-extract-deepseek-flash"])
+        self.assertTrue(md.startswith("---\nname: kg-extract-deepseek-flash\n"))
+        self.assertIn("\nmodel: DeepSeek-Flash\n", md.split("---", 2)[1])
+        out = _Path(self.tmp.name) / "agents"
+        with mock.patch("sys.stdout"):
+            ec.main(["agents", "--id", "t1", "--format", "md", "--dir", str(out)])
+        self.assertEqual(sorted(x.name for x in out.iterdir()),
+                         ["kg-extract-deepseek-flash.md", "kg-extract-qwen3.8-max.md"])
+
     def test_merge_rows_weights_by_items(self):
         a = {"_n": 10, "_cost": {"credits": 10}, "items": 10, "headline_verbatim_pct": 100.0, "ok": 10}
         b = {"_n": 30, "_cost": {}, "items": 30, "headline_verbatim_pct": 50.0, "ok": 30}

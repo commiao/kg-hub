@@ -18,6 +18,9 @@
   start   --models <模型 id>... --executor <工具> [--quota 200] [--batch 50] [--after-id N]
   chain   --file <补充约定.md>        登记新的补充约定版本（之后领的批次生效）
   rules                              打印抽取规则：agent-v4 正文 + 当前补充约定（子代理第一步读它）
+  brief   --model <模型 id>           打印填好的子代理说明（粘给子代理，或由 agents 写进子代理定义）
+  agents  [--format qodercli|md] [--dir 目录]   按战役里的模型生成子代理定义，每个模型一个、带指定模型：
+          qodercli 格式给 `qodercli --agents '<json>'`；md 格式写成带 frontmatter 的文件（qoder 的 agents 目录）
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边），不过不许提交
   submit  --batch <批次 id> [--dry-run]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）
@@ -126,6 +129,47 @@ def rules_text(d: Path, c: dict) -> str:
     if c["chain"] != CHAIN_NONE:
         text += "\n\n" + (d / c["chains"][c["chain"]]["file"]).read_text().rstrip()
     return text + "\n"
+
+
+SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}，你的模型 id 是 {model}。
+在仓库根目录执行命令，解释器用 $HOME/.local/share/kg-hub/venv/bin/python（下称 PY）。
+
+1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（agent-v4 正文 + 战役补充约定），尤其末尾规则 21–28。
+2. 领一批：$PY -m tools.extract_campaign claim --id {cid} --model {model}
+   返回 batch_file（要抽的观测）与 results_file（你要写的结果）。返回 done 就结束并汇报。
+3. 抽取：每次读 batch_file 里 10 条，**读全文再抽**；10 条一组写分片（放在 results_file 同目录、文件名带批次号），
+   全部写完用 python 合并成 results_file：{{"items": [{{"id", "entities": [{{"name","type","summary"}}],
+   "edges": [{{"source","name","target","fact"}}]}}]}}。没有知识的观测给 "entities": []。
+4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」。
+5. 预览：$PY -m tools.extract_campaign submit --id {cid} --batch <批次> --dry-run
+   逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
+   标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
+6. 入库：$PY -m tools.extract_campaign submit --id {cid} --batch <批次>（逐条写图，可能超过 2 分钟，给足超时）。
+7. 汇报（只输出这个 JSON）：
+   {{"batch": "<批次>", "model": "{model}", "submitted": {{"ok": 0, "empty": 0, "error": 0}},
+    "dryrun_mismatch_seen": 0, "renamed_after_dryrun": 0,
+    "lessons": ["最多 4 条：规则哪里不好用、哪类观测难抽、你做了什么取舍"]}}
+
+红线：不碰断路器、不直连 FalkorDB、不改仓库文件、不 git 提交、不读或打印 .env；提交报错只重试一次，仍失败就停下汇报。"""
+
+
+def brief(c: dict, model: str) -> str:
+    if model not in c["models"]:
+        raise SystemExit(f"战役 {c['id']} 没有模型 {model}；有：{', '.join(c['models'])}")
+    return SUBAGENT_BRIEF.format(cid=c["id"], model=model)
+
+
+def agent_defs(c: dict) -> dict[str, dict]:
+    """每个模型一个子代理定义，带指定模型（qoder 已验证：qodercli --agents 的 model 字段生效，
+    modelUsage 里按模型分开记 credits；2026-10-22 用 DeepSeek-Flash / Kimi-K3 两次对照确认）。"""
+    return {f"kg-extract-{slug(m).lower()}": {
+        "description": f"kg-hub 抽取对比战役 {c['id']} 的执行者（模型 {m}）：领批、抽取、自检、dry-run、入库、汇报",
+        "prompt": brief(c, m), "model": m} for m in c["models"]}
+
+
+def agent_markdown(name: str, d: dict) -> str:
+    return (f"---\nname: {name}\ndescription: {d['description']}\nmodel: {d['model']}\n"
+            f"permissionMode: default\n---\n\n{d['prompt']}\n")
 
 
 # ---------- 子命令 ----------
@@ -364,7 +408,7 @@ def cmd_status(cid: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("start", "chain", "rules", "claim", "lint", "submit", "cost", "status", "report"):
+    for name in ("start", "chain", "rules", "brief", "agents", "claim", "lint", "submit", "cost", "status", "report"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -375,8 +419,11 @@ def main(argv=None) -> int:
             s.add_argument("--after-id", type=int, help="游标起点；缺省接着会话自抽取的游标")
         if name == "chain":
             s.add_argument("--file", required=True)
-        if name == "claim":
+        if name in ("claim", "brief"):
             s.add_argument("--model", required=True)
+        if name == "agents":
+            s.add_argument("--format", choices=("qodercli", "md"), default="qodercli")
+            s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
         if name in ("lint", "submit", "cost"):
             s.add_argument("--batch", required=True)
         if name == "submit":
@@ -398,6 +445,24 @@ def main(argv=None) -> int:
         d = campaign_dir(a.id)
         sys.stdout.write(rules_text(d, load(d)))
         return 0
+    elif a.cmd == "brief":
+        d = campaign_dir(a.id)
+        print(brief(load(d), a.model))
+        return 0
+    elif a.cmd == "agents":
+        d = campaign_dir(a.id)
+        defs = agent_defs(load(d))
+        if a.format == "qodercli":
+            print(json.dumps(defs, ensure_ascii=False))
+            return 0
+        if not a.dir:
+            print("\n\n".join(agent_markdown(n, v) for n, v in defs.items()))
+            return 0
+        out_dir = Path(a.dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for n, v in defs.items():
+            (out_dir / f"{n}.md").write_text(agent_markdown(n, v))
+        out = {"written": sorted(str(out_dir / f"{n}.md") for n in defs)}
     elif a.cmd == "claim":
         out = cmd_claim(a.id, a.model, url=a.url, token=ax.api_token())
     elif a.cmd == "lint":
