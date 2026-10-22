@@ -2,7 +2,7 @@
 
 > 粘给 cursor（桌面版 agent 或 `cursor-agent` 命令行）会话的任务说明。四条红线与五步命令见 [_common.md](_common.md)，本文只写 cursor 的接入点。
 
-> **多模型正式对比（入库、每批复盘）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
+> **多模型生产画像（入库、每批复盘；模型准入看 bench）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
 
 ## 接入点
 

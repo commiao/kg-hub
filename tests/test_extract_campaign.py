@@ -39,7 +39,8 @@ def good_item(i):
 
 
 def PASS(model):
-    return {"verdict": "pass", "prompt_version": ax.PROMPT_VERSION + "+bench1", "bench": "b", "decided_at": "t"}
+    return {"verdict": "pass", "prompt_version": ax.PROMPT_VERSION + "+bench1", "bench": "b", "decided_at": "t",
+            "prompt_sha256": ec.prompt_sha(ax.PROMPT_PATH.read_text())}
 
 
 class CampaignTest(unittest.TestCase):
@@ -310,6 +311,64 @@ class CampaignTest(unittest.TestCase):
         with mock.patch("sys.stdout"):
             ec.main(["cost", "--id", "t1", "--overhead", "--credits", "0.5"])
         self.assertEqual(ec.cmd_report("t1")["overhead"]["credits"], 5.0)
+
+    def test_released_items_are_counted_once_with_final_result(self):
+        """2026-10-23 复现：18 条不重复观测、2 条首次提交失败 → release → 重领入库，复盘表曾算成 20 条、错 2，
+        status 已提交 20 > 已领 18。回收出去的条目只归后来领到它的那一批。"""
+        ec.cmd_start("r1", ["M"], executor="x", quota=100, batch=10, after_id=0, lookup=PASS)
+        claim = lambda: ec.cmd_claim("r1", "M", url="u", token=None, fetch=fake_fetch, check=lambda i: {})  # noqa: E731
+        o = claim()
+        items = json.loads(_Path(o["batch_file"]).read_text())["items"]
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}))
+        bad = {items[0]["id"], items[1]["id"]}
+
+        def post(m, u, body, tok):
+            if body.get("dry_run"):
+                return 200, {"status": "dry_run", "resolved": {}, "new_entities": []}
+            oid = int(body["name"].rsplit("-", 1)[1])
+            return (500, {"code": "boom"}) if oid in bad else (200, {"status": "ok"})
+        ec.cmd_submit("r1", o["batch"], dry_run=True, url="u", token=None, post=post)
+        ec.cmd_submit("r1", o["batch"], dry_run=False, url="u", token=None, post=post)
+        first = ec.cmd_report("r1")["batches"][0]
+        self.assertEqual((first["items"], first["ok"], first["error"], first["released"]), (10, 8, 2, 0))
+        ec.cmd_release("r1", o["batch"], reason="2 条失败")
+        bad.clear()
+        o2 = claim()
+        items2 = json.loads(_Path(o2["batch_file"]).read_text())["items"]
+        _Path(o2["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items2]}))
+        ec.cmd_submit("r1", o2["batch"], dry_run=True, url="u", token=None, post=post)
+        ec.cmd_submit("r1", o2["batch"], dry_run=False, url="u", token=None, post=post)
+        uniq = {x["id"] for x in items} | {x["id"] for x in items2}
+        rep = ec.cmd_report("r1")
+        tot = rep["models"][0]
+        self.assertEqual((len(uniq), tot["items"], tot["ok"], tot["error"], tot["released"]), (18, 18, 18, 0, 2))
+        b1 = rep["batches"][0]
+        self.assertEqual((b1["items"], b1["ok"], b1["error"], b1["released"]), (8, 8, 0, 2))
+        st = ec.cmd_status("r1")["models"]["M"]
+        self.assertEqual((st["claimed"], st["submitted"]), (18, 18))
+
+    def test_gate_checks_rule_text_hash_and_revocation(self):
+        base = PASS("M")
+        for rec, why in ((dict(base, prompt_sha256="0" * 64), "正文改过"),
+                         ({k: v for k, v in base.items() if k != "prompt_sha256"}, "旧记录"),
+                         ({"verdict": "revoked", "reason": "x"}, "revoked")):
+            with self.subTest(why=why):
+                with self.assertRaises(SystemExit) as cm:
+                    ec.cmd_start("g1", ["M"], executor="qoder", quota=1, batch=1, after_id=0, lookup=lambda m, r=rec: r)
+                self.assertIn(why, str(cm.exception))
+
+    def test_existing_campaign_reported_before_admission(self):
+        with self.assertRaises(SystemExit) as cm:
+            ec.cmd_start("t1", ["没准入的模型"], executor="qoder", quota=1, batch=1, after_id=0, lookup=lambda m: None)
+        self.assertIn("已存在", str(cm.exception))
+
+    def test_cost_note_and_brief_wording(self):
+        o = self.claim("DeepSeek-Flash")
+        self.assertEqual(ec.cmd_cost("t1", o["batch"], credits=1.0, note="qoder 面板")["cost"],
+                         {"credits": 1.0, "note": "qoder 面板"})
+        b = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
+        self.assertIn("开局冻结的规则正文", b)
+        self.assertNotIn("agent-v4 正文", b)
 
     def test_merge_rows_weights_by_items(self):
         a = {"_n": 10, "_cost": {"credits": 10}, "items": 10, "headline_verbatim_pct": 100.0, "ok": 10}

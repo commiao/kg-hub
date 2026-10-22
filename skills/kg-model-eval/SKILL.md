@@ -39,7 +39,7 @@ $PY -m tools.extract_bench run   --bench ~/.kg-hub/bench/bench-20261022 --models
 $PY -m tools.extract_bench admit --bench ~/.kg-hub/bench/bench-20261022 --run ~/.kg-hub/bench/runs/smoke<日期>-qodercli-A   # 每个模型一次
 ```
 
-`run` 用 qodercli 当模型通道（不开工具、不加载用户级设置），不入库；跑完自动自检并出合表。10 条最多得到 `screen_pass`（筛选通过，不算准入）。
+`run` 用 qodercli 当模型通道（不开工具、不加载用户级设置），不入库；跑完自动自检并出合表。冒烟的 `admit` 不带 `--sheet`，只预览、不写准入记录，10 条最多看到 `screen_pass`（筛选通过，不算准入）。
 不在 qoder 计费体系里的模型：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
 `$PY -m tools.extract_bench register --bench <样本> --results <目录> --model <模型> --executor <工具>`，之后命令一样。
 
@@ -61,7 +61,8 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录A> --sheet 
 
 门槛（写在 `tools/extract_bench.py` 的 `THRESHOLDS`）：规则版本一致；未交 / 自检问题 / 边名越界 / 悬空边 / 未知类型都为 0；
 照抄标题、译文边 ≥95%；中英问句命中各 ≥90% 且每个基线模型那部分不低 5 点以上；盲评 10 条错误 ≤1；≥30 条。
-结论 `fail` / `screen_pass` / `pending_blind` / `pass`，追加进 `~/.kg-hub/bench/admissions/<模型>.json`。
+空观测率不比基线高出 5 点以上；至少有一个基线模型那部分能配对；准入自检只计硬错误（schema / 悬空边 / 缺 edges）。
+结论 `fail` / `screen_pass` / `pending_blind` / `pass`，带 `--sheet` 时追加进 `~/.kg-hub/bench/admissions/<模型>.json`（记录带规则正文哈希，开战役时与快照比对）。撤销准入：`$PY -m tools.extract_bench revoke --model <模型> --reason <原因>`。
 
 ## 4. 战役（定额、全部入库、每轮复盘）
 

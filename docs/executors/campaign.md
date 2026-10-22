@@ -1,8 +1,8 @@
 # 抽取对比战役：一个编排者 + 每个模型一个子代理（任何工具通用）
 
-> 目标：在**给定配额**上比较不同模型的抽取效果，每批复盘、改链路，形成常态可复用的流程。
+> 目标：在**给定配额**上看各模型在生产中的产出画像，每批复盘、改链路，形成常态可复用的流程（模型高下以 bench 准入为准）。
 > 消化积压不是目标；但每个模型抽的都是**不同的新观测、结果全部入库**，花的 token 都变成图谱内容（10-22 三模型 2000 条的做法）。
-> 工具：`tools/extract_campaign.py`。规则：`config/agent_extract_prompt.md`（agent-v4）+ 战役补充约定。四条红线见 [_common.md](_common.md)。
+> 工具：`tools/extract_campaign.py`。规则：开局时从 `config/agent_extract_prompt.md` 冻结的快照（`prompt.md`）+ 战役补充约定。四条红线见 [_common.md](_common.md)。
 >
 > **一句话入口**：skill `kg-model-eval`（仓库 `skills/kg-model-eval/`）——「使用kg-hub对比 A、B 冒烟」「kg-hub 准入 A、B」「使用kg-hub盲测」「对比 A、B、C 20个一轮 共1000条」。
 >
@@ -27,9 +27,14 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
 | 硬性 | 未交 0、自检问题 0、边名越界 0、悬空边 0、未知类型 0；照抄标题 ≥95%、译文边 ≥95% |
 | 质量 | 中英问句 top-10 命中各 ≥90%；在每个基线模型那部分不比该模型低 5 个点以上 |
 | 正确性 | 盲评 10 条，事实错误（方向、数字、因果写反）≤1 条 |
+| 空观测 | 空观测率不比基线在同一批观测上高出 5 个点以上 |
+| 基线对照 | 至少有一个基线模型那部分能配上对（配不上直接判不过，不静默跳过子集检查） |
+| 规则正文 | 准入记录带规则正文哈希；开战役时与开局快照比对，版本号相同但正文改过也要重新准入 |
 | 条数 | ≥30 条才可能 `pass`；10 条冒烟最多 `screen_pass`（快速筛选通过，不算准入） |
 
-结论依次为 `fail` → `screen_pass` → `pending_blind`（缺盲评）→ `pass`，每次判定都追加进本机
+`admit` 不带 `--sheet` 只预览、不写记录（避免一次随手的预览压过此前的 pass）；要撤销准入用 `extract_bench revoke --model <模型> --reason <原因>`。
+准入自检只计硬错误（schema、悬空边、缺 edges 键）；照抄标题、译文边交给比例门槛，没交的交给「未交 = 0」。
+结论依次为 `fail` → `screen_pass` → `pending_blind`（缺盲评）→ `pass`，带 `--sheet` 的每次判定都追加进本机
 `~/.kg-hub/bench/admissions/<模型>.json`（模型、bench、规则版本、逐项检查、盲评、日期），以最新一条为准。
 阈值写在 `tools/extract_bench.py` 的 `THRESHOLDS`，改阈值走 PR。成本不设门槛：处理条数（配额）就是成本上限。
 
@@ -125,4 +130,4 @@ $PY -m tools.extract_campaign launch --id <战役> --tool codex|cursor|qodercli|
 
 - **冒烟**（新模型进场前，不入库）：`tools/extract_bench.py` 在冻结样本上离线评分，见 [qoder.md](qoder.md) 的「对比模式」。
 - **qodercli 运行器**（`extract_bench run`）：把 qoder 当纯模型通道、无人值守地比模型本身；不入库，只用于冒烟。
-- **战役**（本文）：正式对比，入库，每批复盘、改链路。
+- **战役**（本文）：多模型生产画像，入库，每批复盘、改链路；模型能不能用、谁更好看 bench 准入记录。

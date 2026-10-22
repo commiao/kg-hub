@@ -19,7 +19,7 @@
   start   --models <模型 id>... --executor <工具> [--quota 200] [--batch 50] [--after-id N] [--skip-admission 原因]
           每个模型要有 bench 准入记录（verdict=pass、规则正文版本一致），否则拒绝开局
   chain   --file <补充约定.md>        登记新的补充约定版本（之后领的批次生效）
-  rules                              打印抽取规则：agent-v4 正文 + 当前补充约定（子代理第一步读它）
+  rules                              打印抽取规则：开局冻结的规则正文 + 当前补充约定（子代理第一步读它）
   brief   --model <模型 id>           打印填好的子代理说明（粘给子代理，或由 agents 写进子代理定义）
   agents  [--format qodercli|md] [--dir 目录]   按战役里的模型生成子代理定义，每个模型一个、带指定模型：
           qodercli 格式给 `qodercli --agents '<json>'`；md 格式写成带 frontmatter 的文件
@@ -157,7 +157,7 @@ def rules_text(d: Path, c: dict) -> str:
 SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}，你的模型 id 是 {model}。
 在仓库根目录执行命令，解释器用 ${{KG_HUB_PYTHON:-python3}}（装好 kg-hub 依赖的那个 Python，下称 PY）。
 
-1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（agent-v4 正文 + 战役补充约定），尤其末尾规则 21–28。
+1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（开局冻结的规则正文 + 战役补充约定），尤其末尾的链路规则（21–28）。
 2. 领一批：$PY -m tools.extract_campaign claim --id {cid} --model {model}
    返回 batch_file（要抽的观测）与 results_file（你要写的结果）。返回 done 就结束并汇报。
 3. 抽取：每次读 batch_file 里 10 条，**读全文再抽**；10 条一组写分片（放在 results_file 同目录、文件名带批次号），
@@ -227,7 +227,7 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
 
 # ---------- 子命令 ----------
 
-def admission_gate(models: list[str], prompt_version: str, lookup=None) -> dict[str, dict]:
+def admission_gate(models: list[str], prompt_version: str, prompt_sha256: str, lookup=None) -> dict[str, dict]:
     """每个模型最新的 bench 准入记录：要 verdict=pass、且规则正文版本与本战役一致。返回 {模型: 摘要}，含不合格原因。"""
     from tools.extract_bench import base_version, latest_admission
     lookup = lookup or latest_admission
@@ -241,6 +241,9 @@ def admission_gate(models: list[str], prompt_version: str, lookup=None) -> dict[
             why = f"最新准入结论是 {rec.get('verdict')}"
         elif base_version(rec.get("prompt_version")) != prompt_version:
             why = f"准入时的规则 {base_version(rec.get('prompt_version'))} 与本战役 {prompt_version} 不一致"
+        elif rec.get("prompt_sha256") != prompt_sha256:
+            why = ("准入记录没有规则正文哈希（旧记录），请重新准入" if not rec.get("prompt_sha256")
+                   else "准入时的规则正文与本战役开局快照不同（版本号相同、正文改过），请重新准入")
         out[m] = {"verdict": rec and rec.get("verdict"), "bench": rec and rec.get("bench"),
                   "decided_at": rec and rec.get("decided_at"), "ok": why is None, "why": why}
     return out
@@ -249,7 +252,9 @@ def admission_gate(models: list[str], prompt_version: str, lookup=None) -> dict[
 def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
               skip_admission: str | None = None, lookup=None) -> dict:
     d = campaign_dir(cid)
-    gate = admission_gate(models, ax.PROMPT_VERSION, lookup)
+    if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
+        raise SystemExit(f"战役 {cid} 已存在")
+    gate = admission_gate(models, ax.PROMPT_VERSION, prompt_sha(ax.PROMPT_PATH.read_text()), lookup)
     bad = {m: g["why"] for m, g in gate.items() if not g["ok"]}
     if bad and not skip_admission:
         raise SystemExit("这些模型没过 bench 准入，不能进战役（确需例外用 --skip-admission \"原因\"，会记进战役）：\n"
@@ -483,7 +488,7 @@ def cmd_review(cid: str, bid: str, obs: int, *, verdict: str, note: str = "") ->
     return {"batch": bid, "reviewed": len(rv), "errors": sum(r["verdict"] == "error" for r in rv)}
 
 
-def cmd_cost(cid: str, bid: str, *, credits=None, tokens=None, seconds=None) -> dict:
+def cmd_cost(cid: str, bid: str, *, credits=None, tokens=None, seconds=None, note: str = "") -> dict:
     d = campaign_dir(cid)
     with locked(d):
         c = load(d)
@@ -491,8 +496,23 @@ def cmd_cost(cid: str, bid: str, *, credits=None, tokens=None, seconds=None) -> 
         for k, v in (("credits", credits), ("tokens", tokens), ("seconds", seconds)):
             if v is not None:
                 b["cost"][k] = v
+        if note:
+            b["cost"]["note"] = note
         save(d, c)
     return {"batch": bid, "cost": b["cost"]}
+
+
+def final_statuses(d: Path, bid: str, ids: set[int]) -> dict[int, str]:
+    """本批这些观测在 log.jsonl 里最后一次提交的终态。"""
+    p = d / "log.jsonl"
+    out: dict[int, str] = {}
+    if p.exists():
+        for line in p.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                if rec.get("batch") == bid and int(rec["id"]) in ids:
+                    out[int(rec["id"])] = rec.get("status")
+    return out
 
 
 def batch_row(d: Path, b: dict) -> dict:
@@ -500,13 +520,18 @@ def batch_row(d: Path, b: dict) -> dict:
     from schema import EDGE_TYPES, ENTITY_TYPES
     from tools.extract_bench import aggregate, item_metrics
     _, rows = _batch_rows(d, b["id"])
+    # 回收出去的条目属于后来领到它的那一批：这里不算条数、不算指标、不算错误，只记「回收 N」。
+    # 这样模型合计里每条观测只出现一次、取最终结果（2026-10-23 复现：18 条观测、2 条首次失败回收重领，曾算成 20 条、错 2）
+    released = set(b.get("released_ids") or [])
+    rows = [x for x in rows if x[0] not in released]
     rp = d / "results" / f"{b['id']}.json"
     res = {int(it["id"]): it for it in json.loads(rp.read_text()).get("items", [])} if rp.exists() else {}
     r = {"label": f"{b['id']}（{b['chain']}）", "model": b["model"], "chain": b["chain"], "status": b["status"],
          **aggregate([item_metrics(res.get(i), t, ENTITY_TYPES, EDGE_TYPES) for i, t, _ in rows])}
-    counts = b.get("counts") or {}
+    final = final_statuses(d, b["id"], {x[0] for x in rows}) if b["status"] == "submitted" else {}
     # 预览误并候选（dry-run，执行者据此改名）与入库时实际发生的不同名复用分两列
-    r.update(ok=counts.get("ok", 0), error=sum(v for k, v in counts.items() if k not in ("ok", "empty")),
+    r.update(ok=sum(v == "ok" for v in final.values()),
+             error=sum(v not in ("ok", "empty") for v in final.values()), released=len(released),
              dry_mismatch=b.get("dry_run_mismatch"), mismatch=b.get("mismatch"))
     n = max(1, len(rows))
     cost = b.get("cost") or {}
@@ -527,7 +552,7 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     n = sum(r["_n"] for r in rows) or 1
     out = {"label": label, "items": sum(r["items"] for r in rows)}
     for k in ("missing", "empty", "zero_edge", "missing_edges_key", "unknown_type", "dirty_name", "ok", "error",
-              "reviewed", "review_errors"):
+              "released", "reviewed", "review_errors"):
         out[k] = sum(r.get(k) or 0 for r in rows)
     out["dry_mismatch"] = sum(r.get("dry_mismatch") or 0 for r in rows)
     out["mismatch"] = sum(r.get("mismatch") or 0 for r in rows)
@@ -541,7 +566,8 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     return out
 
 
-REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error", "错误"), ("dry_mismatch", "预览误并候选"),
+REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error", "错误"), ("released", "回收"),
+               ("dry_mismatch", "预览误并候选"),
                ("mismatch", "入库不同名复用"),
                ("ent_per_obs", "实体/条"), ("edge_per_obs", "边/条"), ("zero_edge", "零边"),
                ("offschema_edge_pct", "边名越界%"), ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"),
@@ -582,7 +608,7 @@ def cmd_status(cid: str) -> dict:
             "requeue": len(c.get("requeue") or []), "prompt_sha256": c.get("prompt_sha256"),
             "batch": c["batch"], "prompt_version": c["prompt_version"],
             "models": {m: {"run_id": v["run_id"], "claimed": claimed_items(c, m),
-                           "submitted": sum(len(b["ids"]) for b in c["batches"]
+                           "submitted": sum(len(b["ids"]) - len(b.get("released_ids") or []) for b in c["batches"]
                                             if b["model"] == m and b["status"] == "submitted")}
                        for m, v in c["models"].items()},
             "batches": [{k: b.get(k) for k in ("id", "model", "chain", "status", "counts", "mismatch", "cost")}
@@ -689,7 +715,7 @@ def main(argv=None) -> int:
     elif a.cmd == "cost" and a.overhead:
         out = cmd_overhead(a.id, credits=a.credits, tokens=a.tokens, seconds=a.seconds, note=a.note)
     elif a.cmd == "cost":
-        out = cmd_cost(a.id, a.batch, credits=a.credits, tokens=a.tokens, seconds=a.seconds)
+        out = cmd_cost(a.id, a.batch, credits=a.credits, tokens=a.tokens, seconds=a.seconds, note=a.note)
     elif a.cmd == "status":
         out = cmd_status(a.id)
     else:
