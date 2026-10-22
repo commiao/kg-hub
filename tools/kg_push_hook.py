@@ -40,6 +40,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -99,37 +101,104 @@ _SYSTEM_DIRS = {
 
 _MIN_KEYWORD_CHARS = 5
 
+# 只装项目、本身不是项目的容器目录。2026-10-21 实测：~/workspace/libtv-m 首查没
+# 命中，回落到上级 workspace，注入了 kg-hub 的 DESIGN。
+_CONTAINER_DIRS = {"workspace", "workspaces", "worktrees", "projects", "repos", "src"}
+
+# 工具生成的会话目录名：Qoder 的 ~/Documents/Qoder/<日期>/<哈希>（2026-10-22 实测
+# 取到 aa532fee 5 次）。要求带数字，免得把 facade 这类纯 a-f 单词当哈希。
+_HASH_RE = re.compile(r"[0-9a-f]{6,}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+GIT_TIMEOUT_SEC = 1.0  # 本机实测 rev-parse 约 10ms；超时就当不是仓库
+
+
+def _usable_keyword(kw: str) -> bool:
+    if not kw or len(kw) < _MIN_KEYWORD_CHARS:
+        return False
+    if kw in _SYSTEM_DIRS or kw in _CONTAINER_DIRS:
+        return False
+    if kw.startswith("."):           # .claude / .codex / .cursor：工具配置目录
+        return False
+    if _DATE_RE.fullmatch(kw):
+        return False
+    if _HASH_RE.fullmatch(kw) and any(c.isdigit() for c in kw):
+        return False
+    return True
+
+
+def _project_from_layout(p: Path) -> str | None:
+    """认出 agent worktree 的目录形态，不起子进程。
+
+    <仓库>/.claude/worktrees/<名字>[/...]  → 仓库名
+    ~/.codex/worktrees/<id>/<仓库>[/...]   → 仓库名
+    ~/.codex/worktrees/<id>                → ""（已知不是项目）
+    其他                                   → None（交给 git / 旧逻辑）
+    """
+    parts = p.parts
+    for i in range(len(parts) - 1):
+        if parts[i + 1] != "worktrees":
+            continue
+        if parts[i] == ".claude" and i >= 1 and len(parts) > i + 2:
+            return parts[i - 1]
+        if parts[i] == ".codex":
+            return parts[i + 3] if len(parts) > i + 3 else ""
+    return None
+
+
+def _project_from_git(p: Path) -> str | None:
+    """git 仓库里取主检出目录名：worktree 的 --git-common-dir 指回主检出的 .git。
+
+    子模块 / 裸仓库的 common dir 不叫 .git，退回 --show-toplevel。
+    不是仓库、没装 git、超时 → None。
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(p), "rev-parse", "--path-format=absolute",
+             "--git-common-dir", "--show-toplevel"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_SEC, env=env,
+        )
+    except Exception:
+        return None
+    lines = out.stdout.splitlines()
+    if out.returncode != 0 or len(lines) < 2:
+        return None
+    common, top = Path(lines[0]), Path(lines[1])
+    root = common.parent if common.name == ".git" else top
+    return root.name or None
+
 
 def derive_project_keywords(cwd: str) -> list[str]:
     """Convert cwd to a set of keywords for fulltext search.
 
-    For /Users/mac/work-ai/kg-hub →
-        ['kg-hub', 'work-ai']
+    先认项目，认出来就只用项目名（它的上级目录只是容器）：
+      .../kg-hub/.claude/worktrees/<名字>   → ['kg-hub']
+      ~/.codex/worktrees/<id>/sd-server      → ['sd-server']
+      ~/work-ai/kg-hub/tools（git 仓库子目录）→ ['kg-hub']
 
-    For /Users/mac/workspace_codex/foo →
-        ['foo', 'workspace_codex']
+    认不出项目时退回「目录名 + 上级目录名」，并去掉系统目录、容器目录、隐藏目录、
+    日期和哈希：
+      ~/workspace_codex/hello-app → ['hello-app', 'workspace_codex']
+      ~/.claude、~/Documents/Qoder/<日期>/<哈希>、/tmp → []
 
-    For /tmp, /Users, etc. → [] (skip system / generic paths so we don't
-    spam unrelated sessions with canonical injection from substring matches
-    like '/tmp/cache' appearing inside ROADMAP.md).
-
-    The basename is usually the strongest signal; parent dir is a fallback.
+    宁可不注入，也不拿 .claude / 哈希 / workspace 去全文检索，把不相关的
+    canonical 塞进会话。
     """
-    p = Path(cwd).resolve()
+    try:
+        p = Path(cwd).resolve()
+    except Exception:
+        return []
+    project = _project_from_layout(p)
+    if project is None:
+        project = _project_from_git(p)
+    if project is not None:
+        return [project] if _usable_keyword(project) else []
+
     raw_parts = [p.name]
     if p.parent and p.parent.name:
         raw_parts.append(p.parent.name)
-
-    keywords = []
-    for kw in raw_parts:
-        if not kw:
-            continue
-        if kw in _SYSTEM_DIRS:
-            continue
-        if len(kw) < _MIN_KEYWORD_CHARS:
-            continue
-        keywords.append(kw)
-    return keywords
+    return [kw for kw in raw_parts if _usable_keyword(kw)]
 
 
 def empty_output() -> dict:
