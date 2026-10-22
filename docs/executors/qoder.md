@@ -47,7 +47,7 @@ python -m tools.extract_bench run --bench ~/.kg-hub/bench/bench-20261022 \
     --models Qwen3.8-Max GLM-5.3 Kimi-K3 DeepSeek-Flash --tag smoke10 --limit 10 --parallel 4
 ```
 
-运行器把 agent-v4 规则（加一段 bench1 补充约定）与每 10 条观测拼成一次 `qodercli -p -m <模型>` 调用，qoder 不开任何工具、
+运行器把 agent-v4 规则（加一段 bench2 补充约定）与每批至多 10 条观测拼成一次 `qodercli -p -m <模型>` 调用（推理强度统一为 `--effort`，缺省 medium；任务按「组号 → 模型」交错排队），qoder 不开任何工具、
 不加载用户级设置（那里挂着 claude-mem 钩子），只回 JSON；运行器解析、漏掉的拆半重试，写 `~/.kg-hub/bench/runs/<tag>-qodercli-<模型>/`
 （results、run.json 记调用次数/credits/耗时、work/ 存原始回复），跑完自动自检并出合表。`--limit` 按基线模型轮流取样做冒烟，
 去掉就是全量 200 条；已有结果的目录不覆盖，换 `--tag`。之后也可以 `score --run <目录...>` 把多次运行合成一张表。
