@@ -54,6 +54,21 @@ class SkillDocTest(unittest.TestCase):
             self.assertIn(tool, self.manifest["targets"])
         self.assertFalse(self.manifest["security"]["contains_secrets"])
 
+    def test_trigger_is_the_fixed_prefix(self):
+        """2026-10-23 用户定：只认「使用kg-hub对比模型」开头；不带前缀的宽泛说法会在日常讨论 kg-hub 时误触发。"""
+        prefix = "使用kg-hub对比模型"
+        desc = self.manifest["description"]
+        self.assertIn(f"只在用户以「{prefix}」开头时使用", desc)
+        for loose in ("kg-hub 盲评", "kg-hub 模型对比", "kg-hub 准入", "使用kg-hub盲测", "使用kg-hub对比 A"):
+            with self.subTest(loose=loose):
+                self.assertNotIn(loose, desc)
+        examples = re.findall(rf"「({prefix}\+[^」]+)」", desc)
+        self.assertEqual(len(examples), 4)
+        for mode, ex in zip(("冒烟", "准入", "盲测", "战役"), examples):
+            with self.subTest(mode=mode):
+                self.assertIn(f"| 「{ex}」", self.text)                  # 描述里的例子在意图表里都有对应行
+                self.assertIn(f"**{mode}**", self.text)
+
     def test_every_mentioned_subcommand_exists(self):
         have = {"extract_bench": subcommands(xb.main), "extract_campaign": subcommands(ec.main)}
         self.assertIn("register", have["extract_bench"])
