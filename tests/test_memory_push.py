@@ -80,6 +80,27 @@ class ParseTest(unittest.TestCase):
         m = mem(SAMPLE.replace("  modified: 2026-09-22T07:09:08.628Z\n", ""), "2026-10-01T00:00:00+00:00")
         self.assertEqual(m["reference_time"], "2026-10-01T00:00:00+00:00")
 
+    def test_paragraph_leads(self):
+        body = (
+            "第一段**加粗**和 `code`，见 [[other-memory]] 与 [文档](docs/x.md)。第二句不要。\n续行\n\n"
+            "```sh\n代码块不取。\n```\n"
+            "| 表格 | 不取 |\n"
+            "## 标题不取\n\n---\n\n"
+            "- 列表一；后半句不要\n"
+            "* 列表二\n"
+            "1. 编号项。\n\n"
+            "**Why：** 理由段不取。\n\n"
+            "**How to apply:** 做法段不取。\n\n"
+            "最后一段。\n"
+        )
+        self.assertEqual(mp.paragraph_leads(body), [
+            "第一段加粗和 code，见 other-memory 与 文档。", "列表一；", "列表二", "编号项。", "最后一段。"])
+        self.assertEqual(mp.paragraph_leads(body, limit=2), ["第一段加粗和 code，见 other-memory 与 文档。", "列表一；"])
+        # 取的是「前 limit 段」，Why/How 段不占名额
+        many = "\n\n".join(f"第{i}段。" for i in range(10))
+        self.assertEqual(mp.paragraph_leads("**Why:** 理由。\n\n" + many), [f"第{i}段。" for i in range(mp.MAX_LEADS)])
+        self.assertEqual(mem()["leads"], ["正文第一段。"])
+
     def test_no_frontmatter(self):
         m = mem("just text")
         self.assertEqual(m["name"], "")
@@ -148,7 +169,7 @@ class IdentityAndExtractionTest(unittest.TestCase):
         self.assertEqual([(e["name"], e["type"]) for e in ents],
                          [("launchctl-bootout-is-async", "Lesson"), ("kg-hub", "Project"),
                           ("shell-cjk-expansion-utf8-not-c", "Lesson")])
-        self.assertEqual([e["name"] for e in edges], ["belongs_to", "relates_to", "relates_to"])
+        self.assertEqual([e["name"] for e in edges], ["belongs_to", "relates_to", "relates_to", "relates_to"])
         # 主 fact = description / How-to 原文，不带 "slug：" 前缀（中文向量对不上英文前缀）
         self.assertEqual(edges[0]["fact"], mem()["description"])
         self.assertEqual(edges[1]["fact"], mem()["how_to"])
@@ -157,6 +178,19 @@ class IdentityAndExtractionTest(unittest.TestCase):
         self.assertIn("准则 31", edges[2]["fact"])
         # 不在索引里的链接不建实体、不建边
         self.assertNotIn("not-in-index", [e["name"] for e in ents])
+        # memory-v3：段首句挂在主目标上
+        self.assertEqual((edges[3]["source"], edges[3]["target"], edges[3]["fact"]),
+                         ("launchctl-bootout-is-async", "kg-hub", "正文第一段。"))
+
+    def test_lead_edges_dedupe_and_cap(self):
+        m = mem()
+        m["leads"] = [m["description"], "甲。", m["how_to"], "甲。", "", "乙。"]
+        _, edges = mp.build_extraction(m, "kg-hub", {})
+        facts = [e["fact"] for e in edges]
+        self.assertEqual(facts, [m["description"], m["how_to"], "甲。", "乙。"])
+        long_body = "\n\n".join(f"第{i}段。" for i in range(20))
+        _, edges = mp.build_extraction(mem(SAMPLE.replace("正文第一段。", long_body)), None, {})
+        self.assertEqual(len(edges), 2 + mp.MAX_LEADS)
 
     def test_extraction_general_bucket_hangs_on_tool(self):
         ents, edges = mp.build_extraction(mem(), None, {})
@@ -179,7 +213,7 @@ class IdentityAndExtractionTest(unittest.TestCase):
         edges = [ExtractedEdge(**e) for e in p["edges"]]
         n = normalize_extraction(ents, edges, set(ENTITY_TYPES), set(EDGE_TYPES))
         self.assertEqual(n.stats["entities_out"], 3)
-        self.assertEqual(n.stats["edges_out"], 3)
+        self.assertEqual(n.stats["edges_out"], 4)
         for k in ("unknown_type", "offschema_edge", "dangling_edge", "dup_entity", "dup_edge", "self_edge"):
             self.assertEqual(n.stats[k], 0, k)
         self.assertTrue(all(len(e["fact"]) <= mp.MAX_FACT for e in p["edges"]))
@@ -200,6 +234,12 @@ class PlanTest(unittest.TestCase):
         wm = {"a": {"sha": "abc", "episode_name": "agent-memory-claude-code-a@old"}}
         self.assertEqual(mp.plan_changes(wm, {"a": mp.content_key("abc")})["changed"], ["a"])
         self.assertEqual(mp.plan_changes(wm, {"a": "abc:memory-v1"})["unchanged"], ["a"])
+
+    def test_v2_watermark_counts_as_changed(self):
+        # v3 加了段首句边：v2 推过的同一文件也要重推并归档 v2 旧版
+        self.assertEqual(mp.PROMPT_VERSION, "memory-v3")
+        wm = {"a": {"key": "abc:memory-v2", "episode_name": "agent-memory-claude-code-a@v2"}}
+        self.assertEqual(mp.plan_changes(wm, {"a": mp.content_key("abc")})["changed"], ["a"])
 
     def test_post_with_retry_waits_on_draining_only(self):
         calls, sleeps = [], []
