@@ -26,7 +26,8 @@
       KG_HUB_NAS_SSH（默认 commiao@100.123.208.32）、KG_HUB_NAS_CLAUDE_MEM_DB
       （默认 /volume2/4T/kg-hub-data/claude-mem/claude-mem.db）、KG_HUB_AGENT_EXTRACT_DIR
       （状态与日志目录，默认 ~/.kg-hub/agent-extract）、KG_HUB_EXECUTOR / KG_HUB_RUN_ID
-      （submit / run 的缺省来源标记）。token 只从环境变量读，不打印、不落日志。
+      （submit / run 的缺省来源标记）、KG_HUB_CLAIMS_DIR / KG_HUB_CLAIM_TTL_HOURS（全设备在途领取登记，
+      见 tools/claim_registry.py：next 领批会避开别的战役 / 状态目录正领着的观测）。token 只从环境变量读，不打印、不落日志。
 
 只读 claude-mem 副本；写入只经 kg-hub 的治理接口；不调模型、不动断路器。
 """
@@ -47,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
+from tools import claim_registry  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
 PROMPT_VERSION = "agent-v4"   # v1→v2 第 1 轮（haiku）复盘；v2→v3 第 2 轮（opus）复盘；v3→v4 三模型 2000 条 chain-v8 定稿，见 config/agent_extract_prompt.md 末尾
@@ -337,6 +339,11 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
 
 # ---------- 提交前必须 dry-run：由工具自己执行，不靠执行器记得 ----------
 
+def next_owner(sd: Path) -> str:
+    """全设备在途登记里 next 的领取方：每个状态目录一个（同一目录里接着领自己的不互挡）。"""
+    return f"next:{sd.resolve()}"
+
+
 def dryrun_marker_path(sd: Path, batch_id: str) -> Path:
     return sd / f"dryrun-{batch_id}.json"
 
@@ -364,6 +371,8 @@ def dryrun_missing(sd: Path, batch_id: str, results: dict) -> list[int]:
 
 
 SUMMARY_KEYS = ("model", "run_id", "executor")
+# 提交后不再需要占着的终态：入库、空观测（不提交）、别处已入库
+DONE_STATUSES = ("ok", "empty", "skipped")
 
 
 def summarize_log(records: list[dict], key: str = "model") -> dict:
@@ -590,33 +599,39 @@ def main(argv: list[str] | None = None) -> int:
         st = _load_state(state_path)
         after = a.after_id if a.after_id is not None else int(st.get("cursor", 0))
         cfg = load_config()
-        remote = fetch_remote_pending(after, max(a.n * 4, 40))
-        rows = remote["rows"]
-        if not rows:
-            print(json.dumps({"picked": 0, "message": "游标之后没有待处理观测了", "cursor": remote["after"],
-                              "boundary": remote["boundary"], "exhausted": remote["exhausted"]}))
-            return 0
-        idents = [to_identity(r) for r in rows]
-        existing = check_existing(idents, a.url, token)
-        picked, stats = select_batch(rows, cfg, a.n, existing)
-        stats.update({"boundary": remote["boundary"], "skipped_by_watermark": remote["skipped_by_watermark"]})
-        st["batches"] = int(st.get("batches", 0)) + 1
-        batch_id = f"b{st['batches']:04d}"
-        # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没挑到 n 条时），
-        # 中间被闸拒/已入库的不会再看第二遍。
-        last_considered = picked[-1]["id"] if len(picked) >= a.n else rows[-1]["id"]
-        # 前瞻：本批之后紧接着的观测标题（第 2 轮复盘：跨批的更正在下一批才出现，抽取者看不到）
-        lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
-                     for r in rows if r["id"] > last_considered][:a.n]
-        batch = {"batch_id": batch_id, "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                 "after_id": remote["after"], "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
-                 "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked, "lookahead": lookahead}
-        out = Path(a.out) if a.out else sd / f"batch-{batch_id}.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(batch, ensure_ascii=False, indent=1))
-        st["cursor"] = last_considered
-        st["last_batch"] = str(out)
-        _save_state(state_path, st)
+        owner = next_owner(sd)
+        with claim_registry.opened() as reg:
+            remote = fetch_remote_pending(after, max(a.n * 4, 40))
+            rows = remote["rows"]
+            if not rows:
+                print(json.dumps({"picked": 0, "message": "游标之后没有待处理观测了", "cursor": remote["after"],
+                                  "boundary": remote["boundary"], "exhausted": remote["exhausted"]}))
+                return 0
+            # 全设备在途领取登记：剔除别的战役 / 别的 next 状态目录正领着的观测（tools/claim_registry.py）
+            held = reg.held_by_others(owner)
+            avail = [r for r in rows if r["id"] not in held]
+            existing = check_existing([to_identity(r) for r in avail], a.url, token) if avail else {}
+            picked, stats = select_batch(avail, cfg, a.n, existing)
+            stats["held_elsewhere"] = len(rows) - len(avail)
+            stats.update({"boundary": remote["boundary"], "skipped_by_watermark": remote["skipped_by_watermark"]})
+            st["batches"] = int(st.get("batches", 0)) + 1
+            batch_id = f"b{st['batches']:04d}"
+            # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没挑到 n 条时），
+            # 中间被闸拒/已入库的不会再看第二遍。
+            last_considered = picked[-1]["id"] if len(picked) >= a.n else rows[-1]["id"]
+            # 前瞻：本批之后紧接着的观测标题（第 2 轮复盘：跨批的更正在下一批才出现，抽取者看不到）
+            lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
+                         for r in rows if r["id"] > last_considered][:a.n]
+            batch = {"batch_id": batch_id, "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                     "after_id": remote["after"], "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
+                     "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked, "lookahead": lookahead}
+            out = Path(a.out) if a.out else sd / f"batch-{batch_id}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(batch, ensure_ascii=False, indent=1))
+            st["cursor"] = last_considered
+            st["last_batch"] = str(out)
+            _save_state(state_path, st)
+            reg.reserve([x["id"] for x in picked], owner, info=batch_id)
         print(json.dumps({"batch": str(out), "picked": len(picked), "cursor": last_considered,
                           **stats}, ensure_ascii=False))
         return 0
@@ -645,6 +660,8 @@ def main(argv: list[str] | None = None) -> int:
                           executor=a.executor, run_id=a.run_id)
     if a.dry_run:
         record_dryrun(sd, batch_id, recs)
+    else:   # 入库（或别处已入库）的注销在途登记；没入库的留着，超时自动失效
+        claim_registry.release([r["id"] for r in recs if r.get("status") in DONE_STATUSES], next_owner(sd))
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1

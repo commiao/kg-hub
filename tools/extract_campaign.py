@@ -51,6 +51,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import agent_extract as ax  # noqa: E402
+from tools import claim_registry  # noqa: E402
 
 TOOL = "extract_campaign"
 CHAIN_NONE = "c0"
@@ -126,6 +127,11 @@ def episode_prompt_version(c: dict, chain: str) -> str:
 def ax_pattern():
     from utils.extracted_ingest import EXTRACTOR_MODEL_PATTERN
     return EXTRACTOR_MODEL_PATTERN
+
+
+def campaign_owner(cid: str) -> str:
+    """全设备在途登记里的领取方：整个战役一个，战役内各模型、回收重领都不互挡。"""
+    return f"campaign:{cid}"
 
 
 def claimed_items(c: dict, model: str) -> int:
@@ -207,16 +213,19 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
     子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
     codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
     st = state or ax.state_dir()
+    # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
+    reg_dir = claim_registry.claims_dir()
+    adds = f"--add-dir {st}" + ("" if reg_dir.resolve().is_relative_to(Path(st).resolve()) else f" --add-dir {reg_dir}")
     # 解释器不写死某台机器的路径：KG_HUB_PYTHON 指向装好 kg-hub 依赖的 Python，没设就用 python3
     brief_cmd = f'"$(${{KG_HUB_PYTHON:-python3}} -m tools.extract_campaign brief --id {cid} --model {model})"'
     if tool == "codex":
-        return (f"cd {repo} && codex exec -m {model} -C {repo} --add-dir {st} -s workspace-write "
+        return (f"cd {repo} && codex exec -m {model} -C {repo} {adds} -s workspace-write "
                 f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
     if tool == "cursor":
-        return (f"cd {repo} && cursor-agent -p --model {model} --trust --workspace {repo} --add-dir {st} "
+        return (f"cd {repo} && cursor-agent -p --model {model} --trust --workspace {repo} {adds} "
                 f"--force {brief_cmd}")
     if tool == "qodercli":
-        return (f"cd {repo} && qodercli -p -m {model} -w {repo} --add-dir {st} --permission-mode auto "
+        return (f"cd {repo} && qodercli -p -m {model} -w {repo} {adds} --permission-mode auto "
                 f"-o json {brief_cmd}")
     if tool == "dsh":
         # DeepSeek Harness（@deepseek-ai/dsh）无界面模式一次跑完一个任务；它没有模型参数，模型在 DSH 的
@@ -292,25 +301,33 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
     d = campaign_dir(cid)
     fetch = fetch or ax.fetch_remote_pending
     check = check or (lambda idents: ax.check_existing(idents, url, token))
-    with locked(d):
+    owner = campaign_owner(cid)
+    # 先战役锁、后全设备登记锁（提交只拿登记锁），顺序固定不会互等
+    with locked(d), claim_registry.opened() as reg:
         c = load(d)
         if model not in c["models"]:
             raise SystemExit(f"战役 {cid} 没有模型 {model}；有：{', '.join(c['models'])}")
+        held = reg.held_by_others(owner)
         left = c["quota"] - claimed_items(c, model)
         if left <= 0:
             return {"done": True, "model": model, "message": f"{model} 已领满配额 {c['quota']} 条"}
         n = min(c["batch"], left)
         # 先领回收队列（release 放回来的条目），再按游标取新的
         requeued, c["requeue"] = take_requeue(d, c.get("requeue") or [], n, check)
+        # 回收的条目登记超时后可能已被别的战役领走：那就让给它
+        requeued = [i for i in requeued if i["id"] not in held]
         rows, stats, last, lookahead = [], {"requeued": len(requeued)}, c["cursor"], []
         picked = list(requeued)
         if len(picked) < n:
             remote = fetch(c["cursor"], max((n - len(picked)) * 4, 40))
             rows = remote["rows"]
             if rows:
-                fresh, st = ax.select_batch(rows, ax.load_config(), n - len(picked),
-                                            check([ax.to_identity(r) for r in rows]))
+                # 全设备在途领取登记：别的战役 / agent_extract next 正领着的不领（tools/claim_registry.py）
+                avail = [r for r in rows if r["id"] not in held]
+                fresh, st = ax.select_batch(avail, ax.load_config(), n - len(picked),
+                                            check([ax.to_identity(r) for r in avail]) if avail else {})
                 stats.update(st)
+                stats["held_elsewhere"] = len(rows) - len(avail)
                 picked += fresh
                 last = fresh[-1]["id"] if len(fresh) >= n - len(requeued) else rows[-1]["id"]
                 lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
@@ -332,6 +349,7 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
         c["cursor"] = last
         c["batches"].append({"id": bid, "model": model, "chain": c["chain"], "ids": [i["id"] for i in picked],
                              "status": "claimed", "claimed_at": _now(), "cost": {}})
+        reg.reserve([i["id"] for i in picked], owner, info=bid)
         save(d, c)
     run_id = c["models"][model]["run_id"]
     return {"done": False, "batch": bid, "model": model, "run_id": run_id, "chain": c["chain"],
@@ -415,6 +433,9 @@ def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None
         else:
             b.update(status="submitted", submitted_at=_now(), counts=counts, mismatch=len(mismatch))
         save(d, c)
+    # 入库（或别处已入库）的注销全设备在途登记；没入库的留在本战役名下，等 release 后重领。
+    # dry-run 的终态是 dry_run，不在 DONE_STATUSES 里，这里不会注销任何东西
+    claim_registry.release([r["id"] for r in recs if r.get("status") in ax.DONE_STATUSES], campaign_owner(cid))
     return {"batch": bid, "dry_run": dry_run, "by_status": counts, "reuse_mismatch": mismatch,
             "errors": [{"id": r["id"], "error": r.get("error")} for r in recs if r.get("error")]}
 
