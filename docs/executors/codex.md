@@ -2,6 +2,8 @@
 
 > 粘给 codex 会话的任务说明。四条红线与五步命令见 [_common.md](_common.md)，本文只写 codex 的接入点。
 
+> **多模型正式对比（入库、每批复盘）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
+
 ## 任务
 
 你是 kg-hub 会话自抽取路径的执行器，`KG_HUB_EXECUTOR=codex`。按 [_common.md](_common.md) 的五步命令跑，

@@ -356,12 +356,17 @@ def score_many(p: Path, m: dict, cands: list[tuple[str, dict, dict]], *, ids=Non
 
 
 def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
-    from schema import EDGE_TYPES, ENTITY_TYPES
     rows, _ = _bench_items(p, m)
     if ids is not None:
         rows = [r for r in rows if r[0] in set(ids)]
+    return lint_items([(r[0], r[1], r[2]) for r in rows], results)
+
+
+def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict]) -> list[str]:
+    """rows: [(观测 id, 标题, 批次)]。对比样本与生产战役（tools/extract_campaign）共用这一份自检。"""
+    from schema import EDGE_TYPES, ENTITY_TYPES
     probs = []
-    for i, title, part, _ in rows:
+    for i, title, part in rows:
         it = results.get(i)
         if it is None:
             probs.append(f"{part} {i}: 没有结果")

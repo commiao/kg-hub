@@ -49,6 +49,7 @@ python -m tools.agent_extract retro -- checkpoint --lessons-file lessons.md   # 
 每次实验前后各一条：`agent_extract run start --run-id <id> --executor <工具> --model <模型>`（建运行清单，§3）、
 `agent_extract run end --run-id <id> --input-tokens N --output-tokens N`（收尾自报成本）。
 各工具可直接粘贴的任务说明在 `docs/executors/`（claude-code / codex / qoder，公共部分 `_common.md`）。
+多个模型并行的正式对比走「战役」：`tools/extract_campaign.py` + `docs/executors/campaign.md`（编排者 + 每模型一个子代理，领批加锁、全部入库、每批复盘）。
 
 执行器必须满足的四条（放进每个工具的任务说明里）：
 1. 抽取只用提示词文件里的 schema，不自创类型和边名；没有知识就提交空 entities，不凑数。
