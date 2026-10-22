@@ -64,7 +64,7 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录A> --sheet 
 - 偏向风险：基线是 Claude、评审也是 Claude，可能偏向 Claude 的写法——每条 `error` 写清错在哪，结论里注明「Claude 评审」，有争议的列给用户。
 
 门槛（写在 `tools/extract_bench.py` 的 `THRESHOLDS`）：规则版本一致；未交 / 自检问题 / 边名越界 / 悬空边 / 未知类型都为 0；
-照抄标题、译文边 ≥95%；中英问句命中各 ≥90% 且每个基线模型那部分不低 5 点以上；盲评 10 条错误 ≤1；≥30 条。
+照抄标题、译文边 ≥95%；其余 fact 英文占比 ≥90%、长度 60–200 字符的 ≥80%；中英问句命中各 ≥90% 且每个基线模型那部分不低 5 点以上；盲评 10 条错误 ≤1；≥30 条。
 空观测率不比基线高出 5 点以上；至少有一个基线模型那部分能配对；准入自检只计硬错误（schema / 悬空边 / 缺 edges）。
 结论 `fail` / `screen_pass` / `pending_blind` / `pass`，带 `--sheet` 时追加进 `~/.kg-hub/bench/admissions/<模型>.json`（记录带规则正文哈希，开战役时与快照比对）。撤销准入：`$PY -m tools.extract_bench revoke --model <模型> --reason <原因>`。
 

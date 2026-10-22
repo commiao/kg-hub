@@ -81,9 +81,52 @@ def fake_embed(texts, cache_dir=None):
     return np.array(out, dtype=np.float32)
 
 
+class RestFactRule23Test(unittest.TestCase):
+    """2026-10-23 冒烟：gpt-6-luna 其余 fact 全是中文、Qwen3.8-Max 过长，原门槛都没查。"""
+    def agg(self, facts_per_item):
+        return xb.aggregate([xb.item_metrics(item([edge(TITLE), edge("English translation of the title")]
+                                                  + [edge(f) for f in fs]), TITLE, ENTITY_TYPES, EDGE_TYPES)
+                             for fs in facts_per_item])
+
+    def test_english_share_and_length_window(self):
+        en_ok = "A depends on B because the canary sampled the HNSW index path with zero fallbacks"
+        r = self.agg([[en_ok, "全是中文的事实也能写得足够长但不符合规则二十三的英文要求所以不计入英文占比之中"]])
+        self.assertEqual((r["rest_fact_en_pct"], r["rest_fact_len_ok_pct"]), (50.0, 50.0))   # 中文那条只有 40 字
+        self.assertEqual(self.agg([[en_ok, "too short"]])["rest_fact_len_ok_pct"], 50.0)
+        self.assertEqual(self.agg([[en_ok, "x" * 201]])["rest_fact_len_ok_pct"], 50.0)
+        self.assertEqual(self.agg([[en_ok, "y" * 200]])["rest_fact_len_ok_pct"], 100.0)
+
+    def test_english_sentence_with_chinese_entity_names_counts_as_english(self):
+        ents = [{"name": "发布前20问与37条溯源工作规则", "type": "Concept"}, {"name": "关键测试须通过真实变异验证", "type": "Lesson"}]
+        it = {"id": 1, "entities": ents, "edges": [
+            edge(TITLE, "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("English translation of the title", "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("发布前20问与37条溯源工作规则 requires 关键测试须通过真实变异验证 under Rule 17 with a fake PATH",
+                 "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证"),
+            edge("发布前20问与37条溯源工作规则 要求关键测试在临时 HOME 与假 PATH 下做变异验证并复查真实环境未被改动",
+                 "发布前20问与37条溯源工作规则", "关键测试须通过真实变异验证")]}
+        m = xb.item_metrics(it, TITLE, ENTITY_TYPES, EDGE_TYPES)
+        self.assertEqual((m["rest_facts"], m["rest_en"]), (2, 1))   # 英文谓语算英文；整句中文仍算中文
+        self.assertEqual(xb.strip_names("长名字里的短名 x", ["短名", "长名字里的短名"]), "x")
+
+    def test_no_rest_facts_is_not_a_violation(self):
+        r = self.agg([[], []])                     # 只有标题原文 + 译文（增量观测允许）
+        self.assertEqual((r["rest_fact_en_pct"], r["rest_fact_len_ok_pct"]), (100.0, 100.0))
+
+
+class Rule18WordingTest(unittest.TestCase):
+    def test_rule18_says_records_of_docs_and_incidents_are_not_recaps(self):
+        text = xb.PROMPT_PATH.read_text()
+        rule18 = text[text.index("18. **回顾"):text.index("19. **用 batch")]
+        self.assertIn("把本会话前面说过的话再讲一遍", rule18)
+        self.assertIn("事故经过", rule18)
+        self.assertIn("**不是**回顾", rule18)
+
+
 class AdmissionChecksTest(unittest.TestCase):
     ROW = {"label": "x（全样本）", "items": 50, "missing": 0, "headline_verbatim_pct": 100.0, "second_other_lang_pct": 98.0,
-           "hit_zh_pct": 96.0, "hit_en_pct": 100.0, "offschema_edge_pct": 0.0, "dangling_edge_pct": 0.0, "unknown_type": 0}
+           "hit_zh_pct": 96.0, "hit_en_pct": 100.0, "offschema_edge_pct": 0.0, "dangling_edge_pct": 0.0, "unknown_type": 0,
+           "rest_fact_en_pct": 100.0, "rest_fact_len_ok_pct": 100.0}
 
     PAIR = ({"label": "x｜haiku 那部分", "hit_zh_pct": 100.0, "hit_en_pct": 100.0},
             {"label": "haiku（基线）", "hit_zh_pct": 100.0, "hit_en_pct": 100.0})
@@ -101,7 +144,8 @@ class AdmissionChecksTest(unittest.TestCase):
         for bad in ({"row": {"missing": 1}}, {"lint": 2}, {"row": {"headline_verbatim_pct": 94.0}},
                     {"row": {"second_other_lang_pct": 90.0}}, {"row": {"hit_zh_pct": 89.0}},
                     {"row": {"dangling_edge_pct": 0.5}}, {"row": {"unknown_type": 1}}, {"prompt": "agent-v3+bench1"},
-                    {"blind": {"judged": 10, "errors": 2}}):
+                    {"blind": {"judged": 10, "errors": 2}},
+                    {"row": {"rest_fact_en_pct": 89.9}}, {"row": {"rest_fact_len_ok_pct": 79.9}}):   # 规则 23
             with self.subTest(bad=bad):
                 kw = {"blind": ok_blind, **bad}
                 self.assertEqual(self.verdict(**kw)[1], "fail")

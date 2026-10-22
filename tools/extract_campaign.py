@@ -578,7 +578,7 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     out["dry_mismatch"] = sum(r.get("dry_mismatch") or 0 for r in rows)
     out["mismatch"] = sum(r.get("mismatch") or 0 for r in rows)
     for k in ("ent_per_obs", "edge_per_obs", "offschema_edge_pct", "dangling_edge_pct", "headline_verbatim_pct",
-              "second_other_lang_pct", "rest_fact_en_pct", "rest_fact_len"):
+              "second_other_lang_pct", "rest_fact_en_pct", "rest_fact_len", "rest_fact_len_ok_pct"):
         out[k] = round(sum((r.get(k) or 0) * r["_n"] for r in rows) / n, 2)
     for k, col, nd in (("credits", "credits_per_obs", 2), ("tokens", "tokens_per_obs", 0), ("seconds", "sec_per_obs", 1)):
         have = [r for r in rows if r["_cost"].get(k) is not None]
@@ -593,7 +593,7 @@ REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error"
                ("ent_per_obs", "实体/条"), ("edge_per_obs", "边/条"), ("zero_edge", "零边"),
                ("offschema_edge_pct", "边名越界%"), ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"),
                ("dirty_name", "脏命名"), ("headline_verbatim_pct", "照抄标题%"), ("second_other_lang_pct", "译文边%"),
-               ("rest_fact_en_pct", "其余英文%"), ("rest_fact_len", "其余均长"), ("reviewed", "抽查"),
+               ("rest_fact_en_pct", "其余英文%"), ("rest_fact_len", "其余均长"), ("rest_fact_len_ok_pct", "其余长度合规%"), ("reviewed", "抽查"),
                ("review_errors", "抽查错误"), ("credits_per_obs", "credits/条"),
                ("tokens_per_obs", "token/条"), ("sec_per_obs", "秒/条")]
 
