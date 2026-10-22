@@ -79,6 +79,8 @@ class SkillDocTest(unittest.TestCase):
         self.assertIn(f"不低 {t['subset_drop_pts']:.0f} 点以上", self.text)
         self.assertIn(f"盲评 {xb.BLIND_N} 条错误 ≤{t['blind_max_errors']}", self.text)
         self.assertIn(f"≥{xb.ADMISSION_MIN_ITEMS} 条", self.text)
+        self.assertIn(f"空观测率不比基线高出 {t['empty_extra_pts']:.0f} 点以上", self.text)
+        self.assertIn("extract_bench revoke", self.text)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ python -m tools.eval_report --run-id <run_id> [--run-id <对照 run>] --graph-js
 `gateway.custom_extraction`、`gateway.max_tokens`、`gateway.edge_empty_retry`）是服务端环境变量，
 改了要发布，清单里记的是本次实验假定的值。
 
-## 多模型正式对比（入库）
+## 多模型生产画像（入库；准入看 bench）
 
 几个模型在给定配额上比较、每批复盘改链路：一个编排者给每个模型派一个子代理（或每个模型一个会话），
 都走 `tools/extract_campaign.py`——领批加锁保证不撞批，各模型抽不同的新观测并全部入库，复盘表按模型 × 约定版本分组。

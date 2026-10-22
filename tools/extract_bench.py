@@ -15,6 +15,7 @@ opus / sonnet / haiku 5.5 在 chain-v8（≈ agent-v4）下的结果（docs/thre
   lint    --bench <目录> --results <文件>...   写完结果后的自检（悬空边、schema 外类型/边名、缺 edges 键、
           第一条边是否照抄标题、第二条边是否另一语言）。
   register --bench <目录> --results <结果目录> --model <模型> --executor <工具>   把会话里手工抽取的结果登记成运行目录
+  revoke  --model <模型> --reason <原因>   显式撤销准入（admit 不带 --sheet 只预览、不写记录）
   score   --bench <目录> --results <文件或目录>... --label <名字> [--model --executor --tokens --wall-s --json]
           候选与基线并排：全样本一行，再按基线模型各自那部分观测逐对比较。
 
@@ -363,14 +364,18 @@ def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
     return lint_items([(r[0], r[1], r[2]) for r in rows], results)
 
 
-def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict]) -> list[str]:
-    """rows: [(观测 id, 标题, 批次)]。对比样本与生产战役（tools/extract_campaign）共用这一份自检。"""
+def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict], *, chain_rules: bool = True,
+               missing: bool = True) -> list[str]:
+    """rows: [(观测 id, 标题, 批次)]。对比样本与生产战役（tools/extract_campaign）共用这一份自检。
+    执行者自检要全报（chain_rules / missing 都开）；准入判定只要硬错误（schema、悬空边、缺 edges 键）——
+    规则 21/22 交给照抄标题 / 译文边的比例门槛，没交的交给「未交 = 0」，否则错 1 条就等于要求 100%。"""
     from schema import EDGE_TYPES, ENTITY_TYPES
     probs = []
     for i, title, part in rows:
         it = results.get(i)
         if it is None:
-            probs.append(f"{part} {i}: 没有结果")
+            if missing:
+                probs.append(f"{part} {i}: 没有结果")
             continue
         if not it.get("entities"):
             continue
@@ -386,6 +391,8 @@ def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict]) -> li
                 probs.append(f"{part} {i}: 悬空边 {g.get('source')} → {g.get('target')}")
             if (g.get("name") or "").lower() not in {x.lower() for x in EDGE_TYPES}:
                 probs.append(f"{part} {i}: 边名不在 schema 里：{g.get('name')}")
+        if not chain_rules:
+            continue
         mm = item_metrics(it, title, ENTITY_TYPES, EDGE_TYPES)
         if not mm["headline_verbatim"]:
             probs.append(f"{part} {i}: 第一条边没有照抄标题（规则 21）")
@@ -408,6 +415,12 @@ BENCH_ADDENDUM = """
 - 每条都读全文再抽；没有可抽取知识的观测给 `"entities": []`，仍要列出它的 id。
 """.strip()
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
+
+
+def rules_sha(path: Path = PROMPT_PATH) -> str:
+    """规则正文文件的 sha256（与 extract_campaign 开局快照同一算法），准入记录与战役开局据此确认是同一份正文。"""
+    import hashlib
+    return hashlib.sha256(path.read_text().encode("utf-8")).hexdigest()
 
 
 def bench_system_prompt(path: Path = PROMPT_PATH) -> tuple[str, str]:
@@ -578,7 +591,7 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
         tot = {k: sum(x[4][k] for x in mine) for k in ("calls", "credits", "ms")}
         (d / "run.json").write_text(json.dumps({
             "tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": tag,
-            "bench": m["bench_id"], "prompt_version": version, "ids": ids, "chunk": chunk,
+            "bench": m["bench_id"], "prompt_version": version, "prompt_sha256": rules_sha(), "ids": ids, "chunk": chunk,
             "failed": [i for x in mine for i in x[4]["failed"]], **tot,
             "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=1))
     return [dirs[x] for x in models]
@@ -597,7 +610,8 @@ def register_run(p: Path, m: dict, results_dir: Path, *, model: str, executor: s
         raise SystemExit(f"{results_dir} 里没有属于样本 {m['bench_id']} 的结果（results*.json，items 带 id）")
     extra = sorted(set(res) - sample)
     run = {"tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": "manual",
-           "bench": m["bench_id"], "prompt_version": prompt_version or f"{PROMPT_VERSION}+manual", "ids": ids,
+           "bench": m["bench_id"], "prompt_version": prompt_version or f"{PROMPT_VERSION}+manual",
+           "prompt_sha256": rules_sha(), "ids": ids,
            "chunk": None, "failed": [], "calls": None, "credits": credits, "ms": int(seconds * 1000),
            "registered_at": datetime.now(timezone.utc).isoformat(), "ignored_ids": extra}
     (results_dir / "run.json").write_text(json.dumps(run, ensure_ascii=False, indent=1))
@@ -622,7 +636,7 @@ def load_run(d: Path) -> dict:
 ADMISSION_MIN_ITEMS = 30
 BLIND_N = 10
 THRESHOLDS = {"headline_verbatim_pct": 95.0, "second_other_lang_pct": 95.0, "hit_zh_pct": 90.0, "hit_en_pct": 90.0,
-              "subset_drop_pts": 5.0, "blind_max_errors": 1}
+              "subset_drop_pts": 5.0, "blind_max_errors": 1, "empty_extra_pts": 5.0}
 # 基线批次的约定版本 → 等价的规则正文版本：bench-20261022 的基线是 agent-v3 + chain-v8，内容即 agent-v4 规则 21–28
 BASELINE_EQUIV = {"c8": "agent-v4"}
 
@@ -672,7 +686,7 @@ def blind_result(sheet: list[dict], key: dict, label: str) -> dict:
 
 
 def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: str, baseline_prompt: str | None,
-                     lint_problems: int, blind: dict | None) -> tuple[list[dict], str]:
+                     lint_problems: int, blind: dict | None, base_row: dict | None = None) -> tuple[list[dict], str]:
     """row：候选全样本那行；pairs：[(候选在某基线模型那部分, 该基线模型)]。返回 (逐项检查, 结论)。
     结论：fail（任一硬性/质量项不过）> screen_pass（不足 30 条，只算快速筛选）> pending_blind（缺盲评）> pass。"""
     t = THRESHOLDS
@@ -683,11 +697,15 @@ def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: s
     add("规则版本与基线一致", base_version(run_prompt), baseline_prompt,
         baseline_prompt is not None and base_version(run_prompt) == baseline_prompt)
     add("未交 = 0", row["missing"], 0, row["missing"] == 0)
-    add("自检问题 = 0", lint_problems, 0, lint_problems == 0)
+    add("硬错误（schema / 悬空边 / 缺 edges）= 0", lint_problems, 0, lint_problems == 0)
     for k in ("headline_verbatim_pct", "second_other_lang_pct", "hit_zh_pct", "hit_en_pct"):
         add(k, row[k], f">= {t[k]}", row[k] >= t[k])
     for k in ("offschema_edge_pct", "dangling_edge_pct", "unknown_type"):
         add(f"{k} = 0", row[k], 0, row[k] == 0)
+    if base_row is not None:   # 空观测：不比基线在同一批观测上的空观测率高出 empty_extra_pts 点
+        pct = lambda r: round(100 * r["empty"] / max(1, r["items"] - r["missing"]), 1)  # noqa: E731
+        add("空观测率", pct(row), f"<= {pct(base_row) + t['empty_extra_pts']}", pct(row) <= pct(base_row) + t["empty_extra_pts"])
+    add("有基线对照", len(pairs), ">= 1", len(pairs) >= 1)   # 配对为空时子集检查无从做，不能静默放过
     for cand, base in pairs:
         for k in ("hit_zh_pct", "hit_en_pct"):
             add(f"{cand['label']} {k} 不低于基线 {t['subset_drop_pts']} 点以上", cand[k],
@@ -717,22 +735,37 @@ def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, 
     blind = blind_result(sheet, key, run["label"]) if sheet is not None and key is not None else None
     checks, verdict = admission_checks(full, pairs, run_prompt=run.get("prompt_version"),
                                        baseline_prompt=BASELINE_EQUIV.get(m.get("chain")),
-                                       lint_problems=len(lint_items(lint_rows, run["results"])), blind=blind)
+                                       lint_problems=len(lint_items(lint_rows, run["results"], chain_rules=False,
+                                                                    missing=False)), blind=blind,
+                                       base_row=by.get("基线：三模型各自那部分"))
     rec = {"model": run["model"], "label": run["label"], "executor": run.get("executor"), "bench": m["bench_id"],
-           "items": full["items"], "prompt_version": run.get("prompt_version"), "run_dir": run.get("dir"),
+           "items": full["items"], "prompt_version": run.get("prompt_version"),
+           "prompt_sha256": run.get("prompt_sha256"), "run_dir": run.get("dir"),
            "verdict": verdict, "checks": checks, "blind": blind, "thresholds": THRESHOLDS,
            "scores": {k: full.get(k) for k in ("hit_zh_pct", "hit_en_pct", "headline_verbatim_pct",
                                                 "second_other_lang_pct", "ent_per_obs", "edge_per_obs",
                                                 "credits_per_obs", "sec_per_obs")},
            "decided_at": datetime.now(timezone.utc).isoformat()}
     if write:
-        d = bench_root() / "admissions"
-        d.mkdir(parents=True, exist_ok=True)
-        f = d / f"{model_slug(run['model'])}.json"
-        hist = json.loads(f.read_text()) if f.exists() else {"model": run["model"], "history": []}
-        hist["history"].append(rec)
-        f.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
-        rec["record_file"] = str(f)
+        rec["record_file"] = append_admission(run["model"], rec)
+    return rec
+
+
+def append_admission(model: str, rec: dict) -> str:
+    d = bench_root() / "admissions"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{model_slug(model)}.json"
+    hist = json.loads(f.read_text()) if f.exists() else {"model": model, "history": []}
+    hist["history"].append(rec)
+    f.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+    return str(f)
+
+
+def revoke(model: str, reason: str) -> dict:
+    """显式撤销准入：追加一条 verdict=revoked 的记录（以最新一条为准，之后开战役会被拒）。"""
+    rec = {"model": model, "verdict": "revoked", "reason": reason,
+           "decided_at": datetime.now(timezone.utc).isoformat()}
+    rec["record_file"] = append_admission(model, rec)
     return rec
 
 
@@ -753,9 +786,10 @@ def main(argv=None) -> int:
     f.add_argument("--bench-id", required=True)
     f.add_argument("--corpus", required=True)
     f.add_argument("--root", default=str(DEFAULT_ROOT))
-    for name in ("parts", "lint", "score", "run", "blind", "admit", "register"):
+    for name in ("parts", "lint", "score", "run", "blind", "admit", "register", "revoke"):
         s = sub.add_parser(name)
-        s.add_argument("--bench", required=True)
+        if name != "revoke":
+            s.add_argument("--bench", required=True)
         if name in ("lint", "score"):
             s.add_argument("--results", nargs="+", help="结果文件或目录（单个候选）")
             s.add_argument("--run", nargs="+", help="run 子命令产出的运行目录（可多个，合成一张表）")
@@ -763,6 +797,9 @@ def main(argv=None) -> int:
             s.add_argument("--run", nargs="+", required=True)
             s.add_argument("--n", type=int, default=BLIND_N)
             s.add_argument("--out", required=True, help="评审表（不含模型名）；对照表另存为 <out>.key.json")
+        if name == "revoke":
+            s.add_argument("--model", required=True)
+            s.add_argument("--reason", required=True)
         if name == "register":
             s.add_argument("--results", required=True, help="手工抽取的结果目录（results*.json）")
             s.add_argument("--model", required=True)
@@ -796,6 +833,10 @@ def main(argv=None) -> int:
                      Path(a.root).expanduser())
         print(json.dumps(json.loads((out / "manifest.json").read_text()), ensure_ascii=False, indent=1))
         return 0
+    if a.cmd == "revoke":
+        rec = revoke(a.model, a.reason)
+        print(f"{a.model}：已撤销准入（{a.reason}），记录 {rec['record_file']}")
+        return 0
     p, m = _bench(a.bench)
     cache = Path(a.cache_dir) if getattr(a, "cache_dir", None) else None
     if a.cmd == "parts":
@@ -826,11 +867,13 @@ def main(argv=None) -> int:
         if a.sheet:
             sp = Path(a.sheet).expanduser()
             sheet, key = json.loads(sp.read_text()), json.loads(Path(str(sp) + ".key.json").read_text())
-        rec = admit(p, m, run, sheet=sheet, key=key, cache_dir=Path(a.cache_dir) if a.cache_dir else None)
+        # 不带盲评表只预览、不写记录：否则一次随手的预览（pending_blind）会压过此前的 pass，战役随即开不了
+        rec = admit(p, m, run, sheet=sheet, key=key, cache_dir=Path(a.cache_dir) if a.cache_dir else None,
+                    write=sheet is not None)
         print(f"{rec['model']}：{rec['verdict']}（{rec['items']} 条，bench {rec['bench']}，规则 {rec['prompt_version']}）")
         for c in rec["checks"]:
             print(f"  {'✓' if c['pass'] else '✗'} {c['check']}：{c['value']}（要求 {c['want']}）")
-        print(f"准入记录：{rec['record_file']}")
+        print(f"准入记录：{rec['record_file']}" if "record_file" in rec else "（预览，未写准入记录；带 --sheet 才记录）")
         return 0 if rec["verdict"] == "pass" else 1
     if a.cmd == "run":
         dirs = run_models(p, m, a.models, executor=a.executor, out_root=Path(a.out_root).expanduser(), tag=a.tag,
