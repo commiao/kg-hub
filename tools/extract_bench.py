@@ -561,7 +561,37 @@ def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | 
             "tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)}
 
 
-ADAPTERS = {"qodercli": qodercli_call, "codex": codex_call}
+def claude_call(model: str, system: str, query: str, *, cwd: Path, effort: str | None = DEFAULT_EFFORT,
+                timeout: int = 900) -> dict:
+    """claude -p（Claude Code 命令行）非交互单轮调用，与 qodercli / codex 同一套外壳：
+    --safe-mode 关掉 CLAUDE.md、skill、插件、钩子、MCP 等一切自定义（--bare 只认 API key、不读订阅登录，用不了；
+    2026-10-23 实测 safe-mode 下整次调用上下文只有系统提示本身，全局 CLAUDE.md 的「小结」不会混进回复）；
+    --tools "" 不给工具；--system-prompt 整体替换；观测走标准输入。
+    claude 不报 credits，只记 token（输入含缓存读写 + 输出）；modelUsage 里没有所要的模型就当失败，防止被换成别的模型。"""
+    import subprocess
+    cmd = ["claude", "-p", "--safe-mode", "--model", model, *(["--effort", effort] if effort else []),
+           "--tools", "", "--no-session-persistence", "--output-format", "json", "--system-prompt", system]
+    try:
+        r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0, "ms": timeout * 1000}
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return {"text": r.stdout[-2000:], "error": f"rc={r.returncode} 非 JSON 输出：{r.stderr[-300:]}",
+                "stop": None, "credits": None, "tokens": 0, "ms": 0}
+    u = d.get("usage") or {}
+    tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                "cache_read_input_tokens", "output_tokens"))
+    used = list((d.get("modelUsage") or {}).keys())
+    err = d.get("is_error") and (d.get("result") or "is_error")
+    if not err and used and model not in used:
+        err = f"实际模型 {used} 不是 {model}"
+    return {"text": d.get("result") or "", "error": err, "stop": d.get("stop_reason"), "credits": None,
+            "tokens": tokens, "ms": int(d.get("duration_ms") or 0)}
+
+
+ADAPTERS = {"qodercli": qodercli_call, "codex": codex_call, "claude": claude_call}
 
 
 def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> tuple[dict, dict]:

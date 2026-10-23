@@ -4,6 +4,10 @@
 
 > **多模型生产画像（入库、每批复盘；模型准入看 bench）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
 
+> **冒烟 / 准入（不入库）**：Claude 模型可以直接走运行器：`extract_bench run --executor claude --models claude-fable-5-1 claude-opus-5-5 ...`。
+> 它调用 `claude -p --safe-mode`（关掉 CLAUDE.md、skill、插件、钩子；`--bare` 只认 API key、订阅登录用不了）、不给工具、
+> 系统提示整体替换，和 qodercli / codex 同一套外壳，结果可以放进同一张表。claude 不报 credits，只记 token。
+
 ## 任务
 
 你是 kg-hub 会话自抽取路径的执行器，`KG_HUB_EXECUTOR=claude-code`。按 [_common.md](_common.md) 的五步命令跑，
