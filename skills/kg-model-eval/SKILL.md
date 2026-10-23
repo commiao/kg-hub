@@ -17,7 +17,8 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 - **冒烟与准入只能在存放冻结样本的机器上跑**（`~/.kg-hub/bench/bench-20261022`，目前只在 mac-office）；战役在任何满足
   `docs/executors/dsh.md`「前提」的机器上都能跑。
 - 执行器名（`--executor`）按当前所在工具：`claude-code` / `qoder` / `codex` / `cursor` / `dsh`。模型名用该工具里的准确写法
-  （`qodercli --list-models`、`cursor-agent --list-models`、`codex debug models`）。
+  （`qodercli --list-models`、`cursor-agent --list-models`、`codex debug models`；Claude 用 Claude Code 的模型 id，
+  如 claude-fable-5-1、claude-opus-5-5、claude-sonnet-5-5、claude-haiku-5-5）。
 
 ## 1. 先解析意图，回一份计划，等确认
 
@@ -33,22 +34,24 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 | 「使用kg-hub对比模型+A、B、C 20个一轮 共1000条」（或写明「战役」） | **战役** | 每批 20 条；**「共 N 条」= 所有模型合计，平均分**（3 个模型 → 每个 333 条）；说「每个模型 N 条」才按每模型算；结果**全部入库**；每轮复盘 |
 
 计划里必须有：模型、条数（每模型 / 合计）、是否入库、预计 credits（按已知价格：DeepSeek-Flash ≈0.26、Qwen3.8-Max ≈0.33、
-GLM-5.3 ≈2.35、Kimi-K3 ≈4.24 credits/条，qoder 计费；其他模型写「未知，先冒烟」）、预计时长、要用到的命令。
+GLM-5.3 ≈2.35、Kimi-K3 ≈4.24 credits/条，qoder 计费；codex 与 Claude 走订阅、只记 token，
+没有实测数就写「未知，先冒烟」；其他模型同样写「未知，先冒烟」）、预计时长、要用到的命令。
 **用户确认前不跑任何花钱或写图的命令。** 成本不设门槛，条数就是成本上限。
 
 ## 2. 冒烟
 
 ```bash
-$PY -m tools.extract_bench run   --bench ~/.kg-hub/bench/bench-20261022 --executor qodercli|codex --models A B C --tag smoke<日期> --limit 10 --parallel 4
+$PY -m tools.extract_bench run   --bench ~/.kg-hub/bench/bench-20261022 --executor qodercli|codex|claude --models A B C --tag smoke<日期> --limit 10 --parallel 4
 $PY -m tools.extract_bench admit --bench ~/.kg-hub/bench/bench-20261022 --run ~/.kg-hub/bench/runs/smoke<日期>-<执行器>-A   # 每个模型一次
 ```
 
-`run` 把 qodercli 或 codex 当模型通道（不开工具、不加载用户级设置），不入库；跑完自动自检并出合表。两种执行器统一：
+`run` 把 qodercli、codex 或 claude（Claude Code 命令行，`--safe-mode`）当模型通道（不开工具、不加载用户级设置与
+CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统一：
 同一份系统提示、每次调用按批次分组且至多 `--chunk` 条、同一推理强度（`--effort`，缺省 medium）、同一套拆半重试；
-任务按「组号 → 模型」交错排队，各模型一开始就同时在跑。codex 不报 credits，只记 token。**不要自己写运行脚本**——
+任务按「组号 → 模型」交错排队，各模型一开始就同时在跑。codex、claude 不报 credits，只记 token。**不要自己写运行脚本**——
 那样调用条数、推理强度、系统提示会和别的执行器不一样，结果没法放进同一张表。
 冒烟的 `admit` 不带 `--sheet`，只预览、不写准入记录，10 条最多看到 `screen_pass`（筛选通过，不算准入）。
-既不在 qoder、也不在 codex 里的模型（cursor、DSH 等）：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
+不在 qoder、codex、claude 里的模型（cursor、DSH 等）：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
 `$PY -m tools.extract_bench register --bench <样本> --results <目录> --model <模型> --executor <工具>`，之后命令一样。
 
 ## 3. 准入（含盲测）

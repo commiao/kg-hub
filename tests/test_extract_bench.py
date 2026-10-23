@@ -450,6 +450,43 @@ class RunnerPureTest(unittest.TestCase):
         with mock.patch("subprocess.run", fake_run):
             self.assertTrue(xb.qodercli_call("m", "S", "Q", cwd=_Path("/tmp"))["error"])
 
+    def test_claude_adapter_command_isolation_and_usage(self):
+        """2026-10-23：claude -p 当模型通道。--safe-mode 关掉 CLAUDE.md / skill / 插件 / 钩子（全局 CLAUDE.md 的「小结」
+        会混进抽取结果）；--bare 只认 API key、不读订阅登录，不能用。"""
+        seen = {}
+
+        class R:
+            returncode, stderr = 0, ""
+            stdout = json.dumps({"result": '{"items": []}', "is_error": False, "stop_reason": "end_turn",
+                                 "duration_ms": 1500, "total_cost_usd": 0.01,
+                                 "usage": {"input_tokens": 10, "cache_creation_input_tokens": 900,
+                                           "cache_read_input_tokens": 100, "output_tokens": 50},
+                                 "modelUsage": {"claude-fable-5-1": {}}})
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return R()
+        with mock.patch("subprocess.run", fake_run):
+            res = xb.claude_call("claude-fable-5-1", "SYS", "Q", cwd=_Path("/tmp"), effort="medium")
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[:5], ["claude", "-p", "--safe-mode", "--model", "claude-fable-5-1"])
+        self.assertNotIn("--bare", cmd)                                     # 订阅登录下 --bare 认证不过
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+        self.assertEqual(cmd[cmd.index("--system-prompt") + 1], "SYS")
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "medium")
+        self.assertIn("--no-session-persistence", cmd)
+        self.assertEqual(seen["kw"]["input"], "Q")                          # 观测走标准输入，不进命令行
+        self.assertEqual((res["text"], res["error"], res["credits"], res["tokens"], res["ms"]),
+                         ('{"items": []}', False, None, 1060, 1500))       # 不报 credits；token 含缓存读写
+        R.stdout = json.dumps({"result": "{}", "is_error": False, "modelUsage": {"claude-haiku-5-5": {}}})
+        with mock.patch("subprocess.run", fake_run):
+            self.assertIn("不是 claude-fable-5-1", xb.claude_call("claude-fable-5-1", "S", "Q", cwd=_Path("/tmp"))["error"])
+            self.assertNotIn("--effort", (xb.claude_call("m", "S", "Q", cwd=_Path("/tmp"), effort=None), seen["cmd"])[1])
+        R.stdout = "not json"
+        with mock.patch("subprocess.run", fake_run):
+            self.assertTrue(xb.claude_call("m", "S", "Q", cwd=_Path("/tmp"))["error"])
+        self.assertIs(xb.ADAPTERS["claude"], xb.claude_call)
+
     def test_interleave_by_group_then_model(self):
         """2026-10-23 qoder 冒烟：按模型分组排队时，前几个 worker 被第一个模型占满，最后一个模型晚 4 分钟才开始。"""
         per = [["A1", "A2", "A3"], ["B1", "B2", "B3"], ["C1"], ["D1", "D2"]]
