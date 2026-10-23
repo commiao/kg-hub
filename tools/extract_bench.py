@@ -770,15 +770,19 @@ def base_version(v: str | None) -> str:
 
 def blind_sheet(p: Path, m: dict, runs: list[dict], n: int = BLIND_N, seed: str = "") -> tuple[list[dict], dict]:
     """每个候选抽 n 条做盲评：评审表不带模型名（只有随机编号），编号 → 标签的对照另存。
-    评审者对照观测原文看事实方向、数字、因果，把 verdict 填成 ok / error。"""
+    评审者对照观测原文看事实方向、数字、因果，把 verdict 填成 ok / error。
+    每条附上模型调用时看到的 lookahead（同一批次之后观测的标题，规则 19 要求参考）：2026-10-23 Claude 准入，
+    opus 依据 lookahead 写「后续观测 37330 把 check 换成 reconcile」，评审表只有原文，被误判为编造。"""
     import random
     import secrets
     rows, _ = _bench_items(p, m)
     titles = {r[0]: r[1] for r in rows}
-    bodies = {}
+    bodies, lookaheads = {}, {}
     for part in m["parts"]:
-        for it in json.loads((p / f"batch-{part['part']}.json").read_text())["items"]:
+        batch = json.loads((p / f"batch-{part['part']}.json").read_text())
+        for it in batch["items"]:
             bodies[int(it["id"])] = it["episode_body"]
+            lookaheads[int(it["id"])] = batch.get("lookahead") or []   # 运行器按批次把这份 lookahead 随每次调用发出
     sheet, key = [], {}
     for r in runs:
         have = sorted(i for i in r["ids"] if i in r["results"])
@@ -787,6 +791,7 @@ def blind_sheet(p: Path, m: dict, runs: list[dict], n: int = BLIND_N, seed: str 
             key[code] = r["label"]
             it = r["results"][i]
             sheet.append({"code": code, "obs_id": i, "title": titles.get(i), "episode_body": bodies.get(i),
+                          "lookahead": lookaheads.get(i, []),
                           "entities": it.get("entities"), "edges": it.get("edges"), "verdict": None, "note": ""})
     random.Random(f"{m['bench_id']}|shuffle|{seed}").shuffle(sheet)
     return sheet, key

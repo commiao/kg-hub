@@ -202,7 +202,7 @@ class EndToEndTest(unittest.TestCase):
         (src / "rounds.json").write_text(json.dumps(rounds))
         titles = {1: "甲观测标题一", 2: "乙观测标题二", 3: "丙观测标题三"}
         for b, ids in (("b1", [1]), ("b2", [2]), ("b0", [3])):
-            (src / f"batch-{b}.json").write_text(json.dumps({"batch_id": b, "lookahead": [], "items": [
+            (src / f"batch-{b}.json").write_text(json.dumps({"batch_id": b, "lookahead": [{"id": 90 + ids[0], "title": f"{b} 之后的观测"}], "items": [
                 {"id": i, "name": f"obs-{i}", "source_description": "sd", "episode_body": f"[DISCOVERY] {titles[i]}\nbody"}
                 for i in ids]}))
             (src / f"results-{b}.json").write_text(json.dumps({"items": [
@@ -267,6 +267,10 @@ class EndToEndTest(unittest.TestCase):
         self.assertNotIn("甲模型", json.dumps(sheet, ensure_ascii=False))           # 评审表里没有模型名
         self.assertEqual(sorted(set(key.values())), ["qodercli-乙模型", "qodercli-甲模型"])
         self.assertTrue(all(e["episode_body"] and e["title"] for e in sheet))     # 评审者能对照原文
+        # 评审者也能看到模型调用时的 lookahead（规则 19），依据它写的后续更正不会被误判为编造
+        batch_of = {1: "b1", 2: "b2"}
+        for e in sheet:
+            self.assertEqual(e["lookahead"], [{"id": 90 + e["obs_id"], "title": f"{batch_of[e['obs_id']]} 之后的观测"}])
         for e in sheet:
             e["verdict"] = "error" if key[e["code"]] == "qodercli-乙模型" else "ok"
         self.assertEqual(xb.blind_result(sheet, key, "qodercli-乙模型")["errors"], 2)

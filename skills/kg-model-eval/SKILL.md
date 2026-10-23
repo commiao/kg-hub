@@ -68,6 +68,9 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录A> --sheet 
   不能派子代理时：评审者全程不打开对照表。
 - 判 `error` 的标准：事实方向写反、因果写反（如把「造成」写成「捕获」）、数字/版本/时间写错、把 A 的事说成 B 的、编造原文没有的结论。
   措辞、详略、实体粒度不同**不算错**。
+- 评审表每条带 `lookahead`：模型调用时看到的同批之后观测的标题（规则 19 要求参考，用于写「后被 X 推翻 / 更正」）。
+  **依据 lookahead 的写法不算编造**——原文没有、但 lookahead 里有的后续更正照判 `ok`；只有原文和 lookahead 都没有的才算编造。
+  （2026-10-23 Claude 准入：opus 依据 lookahead 写了后续观测 37330 的更正，当时评审表没带 lookahead，被误判为编造。）
 - 偏向风险：基线是 Claude、评审也是 Claude，可能偏向 Claude 的写法——每条 `error` 写清错在哪，结论里注明「Claude 评审」，有争议的列给用户。
 
 门槛（写在 `tools/extract_bench.py` 的 `THRESHOLDS`）：规则版本一致；未交 / 自检问题 / 边名越界 / 悬空边 / 未知类型都为 0；
