@@ -1,0 +1,20 @@
+{
+  "_doc": "观测分诊：在 ingest_filter 之上按规则加减分，分 keep/review/drop 三档。enabled=false 为影子模式（只统计不改判）。规则正文在 utils/obs_triage.py，这里只放权重；改任何一项都要跑 python -m tools.obs_bench score 对冻结集复核（docs/OBSERVATION-TRIAGE.md）。",
+  "version": "triage-v1",
+  "enabled": false,
+  "review_band": 15,
+  "rescue_max_gap": 15,
+  "narrative_chars": 800,
+  "penalty_waived_at_rationale_hits": 3,
+  "neutralize_type_on_penalty": true,
+  "protected_types": ["decision", "security_alert", "security_note"],
+  "rules": {
+    "status_report":       { "weight": 30 },
+    "process_record":      { "weight": 30 },
+    "session_ephemeral":   { "weight": 30 },
+    "test_snapshot":       { "weight": 25 },
+    "routine_code_change": { "weight": 25 },
+    "snapshot_diff":       { "weight": 25 },
+    "rationale":           { "weight": 5, "cap": 4 }
+  }
+}

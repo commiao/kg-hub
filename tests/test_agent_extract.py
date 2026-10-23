@@ -125,7 +125,8 @@ class SelectTest(unittest.TestCase):
                 dict(OBS, id=4, content_hash="h4"), dict(OBS, id=5, content_hash="h5"),
                 dict(OBS, id=6, content_hash="h6")]
         # 质量闸本身另有测试；这里只验证选批对「闸拒 / 已入库 / 抽取中 / 够数即停」的处理
-        fake = lambda obs, c, q: SimpleNamespace(accept=obs["type"] != "change")  # noqa: E731
+        fake = lambda obs, c, q: SimpleNamespace(accept=obs["type"] != "change", would_accept=obs["type"] != "change",  # noqa: E731
+                                                 score=90.0, threshold=60.0, layer="pass", obs_type=obs["type"], reasons=[])
         with mock.patch.object(ax, "evaluate", fake):
             picked, stats = ax.select_batch(rows, cfg, 2, {"h1": "ok", "h2": "pending"})
         self.assertEqual([p["id"] for p in picked], [4, 5])
