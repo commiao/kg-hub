@@ -29,6 +29,7 @@
     },
     "narrative_chars_cap":     800,
     "narrative_chars_divisor":  20,
+    "cjk_char_weight":          2,
     "facts_cap":                10,
     "facts_weight":              3,
     "concepts_cap":              8,
