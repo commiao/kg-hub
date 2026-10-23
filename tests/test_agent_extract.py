@@ -134,6 +134,55 @@ class SelectTest(unittest.TestCase):
         self.assertTrue(ax.evaluate(OBS, cfg, None) is not None)  # 真闸可调用
 
 
+class GatherBatchTest(unittest.TestCase):
+    """逐段往后扫凑满一批（2026-10-23：游标后 80 条只剩 4 条可抽，领批交出 4 条就停）。"""
+
+    @staticmethod
+    def fetch_sparse(every):
+        calls = []
+
+        def fetch(after, limit):
+            calls.append((after, limit))
+            rows = [{"id": i, "title": f"t{i}"} for i in range(after + 1, min(after + 1 + limit, 1000))]
+            return {"rows": rows, "boundary": 0, "after": after, "skipped_by_watermark": 0, "exhausted": not rows}
+        return fetch, calls
+
+    @staticmethod
+    def select(every):
+        def sel(rows, cfg, n, existing):
+            picked = [{"id": r["id"]} for r in rows if r["id"] % every == 0][:n]
+            return picked, {"seen": len(rows), "picked": len(picked)}
+        return sel
+
+    def test_keeps_scanning_until_the_batch_is_full(self):
+        fetch, calls = self.fetch_sparse(30)
+        with unittest.mock.patch.object(ax, "select_batch", self.select(30)), unittest.mock.patch.object(ax, "to_identity", lambda r: r):
+            g = ax.gather_batch(0, 5, fetch=fetch, check=lambda idents: {}, cfg={})
+        self.assertEqual([x["id"] for x in g["picked"]], [30, 60, 90, 120, 150])
+        self.assertEqual(g["last"], 150)                                    # 凑满：游标停在最后挑中的那条
+        self.assertGreater(g["stats"]["rounds"], 1)
+        self.assertEqual(calls[1][0], calls[0][0] + calls[0][1])            # 下一段从上一段末尾接着扫
+        self.assertTrue(g["lookahead"] and g["lookahead"][0]["id"] == 151)
+
+    def test_stops_at_round_limit_or_when_exhausted(self):
+        fetch, _ = self.fetch_sparse(500)
+        with unittest.mock.patch.object(ax, "select_batch", self.select(500)), unittest.mock.patch.object(ax, "to_identity", lambda r: r):
+            g = ax.gather_batch(0, 5, fetch=fetch, check=lambda idents: {}, cfg={}, max_rounds=3)
+            self.assertEqual((len(g["picked"]), g["stats"]["rounds"], g["lookahead"]), (0, 3, []))
+            self.assertEqual(g["last"], 120)                                # 没凑满：游标停在看过的最后一条
+            g = ax.gather_batch(990, 5, fetch=fetch, check=lambda idents: {}, cfg={})
+            self.assertEqual((g["seen"], g["picked"]), (9, []))             # 取尽就停
+            g = ax.gather_batch(999, 5, fetch=fetch, check=lambda idents: {}, cfg={})
+            self.assertEqual((g["seen"], g["last"]), (0, 999))
+
+    def test_held_rows_are_skipped_and_counted(self):
+        fetch, _ = self.fetch_sparse(1)
+        with unittest.mock.patch.object(ax, "select_batch", self.select(1)), unittest.mock.patch.object(ax, "to_identity", lambda r: r):
+            g = ax.gather_batch(0, 3, fetch=fetch, check=lambda idents: {}, cfg={}, held={1, 2})
+        self.assertEqual([x["id"] for x in g["picked"]], [3, 4, 5])
+        self.assertEqual(g["stats"]["held_elsewhere"], 2)
+
+
 class SubmitTest(unittest.TestCase):
     def test_dry_run_accumulates_entities_new_in_this_batch(self):
         """2026-10-22 补交 b0024：dry-run 逐条把前面条目会新建的实体带给服务端，同批内误并才看得见。"""

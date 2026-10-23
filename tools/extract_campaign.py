@@ -316,29 +316,23 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
         requeued, c["requeue"] = take_requeue(d, c.get("requeue") or [], n, check)
         # 回收的条目登记超时后可能已被别的战役领走：那就让给它
         requeued = [i for i in requeued if i["id"] not in held]
-        rows, stats, last, lookahead = [], {"requeued": len(requeued)}, c["cursor"], []
+        stats, last, lookahead, seen = {"requeued": len(requeued)}, c["cursor"], [], 0
         picked = list(requeued)
         if len(picked) < n:
-            remote = fetch(c["cursor"], max((n - len(picked)) * 4, 40))
-            rows = remote["rows"]
-            if rows:
-                # 全设备在途领取登记：别的战役 / agent_extract next 正领着的不领（tools/claim_registry.py）
-                avail = [r for r in rows if r["id"] not in held]
-                fresh, st = ax.select_batch(avail, ax.load_config(), n - len(picked),
-                                            check([ax.to_identity(r) for r in avail]) if avail else {})
-                stats.update(st)
-                stats["held_elsewhere"] = len(rows) - len(avail)
-                picked += fresh
-                last = fresh[-1]["id"] if len(fresh) >= n - len(requeued) else rows[-1]["id"]
-                lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
-                             for r in rows if r["id"] > last][:n]
+            # 全设备在途领取登记：别的战役 / agent_extract next 正领着的不领（tools/claim_registry.py）；
+            # 可抽观测稀疏时逐段往后扫，凑满一批再交（ax.gather_batch，与 next 共用）
+            g = ax.gather_batch(c["cursor"], n - len(picked), fetch=fetch, check=check, cfg=ax.load_config(),
+                                held=held)
+            stats.update(g["stats"])
+            picked += g["picked"]
+            last, lookahead, seen = g["last"], g["lookahead"], g["seen"]
         if not picked:
             c["cursor"] = last
             save(d, c)
-            if not rows:
+            if not seen:
                 return {"done": True, "model": model, "message": "游标之后没有待处理观测了"}
-            # 这一段全被质量闸拒或已入库：游标前移，让调用方再领一次
-            return {"done": False, "batch": None, "model": model, "message": "这一段没有可抽的观测，游标已前移，再领一次",
+            # 扫满上限的几段全被质量闸拒或已入库：游标前移，让调用方再领一次
+            return {"done": False, "batch": None, "model": model, "message": "这几段没有可抽的观测，游标已前移，再领一次",
                     "stats": stats}
         bid = next_batch_id(c, model)
         bpath, rpath = d / "batches" / f"{bid}.json", d / "results" / f"{bid}.json"
