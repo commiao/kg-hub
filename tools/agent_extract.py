@@ -378,9 +378,11 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
 
 # ---------- 提交前必须 dry-run：由工具自己执行，不靠执行器记得 ----------
 
-def next_owner(sd: Path) -> str:
-    """全设备在途登记里 next 的领取方：每个状态目录一个（同一目录里接着领自己的不互挡）。"""
-    return f"next:{sd.resolve()}"
+def next_owner(sd: Path, batch_id: str) -> str:
+    """全设备在途登记里 next 的领取方：每一批一个（`next:<状态目录>:<批次号>`）。
+    按批而不是按目录：同一目录里前一批还没交的条目，后一批（哪怕显式给了同一个 --after-id）也要避开。
+    提交后入库的注销；没入库的留到超时，要重领先 `python -m tools.claim_registry release --owner <它>`。"""
+    return f"next:{sd.resolve()}:{batch_id}"
 
 
 def dryrun_marker_path(sd: Path, batch_id: str) -> Path:
@@ -561,7 +563,9 @@ def _load_state(p: Path) -> dict:
 
 def _save_state(p: Path, st: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    tmp = p.with_name(p.name + ".tmp")   # 原子替换：status 等并发读者不会读到写了一半的文件
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    tmp.replace(p)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -635,11 +639,15 @@ def main(argv: list[str] | None = None) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     if a.cmd == "next":
-        st = _load_state(state_path)
-        after = a.after_id if a.after_id is not None else int(st.get("cursor", 0))
         cfg = load_config()
-        owner = next_owner(sd)
         with claim_registry.opened() as reg:
+            # 游标、批次号必须在登记锁里读：这把全设备锁让并发的 next 排队，后一个拿到前一个推进后的值。
+            # 2026-10-24 实测：原先在锁外读，两个工具用同一状态目录同时 next，领到完全相同的 8 条、
+            # 都写成 batch-b0001.json（后写覆盖先写），state.batches 只记 1。
+            st = _load_state(state_path)
+            after = a.after_id if a.after_id is not None else int(st.get("cursor", 0))
+            batch_id = f"b{int(st.get('batches', 0)) + 1:04d}"
+            owner = next_owner(sd, batch_id)
             # 全设备在途领取登记：剔除别的战役 / 别的 next 状态目录正领着的观测（tools/claim_registry.py）；
             # 可抽观测稀疏时逐段往后扫，凑满一批再交
             g = gather_batch(after, a.n, fetch=fetch_remote_pending, cfg=cfg,
@@ -652,7 +660,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             stats.update({"boundary": remote.get("boundary"), "skipped_by_watermark": remote.get("skipped_by_watermark")})
             st["batches"] = int(st.get("batches", 0)) + 1
-            batch_id = f"b{st['batches']:04d}"
             # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没凑满 n 条时），
             # 中间被闸拒/已入库的不会再看第二遍。前瞻：本批之后紧接着的观测标题（第 2 轮复盘）
             last_considered, lookahead = g["last"], g["lookahead"]
@@ -695,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.dry_run:
         record_dryrun(sd, batch_id, recs)
     else:   # 入库（或别处已入库）的注销在途登记；没入库的留着，超时自动失效
-        claim_registry.release([r["id"] for r in recs if r.get("status") in DONE_STATUSES], next_owner(sd))
+        claim_registry.release([r["id"] for r in recs if r.get("status") in DONE_STATUSES], next_owner(sd, batch_id))
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
