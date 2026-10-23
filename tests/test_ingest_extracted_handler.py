@@ -77,6 +77,69 @@ class HandlerTest(unittest.TestCase):
             resp = asyncio.run(srv.ingest_extracted(_post(payload)))
         return resp.status_code, json.loads(resp.body)
 
+    def _run_empty(self, payload, merge):
+        """空观测：只建 / 复用 IngestedKey、记 status=empty，不写图、不备份正文。"""
+        calls = {"status": [], "cypher": [], "backup": 0, "run": 0}
+
+        class FakeDriver:
+            async def execute_query(self, cypher, **params):
+                calls["cypher"].append((cypher, params))
+                return [], None, None
+
+        class FakeG:
+            driver = FakeDriver()
+            embedder = None
+
+        async def get_g():
+            return FakeG()
+
+        async def fake_merge(*a, **k):
+            return merge
+
+        async def fake_status(g, sd, sid, status, **k):
+            calls["status"].append(status)
+
+        async def fake_run(*a, **k):
+            calls["run"] += 1
+
+        def backup(*a, **k):
+            calls["backup"] += 1
+        with mock.patch.object(srv, "get_graphiti", get_g), \
+                mock.patch.object(srv, "_backup_episode", backup), \
+                mock.patch.object(srv, "merge_or_get_ingested_key", fake_merge), \
+                mock.patch.object(srv, "update_ingested_key_status", fake_status), \
+                mock.patch.object(srv, "_run_recorded_extracted", fake_run), \
+                mock.patch.object(srv, "drain_seconds_left", lambda: 0):
+            resp = asyncio.run(srv.ingest_extracted(_post(payload)))
+        return resp.status_code, json.loads(resp.body), calls
+
+    def test_empty_observation_is_recorded_as_empty_key_without_graph_writes(self):
+        """2026-10-24：空观测原先服务端没有任何记录，refinery 对账认不出、一直挂在「剩余」里。"""
+        base = dict(GOOD, entities=[], edges=[], empty=True, extractor_tool="codex", run_id="r1")
+        new = {"newly_created": True, "status": "pending", "episode_uuid": None}
+        code, d, calls = self._run_empty(base, new)
+        self.assertEqual((code, d["status"], d["duplicate"]), (200, "empty_recorded", False))
+        self.assertEqual(calls["status"], ["empty"])
+        self.assertEqual((calls["backup"], calls["run"]), (0, 0))                     # 不备份正文、不写图
+        tag = [p for c, p in calls["cypher"] if "empty_by_model" in c][0]
+        self.assertEqual((tag["model"], tag["tool"], tag["run_id"]), ("claude-fable-5-1", "codex", "r1"))
+        # 再交一次：幂等，不重复改状态
+        code, d, calls = self._run_empty(base, {"newly_created": False, "status": "empty", "episode_uuid": None})
+        self.assertEqual((code, d["status"], d["duplicate"], calls["status"]), (200, "empty_recorded", True, []))
+        # 已入库 / 正在入库 / 之前失败：不覆盖
+        for st, want in (("ok", (200, "skipped")), ("pending", (202, "in_progress")), ("error", (409, "error"))):
+            code, d, calls = self._run_empty(base, {"newly_created": False, "status": st, "episode_uuid": "e"})
+            self.assertEqual(((code, d["status"]), calls["status"]), (want, []))
+
+    def test_empty_flag_rejects_content_and_dry_run_writes_nothing(self):
+        new = {"newly_created": True, "status": "pending", "episode_uuid": None}
+        code, d, calls = self._run_empty(dict(GOOD, empty=True), new)                 # 带实体还标 empty
+        self.assertEqual((code, d["code"], calls["status"]), (400, "empty_with_content", []))
+        code, d, calls = self._run_empty(dict(GOOD, entities=[], edges=[], empty=True, dry_run=True), new)
+        self.assertEqual((code, d["status"], calls["status"], calls["cypher"]), (200, "dry_run_empty", [], []))
+        code, d = self._run(dict(GOOD, entities=[], edges=[]))                         # 没标 empty 的空提交照旧拒收
+        self.assertEqual((code, d["code"]), (400, "empty_extraction"))
+
     def test_dry_run_passes_pending_and_reports_new_entities(self):
         """2026-10-22 补交 b0024：dry-run 带上同批前面条目的新实体，响应给出本条会新建哪些。"""
         seen = {}

@@ -46,8 +46,11 @@ def PASS(model):
 class CampaignTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # 测试进程不在战役专用目录里：用 CLAUDE_MEM_INTERNAL=1 过「不被 claude-mem 记录」的自检（自检本身另有用例）
         self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": self.tmp.name,
-                                                "KG_HUB_CLAIMS_DIR": os.path.join(self.tmp.name, "claims")})
+                                                "KG_HUB_CLAIMS_DIR": os.path.join(self.tmp.name, "claims"),
+                                                "CLAUDE_MEM_INTERNAL": "1",
+                                                "CLAUDE_MEM_SETTINGS_PATH": os.path.join(self.tmp.name, "cm.json")})
         self.env.start()
         self.patches = [mock.patch.object(ax, "select_batch", fake_select),
                         mock.patch.object(ax, "load_config", lambda: {})]
@@ -187,7 +190,7 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("qodercli -p -m DeepSeek-Flash -w /r", q)
         dsh = ec.launch_command("dsh", "t1", "deepseek-v4-pro", repo=_Path("/r"), state=st)
         self.assertIn("切到 deepseek-v4-pro", dsh)                            # dsh 没有模型参数，先在设置里切
-        self.assertIn("cd /r && dsh --profile headless", dsh)
+        self.assertIn("cd /r && CLAUDE_MEM_INTERNAL=1 dsh --profile headless", dsh)
         for cmd in (codex, cur, q, dsh):                                      # 解释器不写死某台机器的路径
             self.assertIn("${KG_HUB_PYTHON:-python3} -m tools.extract_campaign brief", cmd)
             self.assertNotIn(".local/share", cmd)
@@ -377,6 +380,127 @@ class CampaignTest(unittest.TestCase):
         m = ec.merge_rows("x", [a, b])
         self.assertEqual((m["items"], m["ok"], m["headline_verbatim_pct"], m["credits_per_obs"]), (40, 40, 62.5, 1.0))
 
+
+
+class NoSelfObservationTest(unittest.TestCase):
+    """抽取会话不产生新观测（2026-10-24：跑战役的 codex 会话 2 小时产生 214 条观测，抽取工作又进了待抽队列）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = _Path(self.tmp.name)
+        self.settings = self.root / "cm" / "settings.json"
+        self.ws = self.root / "kg-hub-campaign"
+        self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(self.root / "state"),
+                                                "KG_HUB_CLAIMS_DIR": str(self.root / "claims"),
+                                                "CLAUDE_MEM_SETTINGS_PATH": str(self.settings),
+                                                "KG_HUB_CAMPAIGN_WORKSPACE": str(self.ws)})
+        self.env.start()
+        for k in ("CLAUDE_MEM_INTERNAL", "CLAUDE_PROJECT_DIR"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_path_excluded_matches_claude_mem_semantics(self):
+        pats = "13.*,~/a/*,/w/kg-hub-campaign,/w/kg-hub-campaign/**"
+        for path, want in (("/w/kg-hub-campaign", True), ("/w/kg-hub-campaign/tools/x", True),
+                           ("/w/kg-hub", False), ("/w/kg-hub-campaign2", False),
+                           ("/x/13.abc", True), ("/x/130abc", False),                  # 最后一级目录名也匹配；. 是字面量
+                           (os.path.expanduser("~/a/b"), True), (os.path.expanduser("~/a/b/c"), False)):  # * 不跨目录
+            with self.subTest(path=path):
+                self.assertEqual(ec.path_excluded(path, pats), want)
+        self.assertFalse(ec.path_excluded("/anything", ""))
+
+    def test_guard_refuses_tracked_session_and_accepts_excluded_or_internal(self):
+        with self.assertRaises(SystemExit) as cm:
+            ec.tracking_guard(cwd=str(self.ws))
+        self.assertIn("extract_campaign workspace", str(cm.exception))
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"CLAUDE_MEM_EXCLUDED_PROJECTS": f"13.*,{self.ws},{self.ws}/**"}))
+        self.assertFalse(ec.tracking_guard(cwd=str(self.ws / "tools"))["tracked"])
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": "/elsewhere"}):   # 会话目录不在专用目录：只 cd 进去不算
+            with self.assertRaises(SystemExit):
+                ec.tracking_guard(cwd=str(self.ws))
+        with mock.patch.dict(os.environ, {"CLAUDE_MEM_INTERNAL": "1"}):
+            self.assertFalse(ec.tracking_guard(cwd="/elsewhere")["tracked"])
+        self.assertTrue(ec.tracking_guard("我知道", cwd="/elsewhere")["tracked"])   # 显式例外放行
+
+    def test_start_and_claim_refuse_unless_excluded_and_record_exceptions(self):
+        with self.assertRaises(SystemExit):
+            ec.cmd_start("g1", ["M"], executor="codex", quota=10, batch=5, after_id=0, lookup=PASS)
+        c = ec.cmd_start("g1", ["M"], executor="codex", quota=10, batch=5, after_id=0, lookup=PASS,
+                         allow_tracking="测试")
+        self.assertEqual(c["tracking_exceptions"][0]["reason"], "测试")
+        with mock.patch.object(ax, "select_batch", fake_select), mock.patch.object(ax, "load_config", lambda: {}):
+            with self.assertRaises(SystemExit):
+                ec.cmd_claim("g1", "M", url="http://x", token=None, fetch=fake_fetch, check=lambda i: {})
+            self.assertFalse(list((ec.campaign_dir("g1") / "batches").glob("*.json")))   # 拒绝时一批都没领
+            ec.cmd_claim("g1", "M", url="http://x", token=None, fetch=fake_fetch, check=lambda i: {},
+                         allow_tracking="测试领批")
+        ex = ec.load(ec.campaign_dir("g1"))["tracking_exceptions"]
+        self.assertEqual([e["cmd"] for e in ex], ["start", "claim"])
+
+    def test_workspace_creates_worktree_and_appends_exclusion_with_backup(self):
+        calls = []
+
+        def runner(cmd):
+            calls.append(cmd)
+            if "--git-common-dir" in cmd:
+                return "/main/.git"
+            if cmd[3:5] == ["worktree", "add"]:
+                self.ws.mkdir()
+            if "status" in cmd:
+                return self.dirty
+            return "abc1234" if "rev-parse" in cmd else ""
+        self.dirty = ""
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"CLAUDE_MEM_EXCLUDED_PROJECTS": "13.*", "OTHER": 1}))
+        out = ec.cmd_workspace(runner=runner)
+        self.assertEqual((out["action"], out["excluded"], out["head"]), ("created", True, "abc1234"))
+        self.assertIn(["git", "-C", "/main", "worktree", "add", "--detach", str(self.ws), "origin/main"], calls)
+        data = json.loads(self.settings.read_text())
+        self.assertEqual(data["CLAUDE_MEM_EXCLUDED_PROJECTS"], f"13.*,{self.ws},{self.ws}/**")   # 原有规则保留
+        self.assertEqual(data["OTHER"], 1)
+        self.assertEqual(json.loads(_Path(out["backup"]).read_text())["CLAUDE_MEM_EXCLUDED_PROJECTS"], "13.*")
+        again = ec.cmd_workspace(runner=runner)                                      # 已存在：同步、不重复加规则
+        self.assertEqual((again["action"], again["added_patterns"], again["backup"]), ("synced", [], None))
+        self.dirty = " M tools/x.py"
+        with self.assertRaises(SystemExit):                                         # 专用目录有改动：不动
+            ec.cmd_workspace(runner=runner)
+
+    def test_launch_runs_in_workspace_without_claude_mem(self):
+        for tool in ec.LAUNCH_TOOLS:
+            cmd = ec.launch_command(tool, "t1", "m")
+            with self.subTest(tool=tool):
+                self.assertIn(f"cd {self.ws} && CLAUDE_MEM_INTERNAL=1 ", cmd)
+        self.assertIn("--ignore-user-config", ec.launch_command("codex", "t1", "m"))
+        self.assertIn("--setting-sources local", ec.launch_command("qodercli", "t1", "m"))
+
+    def test_mark_empty_backfills_once_from_campaign_log(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_MEM_INTERNAL": "1"}):
+            ec.cmd_start("g2", ["M"], executor="codex", quota=10, batch=5, after_id=0, lookup=PASS)
+        d = ec.campaign_dir("g2")
+        (d / "batches" / "M-001.json").write_text(json.dumps({"batch_id": "M-001", "items": [
+            {"id": i, "name": f"claude-mem-obs-{i}", "source_description": "sd", "source_obs_id": f"h{i}",
+             "reference_time": "t", "episode_body": "b"} for i in (1, 2, 3)]}))
+        log = [{"id": 1, "status": "ok", "batch": "M-001", "model": "M", "run_id": "g2-M"},
+               {"id": 2, "status": "empty", "batch": "M-001", "model": "M", "run_id": "g2-M", "executor": "codex"},
+               {"id": 3, "status": "empty", "batch": "M-001", "model": "M", "run_id": "g2-M", "executor": "codex",
+                "empty_recorded": True},                                                  # 新版提交时已记过
+               {"id": 9, "status": "empty", "batch": "M-404", "model": "M"}]              # 批次文件找不到
+        (d / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in log))
+        posted = []
+
+        def post(method, url, body, token):
+            posted.append(body)
+            return 200, {"status": "empty_recorded"}
+        out = ec.cmd_mark_empty("g2", url="http://x", token=None, post=post)
+        self.assertEqual((out["candidates"], out["recorded"], out["by_status"].get("batch_missing")), (2, 1, 1))
+        self.assertEqual([(b["source_obs_id"], b["empty"], b["entities"], b["extractor_model"], b["run_id"])
+                          for b in posted], [("h2", True, [], "M", "g2-M")])
+        again = ec.cmd_mark_empty("g2", url="http://x", token=None, post=post)          # 补过的不再补
+        self.assertEqual((again["candidates"], len(posted)), (1, 1))                     # 只剩找不到批次的那条
 
 
 class DeviceWideClaimsTest(unittest.TestCase):

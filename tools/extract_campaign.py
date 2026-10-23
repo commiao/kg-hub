@@ -161,7 +161,7 @@ def rules_text(d: Path, c: dict) -> str:
 
 
 SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}，你的模型 id 是 {model}。
-在仓库根目录执行命令，解释器用 ${{KG_HUB_PYTHON:-python3}}（装好 kg-hub 依赖的那个 Python，下称 PY）。
+在战役专用目录（`extract_campaign workspace` 建的那个，缺省 ~/work-ai/kg-hub-campaign）里执行命令——会话也要在那里打开，这样抽取过程不会被 claude-mem 记成新观测；解释器用 ${{KG_HUB_PYTHON:-python3}}（装好 kg-hub 依赖的那个 Python，下称 PY）。
 
 1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（开局冻结的规则正文 + 战役补充约定），尤其末尾的链路规则（21–28）。
 2. 领一批：$PY -m tools.extract_campaign claim --id {cid} --model {model}
@@ -208,10 +208,111 @@ REPO = Path(__file__).resolve().parent.parent
 LAUNCH_TOOLS = ("codex", "cursor", "qodercli", "dsh")
 
 
-def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state: Path | None = None) -> str:
+# ---------- 抽取会话不产生新观测 ----------
+# 2026-10-24：跑战役的 codex 会话 2 小时里产生了 214 条 claude-mem 观测（同期它入库 293 条），抽取工作本身又进了待抽队列，
+# 看板「剩余」几乎不降。claude-mem 有两个现成开关（claude-mem-fork 源码核对）：
+#   CLAUDE_MEM_INTERNAL=1           钩子一侧不记（会话开始、记观测、写摘要）
+#   CLAUDE_MEM_EXCLUDED_PROJECTS    按会话工作目录排除，钩子与记录服务（worker）两侧都查，对所有工具都生效
+# 所以战役一律在专用目录里跑，并把它写进排除名单；领批前自检，没排除就拒绝。
+
+def workspace_dir() -> Path:
+    return Path(os.environ.get("KG_HUB_CAMPAIGN_WORKSPACE", "~/work-ai/kg-hub-campaign")).expanduser()
+
+
+def claude_mem_settings_path() -> Path:
+    return Path(os.environ.get("CLAUDE_MEM_SETTINGS_PATH", "~/.claude-mem/settings.json")).expanduser()
+
+
+def _glob_regex(pattern: str) -> re.Pattern:
+    """与 claude-mem 的 globToRegex 同一语义：~ 展开；* 不跨目录，** 跨目录，? 单个字符；整串匹配。"""
+    p = os.path.expanduser(pattern.replace("\\", "/")).replace("\\", "/")
+    p = re.sub(r"[.+^${}()|\[\]\\]", lambda m: "\\" + m.group(0), p)
+    p = p.replace("**", "\0").replace("*", "[^/]*").replace("?", "[^/]").replace("\0", ".*")
+    return re.compile("^" + p + "$")
+
+
+def path_excluded(path: str, patterns_csv: str) -> bool:
+    """claude-mem isProjectExcluded 的同义实现：完整路径或最后一级目录名命中任一规则即排除。"""
+    norm = str(path).replace("\\", "/")
+    base = norm.rstrip("/").rsplit("/", 1)[-1]
+    for pat in (x.strip() for x in (patterns_csv or "").split(",")):
+        if pat and (_glob_regex(pat).match(norm) or _glob_regex(pat).match(base)):
+            return True
+    return False
+
+
+def tracking_state(cwd: str | None = None) -> dict:
+    """当前会话会不会被 claude-mem 记录。会话目录取进程工作目录，Claude Code 另有 CLAUDE_PROJECT_DIR 时一并检查
+    （钩子按会话目录判断，只在命令里 cd 进专用目录不算数）。"""
+    sp = claude_mem_settings_path()
+    try:
+        patterns = json.loads(sp.read_text()).get("CLAUDE_MEM_EXCLUDED_PROJECTS", "") if sp.exists() else ""
+    except ValueError:
+        patterns = ""
+    dirs = [cwd or os.getcwd()] + [v for v in (os.environ.get("CLAUDE_PROJECT_DIR"),) if v]
+    excluded = all(path_excluded(x, patterns) for x in dirs)
+    internal = os.environ.get("CLAUDE_MEM_INTERNAL") == "1"
+    return {"tracked": not (internal or excluded), "internal_env": internal, "excluded": excluded,
+            "dirs": dirs, "settings": str(sp), "patterns": patterns}
+
+
+def tracking_guard(allow_tracking: str | None = None, cwd: str | None = None) -> dict:
+    t = tracking_state(cwd)
+    if t["tracked"] and not allow_tracking:
+        raise SystemExit(
+            "当前会话会被 claude-mem 记录：抽取过程本身会变成新的待抽观测（2026-10-24 实测 2 小时 214 条）。\n"
+            f"  会话目录：{', '.join(t['dirs'])}\n"
+            f"  排除规则（{t['settings']}）：{t['patterns'] or '（空）'}\n"
+            "修法：先跑 `python -m tools.extract_campaign workspace` 建专用目录并写进排除名单，"
+            f"再在 {workspace_dir()} 里打开会话执行；或启动时加 CLAUDE_MEM_INTERNAL=1。\n"
+            "确需例外用 --allow-tracking \"原因\"，会记进战役。")
+    return t
+
+
+def cmd_workspace(*, path: Path | None = None, settings: Path | None = None, repo: Path = REPO, runner=None) -> dict:
+    """建 / 同步战役专用目录（kg-hub 主干的独立 worktree，分离 HEAD，不在里面改代码），并写进 claude-mem 排除名单。
+    已存在且干净就快进到 origin/main；有改动就停下不动。排除名单先备份再追加，不覆盖原有规则。"""
+    import subprocess
+    run = runner or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip())
+    ws = (path or workspace_dir()).expanduser()
+    sp = (settings or claude_mem_settings_path()).expanduser()
+    common = Path(run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    main_repo = common.parent
+    run(["git", "-C", str(main_repo), "fetch", "-q", "origin"])
+    if not ws.exists():
+        run(["git", "-C", str(main_repo), "worktree", "add", "--detach", str(ws), "origin/main"])
+        action = "created"
+    elif run(["git", "-C", str(ws), "status", "--porcelain"]):
+        raise SystemExit(f"{ws} 有未提交的改动，专用目录不该改代码；先处理掉再同步")
+    else:
+        run(["git", "-C", str(ws), "checkout", "-q", "--detach", "origin/main"])
+        action = "synced"
+    head = run(["git", "-C", str(ws), "rev-parse", "--short", "HEAD"])
+    data = json.loads(sp.read_text()) if sp.exists() else {}
+    cur = data.get("CLAUDE_MEM_EXCLUDED_PROJECTS", "") or ""
+    want = [str(ws), f"{ws}/**"]
+    add = [w for w in want if w not in [x.strip() for x in cur.split(",")]]
+    backup = None
+    if add:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        if sp.exists():
+            backup = sp.with_name(sp.name + ".bak-" + datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+            backup.write_text(sp.read_text())
+        data["CLAUDE_MEM_EXCLUDED_PROJECTS"] = ",".join([x for x in (cur.strip(),) if x] + add)
+        tmp = sp.with_name(sp.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.replace(sp)
+    ok = path_excluded(str(ws), data.get("CLAUDE_MEM_EXCLUDED_PROJECTS", ""))
+    return {"workspace": str(ws), "action": action, "head": head, "excluded": ok, "added_patterns": add,
+            "settings": str(sp), "backup": str(backup) if backup else None}
+
+
+def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None, state: Path | None = None) -> str:
     """「每个模型一个会话」的启动命令（编排工具派不了指定模型的子代理时的退路，也可用来并行开会话）。
+    在战役专用目录里跑、前缀 CLAUDE_MEM_INTERNAL=1，qodercli 不加载用户级设置、codex 不加载用户配置——抽取过程不变成新观测。
     子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
     codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
+    repo = repo or workspace_dir()
     st = state or ax.state_dir()
     # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
     reg_dir = claim_registry.claims_dir()
@@ -219,18 +320,18 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path = REPO, state:
     # 解释器不写死某台机器的路径：KG_HUB_PYTHON 指向装好 kg-hub 依赖的 Python，没设就用 python3
     brief_cmd = f'"$(${{KG_HUB_PYTHON:-python3}} -m tools.extract_campaign brief --id {cid} --model {model})"'
     if tool == "codex":
-        return (f"cd {repo} && codex exec -m {model} -C {repo} {adds} -s workspace-write "
+        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 codex exec -m {model} -C {repo} {adds} --ignore-user-config -s workspace-write "
                 f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
     if tool == "cursor":
-        return (f"cd {repo} && cursor-agent -p --model {model} --trust --workspace {repo} {adds} "
+        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 cursor-agent -p --model {model} --trust --workspace {repo} {adds} "
                 f"--force {brief_cmd}")
     if tool == "qodercli":
-        return (f"cd {repo} && qodercli -p -m {model} -w {repo} {adds} --permission-mode auto "
+        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 qodercli -p -m {model} -w {repo} {adds} --setting-sources local --permission-mode auto "
                 f"-o json {brief_cmd}")
     if tool == "dsh":
         # DeepSeek Harness（@deepseek-ai/dsh）无界面模式一次跑完一个任务；它没有模型参数，模型在 DSH 的
         # 模型设置里选（profile 的 agent-default-model），所以每个模型的会话开跑前先把模型切过去
-        return f"# 先在 DSH 的模型设置里切到 {model}\ncd {repo} && dsh --profile headless {brief_cmd}"
+        return f"# 先在 DSH 的模型设置里切到 {model}\ncd {repo} && CLAUDE_MEM_INTERNAL=1 dsh --profile headless {brief_cmd}"
     raise SystemExit(f"不认识的工具 {tool}；可选：{', '.join(LAUNCH_TOOLS)}")
 
 
@@ -259,10 +360,11 @@ def admission_gate(models: list[str], prompt_version: str, prompt_sha256: str, l
 
 
 def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
-              skip_admission: str | None = None, lookup=None) -> dict:
+              skip_admission: str | None = None, lookup=None, allow_tracking: str | None = None) -> dict:
     d = campaign_dir(cid)
     if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
         raise SystemExit(f"战役 {cid} 已存在")
+    tracking = tracking_guard(allow_tracking)
     gate = admission_gate(models, ax.PROMPT_VERSION, prompt_sha(ax.PROMPT_PATH.read_text()), lookup)
     bad = {m: g["why"] for m, g in gate.items() if not g["ok"]}
     if bad and not skip_admission:
@@ -276,6 +378,9 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
             after_id = int(st.get("cursor", 0))
         c = new_campaign(cid, models, executor=executor, quota=quota, batch=batch, after_id=after_id)
         c["admission"] = {"gate": gate, "skipped": skip_admission if bad else None}
+        if tracking["tracked"]:
+            c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "start", "reason": allow_tracking,
+                                                           "dirs": tracking["dirs"]})
         for sub in ("batches", "results"):
             (d / sub).mkdir(exist_ok=True)
         (d / "prompt.md").write_text(ax.PROMPT_PATH.read_text())   # 冻结规则正文，战役内不随仓库变
@@ -297,14 +402,19 @@ def cmd_chain(cid: str, file: str) -> dict:
     return {"chain": ver, "file": str(dst)}
 
 
-def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, check=None) -> dict:
+def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, check=None,
+              allow_tracking: str | None = None) -> dict:
     d = campaign_dir(cid)
+    tracking = tracking_guard(allow_tracking)   # 会被 claude-mem 记录的会话不许领批
     fetch = fetch or ax.fetch_remote_pending
     check = check or (lambda idents: ax.check_existing(idents, url, token))
     owner = campaign_owner(cid)
     # 先战役锁、后全设备登记锁（提交只拿登记锁），顺序固定不会互等
     with locked(d), claim_registry.opened() as reg:
         c = load(d)
+        if tracking["tracked"]:
+            c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "claim", "model": model,
+                                                           "reason": allow_tracking, "dirs": tracking["dirs"]})
         if model not in c["models"]:
             raise SystemExit(f"战役 {cid} 没有模型 {model}；有：{', '.join(c['models'])}")
         held = reg.held_by_others(owner)
@@ -366,7 +476,7 @@ def take_requeue(d: Path, queue: list[dict], n: int, check) -> tuple[list[dict],
         if int(q["id"]) in src:
             items.append(src[int(q["id"])])
     existing = check(items) if items else {}
-    return [i for i in items if existing.get(i["source_obs_id"]) != "ok"], rest
+    return [i for i in items if existing.get(i["source_obs_id"]) not in ("ok", "empty")], rest
 
 
 def _batch_rows(d: Path, bid: str) -> tuple[dict, list[tuple[int, str, str]]]:
@@ -503,6 +613,20 @@ def cmd_review(cid: str, bid: str, obs: int, *, verdict: str, note: str = "") ->
     return {"batch": bid, "reviewed": len(rv), "errors": sum(r["verdict"] == "error" for r in rv)}
 
 
+def cmd_mark_empty(cid: str, *, url: str, token: str | None, post=None) -> dict:
+    """补记本战役判为空、服务端还没记录的观测（见 agent_extract.mark_empty_from_log）。
+    记上之后 refinery 对账把它们算作已处理，看板「剩余」随之下降，网关也不会再抽一遍。"""
+    d = campaign_dir(cid)
+    c = load(d)
+
+    def load_batch(bid):
+        p = d / "batches" / f"{bid}.json"
+        return json.loads(p.read_text()) if p.exists() else None
+    with locked(d):
+        return {"campaign": cid, **ax.mark_empty_from_log(d / "log.jsonl", load_batch, url=url, token=token,
+                                                          post=post or ax._http, executor=c["executor"])}
+
+
 def cmd_cost(cid: str, bid: str, *, credits=None, tokens=None, seconds=None, note: str = "") -> dict:
     d = campaign_dir(cid)
     with locked(d):
@@ -633,8 +757,10 @@ def cmd_status(cid: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ws = sub.add_parser("workspace", help="建 / 同步战役专用目录，并写进 claude-mem 排除名单")
+    ws.add_argument("--path", help="缺省 KG_HUB_CAMPAIGN_WORKSPACE 或 ~/work-ai/kg-hub-campaign")
     for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "review",
-                 "cost", "status", "report"):
+                 "cost", "status", "report", "mark-empty"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -644,6 +770,9 @@ def main(argv=None) -> int:
             s.add_argument("--batch", type=int, default=50, help="每批条数（每批复盘一次）")
             s.add_argument("--after-id", type=int, help="游标起点；缺省接着会话自抽取的游标")
             s.add_argument("--skip-admission", metavar="原因", help="没过 bench 准入也开战役（原因记进战役）")
+        if name in ("start", "claim"):
+            s.add_argument("--allow-tracking", metavar="原因",
+                           help="会话会被 claude-mem 记录也照样跑（不推荐；原因记进战役）")
         if name == "chain":
             s.add_argument("--file", required=True)
         if name in ("claim", "brief"):
@@ -674,12 +803,16 @@ def main(argv=None) -> int:
             s.add_argument("--seconds", type=float)
         if name == "report":
             s.add_argument("--json")
-        if name in ("claim", "submit"):
+        if name in ("claim", "submit", "mark-empty"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
-    if a.cmd == "start":
+    if a.cmd == "workspace":
+        out = cmd_workspace(path=Path(a.path) if a.path else None)
+    elif a.cmd == "mark-empty":
+        out = cmd_mark_empty(a.id, url=a.url, token=ax.api_token())
+    elif a.cmd == "start":
         out = cmd_start(a.id, a.models, executor=a.executor, quota=a.quota, batch=a.batch, after_id=a.after_id,
-                        skip_admission=a.skip_admission)
+                        skip_admission=a.skip_admission, allow_tracking=a.allow_tracking)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
     elif a.cmd == "rules":
@@ -716,7 +849,7 @@ def main(argv=None) -> int:
             print(f"# {m}\n{launch_command(a.tool, a.id, m)}\n")
         return 0
     elif a.cmd == "claim":
-        out = cmd_claim(a.id, a.model, url=a.url, token=ax.api_token())
+        out = cmd_claim(a.id, a.model, url=a.url, token=ax.api_token(), allow_tracking=a.allow_tracking)
     elif a.cmd == "lint":
         probs = cmd_lint(a.id, a.batch)
         print("\n".join(probs) if probs else "自检通过")

@@ -32,6 +32,15 @@ class GraphSyncTest(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertIn(11, wm["ingested"]); self.assertNotIn(12, wm["ingested"])
 
+    def test_empty_goes_to_rejected_not_ingested(self):
+        """执行者判为空的观测没进图但已处理：记进 rejected，不再挂在「剩余」里、网关也不会再抽（2026-10-24）。"""
+        wm = _wm()
+        n = R.apply_graph_statuses(wm, {"claude-mem-obs-13": "empty", "claude-mem-obs-14": "ok"})
+        self.assertEqual(n, 2)
+        self.assertIn(13, wm["rejected"]); self.assertNotIn(13, wm["ingested"])
+        self.assertIn(14, wm["ingested"])
+        self.assertEqual(R.apply_graph_statuses(wm, {"claude-mem-obs-13": "empty"}), 0)   # 重复不再计数
+
     def test_sync_throttles_chunks_and_writes_status(self):
         wm = _wm()
         calls = []
