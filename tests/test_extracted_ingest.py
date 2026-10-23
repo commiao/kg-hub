@@ -106,6 +106,18 @@ class LexicalTest(unittest.TestCase):
         self.assertTrue(same("claude-mem 502", "claude-mem 502 错误"))
         self.assertTrue(same("Writer Lock", "writer_lock"))
 
+    def test_names_differing_only_in_number_expressions_are_different(self):
+        """2026-10-23 战役第 1 轮 dry-run：「准则 8 → 准则 26–28」一个单数、一个范围，按段替换数字的守卫漏过。"""
+        same = xi._lexically_same
+        self.assertFalse(same("deploy-standard 准则 8", "deploy-standard 准则 26–28", "Concept"))
+        self.assertFalse(same("credvault 准则 8 至 10", "credvault 准则 8", "Concept"))
+        self.assertFalse(same("Python 3.9 运行时", "Python 3.13 运行时", "Tool"))
+        self.assertFalse(same("灰度 5% 阶段", "灰度 50% 阶段", "Concept"))
+        # 数字一样、只多修饰语或写法不同的照旧复用
+        self.assertTrue(same("claude-mem 502", "claude-mem 502 错误", "Issue"))
+        self.assertTrue(same("PR #49 修复", "PR #49 清理修复", "Fix"))
+        self.assertTrue(same("deploy-standard 准则 26–28", "deploy-standard 准则 26-28", "Concept"))
+
     def test_names_differing_by_word_prefix_are_different(self):
         """2026-10-22 补交 b0024：`prevalidate 阶段相似度计数` 被并进同批先建的 `validate 阶段相似度计数`（包含占比 0.81）。"""
         same = xi._lexically_same

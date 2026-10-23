@@ -191,6 +191,22 @@ def _differ_by_prefix(a: str, b: str) -> bool:
     return False
 
 
+# 数字表达式整体当一个占位：整数、小数、版本号、范围（26–28、19~22、1.2.3）。上面那条「把每段数字换成 #」
+# 只认数字段个数一样的（19–22 / 26–28）；2026-10-23 战役第 1 轮 dry-run 出现「deploy-standard 准则 8 →
+# 准则 26–28」，一个是单数、一个是范围，形状不同就漏过去了。
+_NUM_EXPR = re.compile(r"\d+(?:\s*[.\-–—~～/至到]\s*\d+)*")
+
+
+def _differ_only_in_numbers(a: str, b: str) -> bool:
+    """去掉数字表达式后两边一样、数字本身不同 → 是不同的东西（准则 8 ≠ 准则 26–28、Python 3.9 ≠ Python 3.13）。"""
+    la, lb = (a or "").lower(), (b or "").lower()
+    na, nb = _NUM_EXPR.findall(la), _NUM_EXPR.findall(lb)
+    # 只比数字本身：26–28 与 26-28 是同一个范围，分隔符写法不同不算数字不同
+    if not na or not nb or [re.findall(r"\d+", v) for v in na] == [re.findall(r"\d+", v) for v in nb]:
+        return False
+    return _lex(_NUM_EXPR.sub("#", la)) == _lex(_NUM_EXPR.sub("#", lb))
+
+
 def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     """向量召回的候选必须在词面上也站得住。
 
@@ -228,7 +244,7 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
         return False
     if x == y:
         return True
-    if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y):
+    if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y) or _differ_only_in_numbers(a, b):
         return False
     if _differ_by_contrast(x, y) or _differ_by_prefix(a, b):
         return False

@@ -263,6 +263,45 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
     return picked, stats
 
 
+# 一次领批最多往后扫几段（每段 max(还差条数*4, 40) 条）。可抽观测稀疏时一段凑不满一批：
+# 2026-10-23 战役第 1 轮，游标后 80 条只剩 4 条可抽，gpt-6-astra 领到 4 条就收工，要再起一个会话补配额。
+FILL_MAX_ROUNDS = 8
+
+
+def gather_batch(after: int, n: int, *, fetch, check, cfg: dict, held=frozenset(),
+                 max_rounds: int = FILL_MAX_ROUNDS) -> dict:
+    """从游标 after 起逐段往后扫，凑满 n 条再交；战役 claim 与 next 共用。
+    check(idents) → {source_obs_id: status}；held：别的领取方正占着的 id（全设备在途登记）。
+    返回 picked、stats（各段相加）、last（凑满时为最后挑中的 id，没凑满时为看过的最后一条，一条没看过为 after）、
+    lookahead（last 之后紧接着的标题）、seen（共看过多少条）、remote（最后一段的元信息）。"""
+    picked: list[dict] = []
+    stats: dict = {"rounds": 0, "held_elsewhere": 0}
+    last, lookahead, seen, remote = after, [], 0, {}
+    for _ in range(max(1, max_rounds)):
+        need = n - len(picked)
+        remote = fetch(last, max(need * 4, 40))
+        rows = remote["rows"]
+        if not rows:
+            break
+        stats["rounds"] += 1
+        seen += len(rows)
+        avail = [r for r in rows if r["id"] not in held]
+        fresh, st = select_batch(avail, cfg, need, check([to_identity(r) for r in avail]) if avail else {})
+        for k, v in st.items():
+            stats[k] = stats.get(k, 0) + v
+        stats["held_elsewhere"] += len(rows) - len(avail)
+        picked += fresh
+        if len(fresh) >= need:
+            last = fresh[-1]["id"]
+            lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
+                         for r in rows if r["id"] > last][:n]
+            break
+        last = rows[-1]["id"]
+    stats["picked"] = len(picked)
+    return {"picked": picked, "stats": stats, "last": last, "lookahead": lookahead, "seen": seen,
+            "remote": remote}
+
+
 def build_payload(item: dict, result: dict, *, model: str, session: str | None,
                   prompt_version: str = PROMPT_VERSION, dry_run: bool = False,
                   executor: str | None = None, run_id: str | None = None) -> dict:
@@ -601,29 +640,24 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         owner = next_owner(sd)
         with claim_registry.opened() as reg:
-            remote = fetch_remote_pending(after, max(a.n * 4, 40))
-            rows = remote["rows"]
-            if not rows:
-                print(json.dumps({"picked": 0, "message": "游标之后没有待处理观测了", "cursor": remote["after"],
-                                  "boundary": remote["boundary"], "exhausted": remote["exhausted"]}))
+            # 全设备在途领取登记：剔除别的战役 / 别的 next 状态目录正领着的观测（tools/claim_registry.py）；
+            # 可抽观测稀疏时逐段往后扫，凑满一批再交
+            g = gather_batch(after, a.n, fetch=fetch_remote_pending, cfg=cfg,
+                             check=lambda idents: check_existing(idents, a.url, token),
+                             held=reg.held_by_others(owner))
+            remote, picked, stats = g["remote"], g["picked"], g["stats"]
+            if not g["seen"]:
+                print(json.dumps({"picked": 0, "message": "游标之后没有待处理观测了", "cursor": after,
+                                  "boundary": remote.get("boundary"), "exhausted": remote.get("exhausted")}))
                 return 0
-            # 全设备在途领取登记：剔除别的战役 / 别的 next 状态目录正领着的观测（tools/claim_registry.py）
-            held = reg.held_by_others(owner)
-            avail = [r for r in rows if r["id"] not in held]
-            existing = check_existing([to_identity(r) for r in avail], a.url, token) if avail else {}
-            picked, stats = select_batch(avail, cfg, a.n, existing)
-            stats["held_elsewhere"] = len(rows) - len(avail)
-            stats.update({"boundary": remote["boundary"], "skipped_by_watermark": remote["skipped_by_watermark"]})
+            stats.update({"boundary": remote.get("boundary"), "skipped_by_watermark": remote.get("skipped_by_watermark")})
             st["batches"] = int(st.get("batches", 0)) + 1
             batch_id = f"b{st['batches']:04d}"
-            # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没挑到 n 条时），
-            # 中间被闸拒/已入库的不会再看第二遍。
-            last_considered = picked[-1]["id"] if len(picked) >= a.n else rows[-1]["id"]
-            # 前瞻：本批之后紧接着的观测标题（第 2 轮复盘：跨批的更正在下一批才出现，抽取者看不到）
-            lookahead = [{"id": r["id"], "type": r.get("type"), "title": (r.get("title") or "")[:120]}
-                         for r in rows if r["id"] > last_considered][:a.n]
+            # 游标只推进到「被挑中的最后一条」或「全部看过的最后一条」（没凑满 n 条时），
+            # 中间被闸拒/已入库的不会再看第二遍。前瞻：本批之后紧接着的观测标题（第 2 轮复盘）
+            last_considered, lookahead = g["last"], g["lookahead"]
             batch = {"batch_id": batch_id, "created_at": datetime.now(tz=timezone.utc).isoformat(),
-                     "after_id": remote["after"], "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
+                     "after_id": after, "last_considered_id": last_considered, "prompt": str(PROMPT_PATH),
                      "prompt_version": PROMPT_VERSION, "stats": stats, "items": picked, "lookahead": lookahead}
             out = Path(a.out) if a.out else sd / f"batch-{batch_id}.json"
             out.parent.mkdir(parents=True, exist_ok=True)

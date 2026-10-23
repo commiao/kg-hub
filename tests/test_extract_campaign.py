@@ -464,5 +464,26 @@ class DeviceWideClaimsTest(unittest.TestCase):
         self.assertEqual(inside.count("--add-dir"), 1)                      # 登记目录在状态目录里就不重复加
 
 
+
+class FillBatchTest(unittest.TestCase):
+    """战役领批：可抽观测稀疏时逐段往后扫，凑满一批再交。"""
+    setUp, tearDown = CampaignTest.setUp, CampaignTest.tearDown
+
+    def test_sparse_backlog_still_yields_a_full_batch(self):
+        def sparse_select(rows, cfg, n, existing):
+            picked = [{"id": r["id"], "name": f"claude-mem-obs-{r['id']}", "source_description": "sd",
+                       "source_obs_id": f"h{r['id']}", "reference_time": "2026-10-22T00:00:00Z",
+                       "episode_body": f"[DISCOVERY] {TITLES[r['id']]}\nbody"} for r in rows if r["id"] % 13 == 0][:n]
+            return picked, {"seen": len(rows), "picked": len(picked)}
+        with mock.patch.object(ax, "select_batch", sparse_select):
+            o = ec.cmd_claim("t1", "DeepSeek-Flash", url="http://x", token=None, fetch=fake_fetch,
+                             check=lambda idents: {})
+        ids = [i["id"] for i in json.loads(_Path(o["batch_file"]).read_text())["items"]]
+        self.assertEqual(len(ids), 25)                                       # 一段只有 3 条可抽，照样凑满 25
+        self.assertTrue(all(i % 13 == 0 for i in ids))
+        self.assertGreater(json.loads(_Path(o["batch_file"]).read_text())["stats"]["rounds"], 1)
+        self.assertEqual(ec.load(ec.campaign_dir("t1"))["cursor"], ids[-1])
+
+
 if __name__ == "__main__":
     unittest.main()
