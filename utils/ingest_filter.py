@@ -101,6 +101,25 @@ def normalize_type(raw: object) -> str:
     return str(raw or "").strip().strip(_TYPE_WRAPPERS).strip().lower()
 
 
+# ---------- 正文长度：中文按字折算 ----------
+# 2026-10-24 抽样（30 天 223 条、子代理盲标）：被现状挡住的 6 条高价值观测里有几条是中文写的、分数差一点——
+# 一个汉字的信息量约等于两个英文字符，按字符数计分对中文吃亏。汉字按 cjk_char_weight 个字符计（配置在
+# scoring.cjk_char_weight，缺省 1 = 不折算）；打分、最短正文、长正文豁免三处用同一个长度，口径不分叉。
+# 同一样本上：高价值保留 94%→95%、中价值 92%→93%，低价值不多放一条。
+
+
+def _is_cjk(ch: str) -> bool:
+    return "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
+
+
+def narrative_length(text: str, cjk_weight: float = 1.0) -> float:
+    """正文的「有效长度」：普通字符算 1，汉字算 cjk_weight。"""
+    text = text or ""
+    if cjk_weight == 1:
+        return len(text)
+    return len(text) + (cjk_weight - 1) * sum(1 for c in text if _is_cjk(c))
+
+
 # ---------- Scoring ----------
 
 def compute_score(obs: dict, scoring_cfg: dict) -> tuple[float, dict]:
@@ -111,7 +130,8 @@ def compute_score(obs: dict, scoring_cfg: dict) -> tuple[float, dict]:
     type_weight = scoring_cfg["type_weight"].get(type_, 0)
 
     narrative = obs.get("narrative") or ""
-    narrative_score = min(len(narrative), scoring_cfg["narrative_chars_cap"]) / scoring_cfg["narrative_chars_divisor"]
+    n_len = narrative_length(narrative, scoring_cfg.get("cjk_char_weight", 1))
+    narrative_score = min(n_len, scoring_cfg["narrative_chars_cap"]) / scoring_cfg["narrative_chars_divisor"]
 
     facts = _decode_json_list(obs.get("facts"))
     facts_score = min(len(facts), scoring_cfg["facts_cap"]) * scoring_cfg["facts_weight"]
@@ -191,9 +211,10 @@ def evaluate(
                       obs, type_, platform, project, shadow)
 
     narrative = obs.get("narrative") or ""
-    if len(narrative) < g["min_narrative_chars"]:
+    n_len = narrative_length(narrative, scoring_cfg.get("cjk_char_weight", 1))
+    if n_len < g["min_narrative_chars"]:
         reasons.append(
-            f"narrative too short ({len(narrative)} < {g['min_narrative_chars']})"
+            f"narrative too short ({n_len:g} < {g['min_narrative_chars']})"
         )
         # narrative gate can be bypassed only for security_alert (catastrophic events
         # may have short narratives); decision/bugfix still need substance
@@ -207,7 +228,7 @@ def evaluate(
     # avoids rejecting long-form bugfix/decision obs where the writer poured
     # the content into prose instead of structured facts (e.g. obs #429).
     substantive_narrative_bypass = (
-        len(narrative) >= g.get("substantive_narrative_chars", 300)
+        n_len >= g.get("substantive_narrative_chars", 300)
     )
     if (
         len(facts) + len(files_modified) < g["min_facts_or_files"]
