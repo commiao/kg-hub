@@ -48,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
+from utils import obs_triage  # noqa: E402
 from tools import claim_registry  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
@@ -239,15 +240,28 @@ def check_existing(items: list[dict], url: str, token: str | None, post=_http) -
     return out
 
 
-def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | None]) -> tuple[list[dict], dict]:
-    """质量闸 + 跳过已入库/抽取中。返回 (batch_items, 统计)。"""
-    stats = {"seen": len(rows), "rejected_by_filter": 0, "already_ok": 0, "pending_elsewhere": 0, "picked": 0}
+def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | None],
+                 triage_cfg: dict | None = None) -> tuple[list[dict], dict]:
+    """质量闸 + 分诊 + 跳过已入库/抽取中。返回 (batch_items, 统计)。
+    分诊（utils/obs_triage）在闸放行的观测上再分 keep/review/drop：影子模式（config enabled=false）只计数，
+    enabled=true 才把 drop 档跳过（计入 triage_dropped）。不传 triage_cfg 就读 config/obs_triage.json。"""
+    stats = {"seen": len(rows), "rejected_by_filter": 0, "already_ok": 0, "pending_elsewhere": 0, "picked": 0,
+             "triage_drop": 0, "triage_review": 0, "triage_dropped": 0}
+    tcfg = triage_cfg if triage_cfg is not None else _triage_cfg()
+    enforce = obs_triage.triage_enabled(tcfg)
     picked: list[dict] = []
     for obs in rows:
         d = evaluate(obs, cfg, None)
         if not d.accept:
             stats["rejected_by_filter"] += 1
             continue
+        if tcfg:
+            tier = obs_triage.triage(obs, cfg, tcfg, base=d).tier
+            if tier != "keep":
+                stats[f"triage_{tier}"] += 1
+            if enforce and tier == "drop":
+                stats["triage_dropped"] += 1
+                continue
         ident = to_identity(obs)
         st = existing.get(ident["source_obs_id"])
         if st in ("ok", "empty"):   # empty：别的执行者已判为空并记录过，同样算已处理
@@ -261,6 +275,14 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
             break
     stats["picked"] = len(picked)
     return picked, stats
+
+
+def _triage_cfg() -> dict:
+    """分诊配置；文件不在就当没有分诊（空 dict：不统计也不跳过）。"""
+    try:
+        return obs_triage.load_triage_config()
+    except FileNotFoundError:
+        return {}
 
 
 # 一次领批最多往后扫几段（每段 max(还差条数*4, 40) 条）。可抽观测稀疏时一段凑不满一批：
