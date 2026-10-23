@@ -80,6 +80,9 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录A> --sheet 
 
 ## 4. 战役（定额、全部入库、每轮复盘）
 
+0. **专用目录**：先 `$PY -m tools.extract_campaign workspace`（建 / 同步 `~/work-ai/kg-hub-campaign` 并写进 claude-mem 排除名单），
+   编排者与子代理都在那里打开会话——否则抽取过程会被记成新观测、又进待抽队列；`start` / `claim` 没排除会拒绝
+   （例外须经用户同意加 `--allow-tracking "原因"`）。
 1. 准入检查：`start` 只收最新准入为 `pass` 的模型；没过的先走第 3 步，或经用户同意加 `--skip-admission "原因"`。
 2. 开战役（id 建议 `<日期>-<工具>-<模型简称…>`）：
    `$PY -m tools.extract_campaign start --id <战役> --models A B C --executor <工具> --quota <每模型条数> --batch <每批>`

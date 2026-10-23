@@ -132,6 +132,11 @@ class SelectTest(unittest.TestCase):
         self.assertEqual((stats["already_ok"], stats["pending_elsewhere"], stats["rejected_by_filter"],
                           stats["picked"]), (1, 1, 1, 2))
         self.assertTrue(ax.evaluate(OBS, cfg, None) is not None)  # 真闸可调用
+        # 别的执行者判为空并记录过（status=empty）：同样算已处理，不再领
+        with mock.patch.object(ax, "evaluate", fake):
+            picked, stats = ax.select_batch(rows, cfg, 2, {"h1": "empty", "h4": "empty"})
+        self.assertEqual([p["id"] for p in picked], [2, 5])
+        self.assertEqual(stats["already_ok"], 2)
 
 
 class GatherBatchTest(unittest.TestCase):
@@ -224,6 +229,8 @@ class SubmitTest(unittest.TestCase):
 
         def fake_post(method, url, body, token):
             posted.append((url, body, token))
+            if body.get("empty"):                                      # 空观测正式提交时发「空」记录
+                return 200, {"status": "empty_recorded"}
             return 200, {"status": "ok", "episode_uuid": "u", "nodes_new": 1, "nodes_reused": 0,
                          "edges_new": 0, "edges_reused": 0,
                          "stats": {"entities_in": 1, "edges_in": 1, "offschema_edge": 1, "dirty_name": 0,
@@ -398,7 +405,9 @@ class DryRunGateTest(unittest.TestCase):
         posted = []
 
         def fake_post(method, url, body, token):
-            posted.append(body.get("dry_run", False))
+            posted.append("empty" if body.get("empty") else body.get("dry_run", False))
+            if body.get("empty"):
+                return 200, {"status": "empty_recorded"}
             return 200, {"status": "dry_run" if body.get("dry_run") else "ok", "episode_uuid": "u",
                          "stats": {"entities_in": 1, "edges_in": 0}, "resolved": {}}
         with tempfile.TemporaryDirectory() as d:
@@ -419,7 +428,7 @@ class DryRunGateTest(unittest.TestCase):
                 self.assertTrue((Path(d) / "dryrun-b0009.json").exists())
                 self.assertEqual(ax.main(["dryrun-check", "--batch", str(b), "--file", str(r)]), 0)
                 self.assertEqual(ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"]), 0)
-                self.assertEqual(posted, [True, False])
+                self.assertEqual(posted, [True, False, "empty"])   # 预览不发空记录；正式提交时空观测也记一条
                 # 明确跳过：另一批没 dry-run 也放行
                 b2 = Path(d) / "b2.json"
                 b2.write_text(json.dumps({"batch_id": "b0010", "items": [ax.to_identity(OBS)]}))

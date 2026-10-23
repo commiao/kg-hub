@@ -250,7 +250,7 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
             continue
         ident = to_identity(obs)
         st = existing.get(ident["source_obs_id"])
-        if st == "ok":
+        if st in ("ok", "empty"):   # empty：别的执行者已判为空并记录过，同样算已处理
             stats["already_ok"] += 1
             continue
         if st == "pending":
@@ -340,7 +340,17 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
             out.append({"id": oid, "status": "unknown_id"})
             continue
         if not res.get("entities"):
+            # 空观测：预览时只在本地记；正式提交时也发一条「空」记录（服务端只记 IngestedKey status=empty、不写图），
+            # 否则 refinery 对账认不出它、一直挂在「剩余」里（2026-10-24）
             rec = {"id": oid, "status": "empty", "model": model}
+            if not dry_run:
+                payload = build_payload(item, {"entities": [], "edges": []}, model=model, session=session,
+                                        executor=executor, run_id=run_id, prompt_version=prompt_version)
+                payload["empty"] = True
+                code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
+                st = d.get("status") or f"http_{code}"
+                rec.update(status="empty" if st == "empty_recorded" else st, http=code,
+                           empty_recorded=st == "empty_recorded", error=d.get("code") if code >= 400 else None)
         else:
             payload = build_payload(item, res, model=model, session=session, dry_run=dry_run,
                                     executor=executor, run_id=run_id, prompt_version=prompt_version)
@@ -374,6 +384,49 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                 for e in res.get("entities", []):
                     f.write(f"{e.get('type')}\t{e.get('name')}\n")
     return out
+
+
+def mark_empty_from_log(log_path: Path, load_batch, *, url: str, token: str | None, post=_http,
+                        executor: str | None = None, run_id: str | None = None) -> dict:
+    """补记：日志里判为空、但服务端还没有 empty 记录的观测，逐条发一条「空」记录（2026-10-24 之前提交的空观测
+    只记在本地日志里）。load_batch(批次号) 返回批次文件内容。补记结果追加回同一份日志（带 empty_recorded / backfill），
+    所以重跑只会补还没补上的。"""
+    if not log_path.exists():
+        return {"candidates": 0, "recorded": 0, "by_status": {}}
+    recs = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    done = {int(r["id"]) for r in recs if r.get("empty_recorded")}
+    todo, seen = [], set()
+    for r in recs:
+        oid = int(r["id"])
+        if r.get("status") == "empty" and oid not in done and oid not in seen:
+            seen.add(oid)
+            todo.append(r)
+    batches: dict[str, dict] = {}
+    counts: dict[str, int] = {}
+    out = []
+    for r in todo:
+        bid = r.get("batch")
+        if bid not in batches:
+            batches[bid] = {int(i["id"]): i for i in (load_batch(bid) or {}).get("items", [])}
+        item = batches[bid].get(int(r["id"]))
+        if item is None:
+            counts["batch_missing"] = counts.get("batch_missing", 0) + 1
+            continue
+        payload = build_payload(item, {"entities": [], "edges": []}, model=r.get("model") or "unknown",
+                                session=None, executor=r.get("executor") or executor,
+                                run_id=r.get("run_id") or run_id)
+        payload["empty"] = True
+        code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
+        st = d.get("status") or f"http_{code}"
+        counts[st] = counts.get(st, 0) + 1
+        out.append({**{k: r.get(k) for k in ("id", "batch", "model", "executor", "run_id", "project", "type")},
+                    "status": "empty" if st == "empty_recorded" else st, "empty_recorded": st == "empty_recorded",
+                    "backfill": True, "http": code, "ts": datetime.now(tz=timezone.utc).isoformat()})
+    if out:
+        with log_path.open("a") as f:
+            for rec in out:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return {"candidates": len(todo), "recorded": counts.get("empty_recorded", 0), "by_status": counts}
 
 
 # ---------- 提交前必须 dry-run：由工具自己执行，不靠执行器记得 ----------
@@ -570,7 +623,7 @@ def _save_state(p: Path, st: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check"])
+    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check", "mark-empty"])
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
                     "（gate / status / final / checkpoint --adjust k=v --applied ...）；run：start / end")
     ap.add_argument("--executor", default=os.environ.get("KG_HUB_EXECUTOR") or None,
@@ -675,6 +728,14 @@ def main(argv: list[str] | None = None) -> int:
             reg.reserve([x["id"] for x in picked], owner, info=batch_id)
         print(json.dumps({"batch": str(out), "picked": len(picked), "cursor": last_considered,
                           **stats}, ensure_ascii=False))
+        return 0
+    if a.cmd == "mark-empty":
+        # 补记本状态目录里判为空、服务端还没记录的观测（批次文件 batch-<批次号>.json 与 log.jsonl 都在这里）
+        def load_batch(bid):
+            p = sd / f"batch-{bid}.json"
+            return json.loads(p.read_text()) if p.exists() else None
+        print(json.dumps(mark_empty_from_log(log_path, load_batch, url=a.url, token=token, executor=a.executor,
+                                             run_id=a.run_id), ensure_ascii=False))
         return 0
     if a.cmd == "dryrun-check":
         if not (a.batch and a.file):

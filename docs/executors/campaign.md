@@ -55,6 +55,27 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
 积压稀疏时一段凑不满（2026-10-23 战役第 1 轮：游标后 80 条只剩 4 条可抽），以前会交出不满额的一批、子代理领完就收工。
 8 段都凑不满才交不满额的批次（或提示游标已前移、再领一次）；批次 `stats.rounds` 记扫了几段。
 
+## 抽取会话不产生新观测：战役一律在专用目录里跑
+
+2026-10-24 实测：跑战役的 codex 会话 2 小时里产生了 214 条 claude-mem 观测（同期它入库 293 条）——领批、读观测、抽取、提交的每一步
+都被记成了新观测、又进了待抽队列，看板「剩余」几乎不降。所以：
+
+- **先建专用目录**：`$PY -m tools.extract_campaign workspace` 建（或同步）`~/work-ai/kg-hub-campaign`（kg-hub 主干的独立 worktree，
+  分离 HEAD，不在里面改代码；`KG_HUB_CAMPAIGN_WORKSPACE` 可改位置），并把它追加进 claude-mem 的 `CLAUDE_MEM_EXCLUDED_PROJECTS`
+  （先备份 `~/.claude-mem/settings.json`，原有规则保留）。claude-mem 的钩子与记录服务两侧都按会话目录排除，对所有工具都生效。
+- **编排者与子代理都在专用目录里打开会话**——只在命令里 `cd` 进去不算，钩子按会话目录判断。
+- **领批前自检**：`start`、`claim` 先查会话目录是否已排除（或设了 `CLAUDE_MEM_INTERNAL=1`），没有就拒绝；确需例外用
+  `--allow-tracking "原因"`，会记进战役的 `tracking_exceptions`。
+- `launch` 生成的命令都在专用目录里执行、前缀 `CLAUDE_MEM_INTERNAL=1`；qodercli 加 `--setting-sources local`，codex 加 `--ignore-user-config`。
+- 别的设备（NAS 上的 DSH、Windows）各有自己的 claude-mem 设置，要在那台设备上同样跑一次 `workspace`（或手工加排除规则）。
+
+## 空观测也记录：记为「已处理（空）」
+
+执行者判为「没有可抽取知识」的观测，正式提交时发一条 `empty: true` 的记录：服务端只记 IngestedKey `status=empty`（带判定的模型、
+执行工具、run_id），不写任何图数据；refinery 对账把它记进水位的 `rejected`，看板「剩余」随之下降，断路器恢复后网关也不会再抽一遍。
+领批查重把 `empty` 与 `ok` 一样当作已处理。早先只记在本地日志里的空观测用 `$PY -m tools.extract_campaign mark-empty --id <战役>`
+（普通执行器的状态目录用 `$PY -m tools.agent_extract mark-empty`）补记，可重跑。某个模型判了空就是最终结论，别的模型不会再抽这条。
+
 ## 同一台设备上多个工具、多个战役同时跑
 
 - **同一个战役**：领批、提交、记成本都在战役目录的文件锁里，多个工具（Claude Code、qoder、codex、cursor、DSH）同时跑不会领到同一条。
@@ -88,6 +109,7 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
 战役 id：<战役 id，如 20261101-qoder-ds-qwen>；执行工具：<qoder / codex / cursor / claude-code>；
 参与模型：<模型 id 列表，用工具里的准确模型名>；每个模型配额 <200> 条，每批 <50> 条。
 
+0. 先建好专用目录并在里面打开本会话（只做一次，见上文「战役一律在专用目录里跑」）：`$PY -m tools.extract_campaign workspace`
 1. 开战役（只做一次；每个模型要先有 bench 准入 pass，见上文）：
    $PY -m tools.extract_campaign start --id <战役> --models <模型...> --executor <工具> --quota <配额> --batch <每批>
 2. 每一轮：给每个模型派一个子代理，**子代理必须用那个模型**，任务说明用 `$PY -m tools.extract_campaign brief --id <战役> --model <模型>` 的输出

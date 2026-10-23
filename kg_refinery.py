@@ -768,17 +768,21 @@ def pending_live_ids(wm: dict, boundary: int, ids: list[int]) -> list[int]:
 
 
 def apply_graph_statuses(wm: dict, statuses: dict[str, str]) -> int:
-    """把图里已 ok 的 claude-mem-obs-N 记进 ingested，返回新记的条数。"""
+    """把图里已 ok 的 claude-mem-obs-N 记进 ingested、执行者判为空（empty）的记进 rejected，返回新记的条数。
+    empty 记进 rejected 而不是 ingested：它没有进图，但已处理过，不该再挂在「剩余」里、也不该被网关再抽一遍
+    （2026-10-24：会话自抽取的空观测原先服务端没有记录，对账认不出）。"""
     n = 0
     for name, st in statuses.items():
-        if st == "ok" and name.startswith("claude-mem-obs-"):
-            try:
-                oid = int(name[len("claude-mem-obs-"):])
-            except ValueError:
-                continue
-            if oid not in wm["ingested"]:
-                wm["ingested"].add(oid)
-                n += 1
+        if st not in ("ok", "empty") or not name.startswith("claude-mem-obs-"):
+            continue
+        try:
+            oid = int(name[len("claude-mem-obs-"):])
+        except ValueError:
+            continue
+        target = wm["ingested"] if st == "ok" else wm["rejected"]
+        if oid not in target:
+            target.add(oid)
+            n += 1
     return n
 
 

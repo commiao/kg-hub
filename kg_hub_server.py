@@ -1903,6 +1903,10 @@ class ExtractedIngestBody(IngestBody):
     edges: list[ExtractedEdge] = []
     # 只做消解不写图：返回每个实体会复用到哪个旧实体（第 2 轮复盘要求的写入前预览）
     dry_run: bool = False
+    # 执行者读完判定「没有可抽取的知识」：entities / edges 必须为空，只记一条 status=empty 的 IngestedKey、不写图。
+    # 否则这类观测在服务端没有任何记录，refinery 对账认不出、一直挂在「剩余」里，断路器恢复后还会被网关再抽一遍
+    # （2026-10-24：codex 战役 300 条里 7 条空观测因此留在队列）。
+    empty: bool = False
     # 仅 dry_run：同一批前面条目会新建的实体 [{name, type}]，由执行器按 dry-run 返回的 new_entities 累积。
     # 正式提交时它们已在图里、参与消解；不带上就看不见同批内的误并（2026-10-22 补交 b0024）。
     dry_run_pending: list[PendingEntity] = Field(default_factory=list, max_length=5000)
@@ -2005,6 +2009,8 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001
         return JSONResponse({"status": "error", "code": "bad_reference_time"}, status_code=400)
+    if body.empty:
+        return await _record_empty(body)
     try:
         extraction = normalize_extraction(body.entities, body.edges,
                                           set(ENTITY_TYPES), set(EDGE_TYPES))
@@ -2086,6 +2092,50 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         "stats": extraction.stats, "extractor_model": body.extractor_model,
         "extractor_tool": body.extractor_tool, "run_id": body.run_id,
         "source_description": sd, "source_obs_id": sid})
+
+
+async def _record_empty(body: ExtractedIngestBody) -> JSONResponse:
+    """空观测：只建 / 复用 IngestedKey 并记为 empty（带判定的模型与运行），不写任何图数据、不备份正文。
+    幂等：已是 empty 的再交一次照样回 empty_recorded；已入库（ok）的回 skipped；正在入库的回 in_progress；
+    之前失败过的与正常提交一样回 409，不覆盖。"""
+    sd, sid = body.source_description, body.source_obs_id
+    if body.entities or body.edges:
+        return JSONResponse({"status": "error", "code": "empty_with_content",
+                             "message": "empty=true 时 entities 与 edges 都必须为空"}, status_code=400)
+    if body.dry_run:
+        return JSONResponse({"status": "dry_run_empty", "source_description": sd, "source_obs_id": sid})
+    try:
+        g = await get_graphiti()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "graphiti_unavailable",
+                             "diagnostic": type(exc).__name__}, status_code=503)
+    request_id = str(uuidlib.uuid4())
+    try:
+        merge_result = await merge_or_get_ingested_key(g, sd, sid, request_id, body.name)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "code": "ingest_failed",
+                             "diagnostic": type(exc).__name__}, status_code=500)
+    st = merge_result["status"]
+    if not merge_result["newly_created"] and st != "empty":
+        if st == "ok":
+            return JSONResponse({"status": "skipped", "reason": "duplicate",
+                                 "episode_uuid": merge_result["episode_uuid"],
+                                 "source_description": sd, "source_obs_id": sid})
+        if st == "pending":
+            return JSONResponse({"status": "in_progress", "source_description": sd,
+                                 "source_obs_id": sid}, status_code=202)
+        return JSONResponse({"status": st, "code": "previous_attempt_" + str(st),
+                             "message": merge_result.get("error_message") or "delete the IngestedKey to retry",
+                             "source_description": sd, "source_obs_id": sid}, status_code=409)
+    if st != "empty":
+        await update_ingested_key_status(g, sd, sid, "empty")
+        await g.driver.execute_query(
+            "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
+            "SET k.empty_by_model = $model, k.empty_by_tool = $tool, k.empty_run_id = $run_id",
+            sd=sd, sid=sid, model=body.extractor_model, tool=body.extractor_tool, run_id=body.run_id)
+        logger.info("[ingest_extracted:empty] sd=%s sid=%s model=%s", sd, sid, body.extractor_model)
+    return JSONResponse({"status": "empty_recorded", "duplicate": st == "empty",
+                         "extractor_model": body.extractor_model, "source_description": sd, "source_obs_id": sid})
 
 
 async def ingest_extracted_check(request: Request) -> JSONResponse:
