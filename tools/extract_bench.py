@@ -872,12 +872,22 @@ def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, 
 
 
 def append_admission(model: str, rec: dict) -> str:
+    """追加一条准入记录。读改写在 admissions/.lock 里、写入原子替换：两个工具同时对同一模型 admit 不丢记录，
+    战役开局读最新记录时也不会读到写了一半的文件（2026-10-24 并发核实时发现原先两者都没有）。"""
+    import fcntl
     d = bench_root() / "admissions"
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{model_slug(model)}.json"
-    hist = json.loads(f.read_text()) if f.exists() else {"model": model, "history": []}
-    hist["history"].append(rec)
-    f.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+    with open(d / ".lock", "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            hist = json.loads(f.read_text()) if f.exists() else {"model": model, "history": []}
+            hist["history"].append(rec)
+            tmp = f.with_name(f.name + f".tmp{os.getpid()}")
+            tmp.write_text(json.dumps(hist, ensure_ascii=False, indent=1))
+            tmp.replace(f)
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
     return str(f)
 
 

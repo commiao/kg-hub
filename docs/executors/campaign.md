@@ -63,7 +63,10 @@ $PY -m tools.extract_bench admit --bench <样本> --run <运行目录> --sheet <
   （每个战役一个领取方，每个 next 状态目录一个）；正式提交后入库的注销，没入库的留着等回收重领；登记 12 小时
   （`KG_HUB_CLAIM_TTL_HOURS`）没动静自动失效。被跳过的观测领取方的游标会越过去，若占着的一方最后没入库，
   它们留在积压里，不会丢。
-- 查看与清理：`$PY -m tools.claim_registry list`、`release --owner campaign:<战役>`、`purge`。
+- **同一状态目录里多个工具同时 `agent_extract next`**：游标与批次号在登记锁里读，领取方按批（`next:<状态目录>:<批次号>`），
+  所以几个工具共用默认状态目录、甚至给了同一个 `--after-id`，也各拿各的批、批次号不重（2026-10-24 实测修复前会领到同一批并互相覆盖）。
+- **同时写准入记录**（几个工具对同一模型 `admit`）：`admissions/<模型>.json` 的读改写加锁、原子替换，不丢记录、不会读到半截文件。
+- 查看与清理：`$PY -m tools.claim_registry list`、`release --owner campaign:<战役>`（或 `next:<状态目录>:<批次号>`）、`purge`。
 - 沙箱里的工具要能写登记目录：`launch` 生成的命令已自动加上（`--add-dir`）。
 - **跨设备**不在登记范围内，同时跑仍靠服务端幂等键兜底（图里不重复，但后到的那份抽取白花）；需要时再把领取做到服务端。
 
