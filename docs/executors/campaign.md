@@ -71,6 +71,8 @@
   分离 HEAD，不在里面改代码；`KG_HUB_CAMPAIGN_WORKSPACE` 可改位置），并把它追加进 claude-mem 的 `CLAUDE_MEM_EXCLUDED_PROJECTS`
   （先备份 `~/.claude-mem/settings.json`，原有规则保留）。claude-mem 的钩子与记录服务两侧都按会话目录排除，对所有工具都生效。
 - **编排者与子代理都在专用目录里打开会话**——只在命令里 `cd` 进去不算，钩子按会话目录判断。
+  从别的目录（例如工具为会话自动建的 worktree）触发战役时，在那个会话里只出计划、等确认，确认后到专用目录直接开新会话跑，
+  不给触发会话的目录追加排除、也不加 `--allow-tracking`（2026-10-24 用户约定：战役固定在专用目录，不每次新加目录加白）。
 - **领批前自检**：`start`、`claim` 先查会话目录是否已排除（或设了 `CLAUDE_MEM_INTERNAL=1`），没有就拒绝；确需例外用
   `--allow-tracking "原因"`，会记进战役的 `tracking_exceptions`。
 - `launch` 生成的命令都在真实采集已排除的专用目录里执行，不自动设置 INTERNAL 绕过；qodercli 加 `--setting-sources local`，codex 加 `--ignore-user-config`。
