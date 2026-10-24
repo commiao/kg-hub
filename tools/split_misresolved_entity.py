@@ -8,8 +8,9 @@ prevalidate 节点。入图侧已补前缀守卫与 dry-run 同批模拟；本�
 图里同一个误并节点上、episodes 含该观测、fact 原文相同的那条边，就是要搬的边。
 
 模式：
-  --plan RESULTS --batch BATCH --wrong NAME --entity NAME
-                    本机：从结果文件生成 spec（JSON 打到 stdout）。纯读文件。
+  --plan RESULTS --batch BATCH --wrong NAME --entity NAME [--log LOG]
+                    本机：从结果文件生成 spec（JSON 打到 stdout）。纯读文件。带 --log（战役 log.jsonl）时
+                    从实体最早出现那条观测的成功提交记录带出实际来源（模型、执行器、run_id）。
   --spec SPEC [--manifest OUT]
                     容器内 dry-run，只读（ro_query）：按 spec 在图里认出要搬的边与要改的提及，
                     打印报告；带 --manifest 时冻结成清单，apply/restore 只认清单。
@@ -72,11 +73,26 @@ def _key(name: str) -> str:
 
 # ---------- 纯函数（有测试） ----------
 
-def plan_from_results(results: dict, batch: dict, wrong: str, entity: str) -> dict:
-    """结果文件 → spec：误并实体出现在哪些观测、作哪些边的哪一端。"""
+def _log_provenance(log: list, obs_id: int) -> dict | None:
+    """战役 log.jsonl 里这条观测成功提交的那次：来源与图里写的一致（extract_campaign submit 走
+    /api/ingest_extracted，extraction_mode 恒为 agent）。同一观测重提过时取最后一次成功的。"""
+    ok = [r for r in log if r.get("status") == "ok" and str(r.get("id")) == str(obs_id)]
+    if not ok:
+        return None
+    r = ok[-1]
+    return {"extractor_model": r.get("model"), "extraction_mode": "agent",
+            "extractor_tool": r.get("executor"), "run_id": r.get("run_id")}
+
+
+def plan_from_results(results: dict, batch: dict, wrong: str, entity: str, log: list | None = None) -> dict:
+    """结果文件 → spec：误并实体出现在哪些观测、作哪些边的哪一端。
+
+    2026-10-24 战役：fable 抽出的实体并进了 opus 建的节点，拆分时新节点抄了误并节点的来源，
+    差点记到 opus 名下。所以 spec 带上批次模型；给了 log 时再带上实体最早出现那条观测的实际来源。"""
     names = {int(i["id"]): i["name"] for i in batch["items"]}
     ek, wk = _key(entity), _key(wrong)
-    spec = {"tool": TOOL, "wrong_name": wrong, "entity": None, "episodes": [], "edges": []}
+    spec = {"tool": TOOL, "wrong_name": wrong, "entity": None, "episodes": [], "edges": [],
+            "batch_model": batch.get("model")}
     for it in results.get("items", []):
         ents = {_key(e["name"]): e for e in it.get("entities", [])}
         if ek not in ents:
@@ -84,6 +100,9 @@ def plan_from_results(results: dict, batch: dict, wrong: str, entity: str) -> di
         if spec["entity"] is None:
             e = ents[ek]
             spec["entity"] = {"name": " ".join(e["name"].split()), "type": e["type"], "summary": e.get("summary", "")}
+            prov = _log_provenance(log, it["id"]) if log else None
+            if prov:
+                spec["entity"]["provenance"] = prov
         ep = names[int(it["id"])]
         spec["episodes"].append({"episode": ep, "keep_wrong_mention": wk in ents})
         for ed in it.get("edges", []):
@@ -117,6 +136,18 @@ def select_moves(spec: dict, wrong_uuid: str, graph_edges: list, ep_names: dict)
         moves.append({"uuid": g[0], "end": want["end"], "src": g[1], "dst": g[2], "fact": g[3],
                       "episode": want["episode"]})
     return {"moves": moves, "unmatched": unmatched, "shared": shared}
+
+
+def entity_provenance(spec: dict, wrong_row) -> tuple[dict, str]:
+    """新节点的来源与出处：spec 带了（来自 log）就用它；否则抄误并节点的，但批次模型与误并节点
+    的模型不同（跨模型误并）时拒绝——抄过来就记错了。wrong_row 是 FIND_NODE 的一行。"""
+    if spec["entity"].get("provenance"):
+        return dict(spec["entity"]["provenance"]), "spec"
+    batch_model, wrong_model = spec.get("batch_model"), wrong_row[4]
+    if batch_model and batch_model != wrong_model:
+        raise SystemExit(f"误并实体来自 {batch_model}、误并节点来自 {wrong_model}：用 --plan --log 带出实际来源")
+    return {"extractor_model": wrong_row[4], "extraction_mode": wrong_row[5],
+            "extractor_tool": wrong_row[6], "run_id": wrong_row[7]}, "wrong_node"
 
 
 def moved_endpoints(move: dict, wrong_uuid: str, new_uuid: str, *, back: bool = False) -> tuple:
@@ -167,12 +198,13 @@ def dry_run(graph, spec: dict) -> dict:
     mentions = [{"episode": e["episode"], "episode_uuid": by_name.get(e["episode"]),
                  "keep_wrong_mention": e["keep_wrong_mention"],
                  "wrong_mention": old_mentions.get(by_name.get(e["episode"]))} for e in spec["episodes"]]
+    provenance, provenance_source = entity_provenance(spec, w)
+    entity = {k: v for k, v in spec["entity"].items() if k != "provenance"}
     return {"tool": TOOL, "created_at": datetime.now(timezone.utc).isoformat(),
             "graph": os.environ.get("KG_HUB_FALKORDB_DATABASE", "kg_hub"),
             "wrong": {"uuid": w[0], "name": w[1], "labels": w[2], "group_id": w[3]},
-            "entity": {**spec["entity"], "uuid": str(uuidlib.uuid4()),
-                       "provenance": {"extractor_model": w[4], "extraction_mode": w[5],
-                                      "extractor_tool": w[6], "run_id": w[7]}},
+            "entity": {**entity, "uuid": str(uuidlib.uuid4()), "provenance": provenance,
+                       "provenance_source": provenance_source},
             "edges": sel["moves"], "mentions": mentions,
             "unmatched": sel["unmatched"], "shared": sel["shared"],
             "missing_episodes": [m["episode"] for m in mentions if not m["episode_uuid"]]}
@@ -271,11 +303,15 @@ def main(argv=None) -> int:
     ap.add_argument("--batch", help="--plan：批次文件（观测 id → episode 名）")
     ap.add_argument("--wrong", help="--plan：被并进去的节点名")
     ap.add_argument("--entity", help="--plan：被误并的实体名")
+    ap.add_argument("--log", help="--plan：战役 log.jsonl，带出误并实体的实际来源")
     ap.add_argument("--manifest", help="--spec：冻结清单的输出路径")
     a = ap.parse_args(argv)
     if a.plan:
+        log = None
+        if a.log:
+            log = [json.loads(line) for line in Path(a.log).read_text().splitlines() if line.strip()]
         spec = plan_from_results(json.loads(Path(a.plan).read_text()), json.loads(Path(a.batch).read_text()),
-                                 a.wrong, a.entity)
+                                 a.wrong, a.entity, log=log)
         print(json.dumps(spec, ensure_ascii=False, indent=1))
         return 0
     graph = _graph()
