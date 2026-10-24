@@ -6,6 +6,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 import argparse
+import os
 import json
 import re
 import unittest
@@ -75,6 +76,18 @@ class SkillDocTest(unittest.TestCase):
         for tool in ("qoder", "codex", "cursor", "claude-code", "deepseek-harness"):
             self.assertIn(tool, self.manifest["targets"])
         self.assertFalse(self.manifest["security"]["contains_secrets"])
+
+    def test_orchestrator_must_open_in_dedicated_workspace(self):
+        """2026-10-24 用户定：战役固定在专用目录跑；从别处触发时到专用目录开新会话，不给触发会话的目录加白。"""
+        step0 = self.text[self.text.index("0. **专用目录**"):self.text.index("1. 准入检查")]
+        self.assertIn("编排会话必须开在这个固定的专用目录", step0)
+        self.assertIn("直接开新会话", step0)
+        self.assertIn("不给当前会话目录追加 claude-mem 排除", step0)
+        env = {k: v for k, v in os.environ.items() if k != "KG_HUB_CAMPAIGN_WORKSPACE"}
+        with mock.patch.dict("os.environ", env, clear=True):
+            default = "~/" + str(ec.workspace_dir().relative_to(_Path.home()))
+        self.assertIn(f"缺省 `{default}`", step0)                 # 写出来的缺省目录与代码一致
+        self.assertIn("KG_HUB_CAMPAIGN_WORKSPACE", step0)
 
     def test_trigger_is_the_fixed_prefix(self):
         """2026-10-23 用户定：只认「使用kg-hub对比模型」开头；不带前缀的宽泛说法会在日常讨论 kg-hub 时误触发。"""

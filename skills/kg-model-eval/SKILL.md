@@ -87,6 +87,11 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 0. **专用目录**：先通过公共入口的 `campaign workspace --repo <已核实Git仓库>`（建 / 同步战役目录并写进 claude-mem 排除名单），
    编排者与子代理都在那里打开会话——否则抽取过程会被记成新观测、又进待抽队列；`start` / `claim` 没排除会拒绝
    （例外须经用户同意加 `--allow-tracking "原因"`）。
+   **编排会话必须开在这个固定的专用目录**（缺省 `~/work-ai/kg-hub-campaign`，`KG_HUB_CAMPAIGN_WORKSPACE` 可改）。
+   触发本 skill 的会话不在该目录时（例如工具为会话自动建的 worktree、别的项目目录），本会话只解析意图、出计划、等确认；
+   确认后在专用目录**直接开新会话**（不另建 worktree），把已确认的计划原样交给它跑。
+   不给当前会话目录追加 claude-mem 排除，也不为此加 `--allow-tracking`——每开一次会话就加一次白，名单只会越积越多。
+   （2026-10-24：从桌面 app 自动建的 worktree 触发战役，该目录未排除、也无法切换会话目录，用户定此约定。）
 1. 准入检查：`start` 只收最新准入为 `pass` 的模型；没过的先走第 3 步，或经用户同意加 `--skip-admission "原因"`。
 2. 开战役（id 建议 `<日期>-<工具>-<模型简称…>`）：
    `"$CLI" campaign start --id <战役> --models A B C --executor <工具> --quota <每模型条数> --batch <每批>`
