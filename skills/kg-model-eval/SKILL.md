@@ -13,7 +13,7 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 
 - 使用本机已发布的公共入口，不让会话目录中的旧 `tools/` 抢先被导入：
   `export KG_HUB_CODE=${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}`，`CLI="$KG_HUB_CODE/tools/extract"`。
-  各工具调用同一个 `"$CLI" campaign|agent|bench|repair ...`；远端按该设备的发布目录设置 `KG_HUB_CODE`，不照抄 Mac 路径。
+  各工具调用同一个 `"$CLI" campaign|agent|bench|repair|runtime|regression|eval ...`；远端按该设备的发布目录设置 `KG_HUB_CODE`，不照抄 Mac 路径。
 - 解释器：`tools/extract` 自动选择解释器（要装好 kg-hub 依赖；冒烟 / 准入评分还要 numpy、fastembed 与 MiniLM 缓存）。
   所有设备默认使用当前 HOME 的合格 venv，无需设置 Mac 专用绝对路径；只有显式覆盖才设 `KG_HUB_PYTHON`。
 - 只有发布产物、没有 Git 的设备先 `"$CLI" campaign workspace --session-only`，再在创建的已排除目录打开会话；不要修改发布产物源码或用 INTERNAL 环境变量代替真实排除验收。
@@ -23,6 +23,8 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 - 执行器名（`--executor`）按当前所在工具：`claude-code` / `qoder` / `codex` / `cursor` / `dsh`。模型名用该工具里的准确写法
   （`qodercli --list-models`、`cursor-agent --list-models`、`codex debug models`；Claude 用 Claude Code 的模型 id，
   如 claude-fable-5-1、claude-opus-5-5、claude-sonnet-5-5、claude-haiku-5-5）。
+- 模型调用前使用 `"$CLI" runtime inspect --executor <原生CLI>` 检查本机路由，再用 `"$CLI" runtime probe --executor codex|claude|qodercli --model <准确模型id> --out <新凭据>` 做不带私有正文的真实探测。`bench run` 也会自动探测全部模型后才发送正文；认证/身份错误和持续服务故障记为基础设施失败，停止派发，不签发模型质量失败。只读到 binary/capabilities、登录正常或包 hash 一致不能证明模型可调用。
+  Cursor/DSH 等手工通道没有可验证的工具侧真实探测时标「未验证 / action_required」；不借另一个 CLI 的凭据假装通过。默认 remote consumer 不需 numpy/fastembed 或新增 API token；本机评分依赖仍只由协调器承担。
 
 ## 1. 先解析意图，回一份计划，等确认
 
@@ -81,10 +83,17 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 
 ```bash
 "$CLI" bench run   --bench "$V5_BENCH" --executor qodercli|codex|claude --models A B --tag adm<日期> --limit 50 --chunk 10 --parallel 4 --effort medium
-"$CLI" bench blind --bench "$V5_BENCH" --run <运行目录A> <运行目录B> --n 10 --out <临时目录>/blind-<日期>.json
+"$CLI" bench blind --bench "$V5_BENCH" --run <运行目录A> <运行目录B> --n 10 --out <临时目录>/blind-<日期>.json --review-destination <已核实评审服务入口>
 # 评审（见下）把每条 verdict 填成 ok / error（error 写 note），然后：
-"$CLI" bench admit --bench "$V5_BENCH" --run <运行目录A> --sheet <临时目录>/blind-<日期>.json   # 每个模型一次
+"$CLI" regression sheet --bench "$V5_BENCH" --run <运行目录A> --out <私有定向评审表>
+# 逐条完成独立定向评审，再生成凭据：
+"$CLI" regression check --bench "$V5_BENCH" --run <运行目录A> --review <已填定向评审表> --out <语义凭据>
+"$CLI" bench admit --bench "$V5_BENCH" --run <运行目录A> --sheet <临时目录>/blind-<日期>.json --semantic-review <语义凭据>   # 每个模型一次
 ```
+
+开始前用 `"$CLI" regression create --bench "$V5_BENCH" --spec <私有已知错误清单> --out <suite>` 登记定向 suite，核对内容和哈希后 `"$CLI" regression activate --suite <suite> --reviewer <操作者> --confirm-suite-sha <实际SHA>`。这是本机评测政策登记，不是外发授权；真实已知错案例保存在私有目录，公开包只放合成示例。随机盲评与固定旧错套件分列分母，随机没抽中旧错不代表旧错修好。完整操作见 [回执与新版准入流程](references/evaluation-workflow.md)。
+
+`blind` 自动旁置 `<评审表>.scope.json`，默认 `pending`；只隐藏参评模型身份，正文、lookahead、实体和关系未脱敏。发送前运行 `"$CLI" eval scope-check --scope <范围清单>`，目的地未说明须补齐。需要关联人类授权消息或允许本轮后续聚合归档时，用 `"$CLI" eval scope --spec <具体范围spec> --out <新清单>` 冻结材料哈希。清单只证明范围和字节，不授予权限；持有人类上下文的协调器检查实际授权，在已明确批准的同一范围内复用，不盲目重复询问。材料/目的地/用途变动后重新核对范围，平台拒绝须遵守，不换子代理绕过。评审进程只拿匿名表与评审规则，不拿完整会话或对照表。
 
 **盲评怎么做**（用户已指定由 Claude 评）：
 - 能派子代理的工具：派一个只拿到评审表路径的子代理去评，**不告诉它对照表**（`<评审表>.key.json`）的存在；评完自己再跑 `admit`。
@@ -100,7 +109,7 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 门槛（写在 `tools/extract_bench.py` 的 `THRESHOLDS`）：规则版本一致；未交 / 自检问题 / 边名越界 / 悬空边 / 未知类型都为 0；
 照抄标题、译文边 ≥95%；其余 fact 英文占比 ≥90%、长度 60–200 字符的 ≥80%；中英问句命中各 ≥90% 且每个基线模型那部分不低 5 点以上；盲评 10 条错误 ≤1；≥30 条。
 空观测率不比基线高出 5 点以上；至少有一个基线模型那部分能配对；准入自检只计硬错误（schema / 悬空边 / 缺 edges）。
-结论 `fail` / `screen_pass` / `pending_blind` / `pass`，带 `--sheet` 时追加进 `~/.kg-hub/bench/admissions/<模型>.json`（记录带规则正文哈希，开战役时与快照比对）。撤销准入：`"$CLI" bench revoke --model <模型> --reason <原因>`。
+结论 `fail` / `screen_pass` / `pending_blind` / `pending_semantic_regression` / `semantic_regression_fail` / `pass`。正式新版记录为 `admission-v2`，同时绑定随机盲评、激活的固定旧错套件与语义回执；缺审只提示待补，不写质量失败记录。旧 `pass` 不自动升级，可对已有封存 native run 补审而无需重抽；规则改变仍按新规则重跑。撤销准入：`"$CLI" bench revoke --model <模型> --reason <原因>`。
 
 ## 4. 战役（定额、全部入库、每轮复盘）
 
@@ -112,9 +121,9 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
    确认后在专用目录**直接开新会话**（不另建 worktree），把已确认的计划原样交给它跑。
    不给当前会话目录追加 claude-mem 排除，也不为此加 `--allow-tracking`——每开一次会话就加一次白，名单只会越积越多。
    （2026-10-24：从桌面 app 自动建的 worktree 触发战役，该目录未排除、也无法切换会话目录，用户定此约定。）
-1. 准入检查：`start` 只收最新准入为 `pass` 的模型；没过的先走第 3 步，或经用户同意加 `--skip-admission "原因"`。
+1. 准入检查：新 `start` 要求 `admission-v2` 的最新 `pass` 和每模型 15 分钟内真实模型探测凭据；旧记录缺新门须补审，不能重标。明确用户例外才用 `--skip-admission "原因"`，不靠例外绕过实际探测。
 2. 开战役（id 建议 `<日期>-<工具>-<模型简称…>`）：
-   `"$CLI" campaign start --id <战役> --models A B C --executor <工具> --quota <每模型条数> --batch <每批>`
+   `"$CLI" campaign start --id <战役> --models A B C --executor <工具> --quota <每模型条数> --batch <每批> --model-preflight <A新探测凭据> <B新探测凭据> <C新探测凭据>`
 3. 派子代理（方式二）或每个模型一个会话（退路），按 `docs/executors/campaign.md` 的「各工具怎么派」：
    - Claude Code / qoder / cursor：方式二已验证；`agents --id <战役>` 生成各模型的子代理定义，或用 `brief` 输出当任务说明。
    - codex / DSH：方式二未确认，用 `launch --id <战役> --tool codex|dsh` 打印每个模型的启动命令。
@@ -136,6 +145,7 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
    有新教训才 `chain --file`，补充约定是累加的（`rules` 依次输出 c1…cN），新文件只写本轮新增或改动，不重抄前版；没有新问题就记录沿用。
    `status` 里 `chain_mode` 不是 cumulative 的旧战役只认当前一版，这时新约定仍须合并保留仍有效的前版内容。
 6. 子代理失败：能续就用同一批次号续跑；做坏了 `release --batch --reason`（条目回队列、还配额）。不要手改 `campaign.json`。
+   宿主 Codex 子代理处于 idle/completed 时用 `followup_task` 触发下一轮，running 才用 `send_message` 追加指令；repo CLI 不能代替宿主任务控制。原生执行状态读取 `execution-state.json`，成功须有封存 `run.json`；基础设施失败只有 `run-aborted.json`，queued 未启动与已调用失败分开，不靠新时间戳或「开始了」认定运行。
 7. 收尾同时核对 `claim` 返回 done 与每模型实际提交终态：按 `(batch,id)` 最新日志去重、剔除 released；
    非空 ok 与服务正式记录的 empty 分列，claimed/skipped/失败不算本模型成功。已处理不等于全部事实正确。
 
@@ -145,6 +155,8 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 不能换来源键、直接写图，或整条退休准确原文掩盖错误关系。质量凭据绑定输入，只证明检查过程完成，不保证语义判断必然正确。
 
 ## 5. 汇报格式（每次固定）
+
+先以 `"$CLI" eval index --spec <各阶段真实回执路径spec> --out <索引>` 汇总，再 `"$CLI" eval report --index <索引> --json <报告JSON> --markdown <报告MD>`。索引按 phase/model/tag/run 复合键保留冒烟/准入、旧 v4/新 v5；绑定 run、原提示、样本 IDs、score、semantic 与 admit 的原文件哈希，不手抄多代理数字。无封存输出或缺必需收据只报待补。成本按 extraction/preflight 分列，同一真实 run 重复引用不双算；credits/tokens/编排开销不可见保留 null 和覆盖率，不填零。报告生成本身不调用模型或 embedding。
 
 ```
 模式：冒烟 / 准入 / 盲测 / 战役第 N 轮
@@ -169,5 +181,5 @@ Mac 的 campaign 状态与 claim_registry 是唯一权威目录；Mac 统一 sou
 分发冻结 batch、prompt SHA256、manifest model/tool/run 身份与最新成功 preflight/capabilities 回执；peer 离线 quality-sheet/check 后回传 results 和 receipt。
 dryrun-check 还需 Mac 对同一整批结果实际预览成功生成的绑定 marker；只有能力回执不能替代预览，结果改动即失效。
 回执为受控产物 hash 证据，不是密码学签名；没有 peer API 凭据时不得把其 HTTP 预检写绿，服务端 v5 质量门不能跳过。
-Mac 五工具完整预检、两 peer 离线 12 项检查/tracking/skill hash 已验证；peer 独立 API、source claim、本地 bench/score 未开通/未验证。
+既有 Mac 五工具公共预检、两 peer 离线检查/tracking/skill hash 的历史验证，不代表新版所有模型 live 探测已验证；本轮只按实际新回执逐项报告。peer 独立 API、source claim、本地 bench/score 未开通/未验证。
 独立 API 提交只是需专门授权与 credential 的可选扩展，默认 consumer 路径不签发新 secret，不借 master，也不复制 NAS 全权 SSH 密钥。

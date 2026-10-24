@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RUN_EVIDENCE = "bench-native-run-v1"
+RUN_EVIDENCE_V2 = "bench-native-run-v2"
 REFERENCE_VERSION = "bench-reference-v1"
 CORPUS_FILES = ("archived.json", "edges.jsonl", "vec-minilm.npy")
 
@@ -121,14 +122,21 @@ def seal_run(d: Path, metadata: dict) -> dict:
     files = sorted([*d.glob("results-*.json"), *d.glob("work/*.json"),
                     d / "rules.md", d / "system-prompt.txt", d / "input-contract.json", d / "input-data.json"])
     out = dict(metadata)
-    out["evidence"] = {"version": RUN_EVIDENCE, "metadata_sha256": digest(metadata),
+    v2 = metadata.get("native_evidence_version") == 2
+    if v2:
+        files.append(d / "preflight.json")
+    out["evidence"] = {"version": RUN_EVIDENCE_V2 if v2 else RUN_EVIDENCE, "metadata_sha256": digest(metadata),
                        "files": {str(f.relative_to(d)): sha(f) for f in files}}
     return out
 
 
 def verify_run(d: Path, metadata: dict, *, native: bool = True) -> dict:
     evidence = metadata.get("evidence") or {}
-    need(evidence.get("version") == RUN_EVIDENCE, "run lacks native integrity evidence; rerun with current CLI")
+    need(evidence.get("version") in {RUN_EVIDENCE, RUN_EVIDENCE_V2}, "run lacks native integrity evidence; rerun with current CLI")
+    v2 = evidence.get("version") == RUN_EVIDENCE_V2
+    if v2:
+        need(metadata.get("native_evidence_version") == 2 and metadata.get("status") == "complete" and
+             not (d / "run-aborted.json").exists(), "infrastructure/canceled run is not a quality result")
     bare = {k: v for k, v in metadata.items() if k != "evidence"}
     need(digest(bare) == evidence.get("metadata_sha256"), "run metadata changed")
     if native:
@@ -142,6 +150,18 @@ def verify_run(d: Path, metadata: dict, *, native: bool = True) -> dict:
         f = d / name
         need(not Path(name).is_absolute() and ".." not in Path(name).parts and f.is_file() and not f.is_symlink(), "unsafe/missing evidence file")
         need(sha(f) == expected, "run artifact changed: " + name)
+    if v2:
+        from utils import cli_runtime
+        preflight = metadata.get("preflight") or {}
+        need(preflight.get("path") == "preflight.json" and "preflight.json" in files and
+             preflight.get("sha256") == sha(d / "preflight.json"), "preflight evidence missing/changed")
+        probe = read(d / "preflight.json")
+        need(preflight.get("cost") == probe.get("cost"), "preflight cost differs")
+        if metadata.get("execution_mode") == "native_adapter":
+            try:
+                cli_runtime.validate_probe_integrity(probe, executor=metadata["executor"], model=metadata["model"])
+            except ValueError as exc:
+                need(False, str(exc))
     rule_text = (d / "rules.md").read_text(encoding="utf-8")
     need(sha(d / "rules.md") == metadata.get("prompt_sha256"), "rules snapshot hash differs from run")
     need(rules_version(rule_text) == str(metadata.get("prompt_version", "")).split("+")[0],
@@ -170,10 +190,24 @@ def verify_run(d: Path, metadata: dict, *, native: bool = True) -> dict:
     results = result_items(d)
     need(digest(results) == metadata.get("result_items_sha256"), "native result contents differ from run metadata")
     need(set(results).issubset(set(metadata["ids"])), "native results contain foreign observations")
+    if v2:
+        need(set(metadata.get("failed", [])) == set(metadata["ids"]) - set(results), "missing output IDs differ")
+        for call in calls:
+            need(call.get("native_evidence_version") == 2 and call.get("outcome") in
+                 {"generated", "output_error", "service_error"}, "attempt outcome missing")
+            if call["outcome"] == "service_error":
+                classified = cli_runtime.classify_failure({"error": call.get("response_error"),
+                                                            "status_code": call.get("status_code")})
+                need(classified["kind"] in cli_runtime.TRANSIENT_KINDS and
+                     classified["kind"] == call.get("error_kind"), "unrecognized/terminal service error in completed run")
+            else:
+                need(not call.get("response_error"), "generated attempt contains a provider error")
     if metadata.get("executor") == "claude":
         seen = sorted({model for call in calls for model in (call.get("actual_models") or [])})
         need(seen == metadata.get("actual_models"), "Claude identity metadata differs from call evidence")
-        need(all(call.get("actual_models") == [metadata["model"]] for call in calls), "Claude actual model evidence missing/mismatched")
+        need(all(call.get("actual_models") == [metadata["model"]] or
+                 (v2 and call.get("outcome") == "service_error" and not call.get("actual_models"))
+                 for call in calls), "Claude actual model evidence missing/mismatched")
     return contract
 
 
@@ -222,7 +256,7 @@ def verify_reference(p: Path, m: dict) -> dict | None:
     verify_run(p / "reference-native", saved)
     need(digest(collect_inputs(p, m, m["selection_order"])) == saved.get("input_data_sha256"),
          "reference observations differ from actual native input snapshot")
-    need((saved.get("evidence") or {}).get("version") == RUN_EVIDENCE and
+    need((saved.get("evidence") or {}).get("version") in {RUN_EVIDENCE, RUN_EVIDENCE_V2} and
          saved["evidence"].get("metadata_sha256") == digest({k: v for k, v in saved.items() if k != "evidence"}),
          "reference native metadata seal is invalid")
     need(ref.get("prompt_version") == saved.get("prompt_version") and
