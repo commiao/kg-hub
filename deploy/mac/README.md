@@ -25,6 +25,7 @@
 | `claude-mem-dual-ingest`（在 `optional/`） | 15 分钟 | 合并新旧两代 claude-mem 库，同步到 NAS 供 refinery 消费 | NAS 侧没有新数据可吃 |
 | `capsule-watch` | 每天 9:30 | 胶囊排序有变化时发飞书 | 少一封飞书 |
 | `feedback-digest` | 每天 9:35 | 处理反馈待办⑥ | 少一次自动处理 |
+| `triage-digest` | 每周日 9:40 | 推观测分诊周报（过滤效果、高/低价值保留率、可省 token），补推漏掉的战役打满通知 | 少一封飞书 |
 | `source-drift` | 每天 9:25 | 核对 NAS 源码与 git 提交 | 源码漂移可能漏报 |
 | `com.claude-mem.worker` | 常驻 | claude-mem 采集 worker 的**兜底看门人** | 见下 |
 

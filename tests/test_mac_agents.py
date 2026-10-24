@@ -30,6 +30,8 @@ EXPECTED = {
     "com.kg-hub.claude-mem-guard",
     "com.kg-hub.claude-mem-upgrade-acceptance",
     "com.kg-hub.feedback-digest",
+    # 每周日 09:40 推观测分诊摘要（过滤效果、高/低价值保留率、省下的 token），顺带补推漏掉的战役打满通知。
+    "com.kg-hub.triage-digest",
     # weekly-report 已于 2026-10-14 迁到 NAS 的 weekly_report 容器（T-0269）。
     # 日更的源码漂移巡检：查 NAS 上跑的源码是不是等于 git 里的某个 commit。
     "com.kg-hub.source-drift",

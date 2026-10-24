@@ -86,9 +86,25 @@ topic_mismatch 48。总体 28,338 条、现行闸放行 80%。
    `python -m tools.obs_bench score --bench obs-<日期> --label <改了什么>`，看三件事：
    误杀率不升（H 落 drop 只能是闸本来就拒的）、低价值丢弃上升、dev 与 holdout 差距小（差得多就是在背样本）。
    运行记录落在 `<bench>/runs/`，带规则版本和配置摘要；版本号在 config `version`，规则加了就升。
-6. **影子**：合并后战役与 next 的 stats 里看 `triage_drop` / `triage_review` 的占比；对一批真实领到的观测
-   `python -m tools.obs_bench shadow --from <jsonl>` 看分布。影子跑够一轮战役、drop 档抽 20 条复查无 H，才翻 `enabled`。
+6. **影子**：不用手动看，结果会出现在两处（§4.1）。影子跑够一轮战役后，
+   `python -m tools.triage_notify sample --id <战役>` 从判丢档抽 20 条复查，没有 H 才翻 `enabled`。
 7. **启用后的护栏**：drop 的观测不删，留在 claude-mem 里、游标越过；每轮战役 report 顺带从 drop 档抽样复查，误杀率有数才算「可控」。
+
+### 4.1 结果在哪看、怎么通知（2026-10-24 起）
+
+用户关心三件事：**高价值保留率、低价值保留率、这一阶段的 token**。这三件事落在两处：
+
+| 位置 | 内容 | 什么时候 |
+|---|---|---|
+| 战役复盘报告 `extract_campaign report` | 每批与按模型合计多 6 列：闸拒%、分诊判丢、判丢%、分诊判复核、判复核%、分诊已丢；报告 JSON 顶部 `triage` 段有按模型汇总与可省 / 已省 token | 每轮复盘 |
+| 飞书（kg-hub webhook） | 一条消息三行：保留率（冻结样本上当前规则最新评分，分诊 / 现行闸）、过滤（闸拒、判丢、判复核）、token（影子：启用可省约 N；启用后：已省约 N） | 战役打满时一次（`extract_campaign submit` 正式提交后检查）；每周日 09:40（launchd `com.kg-hub.triage-digest`），顺带补推漏掉的打满通知 |
+
+- 推送工具：`tools/triage_notify.py`（digest / weekly / check-full / sample）。推送失败只记 stderr，不影响提交；
+  打满通知每条战役只推一次，推成功才记在 `~/.kg-hub/agent-extract/triage-notify.json`。
+- token 估算 = 判丢条数 × 该模型本战役自报的 token/条（`cost --tokens`）；没记 token 的战役显示「—」。
+- 保留率没有逐条标签可算，用冻结样本的评分代替；换了规则版本还没评分时，消息里会直说「还没评过分」。
+- 判丢 / 判复核的条目在批次文件里带 `triage_tier`，`sample` 就从这里抽。10-24 13:56 Mac 发布切到含 #238 的版本之前领的批没有分诊计数，报告显示「—」，摘要里合并成一行。
+- 分母口径：闸拒% = 闸拒 / 过闸前看过的；判丢% 与判复核% = 各档 / 分诊看过的（领到 + 已入库 + 别处在抽 + 启用后跳过）。合计比例从相加后的计数重算。
 
 ## 5. 加一条规则的规矩
 

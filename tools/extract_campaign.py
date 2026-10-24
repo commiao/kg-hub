@@ -526,7 +526,8 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
             bpath.write_text(json.dumps({"batch_id": bid, "created_at": _now(), "campaign": cid, "model": model,
                                          "chain": c["chain"], "prompt_version": c["prompt_version"],
                                          "after_id": c["cursor"], "last_considered_id": last, "stats": stats,
-                                         "items": picked, "lookahead": lookahead}, ensure_ascii=False, indent=1))
+                                         "triage": triage_info(), "items": picked, "lookahead": lookahead},
+                                        ensure_ascii=False, indent=1))
             c["cursor"] = last
             c["batches"].append({"id": bid, "model": model, "chain": c["chain"], "ids": [i["id"] for i in picked],
                                  "status": "claimed", "claimed_at": _now(), "cost": {}})
@@ -795,6 +796,48 @@ def final_statuses(d: Path, bid: str, ids: set[int]) -> dict[int, str]:
     return out
 
 
+def triage_info() -> dict:
+    """领批那一刻的分诊规则版本与开关（复盘时按这个分组，规则改了不混算）。"""
+    tcfg = ax._triage_cfg()
+    return {"version": ax.obs_triage.rules_version(tcfg) if tcfg else None,
+            "enabled": ax.obs_triage.triage_enabled(tcfg) if tcfg else False}
+
+
+def batch_triage(d: Path, bid: str) -> dict | None:
+    """一批领批时的闸与分诊计数（批次文件 stats）。#238 之前领的批没有分诊计数，返回 None。
+    分诊看过的条数 = 领到 + 已入库 + 别处在抽 + 启用后跳过（选批循环里过了闸的每一条都先分诊）；
+    #239 起 stats 里直接有 triaged，旧批按这个式子补。"""
+    p = d / "batches" / f"{bid}.json"
+    if not p.exists():
+        return None
+    bf = json.loads(p.read_text())
+    st = bf.get("stats") or {}
+    if "triage_drop" not in st:
+        return None
+    triaged = st.get("triaged")
+    if triaged is None:
+        triaged = sum(int(st.get(k) or 0) for k in ("picked", "already_ok", "pending_elsewhere", "triage_dropped"))
+    return {"gate_reject": int(st.get("rejected_by_filter") or 0), "triaged": int(triaged),
+            "triage_drop": int(st.get("triage_drop") or 0), "triage_review": int(st.get("triage_review") or 0),
+            "triage_dropped": int(st.get("triage_dropped") or 0),
+            "triage_version": (bf.get("triage") or {}).get("version"),
+            "triage_enabled": bool((bf.get("triage") or {}).get("enabled")),
+            "drop_ids": [int(i["id"]) for i in bf.get("items", []) if i.get("triage_tier") == "drop"],
+            "review_ids": [int(i["id"]) for i in bf.get("items", []) if i.get("triage_tier") == "review"]}
+
+
+TRIAGE_COUNTS = ("gate_reject", "triaged", "triage_drop", "triage_review", "triage_dropped")
+
+
+def triage_pcts(t: dict) -> dict:
+    """闸拒% = 闸拒 / 过闸前看过的；判丢% / 判复核% = 各档 / 分诊看过的。计数为 0 时给 None（显示「—」）。"""
+    gated = t.get("gate_reject", 0) + t.get("triaged", 0)
+    tri = t.get("triaged", 0)
+    return {"gate_reject_pct": round(100 * t["gate_reject"] / gated, 1) if gated else None,
+            "triage_drop_pct": round(100 * t["triage_drop"] / tri, 1) if tri else None,
+            "triage_review_pct": round(100 * t["triage_review"] / tri, 1) if tri else None}
+
+
 def batch_row(d: Path, b: dict) -> dict:
     """一批的复盘行：提交口径（log.jsonl）+ 离线指标（结果文件，与对比套件同一套 item_metrics）+ 自报成本。"""
     from schema import EDGE_TYPES, ENTITY_TYPES
@@ -838,6 +881,10 @@ def batch_row(d: Path, b: dict) -> dict:
     r["cost_coverage"] = {k: {"items": len(rows) if cost.get(k) is not None else 0,
                                 "total_items": len(rows), "value": cost.get(k)}
                           for k in ("tokens", "seconds", "credits")}
+    t = batch_triage(d, b["id"])
+    r["_triage"] = t
+    if t:
+        r.update({k: t[k] for k in TRIAGE_COUNTS}, triage_version=t["triage_version"], **triage_pcts(t))
     r["_n"], r["_cost"] = len(rows), cost
     return r
 
@@ -856,6 +903,11 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     for k in ("ent_per_obs", "edge_per_obs", "offschema_edge_pct", "dangling_edge_pct", "headline_verbatim_pct",
               "second_other_lang_pct", "rest_fact_en_pct", "rest_fact_len", "rest_fact_len_ok_pct"):
         out[k] = round(sum((r.get(k) or 0) * r["_n"] for r in rows) / n, 2)
+    tri = [r["_triage"] for r in rows if r.get("_triage")]
+    if tri:
+        tsum = {k: sum(t[k] for t in tri) for k in TRIAGE_COUNTS}
+        out.update(tsum, **triage_pcts(tsum))
+        out["triage_batches"] = len(tri)
     out["cost_coverage"] = {}
     for k, col, nd in (("credits", "credits_per_obs", 2), ("tokens", "tokens_per_obs", 0), ("seconds", "sec_per_obs", 1)):
         have = [r for r in rows if r["_cost"].get(k) is not None]
@@ -869,6 +921,8 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
 
 
 REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error", "错误"), ("released", "回收"),
+               ("gate_reject_pct", "闸拒%"), ("triage_drop", "分诊判丢"), ("triage_drop_pct", "判丢%"),
+               ("triage_review", "分诊判复核"), ("triage_review_pct", "判复核%"), ("triage_dropped", "分诊已丢"),
                ("dry_mismatch", "预览误并候选"),
                ("mismatch", "入库不同名复用"),
                ("ent_per_obs", "实体/条"), ("edge_per_obs", "边/条"), ("zero_edge", "零边"),
@@ -883,7 +937,8 @@ REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error"
 
 def render(rows: list[dict]) -> str:
     head = "| 组 | " + " | ".join(c[1] for c in REPORT_COLS) + " |\n|" + "---|" * (len(REPORT_COLS) + 1)
-    body = ["| " + r["label"] + " | " + " | ".join(str(r.get(k, "—")) for k, _ in REPORT_COLS) + " |" for r in rows]
+    body = ["| " + r["label"] + " | " + " | ".join("—" if r.get(k) is None else str(r[k]) for k, _ in REPORT_COLS) + " |"
+            for r in rows]
     return "\n".join([head, *body])
 
 
@@ -902,7 +957,59 @@ def cmd_report(cid: str) -> dict:
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
     return {"campaign": cid, "prompt_version": c["prompt_version"], "prompt_sha256": c.get("prompt_sha256"),
-            "overhead": overhead_total(c), "models": models, "by_chain": totals, "batches": clean}
+            "overhead": overhead_total(c), "triage": triage_summary(d, c), "models": models, "by_chain": totals,
+            "batches": clean}
+
+
+def campaign_full(c: dict) -> bool:
+    """打满：每个模型都领满配额，且没有领了还没正式提交的批。"""
+    return bool(c["models"]) and all(claimed_items(c, m) >= c["quota"] for m in c["models"]) \
+        and not any(b["status"] == "claimed" for b in c["batches"])
+
+
+def triage_summary(d: Path, c: dict, since: str | None = None) -> dict:
+    """全战役（或 since 之后领的批）按模型汇总闸与分诊计数，供复盘报告顶部与飞书摘要共用。"""
+    per_model: dict[str, dict] = {}
+    versions, enabled = set(), set()
+    for b in c["batches"]:
+        if b["status"] == "released" or (since and (b.get("claimed_at") or "") < since):
+            continue
+        t = batch_triage(d, b["id"])
+        m = per_model.setdefault(b["model"], {"batches": 0, "items": 0, "triage_batches": 0,
+                                              **{k: 0 for k in TRIAGE_COUNTS}, "drop_ids": [], "review_ids": []})
+        m["batches"] += 1
+        m["items"] += len(b["ids"]) - len(b.get("released_ids") or [])
+        if t:
+            m["triage_batches"] += 1
+            for k in TRIAGE_COUNTS:
+                m[k] += t[k]
+            m["drop_ids"] += t["drop_ids"]
+            m["review_ids"] += t["review_ids"]
+            # 影子批：判丢的照样抽了，是「启用就能省」；启用批：跳过的才是「已省」
+            m["_saveable"] = m.get("_saveable", 0) + (0 if t["triage_enabled"] else t["triage_drop"])
+            m["_skipped"] = m.get("_skipped", 0) + t["triage_dropped"]
+            versions.add(t["triage_version"])
+            enabled.add(t["triage_enabled"])
+        cost = b.get("cost") or {}
+        if cost.get("tokens") is not None:
+            m["_tok"] = m.get("_tok", 0) + cost["tokens"]
+            m["_tok_items"] = m.get("_tok_items", 0) + len(b["ids"]) - len(b.get("released_ids") or [])
+    for m in per_model.values():
+        # 判丢的观测每条本来要花的 token：取这个模型本战役自报的 token/条。影子模式下是「启用就能省」，启用后是「已省」
+        tpo = m.pop("_tok", 0) / m["_tok_items"] if m.get("_tok_items") else None
+        m.pop("_tok_items", None)
+        m["tokens_per_obs"] = round(tpo) if tpo is not None else None
+        saveable, skipped = m.pop("_saveable", 0), m.pop("_skipped", 0)
+        m["tokens_saveable_est"] = round(tpo * saveable) if tpo is not None else None
+        m["tokens_saved_est"] = round(tpo * skipped) if tpo is not None else None
+    total = {k: sum(m[k] for m in per_model.values()) for k in ("batches", "items", "triage_batches", *TRIAGE_COUNTS)}
+    for k in ("tokens_saveable_est", "tokens_saved_est"):
+        vals = [m[k] for m in per_model.values() if m[k] is not None]
+        total[k] = sum(vals) if vals else None
+    for m in [*per_model.values(), total]:
+        m.update(triage_pcts(m))
+    return {"models": per_model, "total": total, "versions": sorted(v for v in versions if v),
+            "enabled": sorted(enabled), "full": campaign_full(c), "quota": c["quota"]}
 
 
 def cmd_status(cid: str) -> dict:
@@ -1047,6 +1154,13 @@ def main(argv=None) -> int:
         return 1 if probs else 0
     elif a.cmd == "submit":
         out = cmd_submit(a.id, a.batch, dry_run=a.dry_run, url=a.url, token=ax.api_token())
+        if not a.dry_run:
+            # 战役打满就推一条分诊摘要到飞书（每条战役一次）；推不出去不影响提交，每周任务会补推
+            try:
+                from tools import triage_notify
+                triage_notify.notify_if_full(a.id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[triage-notify] skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
     elif a.cmd == "quality-sheet":
         out = cmd_quality_sheet(a.id, a.batch, a.out)
     elif a.cmd == "quality-check":

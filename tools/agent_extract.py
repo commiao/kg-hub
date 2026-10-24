@@ -265,7 +265,7 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
     分诊（utils/obs_triage）在闸放行的观测上再分 keep/review/drop：影子模式（config enabled=false）只计数，
     enabled=true 才把 drop 档跳过（计入 triage_dropped）。不传 triage_cfg 就读 config/obs_triage.json。"""
     stats = {"seen": len(rows), "rejected_by_filter": 0, "already_ok": 0, "pending_elsewhere": 0, "picked": 0,
-             "triage_drop": 0, "triage_review": 0, "triage_dropped": 0}
+             "triaged": 0, "triage_drop": 0, "triage_review": 0, "triage_dropped": 0}
     tcfg = triage_cfg if triage_cfg is not None else _triage_cfg()
     enforce = obs_triage.triage_enabled(tcfg)
     picked: list[dict] = []
@@ -274,8 +274,10 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
         if not d.accept:
             stats["rejected_by_filter"] += 1
             continue
+        tier = "keep"
         if tcfg:
             tier = obs_triage.triage(obs, cfg, tcfg, base=d).tier
+            stats["triaged"] += 1
             if tier != "keep":
                 stats[f"triage_{tier}"] += 1
             if enforce and tier == "drop":
@@ -289,6 +291,9 @@ def select_batch(rows: list[dict], cfg: dict, n: int, existing: dict[str, str | 
         if st == "pending":
             stats["pending_elsewhere"] += 1
             continue
+        if tier != "keep":
+            # 影子模式下判丢 / 判复核的照样领走；记在条目上，打满后从这里抽样复查（tools/triage_notify sample）
+            ident["triage_tier"] = tier
         picked.append(ident)
         if len(picked) >= n:
             break
