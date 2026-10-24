@@ -246,10 +246,27 @@ def brief(c: dict, model: str) -> str:
         raise SystemExit(f"战役 {c['id']} 没有模型 {model}；有：{', '.join(c['models'])}")
     text = SUBAGENT_BRIEF.format(cid=c["id"], model=model)
     text = text.replace("$PY -m tools.extract_campaign", cli_command())
+    settings = runtime_settings(c)
+    text += (f"\n本战役冻结运行设置：effort={settings['effort']}，proxy_mode={settings['proxy_mode']}。"
+             "原生会话使用 campaign launch 生成的 runtime exec 命令，确保正式调用与探测使用相同子进程环境和推理强度。"
+             "宿主手工子代理定义仅提供模型与任务文本，不能证明宿主已应用这些设置；需工具侧证据，未验证不能声称就绪。\n")
     return text + ("\n正式提交前：先 quality-sheet --id " + c["id"] + " --batch <批次> --out <审核表>，"
                    "逐条读全文填证据、完整译文/事实/归属及判空理由，再 quality-check --id " + c["id"] +
                    " --batch <批次> --review <审核表>。通过后才能dry-run和submit；改结果/正文/lookahead/规则都须重新审。"
-                   "审核不能自动填true或编造quote。提交成功不等于语义全对；成本不可见填unknown，不估。\n")
+                   "审核不能自动填true或编造quote。提交成功不等于语义全对；成本不可见填unknown，不估。\n"
+                   "新战役编排者先用 runtime probe --executor <原生CLI> --model <模型> --out <新凭据> 做真实无数据探测；"
+                   "runtime inspect、binary、capabilities 或公共包hash不代表真实模型可用。Cursor/DSH手工通道无可验证探测时标未验证，不能冒绿。\n"
+                   "当前准入流程是 regression create --bench <参考> --spec <私有旧错清单> --out <suite>，"
+                   "regression activate --suite <suite> --reviewer <操作者> --confirm-suite-sha <实际SHA>；"
+                   "regression sheet --bench <参考> --run <封存run> --out <待评表> 逐条审，"
+                   "再 regression check --bench <参考> --run <封存run> --review <已填表> --out <凭据>；"
+                   "bench admit --semantic-review <凭据>，campaign start --model-preflight <每模型新凭据>。旧pass不自动升级，可补审既有封存run。\n"
+                   "向外发送盲评或归档前，协调器运行 eval scope --spec <具体范围> --out <清单> 及 eval scope-check --scope <清单>；"
+                   "清单默认pending，只证明字节和范围，不授予权限。已有明确同范围人类授权可复用，范围或字节改变则重新核对；平台拒绝必须遵守。"
+                   "盲评进程只拿匿名表和评审规则，不拿完整会话/模型对照表。\n"
+                   "宿主Codex子代理idle/completed时用followup_task启动下一轮，running时用send_message；"
+                   "repo状态不能代替宿主真实状态。通过 eval index --spec <回执索引> --out <索引>、eval report --index <索引> "
+                   "--json <报告> --markdown <报告> 汇总，不按口头开始或新时间戳宣布完成。\n")
 
 
 def agent_defs(c: dict) -> dict[str, dict]:
@@ -378,29 +395,55 @@ def cmd_workspace(*, path: Path | None = None, settings: Path | None = None, rep
             "settings": str(sp), "backup": str(backup) if backup else None, "session_only": session_only}
 
 
-def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None, state: Path | None = None) -> str:
+def runtime_settings(cfg: dict | None = None) -> dict:
+    """One source for frozen settings; legacy campaigns retain their defaults."""
+    contract = (cfg or {}).get("start_contract") or {}
+    settings = {"effort": contract.get("effort", "medium"), "proxy_mode": contract.get("proxy_mode", "auto")}
+    if settings["proxy_mode"] not in {"auto", "env-only", "none"}:
+        raise SystemExit("invalid frozen campaign proxy_mode")
+    if settings["effort"] is not None and (not isinstance(settings["effort"], str) or not settings["effort"]):
+        raise SystemExit("invalid frozen campaign effort")
+    return settings
+
+
+def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None, state: Path | None = None,
+                   cfg: dict | None = None, runtime_cli: Path | None = None) -> str:
     """「每个模型一个会话」的启动命令（编排工具派不了指定模型的子代理时的退路，也可用来并行开会话）。
     在真实采集已排除的战役专用目录里跑，qodercli 不加载用户级设置、codex 不加载用户配置——抽取过程不变成新观测。
     子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
     codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
     import shlex
     quote = lambda value: shlex.quote(str(value))
+    if cfg is not None and "start_contract" in cfg:
+        frozen = (cfg["start_contract"] or {}).get("model_preflight") or {}
+        if model not in cfg.get("models", {}) or model not in frozen:
+            raise SystemExit("campaign_launch_precondition: model is not in the frozen start contract")
+        aliases = {"qoder": "qodercli", "claude-code": "claude"}
+        frozen_executor = frozen[model].get("executor")
+        declared_executor = aliases.get(cfg.get("executor"), cfg.get("executor"))
+        if frozen_executor != tool or declared_executor != frozen_executor:
+            raise SystemExit("campaign_launch_precondition: tool differs from the frozen executor")
     repo = repo or workspace_dir()
     st = state or ax.state_dir()
+    settings = runtime_settings(cfg)
+    public_entry = quote(runtime_cli) if runtime_cli is not None else cli_command().removesuffix(" campaign")
+    native_prefix = f"{public_entry} runtime exec --proxy-mode {quote(settings['proxy_mode'])} -- "
     # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
     reg_dir = claim_registry.claims_dir()
     adds = f"--add-dir {quote(st)}" + ("" if reg_dir.resolve().is_relative_to(Path(st).resolve()) else f" --add-dir {quote(reg_dir)}")
     # The public shell entry chooses the current HOME runtime. Quote each shell argument.
     brief_cmd = f'"$({cli_command()} brief --id {quote(cid)} --model {quote(model)})"'
     if tool == "codex":
-        return (f"cd {quote(repo)} && codex exec -m {quote(model)} -C {quote(repo)} {adds} --ignore-user-config --approve-for-me "
-                f"-c features.unified_exec=false -c model_reasoning_effort=medium "
+        effort_arg = "" if settings["effort"] is None else "-c " + quote("model_reasoning_effort=" + settings["effort"]) + " "
+        return (f"cd {quote(repo)} && {native_prefix}codex exec -m {quote(model)} -C {quote(repo)} {adds} --ignore-user-config --approve-for-me "
+                f"-c features.unified_exec=false {effort_arg}"
                 f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
     if tool == "cursor":
         return (f"cd {quote(repo)} && cursor-agent -p --model {quote(model)} --trust --workspace {quote(repo)} {adds} "
                 f"--force {brief_cmd}")
     if tool == "qodercli":
-        return (f"cd {quote(repo)} && qodercli -p -m {quote(model)} -w {quote(repo)} {adds} --setting-sources local --permission-mode auto "
+        effort_arg = "" if settings["effort"] is None else "--reasoning-effort " + quote(settings["effort"]) + " "
+        return (f"cd {quote(repo)} && {native_prefix}qodercli -p -m {quote(model)} -w {quote(repo)} {adds} {effort_arg}--setting-sources local --permission-mode auto "
                 f"-o json {brief_cmd}")
     if tool == "dsh":
         # DeepSeek Harness（@deepseek-ai/dsh）无界面模式一次跑完一个任务；它没有模型参数，模型在 DSH 的
@@ -413,12 +456,14 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None,
 
 def admission_gate(models: list[str], prompt_version: str, prompt_sha256: str, lookup=None) -> dict[str, dict]:
     """每个模型最新的 bench 准入记录：要 verdict=pass、且规则正文版本与本战役一致。返回 {模型: 摘要}，含不合格原因。"""
-    from tools.extract_bench import base_version, latest_admission
+    from tools.extract_bench import base_version, latest_admission, bench_root
+    from utils import semantic_regression as semantic
     lookup = lookup or latest_admission
     out = {}
     for m in models:
         rec = lookup(m)
         why = None
+        semantic_summary = None
         if rec is None:
             why = "没有准入记录（先跑 extract_bench run → blind → admit）"
         elif rec.get("verdict") != "pass":
@@ -428,13 +473,43 @@ def admission_gate(models: list[str], prompt_version: str, prompt_sha256: str, l
         elif rec.get("prompt_sha256") != prompt_sha256:
             why = ("准入记录没有规则正文哈希（旧记录），请重新准入" if not rec.get("prompt_sha256")
                    else "准入时的规则正文与本战役开局快照不同（版本号相同、正文改过），请重新准入")
+        elif rec.get("model") not in (None, m):
+            why = "准入记录属于另一个模型，需补对应模型的独立评审"
+        else:
+            try:
+                semantic_summary = semantic.validate_admission(rec, bench_root())
+            except (ValueError, OSError, KeyError, TypeError, SystemExit) as exc:
+                why = str(exc)
         out[m] = {"verdict": rec and rec.get("verdict"), "bench": rec and rec.get("bench"),
-                  "decided_at": rec and rec.get("decided_at"), "ok": why is None, "why": why}
+                  "decided_at": rec and rec.get("decided_at"), "ok": why is None, "why": why,
+                  "semantic_review": semantic_summary}
     return out
 
 
+def model_readiness(models, executor, receipts, *, effort="medium", proxy_mode="auto"):
+    """A real nonce response is mandatory for a new campaign; never use auth status."""
+    from utils.cli_runtime import validate_probe_receipt
+    from utils import semantic_regression as semantic
+    tool = {"claude-code": "claude", "qoder": "qodercli"}.get(executor, executor)
+    if tool not in ("claude", "codex", "qodercli"):
+        raise ValueError("requiring_tool_side_probe: 当前执行工具需提供实际模型探测能力；未验证 " + executor)
+    loaded = [semantic.read(p) if isinstance(p, (str, Path)) else p for p in (receipts or [])]
+    summary = {}
+    for model in models:
+        matches = [r for r in loaded if isinstance(r, dict) and r.get("requested_model") == model]
+        if len(matches) != 1:
+            raise ValueError(f"CLI readiness precondition: {model} 需且仅需一份真实模型探测凭据（--model-preflight）；未签发模型质量失败")
+        receipt = validate_probe_receipt(matches[0], executor=tool, model=model, effort=effort, proxy_mode=proxy_mode)
+        summary[model] = {k: receipt.get(k) for k in ("version", "executor", "requested_model", "created_at",
+                         "receipt_sha256", "identity_evidence", "cost", "configuration_sha256", "code_sha256")}
+    if len(loaded) != len(models):
+        raise ValueError("CLI readiness precondition: unrelated or duplicate model probe receipts")
+    return summary
+
+
 def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
-              skip_admission: str | None = None, lookup=None, allow_tracking: str | None = None) -> dict:
+              skip_admission: str | None = None, lookup=None, allow_tracking: str | None = None,
+              model_preflight=None, effort="medium", proxy_mode="auto") -> dict:
     d = campaign_dir(cid)
     if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
         raise SystemExit(f"战役 {cid} 已存在")
@@ -444,6 +519,10 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
     if bad and not skip_admission:
         raise SystemExit("这些模型没过 bench 准入，不能进战役（确需例外用 --skip-admission \"原因\"，会记进战役）：\n"
                          + "\n".join(f"  {m}：{w}" for m, w in bad.items()))
+    try:
+        readiness = model_readiness(models, executor, model_preflight, effort=effort, proxy_mode=proxy_mode)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     with locked(d):
         if (d / "campaign.json").exists():
             raise SystemExit(f"战役 {cid} 已存在")
@@ -452,6 +531,8 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
             after_id = int(st.get("cursor", 0))
         c = new_campaign(cid, models, executor=executor, quota=quota, batch=batch, after_id=after_id)
         c["admission"] = {"gate": gate, "skipped": skip_admission if bad else None}
+        c["start_contract"] = {"version": "campaign-start-v2", "admission_version": "admission-v2",
+                               "effort": effort, "proxy_mode": proxy_mode, "model_preflight": readiness}
         if tracking["tracked"]:
             c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "start", "reason": allow_tracking,
                                                            "dirs": tracking["dirs"]})
@@ -956,7 +1037,13 @@ def cmd_report(cid: str) -> dict:
         by_model.setdefault(r["model"], []).append(r)
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
+    from utils.evaluation_receipts import artifact, overhead_coverage
+    evidence = [artifact(p) for p in [d / "campaign.json", d / "log.jsonl", d / "prompt.md",
+                                      *sorted(d.glob("chain-*.md"))] if p.is_file()]
     return {"campaign": cid, "prompt_version": c["prompt_version"], "prompt_sha256": c.get("prompt_sha256"),
+            "report_ready": campaign_full(c) and bool(per) and all(r.get("status") == "submitted" and
+                                                r.get("ok", 0) + r.get("empty", 0) == r.get("items", 0) for r in per),
+            "evidence": evidence, "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "overhead": overhead_total(c), "triage": triage_summary(d, c), "models": models, "by_chain": totals,
             "batches": clean}
 
@@ -1015,7 +1102,10 @@ def triage_summary(d: Path, c: dict, since: str | None = None) -> dict:
 def cmd_status(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
+    from utils.evaluation_receipts import overhead_coverage
     return {"campaign": cid, "executor": c["executor"], "chain": c["chain"], "chain_mode": c.get("chain_mode", "latest"),
+            "overhead_coverage": overhead_coverage(c.get("overhead") or []),
+            "host_task_state": "unverified_by_repository",
             "chain_versions": chain_versions(c), "quota": c["quota"],
             "requeue": len(c.get("requeue") or []), "prompt_sha256": c.get("prompt_sha256"),
             "batch": c["batch"], "prompt_version": c["prompt_version"],
@@ -1047,6 +1137,9 @@ def main(argv=None) -> int:
             s.add_argument("--batch", type=int, default=50, help="每批条数（每批复盘一次）")
             s.add_argument("--after-id", type=int, help="游标起点；缺省接着会话自抽取的游标")
             s.add_argument("--skip-admission", metavar="原因", help="没过 bench 准入也开战役（原因记进战役）")
+            s.add_argument("--model-preflight", nargs="+", help="每个模型一份 runtime probe 的真实调用凭据（15分钟内）")
+            s.add_argument("--effort", default="medium")
+            s.add_argument("--proxy-mode", choices=("auto", "env-only", "none"), default="auto")
         if name in ("start", "claim"):
             s.add_argument("--allow-tracking", metavar="原因",
                            help="会话会被 claude-mem 记录也照样跑（不推荐；原因记进战役）")
@@ -1101,7 +1194,8 @@ def main(argv=None) -> int:
         if not flight["ok"]:
             raise SystemExit(json.dumps(flight, ensure_ascii=False))
         out = cmd_start(a.id, a.models, executor=a.executor, quota=a.quota, batch=a.batch, after_id=a.after_id,
-                        skip_admission=a.skip_admission, allow_tracking=a.allow_tracking)
+                        skip_admission=a.skip_admission, allow_tracking=a.allow_tracking,
+                        model_preflight=a.model_preflight, effort=a.effort, proxy_mode=a.proxy_mode)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
     elif a.cmd == "rules":
@@ -1135,7 +1229,7 @@ def main(argv=None) -> int:
         for m in a.model or list(c["models"]):
             if m not in c["models"]:
                 raise SystemExit(f"战役 {a.id} 没有模型 {m}")
-            print(f"# {m}\n{launch_command(a.tool, a.id, m)}\n")
+            print(f"# {m}\n{launch_command(a.tool, a.id, m, cfg=c)}\n")
         return 0
     elif a.cmd == "claim":
         d = campaign_dir(a.id)

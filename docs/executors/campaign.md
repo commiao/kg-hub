@@ -19,15 +19,18 @@
 
 ## 开战役之前：bench 准入（每个模型一次）
 
-`start` 只接受有准入记录、结论为 `pass`、且规则正文版本与本战役一致的模型（确需例外用 `--skip-admission "原因"`，原因记进战役）。
+新 `start` 只接受新版 `admission-v2` 的最新 `pass`、匹配规则正文和激活套件的语义回执，并要求每模型 15 分钟内真实 `runtime probe` 凭据。旧 pass 可补审既有 native run，不自动升级。确需准入例外用已获授权的 `--skip-admission "原因"`，不跳过真实模型探测。详见 [新版评测工作流](../../skills/kg-model-eval/references/evaluation-workflow.md)。
 
 先确认参考与当前规则兼容；旧 c8 仅等价于 v4，v5 需按 [当前规则下建立新的 bench 参考](bench-reference.md) 生成真实参考。以下命令的样本目录应使用该兼容参考。
 
 ```
-"$CLI" bench run   --bench ~/.kg-hub/bench/bench-20261022 --models <模型> --tag adm50 --limit 50
+"$CLI" bench run   --bench "$V5_BENCH" --executor codex|claude|qodercli --models <模型> --tag adm50 --limit 50
 "$CLI" bench blind --bench <样本> --run <运行目录...> --n 10 --out <评审表>.json
 #   评审者打开评审表（不含模型名），对照观测原文把每条的 verdict 填成 ok / error（error 写 note）；评完前不看 <评审表>.json.key.json
-"$CLI" bench admit --bench <样本> --run <运行目录> --sheet <评审表>.json
+"$CLI" regression sheet --bench "$V5_BENCH" --run <运行目录> --out <待评定向表>.json
+# 独立评审填证据后：
+"$CLI" regression check --bench "$V5_BENCH" --run <运行目录> --review <已填定向表>.json --out <语义回执>.json
+"$CLI" bench admit --bench "$V5_BENCH" --run <运行目录> --sheet <评审表>.json --semantic-review <语义回执>.json
 ```
 
 | 门槛 | 要求 |
@@ -43,7 +46,7 @@
 
 `admit` 不带 `--sheet` 只预览、不写记录（避免一次随手的预览压过此前的 pass）；要撤销准入用 `extract_bench revoke --model <模型> --reason <原因>`。
 准入自检只计硬错误（schema、悬空边、缺 edges 键）；照抄标题、译文边交给比例门槛，没交的交给「未交 = 0」。
-结论依次为 `fail` → `screen_pass` → `pending_blind`（缺盲评）→ `pass`，带 `--sheet` 的每次判定都追加进本机
+结论包括 `fail`、`screen_pass`、`pending_blind`（缺盲评）、`pending_semantic_regression`（缺定向评审）、`semantic_regression_fail`（真实定向错误）、`pass`；缺新版评审不写质量失败。完整正式判定追加进本机
 `~/.kg-hub/bench/admissions/<模型>.json`（模型、bench、规则版本、逐项检查、盲评、日期），以最新一条为准。
 阈值写在 `tools/extract_bench.py` 的 `THRESHOLDS`，改阈值走 PR。成本不设门槛：处理条数（配额）就是成本上限。
 
@@ -144,7 +147,7 @@
 
 0. 先核对公共稳定入口和 preflight，再建好专用目录并在里面打开本会话（只做一次，见上文「战役一律在专用目录里跑」）：`"$CLI" campaign workspace --repo <已核实Git仓库>`
 1. 开战役（只做一次；每个模型要先有 bench 准入 pass，见上文）：
-   "$CLI" campaign start --id <战役> --models <模型...> --executor <工具> --quota <配额> --batch <每批>
+   "$CLI" campaign start --id <战役> --models <模型...> --executor <工具> --quota <配额> --batch <每批> --model-preflight <每模型新探测回执...>
 2. 每一轮：给每个模型派一个子代理，**子代理必须用那个模型**，任务说明用 `"$CLI" campaign brief --id <战役> --model <模型>` 的输出
    （或直接用 `agents` 生成的子代理定义，见下文「各工具怎么派」）。
    每批正式提交前先生成并完成逐条质量证据：

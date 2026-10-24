@@ -29,7 +29,7 @@ quality-check 不重复传身份；前项结果变化后整批重新预览，含
 ## 冒烟与准入（不入库）
 
 codex 的模型直接走运行器，**不要自己写脚本**：
-`"$CLI" bench run --bench ~/.kg-hub/bench/bench-20261022 --executor codex --models gpt-6-luna gpt-6-sol --tag <标签> --limit 10`。
+`"$CLI" bench run --bench "$V5_BENCH" --executor codex --models gpt-6-luna gpt-6-sol --tag <标签> --limit 10`；`V5_BENCH` 先按 [当前参考流程](bench-reference.md) 验证完整 prompt/hash。
 运行器用 `codex exec --ignore-user-config --ephemeral -s read-only` 单轮调用：关 shell 工具与钩子、不读项目文档，
 系统提示经 `developer_instructions` 传入（与 qodercli 的逐字相同），观测走标准输入；推理强度用 `--effort`（缺省 medium）。
 codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex 会话自写脚本，每个模型一次发 10 条、推理强度 medium、
@@ -42,6 +42,7 @@ codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex �
   `"$CLI" campaign launch --id <战役> --tool codex` 打印
   具体命令由已发布的 `campaign launch` 生成，不复制旧的 `codex exec` 参数。会话在采集排除目录打开；代码从稳定入口加载。
 - 子代理必须能写战役状态和领取登记目录、访问 NAS/kg-hub；保留真实工具错误，不能把沙箱网络失败当服务端已经处理成功。
+- 已有宿主子代理 idle/completed 时用 `followup_task` 触发后续任务；running 才用 `send_message`。repo campaign 状态不等于 App 的宿主任务状态，新开原生调用仍需真实探测回执。
 - 模型名用 `codex debug models` 里 `visibility=list` 的那些（如 gpt-6-astra、gpt-6-luna、gpt-5.6-sol）。
 
 ## 完成标准
