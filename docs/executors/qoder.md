@@ -63,6 +63,8 @@ dry-run 在对比模式下不需要：样本观测的实体已在图里，预览
 
 ## 准入：进战役前先在 bench 上过门槛
 
+当前规则没有兼容参考时，按 [建立新的 bench 参考](bench-reference.md) 从真实 Claude 运行冻结新参考；旧 c8 不能重标成 v5。新参考的正式准入要求公共运行器的完整证据，手工登记仅供历史评分。
+
 冒烟（`--limit 10`）只能得到 `screen_pass`；要进战役，跑 30–50 条、做 10 条盲评，再 `extract_bench admit`。
 门槛、结论分级与记录位置见 [campaign.md 的「开战役之前：bench 准入」](campaign.md#开战役之前bench-准入每个模型一次)。
 

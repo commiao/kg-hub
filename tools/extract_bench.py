@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils import bench_reference as reference
 
 TOOL = "extract_bench"
 DEFAULT_ROOT = Path.home() / ".kg-hub" / "bench"
@@ -254,6 +256,7 @@ def _bench(d: str) -> tuple[Path, dict]:
     m = json.loads((p / "manifest.json").read_text())
     if m.get("tool") != TOOL:
         raise SystemExit(f"{p} 不是 {TOOL} 的样本目录")
+    reference.verify_reference(p, m)
     return p, m
 
 
@@ -264,7 +267,7 @@ def _bench_items(p: Path, m: dict):
     for part in m["parts"]:
         b = part["part"]
         for it in json.loads((p / f"batch-{b}.json").read_text())["items"]:
-            rows.append((int(it["id"]), observation_title(it["episode_body"]), b, part["baseline_model"]))
+            rows.append((int(it["id"]), observation_title(it["episode_body"]), b, reference.comparison_label(part)))
         for it in json.loads((p / f"baseline-{b}.json").read_text()).get("items", []):
             base[int(it["id"])] = it
     return rows, base
@@ -364,7 +367,7 @@ def score_many(p: Path, m: dict, cands: list[tuple[str, dict, dict]], *, ids=Non
         cm = {i: item_metrics(results.get(i), titles[i], ENTITY_TYPES, EDGE_TYPES) for i in ids}
         scored.append((label, cm, retrieval(p, m, results, ids, cache_dir), cost))
     out = [_row(f"{label}（全样本）", [cm[i] for i in ids], ch, ids, cost) for label, cm, ch, cost in scored]
-    out.append(_row("基线：三模型各自那部分", [bm[i] for i in ids], bh, ids))
+    out.append(_row(reference.baseline_label(m), [bm[i] for i in ids], bh, ids))
     for model in sorted({r[3] for r in rows}):
         sub = [r[0] for r in rows if r[3] == model]
         out += [_row(f"{label}｜{model} 那部分", [cm[i] for i in sub], ch, sub) for label, cm, ch, _ in scored]
@@ -485,11 +488,7 @@ def select_ids(rows: list[tuple], limit: int | None) -> list[int]:
 
 
 def build_query(items: list[dict], lookahead: list) -> str:
-    obs = [{"id": i["id"], "name": i.get("name"), "source_description": i.get("source_description"),
-            "episode_body": i["episode_body"]} for i in items]
-    return ("按系统提示里的规则抽取下面每一条观测，只输出一个 JSON 对象 {\"items\": [...]}，每条带原样的 id。\n\n"
-            f"lookahead（之后观测的标题，用于规则 19）：{json.dumps(lookahead, ensure_ascii=False)}\n\n"
-            f"观测：{json.dumps(obs, ensure_ascii=False)}")
+    return reference.query_text(items, lookahead)
 
 
 def parse_items(text: str, want: list[int]) -> dict[int, dict]:
@@ -514,6 +513,8 @@ def parse_items(text: str, want: list[int]) -> dict[int, dict]:
         except (TypeError, ValueError, AttributeError):
             continue
         if i in want_set:
+            if i in out:
+                raise ValueError(f"JSON 里重复的观测 id：{i}")
             out[i] = {**it, "id": i}
     return out
 
@@ -558,7 +559,8 @@ def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | 
     try:
         r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0, "ms": timeout * 1000}
+        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0,
+                "tokens_known": False, "ms": timeout * 1000}
     ms = int((time.monotonic() - t0) * 1000)
     usage, errors = {}, []
     for line in (r.stdout or "").splitlines():
@@ -576,6 +578,7 @@ def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | 
     return {"text": text, "error": (f"rc={r.returncode} {json.dumps(errors[-1:], ensure_ascii=False)[:300]}"
                                     if failed else None),
             "stop": None, "credits": None, "ms": ms,
+            "tokens_known": bool(usage),
             "tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)}
 
 
@@ -592,20 +595,23 @@ def claude_call(model: str, system: str, query: str, *, cwd: Path, effort: str |
     try:
         r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0, "ms": timeout * 1000}
+        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0,
+                "tokens_known": False, "ms": timeout * 1000}
     try:
         d = json.loads(r.stdout)
     except ValueError:
         return {"text": r.stdout[-2000:], "error": f"rc={r.returncode} 非 JSON 输出：{r.stderr[-300:]}",
-                "stop": None, "credits": None, "tokens": 0, "ms": 0}
+                "stop": None, "credits": None, "tokens": 0, "tokens_known": False, "ms": 0}
     u = d.get("usage") or {}
     tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
                                                 "cache_read_input_tokens", "output_tokens"))
     used = list((d.get("modelUsage") or {}).keys())
     err = d.get("is_error") and (d.get("result") or "is_error")
-    if not err and used and model not in used:
+    identity_error = not err and set(used) != {model}
+    if identity_error:
         err = f"实际模型 {used} 不是 {model}"
     return {"text": d.get("result") or "", "error": err, "stop": d.get("stop_reason"), "credits": None,
+            "actual_models": used, "retryable": not identity_error, "tokens_known": bool(u),
             "tokens": tokens, "ms": int(d.get("duration_ms") or 0)}
 
 
@@ -615,7 +621,8 @@ ADAPTERS = {"qodercli": qodercli_call, "codex": codex_call, "claude": claude_cal
 def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> tuple[dict, dict]:
     """一组观测调一次；漏掉或解析失败的再拆半重试（最多两层），仍拿不到的记 failed。"""
     want = [i["id"] for i in items]
-    res = call(build_query(items, lookahead))
+    query = build_query(items, lookahead)
+    res = {**call(query), "query_sha256": hashlib.sha256(query.encode()).hexdigest()}
     got, err = {}, res["error"]
     if not err:
         try:
@@ -624,9 +631,10 @@ def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> 
             err = str(exc)
     log(want, res, err)
     st = {"calls": 1, "credits": res["credits"] or 0.0, "credits_known": res["credits"] is not None,
-          "tokens": res.get("tokens") or 0, "ms": res["ms"], "failed": []}
+          "tokens": res.get("tokens") or 0, "tokens_known": res.get("tokens_known", res.get("tokens") is not None),
+          "actual_models": res.get("actual_models") or [], "ms": res["ms"], "failed": []}
     missing = [i for i in items if i["id"] not in got]
-    if missing and depth < 2:
+    if missing and depth < 2 and res.get("retryable", True):
         halves = [missing[:len(missing) // 2], missing[len(missing) // 2:]] if len(missing) > 1 else [missing]
         for h in (x for x in halves if x):
             g2, s2 = run_chunk(call, h, lookahead, log, depth + 1)
@@ -634,6 +642,8 @@ def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> 
             for k in ("calls", "credits", "tokens", "ms"):
                 st[k] += s2[k]
             st["credits_known"] = st["credits_known"] and s2["credits_known"]
+            st["tokens_known"] = st["tokens_known"] and s2["tokens_known"]
+            st["actual_models"] = sorted(set(st["actual_models"]) | set(s2["actual_models"]))
             st["failed"] += s2["failed"]
     elif missing:
         st["failed"] = [i["id"] for i in missing]
@@ -657,17 +667,21 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
     所有执行器统一：同一份系统提示、每次调用按批次分组且至多 chunk 条、同一推理强度、同一套拆半重试。"""
     from concurrent.futures import ThreadPoolExecutor
     from threading import Lock
+    reference.need(type(chunk) is int and chunk > 0 and type(parallel) is int and parallel > 0,
+                   "chunk and parallel must be positive")
     rows, _ = _bench_items(p, m)
-    ids = select_ids(rows, limit)
+    ids = reference.selected_ids(rows, m, limit, select_ids)
     keep = set(ids)
     system, version = bench_system_prompt()
-    parts = {}
-    for part in m["parts"]:
-        b = part["part"]
-        batch = json.loads((p / f"batch-{b}.json").read_text())
-        its = [i for i in batch["items"] if int(i["id"]) in keep]
-        if its:
-            parts[b] = (its, batch.get("lookahead") or [])
+    # Capture once before calling any adapter; never re-read changed rules as if
+    # they had been used for already completed requests.
+    rule_bytes = PROMPT_PATH.read_bytes()
+    rule_hash = hashlib.sha256(rule_bytes).hexdigest()
+    reference.need(reference.rules_version(rule_bytes.decode()) == base_version(version), "loaded rules version changed")
+    reference.need(system == rule_bytes.decode().strip() + "\n\n" + BENCH_ADDENDUM, "loaded system/rules mismatch")
+    snapshot = reference.collect_inputs(p, m, ids)
+    contract = reference.input_contract(p, m, ids, snapshot=snapshot)
+    parts = {part["part"]: (part["items"], part["lookahead"]) for part in snapshot["parts"]}
     dirs, per_model, lock = {}, {}, Lock()
     for model in models:
         model_slug = re.sub(r"[^\w.-]+", "_", model)
@@ -675,6 +689,10 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
         if d.exists():
             raise SystemExit(f"{d} 已存在：换个 --tag，不覆盖已有结果")
         (d / "work").mkdir(parents=True)
+        (d / "rules.md").write_bytes(rule_bytes)
+        (d / "system-prompt.txt").write_text(system, encoding="utf-8")
+        reference.write(d / "input-contract.json", contract)
+        reference.write(d / "input-data.json", snapshot)
         dirs[model] = d
         per_model[model] = [(model, b, k // chunk, its[k:k + chunk], la)
                             for b, (its, la) in parts.items() for k in range(0, len(its), chunk)]
@@ -693,11 +711,15 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
         def log(want, res, err):
             n[0] += 1
             (d / "work" / f"{b}.c{k}.a{n[0]}.json").write_text(json.dumps(
-                {"ids": want, "error": err, "stop": res["stop"], "credits": res["credits"], "tokens": res.get("tokens"),
+                {"part": b, "ids": want, "query_sha256": res["query_sha256"],
+                 "error": err, "stop": res["stop"], "credits": res["credits"], "tokens": res.get("tokens"),
+                 "tokens_known": res.get("tokens_known", res.get("tokens") is not None),
+                 "actual_models": res.get("actual_models"),
                  "ms": res["ms"], "text": res["text"]}, ensure_ascii=False))
         got, st = run_chunk(make_call(model, d), its, la, log)
         with lock:
-            cost = f"{st['credits']:.2f} credits" if st["credits_known"] else f"{st['tokens']} token"
+            cost = (f"{st['credits']:.2f} credits" if st["credits_known"] else
+                    f"{st['tokens']} token" if st["tokens_known"] else "token 未知/仅部分可见")
             print(f"  {model} {b} 第 {k + 1} 组：{len(got)}/{len(its)} 条，调用 {st['calls']} 次，"
                   f"{cost}，{st['ms'] / 1000:.0f}s", flush=True)
         return model, b, its, got, st
@@ -714,12 +736,22 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
             (d / f"results-{b}.json").write_text(json.dumps({"items": items}, ensure_ascii=False, indent=1))
         tot = {k: sum(x[4][k] for x in mine) for k in ("calls", "credits", "tokens", "ms")}
         tot["credits_known"] = all(x[4]["credits_known"] for x in mine)
-        (d / "run.json").write_text(json.dumps({
+        tot["tokens_known"] = all(x[4]["tokens_known"] for x in mine)
+        metadata = {
             "tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": tag,
-            "bench": m["bench_id"], "prompt_version": version, "prompt_sha256": rules_sha(), "ids": ids, "chunk": chunk,
+            "bench": m["bench_id"], "prompt_version": version, "prompt_sha256": rule_hash, "ids": ids, "chunk": chunk, "limit": limit,
+            "system_prompt_sha256": reference.sha(d / "system-prompt.txt"),
+            "input_contract_sha256": reference.digest(contract),
+            "input_data_sha256": reference.digest(snapshot),
+            "comparison_strata": {part["part"]: part.get("comparison_stratum", part["baseline_model"])
+                                  for part in m["parts"] if part["part"] in {x["part"] for x in snapshot["parts"]}},
+            "result_items_sha256": reference.digest(reference.result_items(d)),
+            "execution_mode": "test_adapter" if call_factory else "native_adapter",
+            "actual_models": sorted({used for x in mine for used in x[4]["actual_models"]}),
             "effort": effort,
             "failed": [i for x in mine for i in x[4]["failed"]], **tot,
-            "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=1))
+            "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat()}
+        (d / "run.json").write_text(json.dumps(reference.seal_run(d, metadata), ensure_ascii=False, indent=1))
     return [dirs[x] for x in models]
 
 
@@ -748,13 +780,15 @@ def load_run(d: Path) -> dict:
     r = json.loads((d / "run.json").read_text())
     if r.get("tool") != TOOL:
         raise SystemExit(f"{d} 不是 {TOOL} 的运行目录")
+    if r.get("evidence"):
+        reference.verify_run(d, r, native=False)
     n = max(1, len(r["ids"]))
     r["results"] = load_results([str(d)])
     r["dir"] = str(d)
     r["cost"] = {"sec_per_obs": round(r["ms"] / 1000 / n, 1)}
     if r.get("credits_known", True):          # codex 不报 credits：未知就不显示，不当成 0
         r["cost"]["credits_per_obs"] = round((r["credits"] or 0) / n, 2)
-    if r.get("tokens"):
+    if r.get("tokens") is not None and r.get("tokens_known", bool(r.get("tokens"))):
         r["cost"]["tokens_per_obs"] = round(r["tokens"] / n)
     return r
 
@@ -817,10 +851,43 @@ def blind_sheet(p: Path, m: dict, runs: list[dict], n: int = BLIND_N, seed: str 
 
 
 def blind_result(sheet: list[dict], key: dict, label: str) -> dict:
+    codes = [entry.get("code") for entry in sheet]
+    reference.need(len(codes) == len(set(codes)), "duplicate blind review codes")
     mine = [e for e in sheet if key.get(e["code"]) == label]
     judged = [e for e in mine if e.get("verdict") in ("ok", "error")]
     return {"sampled": len(mine), "judged": len(judged), "errors": sum(e["verdict"] == "error" for e in judged),
             "notes": [e["note"] for e in judged if e["verdict"] == "error" and e.get("note")]}
+
+
+def validate_blind_sheet(p: Path, m: dict, run: dict, sheet: list[dict], key: dict) -> None:
+    """A verdict must address the actual frozen observation/result, once only."""
+    reference.need(isinstance(sheet, list) and isinstance(key, dict) and all(isinstance(e, dict) for e in sheet),
+                   "invalid blind review sheet/key")
+    codes = [entry.get("code") for entry in sheet]
+    reference.need(all(isinstance(code, str) and code in key for code in codes) and len(codes) == len(set(codes)),
+                   "unknown or duplicate blind review code")
+    expected = {code for code, label in key.items() if label == run["label"]}
+    mine = [entry for entry in sheet if key[entry["code"]] == run["label"]]
+    reference.need(len(expected) >= BLIND_N and {entry["code"] for entry in mine} == expected,
+                   "blind review is incomplete for this run")
+    reference.need(len({entry.get("obs_id") for entry in mine}) == len(mine), "duplicate blind observation")
+    rows, _ = _bench_items(p, m)
+    titles = {row[0]: row[1] for row in rows}
+    originals = {}
+    for part in m["parts"]:
+        batch = reference.read(p / f"batch-{part['part']}.json")
+        for item in batch["items"]:
+            originals[int(item["id"])] = {"episode_body": item["episode_body"], "lookahead": batch.get("lookahead") or []}
+    for entry in mine:
+        ident = entry.get("obs_id")
+        reference.need(ident in run["ids"] and ident in run["results"] and ident in originals,
+                       "blind observation is not in this run")
+        wanted = {"title": titles[ident], **originals[ident],
+                  "entities": run["results"][ident].get("entities"), "edges": run["results"][ident].get("edges")}
+        reference.need(all(entry.get(name) == value for name, value in wanted.items()), "blind review source/result changed")
+        reference.need(entry.get("verdict") in ("ok", "error"), "blind verdict missing")
+        reference.need(entry["verdict"] != "error" or bool(str(entry.get("note") or "").strip()),
+                       "blind error requires an evidence note")
 
 
 def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: str, baseline_prompt: str | None,
@@ -861,11 +928,33 @@ def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: s
 
 
 def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, write: bool = True) -> dict:
+    ref = reference.verify_reference(p, m)
+    baseline_version = base_version(ref["prompt_version"]) if ref else BASELINE_EQUIV.get(m.get("chain"))
+    current_system, current_version = bench_system_prompt()
+    reference.need(baseline_version is not None and base_version(run.get("prompt_version")) == baseline_version,
+                   "baseline/rules versions incompatible; no model verdict or admission record written")
+    reference.need(base_version(run.get("prompt_version")) == base_version(current_version) and
+                   run.get("prompt_sha256") == rules_sha(), "candidate rules are not current; no admission written")
+    if ref:
+        contract = reference.verify_run(Path(run["dir"]), {k: v for k, v in run.items() if k not in ("results", "dir", "cost")})
+        reference.need(run.get("bench") == m["bench_id"], "candidate belongs to another frozen bench")
+        reference.need(contract == reference.input_contract(p, m, run["ids"]), "candidate source inputs changed")
+        reference.need(run.get("prompt_sha256") == ref["prompt_sha256"], "candidate/reference rule hashes differ")
+        reference.need(run.get("prompt_version") == ref["prompt_version"] == current_version,
+                       "candidate/reference complete prompt versions differ")
+        reference.need(run.get("system_prompt_sha256") == reference.read(p / "reference-run.json")["system_prompt_sha256"] ==
+                       hashlib.sha256(current_system.encode()).hexdigest(), "candidate/reference system prompts differ")
+        reference.need(run["ids"] == m["selection_order"][:len(run["ids"])], "candidate selection order differs")
+        reference.need(run.get("model") != ref["model"], "self-reference cannot issue model admission")
+        if sheet is None:
+            write = False
+    if sheet is not None or key is not None:
+        validate_blind_sheet(p, m, run, sheet, key)
     rows = score_many(p, m, [(run["label"], run["results"], run.get("cost") or {})], ids=run["ids"], cache_dir=cache_dir)
     full = rows[0]
     by = {r["label"]: r for r in rows}
     pairs = []
-    for model in sorted({part["baseline_model"] for part in m["parts"]}):
+    for model in sorted({reference.comparison_label(part) for part in m["parts"]}):
         cand, base = by.get(f"{run['label']}｜{model} 那部分"), by.get(f"{model}（基线）")
         if cand and base and cand["questions"]:
             pairs.append((cand, base))
@@ -873,10 +962,10 @@ def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, 
     lint_rows = [(r[0], r[1], r[2]) for r in rows_all if r[0] in set(run["ids"])]
     blind = blind_result(sheet, key, run["label"]) if sheet is not None and key is not None else None
     checks, verdict = admission_checks(full, pairs, run_prompt=run.get("prompt_version"),
-                                       baseline_prompt=BASELINE_EQUIV.get(m.get("chain")),
+                                       baseline_prompt=baseline_version,
                                        lint_problems=len(lint_items(lint_rows, run["results"], chain_rules=False,
                                                                     missing=False)), blind=blind,
-                                       base_row=by.get("基线：三模型各自那部分"))
+                                       base_row=by.get(reference.baseline_label(m)))
     rec = {"model": run["model"], "label": run["label"], "executor": run.get("executor"), "bench": m["bench_id"],
            "items": full["items"], "prompt_version": run.get("prompt_version"),
            "prompt_sha256": run.get("prompt_sha256"), "run_dir": run.get("dir"),
@@ -935,6 +1024,11 @@ def main(argv=None) -> int:
     f.add_argument("--bench-id", required=True)
     f.add_argument("--corpus", required=True)
     f.add_argument("--root", default=str(DEFAULT_ROOT))
+    b = sub.add_parser("baseline", help="freeze a new reference from a complete native Claude run; never relabel legacy data")
+    b.add_argument("--bench", required=True, help="unchanged source bench used by the reference run")
+    b.add_argument("--run", required=True, help="native Claude reference run directory")
+    b.add_argument("--bench-id", required=True)
+    b.add_argument("--root", default=str(DEFAULT_ROOT))
     for name in ("parts", "lint", "score", "run", "blind", "admit", "register", "revoke"):
         s = sub.add_parser(name)
         if name != "revoke":
@@ -989,6 +1083,17 @@ def main(argv=None) -> int:
         print(f"{a.model}：已撤销准入（{a.reason}），记录 {rec['record_file']}")
         return 0
     p, m = _bench(a.bench)
+    if a.cmd == "baseline":
+        system, version = bench_system_prompt()
+        reference_run = reference.read(Path(a.run).expanduser() / "run.json")
+        source_rows, _ = _bench_items(p, m)
+        expected_ids = reference.selected_ids(source_rows, m, reference_run.get("limit"), select_ids)
+        out = reference.freeze_reference(p, m, Path(a.run).expanduser(), a.bench_id, Path(a.root).expanduser(),
+                                         current_version=version, current_sha=rules_sha(),
+                                         current_system_sha=hashlib.sha256(system.encode()).hexdigest(), expected_ids=expected_ids)
+        print(json.dumps({"bench": str(out), "reference": json.loads((out / "manifest.json").read_text())["reference"]},
+                         ensure_ascii=False, indent=1))
+        return 0
     cache = Path(a.cache_dir) if getattr(a, "cache_dir", None) else None
     if a.cmd == "parts":
         print(f"样本 {m['bench_id']}：{m['items']} 条，{len(m['parts'])} 批（基线约定 {m['chain']}）")

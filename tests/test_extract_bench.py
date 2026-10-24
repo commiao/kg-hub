@@ -200,10 +200,15 @@ class EndToEndTest(unittest.TestCase):
         legacy_text = "# Synthetic frozen c8 rules (prompt_version = agent-v4)\nCopy the complete title and its translation; retain supported facts.\n"
         import hashlib
         legacy_sha = hashlib.sha256(legacy_text.encode()).hexdigest()
+        rules_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(rules_tmp.cleanup)
+        rules_path = _Path(rules_tmp.name) / "rules.md"
+        rules_path.write_text(legacy_text)
         for patcher in (
             mock.patch.object(ax, "PROMPT_VERSION", "agent-v4"),
-            mock.patch.object(xb, "bench_system_prompt", return_value=(legacy_text + "\n\n" + xb.BENCH_ADDENDUM, "agent-v4+" + xb.BENCH_ADDENDUM_VERSION)),
+            mock.patch.object(xb, "bench_system_prompt", return_value=(legacy_text.strip() + "\n\n" + xb.BENCH_ADDENDUM, "agent-v4+" + xb.BENCH_ADDENDUM_VERSION)),
             mock.patch.object(xb, "rules_sha", return_value=legacy_sha),
+            mock.patch.object(xb, "PROMPT_PATH", rules_path),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -286,6 +291,7 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(e["lookahead"], [{"id": 90 + e["obs_id"], "title": f"{batch_of[e['obs_id']]} 之后的观测"}])
         for e in sheet:
             e["verdict"] = "error" if key[e["code"]] == "qodercli-乙模型" else "ok"
+            e["note"] = "Synthetic independently reviewed factual error" if e["verdict"] == "error" else ""
         self.assertEqual(xb.blind_result(sheet, key, "qodercli-乙模型")["errors"], 2)
         with mock.patch.object(xb, "embed", fake_embed), mock.patch.object(xb, "BLIND_N", 2), \
                 mock.patch.object(xb, "ADMISSION_MIN_ITEMS", 2), mock.patch.dict("os.environ", {"KG_HUB_BENCH_ROOT": str(root)}):
