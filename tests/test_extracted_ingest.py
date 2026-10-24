@@ -135,6 +135,87 @@ class LexicalTest(unittest.TestCase):
             with self.subTest(a=a):
                 self.assertTrue(same(a, b, "Concept"))
 
+    def test_campaign_1024_near_names_are_different(self):
+        """2026-10-24 opus/fable 战役 dry-run：子代理逐批改名才没让这些近名并进图（另有一对发布物 hash 已并进）。"""
+        same = xi._lexically_same
+        cases = {
+            # ① 只换动词词头的命令/方法名
+            "verb": [("adopt-reviewed-routes 命令（nas-compose-control.sh）",
+                      "prepare-reviewed-routes 命令（nas-compose-control.sh）"),
+                     ("arm_with_outcome_guard（ProviderStateStore）", "arm_outcome_write_guard（ProviderStateStore）")],
+            # ② 分支名只差末尾单词
+            "branch": [("claude/t-0219-reconcile-readonly 分支（credvault）",
+                        "claude/t-0219-reconcile-backoff 分支（credvault）")],
+            # ③ 含字母的短 hash / 版本号
+            "hash": [("a1b2c3d 发布工作树（credvault t-0219-release6，2026-10-09）",
+                      "9f8e7d6 发布工作树（credvault t-0219-release8，2026-10-09）"),
+                     ("fleet-ops Mac 发布物 b28fd06（mac-release.py，2026-10-10）",
+                      "fleet-ops Mac 发布物 7a9b6c1（mac-release.py，2026-10-10）"),
+                     ("rollback-witness-v5 schema", "v4 rollback-witness schema")],
+            # ④ 只差数字（另一边多一个带数字的词）
+            "number": [("md2 阵列（NAS RAID）", "md3 阵列（NAS RAID1）"),
+                       ("credvault release4 工作树（2026-10-09）", "credvault release5 工作树（2026-10-09）")],
+            # ⑤ 工作树名只差中间用途词
+            "purpose": [("credvault t-0219-wal 工作树（2026-10-09）", "credvault t-0219-scenario 工作树（2026-10-09）"),
+                        ("t-0219-plan2 工作树（credvault）", "t-0219-release2 工作树（credvault）")],
+            # ⑥ 中文对立词（时间也不同、时间相同两种）
+            "contrast": [("人工闭合 kg_hub.entity_extract 断路器（T-0195，21:02）",
+                          "人工断开 kg_hub.entity_extract 断路器（T-0195，14:07）"),
+                         ("人工闭合 kg_hub.entity_extract 断路器（T-0195）",
+                          "人工断开 kg_hub.entity_extract 断路器（T-0195）")],
+            # ⑦ 方法/常量被所属类或相邻标识符吸走
+            "member": [("RequestQueue.cancel（llm_request_queue.py）", "RequestQueue（llm_request_queue.py）"),
+                       ("claim()（RequestQueue，llm_request_queue.py）", "RequestQueue（llm_request_queue.py）"),
+                       ("_cancel()（utils/gateway_queue.py）", "QueueCancelled（utils/gateway_queue.py）"),
+                       ("_submit（utils/gateway_queue.py）", "SUBMIT_ATTEMPTS（utils/gateway_queue.py）"),
+                       ("ReceiptBackoff（utils/gateway_queue.py）", "receipt_loop（utils/gateway_queue.py）"),
+                       ("can_submit()（kg_refinery.py）", "pool_can_submit()（kg_refinery.py）"),
+                       ("_cancel()", "QueueCancelled"), ("_submit", "SUBMIT_ATTEMPTS"),
+                       ("can_submit()", "pool_can_submit()")],
+        }
+        for kind, pairs in cases.items():
+            for a, b in pairs:
+                with self.subTest(kind=kind, a=a):
+                    self.assertFalse(same(a, b, "Concept"))
+                    self.assertFalse(same(b, a, "Concept"))
+
+    def test_campaign_1024_correct_reuses_still_match(self):
+        """同一战役里正式提交、核对为正确的复用（每类各取一两条），守卫补强后不能回归。"""
+        same = xi._lexically_same
+        for a, b, t in (
+                ("tests/test_gateway_queue.py", "test_gateway_queue.py", "File"),       # 同仓库全路径 → 短名
+                ("ReadDependencies（graphiti_parallel）", "ReadDependencies (utils/graphiti_parallel.py)", "Concept"),
+                ("summarize_attempts()", "summarize_attempts", "Concept"),            # 带不带 ()
+                ("assert_container_binding()（nas-compose-control.sh）",
+                 "assert_container_binding（nas-compose-control.sh）", "Concept"),
+                ("reconcile_due（queuedispatcher）", "reconcile_due()（QueueDispatcher）", "Concept"),
+                ("execute_queued_request（model-gateway）", "execute_queued_request（ModelGateway）", "Concept"),
+                ("排队作业取消 cancel()（RequestQueue，llm_request_queue.py）",
+                 "作业取消方法 cancel（RequestQueue，llm_request_queue.py）", "Concept"),
+                ("_max_task_http_calls", "_MAX_TASK_HTTP_CALLS = 3", "Concept"),
+                ("model_stage contextvar（kg-hub）", "_model_stage contextvar", "Concept"),
+                ("performgracefulshutdown", "performGracefulShutdown function", "Concept"),
+                ("avgsnapshotbytes 统计（createx 进度日志）", "avgSnapshotBytes（CreateX 进度统计）", "Concept"),
+                ("witness-preflight-cancel 运维出口（model-gateway）",
+                 "witness-preflight-cancel 命令（model_gateway.py CLI）", "Concept"),
+                ("NAS 发布 a1b2c3d（credvault 网关 PR #58，2026-10-09 03:03）",
+                 "NAS 发布 a1b2c3d（credvault PR #58，2026-10-09）", "Concept"),
+                ("跨天重试复用幂等键致永久 425（2026-09-05）", "跨日复用幂等键导致永久425（2026-09-05）", "Issue"),
+                ("--refinery-window-22-08（release.sh 选项）", "--refinery-window-22-08 标志（kg-hub release.sh）", "Concept"),
+                ("对账任务列表端点（ingest_reconciliation）", "对账列表端点（GET /api/ingest/reconciliation）", "Concept"),
+                # 补强守卫时差点误伤的：空格隔开的英文换说法、连字符写法、版本号带点
+                ("gateway reconciliation endpoints", "gateway reconciliation API", "Concept"),
+                ("model gateway reconciliation endpoints", "gateway reconciliation REST endpoints", "Concept"),
+                ("kg_hub_default 网络", "kg-hub_default", "Concept"),
+                ("上游 graphiticore v0.29.0 库", "graphiti-core 0.29.0", "Tool"),
+                # 三条新守卫各自的放行豁免：单复数、数字相同只是贴的字母不同、版本号里的点不是成员访问
+                ("claude-mem-workers 队列积压", "claude-mem-worker 队列积压", "Issue"),
+                ("T-0195 断路器人工断开复盘记录", "T0195 断路器人工断开复盘", "Fix"),
+                ("Python v3.13 运行时升级记录", "Python v3.13.0 运行时升级", "Tool"),
+        ):
+            with self.subTest(a=a):
+                self.assertTrue(same(a, b, t))
+
     def test_repo_prefixed_names_only_match_same_repo(self):
         """2026-10-22 三模型对比第 1 轮：仓库:路径 被后缀规则并进不带前缀的同名文件。"""
         same = xi._lexically_same
