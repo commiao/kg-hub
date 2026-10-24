@@ -39,6 +39,12 @@ NEXT_WORKER = textwrap.dedent('''
     ax.load_config = lambda: {{}}
     ax.check_existing = lambda idents, url, token: {{}}
     ax.api_token = lambda *a, **k: "t"
+    # This harness exercises process locks, not NAS capabilities/tracking.
+    # Production preflight remains mandatory; its real gate has separate tests.
+    ax.runtime_preflight = lambda *a, **k: {{"ok": True, "fixture": "isolated-lock-worker"}}
+    def no_http(*a, **k):
+        raise AssertionError("lock fixture must never reach network")
+    ax._http = no_http
     sys.exit(ax.main(["next", "--n", "5"] + sys.argv[1:]))
 ''')
 

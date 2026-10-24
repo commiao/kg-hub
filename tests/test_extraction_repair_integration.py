@@ -144,6 +144,11 @@ class RealRepairTests(unittest.IsolatedAsyncioTestCase):
         req = await self.request()
         result = await repair.apply(self.g, req, GROUP, quality_validator=lambda p: [])
         self.assertTrue(result["verified"])
+        proof = result["shared_edge_verification"]
+        self.assertEqual(proof["status"], "verified")
+        self.assertEqual(proof["before_snapshot_sha256"], before["snapshot_sha256"])
+        self.assertEqual(proof["count"], 1)
+        self.assertEqual(proof["edges"][0]["uuid"], "wrong")
         wrong = await self.rows("MATCH ()-[r:RELATES_TO {uuid:'wrong'}]->() RETURN r.episodes AS episodes")
         self.assertEqual(wrong, [{"episodes": ["other"]}])
         after = await repair.snapshot(self.driver, "fixture-source", "one", GROUP)
@@ -154,6 +159,32 @@ class RealRepairTests(unittest.IsolatedAsyncioTestCase):
         saved = await repair.audit(self.driver, req["repair_id"])
         self.assertEqual(saved["state"], "applied")
         self.assertEqual(saved["before"]["episode"], before["episode"])
+
+    async def test_shared_other_source_corruption_blocks_success_on_real_graph(self):
+        for corruption in ("missing", "episodes", "fact", "endpoint"):
+            with self.subTest(corruption=corruption):
+                await self.fixture(shared=True)
+                request = await self.request("corrupt-" + corruption)
+                driver = self.driver
+                mutations = {
+                    "missing": "MATCH ()-[r:RELATES_TO {uuid:'wrong'}]->() DELETE r",
+                    "episodes": "MATCH ()-[r:RELATES_TO {uuid:'wrong'}]->() SET r.episodes=['other-changed']",
+                    "fact": "MATCH ()-[r:RELATES_TO {uuid:'wrong'}]->() SET r.fact='tampered original fact'",
+                    "endpoint": "MATCH (a:Entity)-[r:RELATES_TO {uuid:'wrong'}]->() "
+                        "WITH a,properties(r) AS props,r DELETE r WITH a,props "
+                        "MATCH (b:Entity {uuid:'right-project'}) CREATE (a)-[r:RELATES_TO]->(b) SET r=props",
+                }
+                class CorruptSharedReadback:
+                    async def execute_query(self, query, **params):
+                        if "/* repair:shared-readback */" in query:
+                            await driver.execute_query(mutations[corruption])
+                        return await driver.execute_query(query, **params)
+                g = SimpleNamespace(driver=CorruptSharedReadback(), embedder=Embedder())
+                with self.assertRaisesRegex(repair.RepairError, "shared fact"):
+                    await repair.apply(g, request, GROUP, quality_validator=lambda payload: [])
+                saved = await repair.audit(self.driver, request["repair_id"])
+                self.assertEqual(saved["state"], "pending")
+                self.assertNotIn("result", saved)
 
     async def test_orphan_removal_new_node_vectors_and_audit_materialize(self):
         await self.fixture()

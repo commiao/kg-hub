@@ -190,11 +190,11 @@ def batch_rules_text(d: Path, c: dict, b: dict) -> str:
 
 
 def cli_command() -> str:
-    return '${KG_HUB_PYTHON:-python3} "${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract_cli.py" campaign'
+    return '"${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract" campaign'
 
 
 SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}，你的模型 id 是 {model}。
-在战役专用目录（`extract_campaign workspace` 建的那个，缺省 ~/work-ai/kg-hub-campaign）里执行命令——会话也要在那里打开，这样抽取过程不会被 claude-mem 记成新观测；解释器用 ${{KG_HUB_PYTHON:-python3}}（装好 kg-hub 依赖的那个 Python，下称 PY）。
+在战役专用目录（`extract_campaign workspace` 建的那个，缺省 ~/work-ai/kg-hub-campaign）里执行命令——会话也要在那里打开，这样抽取过程不会被 claude-mem 记成新观测；公共 tools/extract 入口优先 KG_HUB_PYTHON，再选当前 HOME 下合格的 ~/.local/share/kg-hub/venv/bin/python，最后 python3。
 
 1. 读规则：$PY -m tools.extract_campaign rules --id {cid}（开局冻结的规则正文 + 战役补充约定），尤其末尾的链路规则（21–28）。
 2. 领一批：$PY -m tools.extract_campaign claim --id {cid} --model {model}
@@ -301,31 +301,41 @@ def tracking_guard(allow_tracking: str | None = None, cwd: str | None = None) ->
             "当前会话会被 claude-mem 记录：抽取过程本身会变成新的待抽观测（2026-10-24 实测 2 小时 214 条）。\n"
             f"  会话目录：{', '.join(t['dirs'])}\n"
             f"  排除规则（{t['settings']}）：{t['patterns'] or '（空）'}\n"
-            "修法：先跑 `python -m tools.extract_campaign workspace` 建专用目录并写进排除名单，"
-            f"再在 {workspace_dir()} 里打开会话执行；或启动时加 CLAUDE_MEM_INTERNAL=1。\n"
+            f"修法：先跑 `{cli_command()} workspace` 建专用目录并写进排除名单，"
+            f"再在 {workspace_dir()} 里打开会话执行；发布产物设备使用 workspace --session-only；必须在专用目录打开会话。\n"
             "确需例外用 --allow-tracking \"原因\"，会记进战役。")
     return t
 
 
-def cmd_workspace(*, path: Path | None = None, settings: Path | None = None, repo: Path = REPO, runner=None) -> dict:
+def cmd_workspace(*, path: Path | None = None, settings: Path | None = None, repo: Path = REPO, runner=None, session_only: bool = False) -> dict:
     """建 / 同步战役专用目录（kg-hub 主干的独立 worktree，分离 HEAD，不在里面改代码），并写进 claude-mem 排除名单。
-    已存在且干净就快进到 origin/main；有改动就停下不动。排除名单先备份再追加，不覆盖原有规则。"""
+    已存在且干净就快进到 origin/main；有改动就停下不动。session_only 仅建普通会话目录，不运行 Git 或触碰发布代码。
+    排除名单先备份再追加，不覆盖原有规则。"""
     import subprocess
     run = runner or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip())
     ws = (path or workspace_dir()).expanduser()
     sp = (settings or claude_mem_settings_path()).expanduser()
-    common = Path(run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"]))
-    main_repo = common.parent
-    run(["git", "-C", str(main_repo), "fetch", "-q", "origin"])
-    if not ws.exists():
-        run(["git", "-C", str(main_repo), "worktree", "add", "--detach", str(ws), "origin/main"])
-        action = "created"
-    elif run(["git", "-C", str(ws), "status", "--porcelain"]):
-        raise SystemExit(f"{ws} 有未提交的改动，专用目录不该改代码；先处理掉再同步")
+    if session_only:
+        if any(ws.resolve().is_relative_to(code_root) for code_root in {REPO.resolve(), repo.resolve()}):
+            raise SystemExit("session-only workspace must be outside the published code artifact")
+        if (ws / ".git").exists():
+            raise SystemExit("session-only cannot repurpose a Git checkout; use --repo for an existing worktree")
+        existed = ws.exists()
+        ws.mkdir(parents=True, exist_ok=True)
+        action, head = ("session_existing" if existed else "session_created"), None
     else:
-        run(["git", "-C", str(ws), "checkout", "-q", "--detach", "origin/main"])
-        action = "synced"
-    head = run(["git", "-C", str(ws), "rev-parse", "--short", "HEAD"])
+        common = Path(run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        main_repo = common.parent
+        run(["git", "-C", str(main_repo), "fetch", "-q", "origin"])
+        if not ws.exists():
+            run(["git", "-C", str(main_repo), "worktree", "add", "--detach", str(ws), "origin/main"])
+            action = "created"
+        elif run(["git", "-C", str(ws), "status", "--porcelain"]):
+            raise SystemExit(f"{ws} 有未提交的改动，专用目录不该改代码；先处理掉再同步")
+        else:
+            run(["git", "-C", str(ws), "checkout", "-q", "--detach", "origin/main"])
+            action = "synced"
+        head = run(["git", "-C", str(ws), "rev-parse", "--short", "HEAD"])
     data = json.loads(sp.read_text()) if sp.exists() else {}
     cur = data.get("CLAUDE_MEM_EXCLUDED_PROJECTS", "") or ""
     want = [str(ws), f"{ws}/**"]
@@ -342,35 +352,37 @@ def cmd_workspace(*, path: Path | None = None, settings: Path | None = None, rep
         tmp.replace(sp)
     ok = path_excluded(str(ws), data.get("CLAUDE_MEM_EXCLUDED_PROJECTS", ""))
     return {"workspace": str(ws), "action": action, "head": head, "excluded": ok, "added_patterns": add,
-            "settings": str(sp), "backup": str(backup) if backup else None}
+            "settings": str(sp), "backup": str(backup) if backup else None, "session_only": session_only}
 
 
 def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None, state: Path | None = None) -> str:
     """「每个模型一个会话」的启动命令（编排工具派不了指定模型的子代理时的退路，也可用来并行开会话）。
-    在战役专用目录里跑、前缀 CLAUDE_MEM_INTERNAL=1，qodercli 不加载用户级设置、codex 不加载用户配置——抽取过程不变成新观测。
+    在真实采集已排除的战役专用目录里跑，qodercli 不加载用户级设置、codex 不加载用户配置——抽取过程不变成新观测。
     子代理要跑 python、写战役状态目录、连 NAS 与 kg-hub 服务，所以都要把状态目录加成可写、放开网络；
     codex exec 不关标准输入会一直等输入（2026-10-22 实测）。"""
+    import shlex
+    quote = lambda value: shlex.quote(str(value))
     repo = repo or workspace_dir()
     st = state or ax.state_dir()
     # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
     reg_dir = claim_registry.claims_dir()
-    adds = f"--add-dir {st}" + ("" if reg_dir.resolve().is_relative_to(Path(st).resolve()) else f" --add-dir {reg_dir}")
-    # 解释器不写死某台机器的路径：KG_HUB_PYTHON 指向装好 kg-hub 依赖的 Python，没设就用 python3
-    brief_cmd = f'"$({cli_command()} brief --id {cid} --model {model})"'
+    adds = f"--add-dir {quote(st)}" + ("" if reg_dir.resolve().is_relative_to(Path(st).resolve()) else f" --add-dir {quote(reg_dir)}")
+    # The public shell entry chooses the current HOME runtime. Quote each shell argument.
+    brief_cmd = f'"$({cli_command()} brief --id {quote(cid)} --model {quote(model)})"'
     if tool == "codex":
-        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 codex exec -m {model} -C {repo} {adds} --ignore-user-config --approve-for-me "
+        return (f"cd {quote(repo)} && codex exec -m {quote(model)} -C {quote(repo)} {adds} --ignore-user-config --approve-for-me "
                 f"-c features.unified_exec=false -c model_reasoning_effort=medium "
                 f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check {brief_cmd} < /dev/null")
     if tool == "cursor":
-        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 cursor-agent -p --model {model} --trust --workspace {repo} {adds} "
+        return (f"cd {quote(repo)} && cursor-agent -p --model {quote(model)} --trust --workspace {quote(repo)} {adds} "
                 f"--force {brief_cmd}")
     if tool == "qodercli":
-        return (f"cd {repo} && CLAUDE_MEM_INTERNAL=1 qodercli -p -m {model} -w {repo} {adds} --setting-sources local --permission-mode auto "
+        return (f"cd {quote(repo)} && qodercli -p -m {quote(model)} -w {quote(repo)} {adds} --setting-sources local --permission-mode auto "
                 f"-o json {brief_cmd}")
     if tool == "dsh":
         # DeepSeek Harness（@deepseek-ai/dsh）无界面模式一次跑完一个任务；它没有模型参数，模型在 DSH 的
         # 模型设置里选（profile 的 agent-default-model），所以每个模型的会话开跑前先把模型切过去
-        return f"# 先在 DSH 的模型设置里切到 {model}\ncd {repo} && CLAUDE_MEM_INTERNAL=1 dsh --profile headless {brief_cmd}"
+        return f"# 先在 DSH 的模型设置里切到 {model}\ncd {quote(repo)} && dsh --profile headless {brief_cmd}"
     raise SystemExit(f"不认识的工具 {tool}；可选：{', '.join(LAUNCH_TOOLS)}")
 
 
@@ -871,6 +883,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     ws = sub.add_parser("workspace", help="建 / 同步战役专用目录，并写进 claude-mem 排除名单")
     ws.add_argument("--path", help="缺省 KG_HUB_CAMPAIGN_WORKSPACE 或 ~/work-ai/kg-hub-campaign")
+    ws.add_argument("--session-only", action="store_true", help="excluded session directory without Git or network")
     ws.add_argument("--repo", help="Git checkout used to create workspace; released code is not a Git checkout")
     flight = sub.add_parser("preflight", help="read-only loaded-code, dependency, tracking and server capability checks")
     flight.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
@@ -927,7 +940,7 @@ def main(argv=None) -> int:
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
     if a.cmd == "workspace":
-        out = cmd_workspace(path=Path(a.path) if a.path else None, repo=Path(a.repo).expanduser() if a.repo else REPO)
+        out = cmd_workspace(path=Path(a.path) if a.path else None, repo=Path(a.repo).expanduser() if a.repo else REPO, session_only=a.session_only)
     elif a.cmd == "preflight":
         out = ax.runtime_preflight(a.url, ax.api_token())
         print(json.dumps(out, ensure_ascii=False, indent=2))

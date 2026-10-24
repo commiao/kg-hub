@@ -11,6 +11,7 @@ import numpy as np
 
 from schema import EDGE_TYPES, ENTITY_TYPES
 from tools import extract_bench as xb
+from tools import agent_extract as ax
 
 TITLE = "边向量索引灰度第 4 次采样：零回退"
 
@@ -194,6 +195,18 @@ class AdmissionLintScopeTest(unittest.TestCase):
 
 class EndToEndTest(unittest.TestCase):
     def setUp(self):
+        # Frozen c8 is genuinely v4; keep its candidate identity explicit while
+        # the production default advances to v5. Never relabel frozen admission.
+        legacy_text = "# Synthetic frozen c8 rules (prompt_version = agent-v4)\nCopy the complete title and its translation; retain supported facts.\n"
+        import hashlib
+        legacy_sha = hashlib.sha256(legacy_text.encode()).hexdigest()
+        for patcher in (
+            mock.patch.object(ax, "PROMPT_VERSION", "agent-v4"),
+            mock.patch.object(xb, "bench_system_prompt", return_value=(legacy_text + "\n\n" + xb.BENCH_ADDENDUM, "agent-v4+" + xb.BENCH_ADDENDUM_VERSION)),
+            mock.patch.object(xb, "rules_sha", return_value=legacy_sha),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = _Path(self.tmp.name)
         src, corpus = root / "exp", root / "corpus"

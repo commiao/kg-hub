@@ -103,7 +103,7 @@ from utils.extracted_ingest import (  # noqa: E402
     ExtractedEntity, ExtractedEdge, EXTRACTOR_MODEL_PATTERN, normalize_extraction,
     write_extraction, check_keys, check_names,
 )
-from utils.extraction_quality import validate_payload_quality  # noqa: E402
+from utils.extraction_quality import requires_quality, validate_payload_quality  # noqa: E402
 from utils import extraction_repair  # noqa: E402
 from utils.gateway_post_normalize import post_ingest_normalize  # noqa: E402
 from utils.single_pass_extract import (  # noqa: E402
@@ -248,6 +248,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                  "message": "this token is not allowed on this endpoint"},
                 status_code=403,
             )
+        request.state.kg_hub_principal = principal
         return await call_next(request)
 
 
@@ -2013,6 +2014,11 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001
         return JSONResponse({"status": "error", "code": "bad_reference_time"}, status_code=400)
+    principal = getattr(request.state, "kg_hub_principal", None)
+    if (principal and token_auth.EXTRACT_SCOPE in principal.get("scopes", [])
+            and not requires_quality(body.prompt_version)):
+        return JSONResponse({"status": "error", "code": "extract_protocol_required",
+                             "message": "extract scope requires agent-v5 or newer with a valid quality review"}, status_code=403)
     quality_errors = validate_payload_quality(raw)
     if quality_errors:
         return JSONResponse({"status": "error", "code": "quality_review_failed",

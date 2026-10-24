@@ -317,6 +317,77 @@ class ClientGateTest(unittest.TestCase):
             ax.record_dryrun(sd, "b1", preview())
             self.assertEqual(ax.dryrun_missing(sd, "b1", results, batch=batch, prompt_text=PROMPT, identity=IDENTITY), [])
 
+    def test_public_shell_selects_home_venv_override_and_fallback(self):
+        entry = Path(ax.__file__).resolve().parent / "extract"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            venv = home / ".local/share/kg-hub/venv/bin/python"
+            venv.parent.mkdir(parents=True)
+            venv.symlink_to(sys.executable)
+            env = dict(os.environ, HOME=str(home))
+            env.pop("KG_HUB_PYTHON", None)
+            def runtime():
+                return json.loads(subprocess.run([str(entry), "--runtime"], env=env,
+                    capture_output=True, text=True, check=True).stdout)
+            self.assertEqual(runtime()["python"], str(venv))
+            env["KG_HUB_PYTHON"] = sys.executable
+            self.assertEqual(runtime()["python"], sys.executable)
+            env.pop("KG_HUB_PYTHON")
+            venv.unlink(); venv.write_text("#!/bin/sh\nexit 1\n"); venv.chmod(0o755)
+            fallback = home / "bin/python3"
+            fallback.parent.mkdir(); fallback.symlink_to(sys.executable)
+            env["PATH"] = str(fallback.parent) + os.pathsep + os.environ.get("PATH", "")
+            self.assertEqual(runtime()["python"], str(fallback))
+
+    def test_session_only_workspace_works_from_artifact_without_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact, session, settings = root / "artifact", root / "session", root / "settings.json"
+            artifact.mkdir(); (artifact / "do-not-change").write_text("published")
+            settings.write_text(json.dumps({"CLAUDE_MEM_EXCLUDED_PROJECTS": "old-project", "keep": True}))
+            before = (artifact / "do-not-change").read_bytes()
+            runner = mock.Mock(side_effect=AssertionError("session-only must never execute Git/network"))
+            out = ec.cmd_workspace(path=session, settings=settings, repo=artifact, runner=runner, session_only=True)
+            self.assertTrue(out["excluded"])
+            self.assertIsNone(out["head"])
+            self.assertTrue(Path(out["backup"]).is_file())
+            self.assertEqual(json.loads(settings.read_text())["keep"], True)
+            with mock.patch.dict(os.environ, {"CLAUDE_MEM_SETTINGS_PATH": str(settings), "CLAUDE_MEM_INTERNAL": "", "CLAUDE_PROJECT_DIR": str(session)}):
+                self.assertTrue(ec.tracking_state(str(session))["excluded"])
+                with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(artifact)}):
+                    self.assertFalse(ec.tracking_state(str(session))["excluded"])
+            self.assertEqual((artifact / "do-not-change").read_bytes(), before)
+            runner.assert_not_called()
+
+    def test_dedicated_extract_token_file_requires_private_owned_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "extract-token"
+            path.write_text("synthetic-extract-token"); path.chmod(0o600)
+            env = {"KG_HUB_TOKEN_FILE": str(path)}
+            self.assertEqual(ax.api_token(env, ()), "synthetic-extract-token")
+            self.assertEqual(ax.api_token({**env, "KG_HUB_API_TOKEN": "explicit"}, ()), "explicit")
+            path.chmod(0o644)
+            with self.assertRaises(SystemExit):
+                ax.api_token(env, ())
+            path.unlink()
+            with self.assertRaises(SystemExit):
+                ax.api_token(env, ())
+
+    def test_unsafe_default_token_never_falls_back_to_legacy_secret(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"HOME": directory}):
+            home = Path(directory)
+            path = home / ".config/kg-hub/extraction-token"
+            path.parent.mkdir(parents=True)
+            legacy = home / "legacy.txt"
+            legacy.write_text("KG_HUB_TOKEN=synthetic-legacy-admin")
+            path.symlink_to(home / "missing-target")
+            with self.assertRaises(SystemExit):
+                ax.api_token({}, (str(legacy),))
+            path.unlink()
+            os.mkfifo(path, 0o600)
+            with self.assertRaises(SystemExit):
+                ax.api_token({}, (str(legacy),))
+
     def test_preflight_rejects_health_only_or_wrong_protocol(self):
         with mock.patch.dict(os.environ, {"CLAUDE_MEM_INTERNAL": "1"}):
             for response in ({"ok": True}, {"quality_versions": ["old"], "prompt_versions": ["agent-v5"]}):

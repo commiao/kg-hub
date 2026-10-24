@@ -35,6 +35,42 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(response.body)["code"], "quality_review_failed")
         g.assert_not_awaited()
 
+    async def test_extract_scope_allows_only_v5_reviewed_submission_and_no_repair(self):
+        from tests import test_extraction_quality as quality_tests
+        middleware = srv.BearerAuthMiddleware(None)
+        principal = {"name": "extractor@device", "scopes": ["extract"]}
+        async def invoke(payload):
+            with patch.object(srv, "API_TOKEN", "unit-admin"), \
+                    patch.object(srv.token_auth, "principal_for", return_value=principal):
+                return await middleware.dispatch(request(payload, path="/api/ingest_extracted", token="unit-extract"), srv.ingest_extracted)
+        graph = AsyncMock()
+        with patch.object(srv, "get_graphiti", graph), patch.object(srv, "drain_seconds_left", return_value=0):
+            response = await invoke({**GOOD, "prompt_version": "agent-v4"})
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(json.loads(response.body)["code"], "extract_protocol_required")
+            response = await invoke({**GOOD, "prompt_version": "agent-v5"})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(json.loads(response.body)["code"], "quality_review_failed")
+            graph.assert_not_awaited()
+        batch, results, review = quality_tests.fixture()
+        payload = quality_tests.payload(batch, results, review)
+        payload["dry_run"] = True
+        from utils.extracted_ingest import WriteResult
+        graph = AsyncMock()
+        with patch.object(srv, "get_graphiti", AsyncMock(return_value=graph)), \
+                patch.object(srv, "write_extraction", AsyncMock(return_value=WriteResult(episode_uuid=None, nodes_new=2, nodes_reused=0, edges_new=3, edges_reused=0, resolved={"worker": {"uuid": "worker", "reused": False, "matched_name": None}, "provider": {"uuid": "provider", "reused": False, "matched_name": None}}))), \
+                patch.object(srv, "drain_seconds_left", return_value=0):
+            response = await invoke(payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["status"], "dry_run")
+        for path, method in (("/api/extraction/repair", "POST"), ("/api/ingest", "POST")):
+            with patch.object(srv, "API_TOKEN", "unit-admin"), \
+                    patch.object(srv.token_auth, "principal_for", return_value=principal):
+                next_call = AsyncMock()
+                response = await middleware.dispatch(request({}, path=path, method=method, token="unit-extract"), next_call)
+                self.assertEqual(response.status_code, 403)
+                next_call.assert_not_awaited()
+
     async def test_capabilities_are_real_protocol_not_plain_health(self):
         response = await srv.extraction_capabilities(request(method="GET"))
         body = json.loads(response.body)

@@ -8,7 +8,7 @@
 > 它调用 `claude -p --safe-mode`（关掉 CLAUDE.md、skill、插件、钩子；`--bare` 只认 API key、订阅登录用不了）、不给工具、
 > 系统提示整体替换，和 qodercli / codex 同一套外壳，结果可以放进同一张表。claude 不报 credits，只记 token。
 
-所有新战役使用[公共稳定入口与质量门](_common.md)：`CLI="$KG_HUB_CODE/tools/extract_cli.py"`，先 `"$PY" "$CLI" campaign preflight`，
+所有新战役使用[公共稳定入口与质量门](_common.md)：`CLI="$KG_HUB_CODE/tools/extract"`，先 `"$CLI" campaign preflight`，
 逐批按 quality-sheet → 逐条证据审阅 → quality-check → dry-run → submit 执行。默认 agent-v5；旧冻结战役及旧准入不重标。
 质量表绑定真实 model / executor / run_id：战役从 manifest 自动取；单模型 quality-sheet、submit、dryrun-check 均传同一 `--model --executor --run-id`（后两项可用环境默认）。
 quality-check 不重复传身份；前项结果变化后整批重新预览，含后项 pending 实体上下文。
@@ -23,9 +23,9 @@ quality-check 不重复传身份；前项结果变化后整批重新预览，含
 
 - **模型由会话模型决定**：`--model` 填当前会话真实的模型 id（claude-fable-5-1 / claude-opus-5-5 / claude-haiku-5-5），
   不要填「claude」。换模型就是换 run_id，并且不能同时改规则。
-- **子代理或会话直接跑**：`"$PY" "$CLI" agent` 的公共命令都是本机命令；读 batch、写 results 由会话本身完成，
+- **子代理或会话直接跑**：`"$CLI" agent` 的公共命令都是本机命令；读 batch、写 results 由会话本身完成，
   中间不经任何模型网关。
-- **先读规则再抽**：开工时 `"$PY" "$CLI" agent prompt` 把规则重读一遍；每批抽完自检悬空边、自创边名。
+- **先读规则再抽**：开工时 `"$CLI" agent prompt` 把规则重读一遍；每批抽完自检悬空边、自创边名。
 - **自报成本**：Claude Code 的 token 用量看会话的用量统计（`/cost` 或 app 的用量面板），每批记一行，
   run 结束时汇总进 `run end --input-tokens --output-tokens`。
 - **已用名**：`submit` 会把本会话用过的实体名追加到状态目录的 `names-<模型>.tsv`，抽取前翻一眼，避免同物异名。
@@ -34,3 +34,5 @@ quality-check 不重复传身份；前项结果变化后整批重新预览，含
 
 `agent_extract status --group-by run_id` 里本 run 的 error 为 0、`reuse_mismatch_per_obs` ≤ 0.2；
 运行清单有 `ended_at` 与自报成本；每 500 条有一份 lessons 并经 `retro -- checkpoint` 登记。
+
+公共命令通过 `tools/extract` 执行：显式 `KG_HUB_PYTHON` 优先，否则当前 HOME 的合格 `~/.local/share/kg-hub/venv/bin/python` 优先于系统 `python3`。

@@ -51,7 +51,7 @@ class Driver:
     async def execute_query(self, query, **p):
         import re
         tag = (re.search(r"/\* (repair:[^ ]+) \*/", query) or [None, None])[1]
-        if tag and tag not in {"repair:snapshot-key", "repair:snapshot-episode", "repair:snapshot-edges", "repair:snapshot-entities", "repair:source-counts", "repair:audit-read"}:
+        if tag and tag not in {"repair:snapshot-key", "repair:snapshot-episode", "repair:snapshot-edges", "repair:snapshot-entities", "repair:source-counts", "repair:shared-readback", "repair:audit-read"}:
             self.mutations.append(tag)
         if self.fail_at is not None and self.fail_at == tag:
             self.fail_at = None
@@ -66,6 +66,12 @@ class Driver:
                        "source_name": self.nodes[e["source_uuid"]]["name"],
                        "target_name": self.nodes[e["target_uuid"]]["name"]}
                       for e in sorted(self.edges.values(), key=lambda x: x["uuid"]) if p["ep"] in e["episodes"]]
+        elif tag == "repair:shared-readback":
+            self.assert_guard(query, "e.uuid IN $ids")
+            self.assert_guard(query, "e.group_id=$group_id")
+            result = [{"props": {k: deepcopy(v) for k, v in e.items() if k not in {"source_uuid", "target_uuid"}},
+                       "source_uuid": e["source_uuid"], "target_uuid": e["target_uuid"]}
+                      for e in self.edges.values() if e["uuid"] in p["ids"]]
         elif tag == "repair:snapshot-entities":
             result = [{"props": deepcopy(self.nodes[n]), "labels": ["Entity", self.nodes[n]["type"]]} for n in sorted(self.mentions)]
         elif tag == "repair:audit-read":
@@ -213,6 +219,35 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(g.driver.mutations.index("repair:prepare"), g.driver.mutations.index("repair:edge"))
         self.assertLess(g.driver.mutations.index("repair:edge"), g.driver.mutations.index("repair:detach"))
         self.assertTrue(g.driver.episode["entity_edges"])
+
+    async def test_shared_readback_proves_other_sources_and_rejects_corruption(self):
+        for corruption in (None, "missing", "episodes", "fact", "source_uuid", "target_uuid"):
+            with self.subTest(corruption=corruption):
+                g = self.graph(shared=True)
+                req = await self.request(g)
+                query = g.driver.execute_query
+                async def readback(sql, **params):
+                    rows, meta, extra = await query(sql, **params)
+                    if "/* repair:shared-readback */" in sql and corruption:
+                        if corruption == "missing":
+                            rows = []
+                        elif corruption in ("source_uuid", "target_uuid"):
+                            rows[0][corruption] = "tampered-endpoint"
+                        else:
+                            rows[0]["props"][corruption] = [] if corruption == "episodes" else "tampered fact"
+                    return rows, meta, extra
+                g.driver.execute_query = readback
+                if corruption:
+                    with self.assertRaisesRegex(repair.RepairError, "shared fact"):
+                        await repair.apply(g, req, "kg_hub", quality_validator=lambda p: [])
+                    self.assertEqual(g.driver.audits["repair-one"]["state"], "pending")
+                else:
+                    result = await repair.apply(g, req, "kg_hub", quality_validator=lambda p: [])
+                    proof = result["shared_edge_verification"]
+                    self.assertEqual(proof["count"], 1)
+                    self.assertEqual(proof["edges"][0]["uuid"], "wrong")
+                    self.assertEqual(proof["edges"][0]["other_episodes_count"], 1)
+                    self.assertFalse(proof["truncated"])
 
     async def test_empty_upgrades_same_key_and_preserves_original_empty_provenance(self):
         g = self.graph(empty=True)
