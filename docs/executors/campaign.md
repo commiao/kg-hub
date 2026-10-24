@@ -82,6 +82,66 @@
 还没 dry-run 的条目这一项不查，`lint` 会在标准错误提示「dry-run 后再 lint 一次」；正式提交要求每条都 dry-run 过，
 所以提交前那次自检一定查得到。改了 summary 结果就变了，要重新 dry-run（与改名同一规矩）。
 
+## 并行批次的命名同步与 NAS 闸门
+
+2026-10-24 opus2000 战役两路并行时，同一事物在相邻批次起了不同名字，图里留下重复节点（人工发现约 12 组；
+回放已提交批次又找到 4 起人工没发现的）；而每次 dry-run、正式提交都让 NAS CPU 温度短时上升 5–16°C。
+要跑 4 路并行，这两件事都不能靠模型自觉，工具里做成了确定性的规则。
+
+### 命名同步：`campaign namesync`
+
+`tools/campaign_namesync.py` 从名字和观测正文算**锚点键**，同键不同名就统一（不判断「是不是同一个东西」）：
+
+| 键 | 怎么算 | 处理 |
+|---|---|---|
+| file | 仓库 + 仓库内相对路径（名字前缀 `仓库:`、括号里的仓库名、正文绝对路径；`recruitment-intel-service` 记为 `zhaopin`） | 自动改 |
+| id | 名字主体是纯标识符（含 `_ . -` 或驼峰，末尾 `()` 不算差异），括号里没指明别的仓库，类型类别相同 | 自动改（类型不同只报告 `id-type`） |
+| wt | 名字以「工作树 / worktree」结尾，按正文里的 `.claude/worktrees/<名>`、已知工作树目录名、其前缀或 hash 后缀对上 | 自动改 |
+| core / pr / head | 同主体不同括号限定；同仓库同 PR 号的不同 Fix 名；「标识符 + 短后缀」对上全名标识符 | 只报告，执行者判断 |
+
+规范名：图里已有同键节点时，取**挂得最多的干净节点名**（按各战役 `log.jsonl` 的服务端复用映射换算；不是绝对路径、不以任务号开头）；
+服务端本来就会自己合并的写法（不带前缀和括号的全路径与短名、只差 `()`）不改；图里没有时取本战役**更早的待提交批次**的写法
+（并行批次之间按批次号先到先得，还没合并的分片也算）；都没有就本批内部统一成首次出现的写法。
+参照物是本机状态目录下**全部战役**的已提交批次；不在任何战役里的旧图节点看不到，`--graph` 只对「标识符 + 短后缀」名问图（只读，至多 20 次）。
+
+```
+"$CLI" campaign namesync --id <战役> --batch <批次>                  # 只看报告
+"$CLI" campaign namesync --id <战役> --batch <批次> --apply --graph  # lint 通过后、质量表之前：自动统一 auto 类
+"$CLI" campaign namesync-replay --id <战役>                           # 回放各批会被抓到的同键异名与分裂（只读，统计用）
+```
+
+`--apply` 改写结果文件：实体名、边两端，以及第 3 条边起 fact 里整词出现的旧名（前两条照抄标题与译文不动）；改名后会成自环的边不改、列进 `skipped`。
+改过就要重新 lint、重做质量表与 dry-run（旧的都已失效，工具会按内容摘要拒绝）。
+
+**提交前的分裂判据**接在 `submit` 里（正式提交时自动查，不用另跑）：最近一次 dry-run 的 `new_entities` 里有这个名字（服务端会新建节点），
+而同键在图里已有别的名字的节点 → 提交后图里会多一个同物节点，拒绝。确属不同事物用 `--allow-split "原因"` 放行，原因与被放行的行记进批次的 `split_exceptions`。
+单模型 `agent_extract` 同一套：`"$CLI" agent namesync --batch <批次文件> --file <结果> [--apply]`，`submit` 同样拦分裂、同样经闸门。
+
+### NAS 重操作闸门
+
+`submit --dry-run` 与 `submit` 都先过 `tools/nas_gate.py`（命令内置，不用另外包）：
+
+1. **全机一把锁**：同一时刻只有一个重操作在 NAS 上跑，其余排队；
+2. **间隔**：距上一次重操作结束至少 60 秒（dry-run）/ 180 秒（submit）；
+3. **测温**：连读 3 次 NAS CPU 温度取均值，≤90°C 才放行，否则每 120 秒复测。
+
+配置在 `config/nas_gate.json`（SSH 目标、传感器路径、门槛、间隔、锁目录）；`KG_HUB_NAS_TEMP_SSH` / `KG_HUB_NAS_TEMP_SENSOR` / `KG_HUB_NAS_GATE_DIR`
+覆盖单项，`KG_HUB_NAS_GATE_CONFIG` 换整份。锁目录缺省 `~/.kg-hub/campaign-tools`，与仓库外原来的 `nas_gate.py` 是同一把锁、同一个状态文件，过渡期混用也互斥。
+`python -m tools.nas_gate --probe` 只读一次温度与上次重操作时间；`python -m tools.nas_gate --kind dryrun -- <命令>` 可以包别的重操作。
+排队、等间隔、等降温合计最多等 1 小时；4 路并行时一次提交可能要排十几分钟，命令放后台跑、给足超时，不要中途杀掉重来。
+每天约 02:00 家里路由器重启，那段时间读不到温度属正常，闸门会退出 75，过后重跑即可。
+
+### `submit` / `namesync` 的退出码
+
+| 退出码 | 含义 | 子代理怎么办 |
+|---|---|---|
+| 0 | 成功（namesync：没有要改的、按当前 dry-run 也不会分裂） | 继续下一步 |
+| 1 | 原有拒绝：lint 没过、没 dry-run 或预览后改过结果、缺质量表、批次已提交 / 已回收 | 按提示修 |
+| 2 | 命名：namesync 还有没改掉的 auto，或 submit 判出会分裂 | `namesync --apply`（自环等改不掉的手动改）→ lint → 质量表 → dry-run → 再提交 |
+| 3 | dry-run 标记太旧（旧版本预览没记 `new_entities`），判不了分裂 | 重新 `submit --dry-run` |
+| 75 | NAS 闸门：连续 5 轮读不到温度，没提交 | 停下汇报（02:00 前后属正常，过后重跑） |
+| 76 | NAS 闸门：排队、间隔、降温合计等了 1 小时还没放行，没提交 | 停下汇报，不要绕过闸门 |
+
 ## 领批：凑满一批再交
 
 `claim`（以及 `agent_extract next`）从游标往后逐段扫（每段 `max(还差条数×4, 40)` 条，最多 8 段，
@@ -154,6 +214,8 @@
    "$CLI" campaign quality-sheet --id <战役> --batch <批次> --out <质量表>
    质量表身份自动绑定manifest中的真实模型、执行工具和run_id；审阅完整原文与lookahead，填写真实证据后：
    "$CLI" campaign quality-check --id <战役> --batch <批次> --review <质量表>
+   质量表之前子代理已跑过 `namesync --apply --graph`；dry-run 与正式 submit 都经 NAS 闸门排队，正式 submit 另查命名分裂（退出码 2 退回子代理按报告改名重做）。
+   并行 4 路时错开约 5 分钟派出，让先落盘的分片名字被后面的批次查到。
    然后dry-run判读、正式submit；结果或身份改变须重审、整批重预览，前项变更也影响后项pending实体上下文。子代理并行跑；全部回来后：
    "$CLI" campaign report --id <战役>
    看每批：入库数、错误、预览误并候选、照抄标题%、译文边%、边名越界、悬空边、零边、credits/条、秒/条。
@@ -187,8 +249,9 @@
 ```
 
 子代理的流程：读 `rules` → `claim` 领一批 → 每 10 条一组读全文抽取（起草时就按一句一事实写短句）→ `lint` 自检 →
-`quality-sheet` 生成待审表 → 逐条提供原文证据并核对归属/完整句/译文/覆盖及判空 → `quality-check` →
-`submit --dry-run` 看复用候选 → 再 `lint` 一次（查新建实体 summary）→ `submit` 入库。
+`namesync --apply --graph` 命名同步（改过名再 lint）→ `quality-sheet` 生成待审表 → 逐条提供原文证据并核对归属/完整句/译文/覆盖及判空 → `quality-check` →
+`submit --dry-run` 看复用候选 → 再 `lint` 一次（查新建实体 summary）→ `submit` 入库（自动查命名分裂；两次提交都经 NAS 闸门，
+退出码见上文「`submit` / `namesync` 的退出码」）。
 被权限、hook 或分类器拦下时立即停下汇报，不换写法绕过。
 若修改结果或身份，重新生成并审阅质量表、重新核验和整批预览。汇报包括实际终态、未修问题与成本覆盖。红线同 [_common.md](_common.md)。
 

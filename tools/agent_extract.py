@@ -12,6 +12,10 @@
           追加到 log.jsonl；游标推进到本批最大 id。**正式提交前必须对同一批做过 --dry-run**（四条红线之 2，
           docs/EXTRACTION-EVAL-FRAMEWORK.md §2）：--dry-run 成功后在状态目录记 dryrun-<batch_id>.json，
           正式提交时逐 id 核对，没预览过的 id 拒绝提交；确需跳过用 --skip-dryrun-check 明确表态
+  namesync  命名同步（tools/campaign_namesync.py 的锚点键规则）：--batch --file [--apply]，和全部战役已提交批次比、
+          本批内部统一；--apply 改写 --file。退出码 0 干净 / 2 还有同键异名。正式提交前另按 dry-run 的 new_entities
+          查命名分裂（会新建的名字同键在图里已有节点）：拦下退出码 2，确属不同事物用 --allow-split "原因"；
+          dry-run 标记太旧判不了退出码 3。dry-run 与正式提交都先过 NAS 重操作闸门（tools/nas_gate.py，75/76 见那里）
   dryrun-check  只做上面那个核对（rc 0 = 全部预览过，1 = 有没预览的），给 codex / qoder 的钩子用--executor / --run-id 是来源标记的另外两个维度
           （执行工具、实验 run；docs/EXTRACTION-EVAL-FRAMEWORK.md §1），缺省从 KG_HUB_EXECUTOR /
           KG_HUB_RUN_ID 取，都没有就不打
@@ -567,6 +571,36 @@ def dryrun_missing(sd: Path, batch_id: str, results: dict, *, batch: dict | None
     return sorted({int(r["id"]) for r in items if r.get("entities")} - seen)
 
 
+# ---------- 命名同步（单模型）：和全部战役已提交批次比，加本批内部统一 ----------
+
+def namesync_report(batch: dict, results: dict, *, new_entities: dict[str, set[str]] | None = None,
+                    root: Path | None = None, layout=None) -> dict:
+    """单模型批次的命名同步报告（规则与战役同一份，见 tools/campaign_namesync.py）。
+    参照物是 root（缺省 状态目录/campaigns）下全部战役的已提交批次；本状态目录自己的旧批不留结果文件，不参与。"""
+    from tools import campaign_namesync as ns
+    layout = layout or ns.Layout.from_disk()
+    recs, _ = ns.campaign_records(root or state_dir() / "campaigns", None, layout)
+    bodies = {it.get("id"): ns.Body(it.get("episode_body", ""), layout) for it in batch.get("items", [])}
+    for body in bodies.values():
+        layout.known_wts.update(body.wts)
+    last = (2, "", "")   # 排在全部已提交、待提交批次之后
+    mine = ns.records_for("agent_extract", batch.get("batch_id") or "?", ns.items_of(results), bodies, last, layout)
+    earlier = ns.earlier_index(recs, last)
+    rep = {"batch": batch.get("batch_id"), **ns.analyse(mine, earlier, layout)}
+    rep["splits"] = ns.dryrun_splits(mine, earlier, new_entities) if new_entities is not None else []
+    return rep
+
+
+def dryrun_new_entities(sd: Path, batch_id: str, results: dict) -> dict[str, set[str]] | None:
+    """dry-run 标记里每条会新建的实体名；有实体的条目缺记录（旧版本预览）返回 None。"""
+    p = dryrun_marker_path(sd, batch_id)
+    known = (json.loads(p.read_text()).get("new_entities") or {}) if p.exists() else {}
+    items = results.get("items", [results] if "entities" in results else [])
+    if any(str(r["id"]) not in known for r in items if r.get("entities")):
+        return None
+    return {k: set(v) for k, v in known.items()}
+
+
 def quality_file(sd: Path, batch_id: str) -> Path:
     return sd / "reviews" / f"{batch_id}.json"
 
@@ -799,7 +833,7 @@ def _save_state(p: Path, st: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check", "mark-empty",
-                                    "quality-sheet", "quality-check", "preflight"])
+                                    "quality-sheet", "quality-check", "preflight", "namesync"])
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
                     "（gate / status / final / checkpoint --adjust k=v --applied ...）；run：start / end")
     ap.add_argument("--executor", default=os.environ.get("KG_HUB_EXECUTOR") or None,
@@ -818,6 +852,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="submit：只让服务端消解不写图，看每个实体会并到谁")
     ap.add_argument("--skip-dryrun-check", action="store_true",
                     help="submit：跳过「本批必须先 dry-run」的核对（默认拒绝没预览过的 id；跳过要写进 lessons）")
+    ap.add_argument("--apply", action="store_true", help="namesync：把同键异名改成规范名，写回 --file")
+    ap.add_argument("--allow-split", metavar="原因",
+                    help="submit：命名分裂判据拦下的名字确属不同事物时照样提交（原因写进 lessons）")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--after-id", type=int, help="next：覆盖游标起点")
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
@@ -943,6 +980,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(mark_empty_from_log(log_path, load_batch, url=a.url, token=token, executor=a.executor,
                                              run_id=a.run_id), ensure_ascii=False))
         return 0
+    if a.cmd == "namesync":
+        if not (a.batch and a.file):
+            raise SystemExit("namesync 需要 --batch --file")
+        from tools import campaign_namesync as ns
+        batch, results = json.loads(Path(a.batch).read_text()), json.loads(Path(a.file).read_text())
+        rep = namesync_report(batch, results)
+        if a.apply and rep["auto"]:
+            skipped = ns.apply_renames(results, rep["auto"])
+            tmp = Path(a.file).with_name(Path(a.file).name + ".namesync-tmp")
+            tmp.write_text(json.dumps(results, ensure_ascii=False, indent=1))
+            tmp.replace(Path(a.file))
+            after = namesync_report(batch, results)
+            rep.update(applied=rep["renames"], skipped=skipped, auto=after["auto"], renames=after["renames"],
+                       redo="结果已改：重做质量表与 dry-run（旧的都已失效）")
+        print(json.dumps(rep, ensure_ascii=False, indent=1))
+        return 2 if rep["auto"] else 0
     if a.cmd == "dryrun-check":
         if not (a.batch and a.file):
             raise SystemExit("dryrun-check 需要 --batch --file")
@@ -976,11 +1029,28 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             raise SystemExit(f"本批 {batch_id} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}{'…' if len(missing) > 10 else ''}）；"
                              f"先 submit --dry-run，确需跳过加 --skip-dryrun-check 并写进 lessons")
-    recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
-                          token=token, log_path=log_path, dry_run=a.dry_run,
-                          names_path=sd / f"names-{a.model}.tsv",
-                          executor=a.executor, run_id=a.run_id, prompt_version=version,
-                          quality_review=review, prompt_text=prompt)
+        new = dryrun_new_entities(sd, batch_id, results)
+        if new is None:
+            print(f"本批 {batch_id} 的 dry-run 标记没记 new_entities（旧版本预览），判不了命名分裂：重新 submit --dry-run",
+                  file=sys.stderr)
+            return 3
+        splits = namesync_report(batch, results, new_entities=new)["splits"]
+        if splits and not a.allow_split:
+            print(json.dumps({"batch": batch_id, "name_splits": splits}, ensure_ascii=False, indent=1), file=sys.stderr)
+            print(f"{len(splits)} 个名字提交后会在图里分裂成重复节点：namesync --apply 后重做质量表与 dry-run；"
+                  "确属不同事物用 --allow-split \"原因\"", file=sys.stderr)
+            return 2
+    from tools import nas_gate
+    try:
+        with nas_gate.hold("dryrun" if a.dry_run else "submit"):
+            recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
+                                  token=token, log_path=log_path, dry_run=a.dry_run,
+                                  names_path=sd / f"names-{a.model}.tsv",
+                                  executor=a.executor, run_id=a.run_id, prompt_version=version,
+                                  quality_review=review, prompt_text=prompt)
+    except nas_gate.GateRefused as e:
+        print(e.message, file=sys.stderr)
+        return e.code
     if a.dry_run:
         record_dryrun(sd, batch_id, recs)
     else:   # 入库（或别处已入库）的注销在途登记；没入库的留着，超时自动失效

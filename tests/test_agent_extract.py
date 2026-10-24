@@ -5,6 +5,7 @@ import os as _os
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 _os.environ.setdefault("KG_HUB_API_TOKEN", "unit-test-only-token")
+import contextlib
 import json
 import tempfile
 import unittest
@@ -13,6 +14,9 @@ from pathlib import Path
 
 from tools import agent_extract as ax
 from utils.ingest_filter import load_config
+
+# NAS 重操作闸门换成空的：测试不 ssh 测温、不碰本机真实的全机锁（tools/nas_gate.py）
+NO_GATE = unittest.mock.patch("tools.nas_gate.hold", lambda kind: contextlib.nullcontext({"kind": kind}))
 
 OBS = {"id": 29995, "project": "credvault", "type": "discovery", "title": "T-0167 closed",
        "subtitle": "premise falsified", "facts": json.dumps(["a", "b"]), "narrative": "n" * 200,
@@ -326,7 +330,7 @@ class ProvenanceAndRunTest(unittest.TestCase):
             r.write_text(json.dumps({"items": []}))
             env = {"KG_HUB_EXECUTOR": "qoder", "KG_HUB_RUN_ID": "run-env", "KG_HUB_AGENT_EXTRACT_DIR": d,
                    "KG_HUB_CLAIMS_DIR": d + "/claims"}
-            with unittest.mock.patch.dict(_os.environ, env), \
+            with unittest.mock.patch.dict(_os.environ, env), NO_GATE, \
                     unittest.mock.patch.object(ax, "submit_results", fake_submit):
                 ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
                 self.assertEqual((seen["executor"], seen["run_id"]), ("qoder", "run-env"))
@@ -432,7 +436,7 @@ class DryRunGateTest(unittest.TestCase):
             real = ax.submit_results
             # submit_results 的 post 参数在定义时就绑定了 _http，patch 模块属性不生效；包一层把假 post 塞进去，
             # 测试绝不能真的打到 NAS
-            with unittest.mock.patch.dict(_os.environ, env), \
+            with unittest.mock.patch.dict(_os.environ, env), NO_GATE, \
                     unittest.mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": fake_post})):
                 with self.assertRaises(SystemExit) as cm:              # 没 dry-run 过：拒绝，且一条都没发
                     ax.main(["submit", "--batch", str(b), "--file", str(r), "--model", "m"])
@@ -450,6 +454,74 @@ class DryRunGateTest(unittest.TestCase):
                 b2.write_text(json.dumps({"batch_id": "b0010", "items": [ax.to_identity(OBS)]}))
                 self.assertEqual(ax.main(["submit", "--batch", str(b2), "--file", str(r), "--model", "m",
                                           "--skip-dryrun-check"]), 0)
+
+
+class SingleModelNameSyncTest(unittest.TestCase):
+    """单模型也用战役的锚点键规则：和全部战役已提交批次比；正式提交前按 dry-run 的 new_entities 拦命名分裂；
+    dry-run 与正式提交都经 NAS 闸门（这里换成记录调用的替身）。"""
+    def setUp(self):
+        from tools import campaign_namesync as ns
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        sd = Path(self.tmp.name)
+        old = sd / "campaigns" / "old"
+        for sub in ("batches", "results"):
+            (old / sub).mkdir(parents=True)
+        (old / "campaign.json").write_text(json.dumps({"tool": "extract_campaign", "batches": [
+            {"id": "o-001", "status": "submitted", "submitted_at": "2026-10-24T00:00:00+00:00"}]}))
+        (old / "batches" / "o-001.json").write_text(json.dumps({"items": [{"id": 1, "episode_body": ""}]}))
+        (old / "results" / "o-001.json").write_text(json.dumps({"items": [{"id": 1, "entities": [
+            {"name": "zhaopin:deploy/check_source_drift.py", "type": "File"}]}]}))
+        self.b, self.r = sd / "b.json", sd / "r.json"
+        self.b.write_text(json.dumps({"batch_id": "b0001", "items": [ax.to_identity(OBS)]}))
+        self.r.write_text(json.dumps({"items": [{"id": 29995, "entities": [
+            {"name": "recruitment-intel-service:deploy/check_source_drift.py", "type": "File"}], "edges": []}]}))
+        self.gated, self.new = [], ["recruitment-intel-service:deploy/check_source_drift.py"]
+        lay = ns.Layout(workai=str(sd / "work-ai"), home=str(sd))
+        real = ax.submit_results
+
+        def post(method, url, body, token):
+            if body.get("dry_run"):
+                return 200, {"status": "dry_run", "resolved": {}, "new_entities": [{"name": n} for n in self.new]}
+            return 200, {"status": "ok", "episode_uuid": "u"}
+
+        def gate(kind):
+            self.gated.append(kind)
+            return contextlib.nullcontext()
+        for p in (unittest.mock.patch.object(ax, "PROMPT_VERSION", "agent-v4"),
+                  unittest.mock.patch.dict(_os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(sd),
+                                                         "KG_HUB_CLAIMS_DIR": str(sd / "claims")}),
+                  unittest.mock.patch.object(ns.Layout, "from_disk", classmethod(lambda cls, *a, **k: lay)),
+                  unittest.mock.patch("tools.nas_gate.hold", gate),
+                  unittest.mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": post})),
+                  unittest.mock.patch("sys.stdout"), unittest.mock.patch("sys.stderr")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def main(self, *args):
+        return ax.main([*args, "--batch", str(self.b), "--file", str(self.r)])
+
+    def test_split_refused_until_renamed_or_allowed(self):
+        self.assertEqual(self.main("namesync"), 2)
+        self.assertEqual(self.main("submit", "--model", "m", "--dry-run"), 0)
+        self.assertEqual(self.main("submit", "--model", "m"), 2)            # 会新建一个前缀不同的同物节点
+        self.assertEqual(self.gated, ["dryrun"])
+        self.assertEqual(self.main("submit", "--model", "m", "--allow-split", "核对过"), 0)
+        self.assertEqual(self.gated, ["dryrun", "submit"])
+
+    def test_apply_then_fresh_dry_run_passes(self):
+        self.assertEqual(self.main("namesync", "--apply"), 0)
+        name = json.loads(self.r.read_text())["items"][0]["entities"][0]["name"]
+        self.assertEqual(name, "zhaopin:deploy/check_source_drift.py")
+        self.new = []
+        self.assertEqual(self.main("submit", "--model", "m", "--dry-run"), 0)
+        self.assertEqual(self.main("submit", "--model", "m"), 0)
+
+    def test_old_marker_without_new_entities_needs_fresh_dry_run(self):
+        self.assertEqual(self.main("submit", "--model", "m", "--dry-run"), 0)
+        marker = ax.dryrun_marker_path(Path(self.tmp.name), "b0001")
+        marker.write_text(json.dumps({k: v for k, v in json.loads(marker.read_text()).items() if k != "new_entities"}))
+        self.assertEqual(self.main("submit", "--model", "m"), 3)
 
 
 if __name__ == "__main__":

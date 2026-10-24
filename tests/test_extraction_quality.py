@@ -1,6 +1,7 @@
 """Source-bound review and preview regressions; all networking is fake."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -235,7 +236,9 @@ class ClientGateTest(unittest.TestCase):
             args = ["--batch", str(b), "--file", str(r), "--prompt-file", str(prompt),
                     "--executor", "codex", "--run-id", "run-1"]
             env = {"KG_HUB_AGENT_EXTRACT_DIR": directory, "KG_HUB_CLAIMS_DIR": str(root / "claims")}
+            # 闸门换成空的：不 ssh 测温、不碰本机真实的全机锁
             with mock.patch.dict(os.environ, env), mock.patch.object(ax, "api_token", return_value="fake"), \
+                    mock.patch("tools.nas_gate.hold", lambda kind: contextlib.nullcontext()), \
                     mock.patch.object(ax, "submit_results", side_effect=lambda *a, **kw: real_submit(*a, **{**kw, "post": post})), \
                     mock.patch("sys.stdout"):
                 with self.assertRaises(SystemExit):
