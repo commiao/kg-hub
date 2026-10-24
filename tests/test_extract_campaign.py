@@ -52,7 +52,11 @@ class CampaignTest(unittest.TestCase):
                                                 "CLAUDE_MEM_INTERNAL": "1",
                                                 "CLAUDE_MEM_SETTINGS_PATH": os.path.join(self.tmp.name, "cm.json")})
         self.env.start()
-        self.patches = [mock.patch.object(ax, "select_batch", fake_select),
+        legacy_prompt = _Path(self.tmp.name) / "legacy-v4.md"
+        legacy_prompt.write_text(ax.PROMPT_PATH.read_text().replace("agent-v5", "agent-v4"))
+        self.patches = [mock.patch.object(ax, "PROMPT_VERSION", "agent-v4"),
+                        mock.patch.object(ax, "PROMPT_PATH", legacy_prompt),
+                        mock.patch.object(ax, "select_batch", fake_select),
                         mock.patch.object(ax, "load_config", lambda: {})]
         for p in self.patches:
             p.start()
@@ -192,8 +196,8 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("切到 deepseek-v4-pro", dsh)                            # dsh 没有模型参数，先在设置里切
         self.assertIn("cd /r && CLAUDE_MEM_INTERNAL=1 dsh --profile headless", dsh)
         for cmd in (codex, cur, q, dsh):                                      # 解释器不写死某台机器的路径
-            self.assertIn("${KG_HUB_PYTHON:-python3} -m tools.extract_campaign brief", cmd)
-            self.assertNotIn(".local/share", cmd)
+            self.assertIn('"${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract_cli.py" campaign brief', cmd)
+            self.assertNotIn("-m tools.extract_campaign", cmd)
         with self.assertRaises(SystemExit):
             ec.launch_command("vim", "t1", "m")
 
@@ -240,6 +244,71 @@ class CampaignTest(unittest.TestCase):
         posted.clear()
         ec.cmd_submit("t1", o2["batch"], dry_run=True, url="http://x", token=None, post=post)
         self.assertEqual(posted[0]["prompt_version"], ax.PROMPT_VERSION + "+c1")
+
+    def test_frozen_snapshot_failures_block_all_consumers_before_side_effects(self):
+        d = ec.campaign_dir("t1")
+        claimed = self.claim("DeepSeek-Flash")
+        bid = claimed["batch"]
+        items = json.loads(_Path(claimed["batch_file"]).read_text())["items"]
+        _Path(claimed["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}))
+        original = ec.load(d)
+        snapshot = (d / "prompt.md").read_bytes()
+        output = _Path(self.tmp.name) / "unapproved.json"
+        review = _Path(self.tmp.name) / "receipt.json"
+        review.write_text("{}")
+        for corruption in ("missing", "wrong_sha", "wrong_bytes", "wrong_header", "missing_sha", "no_header"):
+            for consumer in ("rules", "sheet", "check", "claim", "submit", "cli_claim", "mark_empty"):
+                with self.subTest(corruption=corruption, consumer=consumer):
+                    c = json.loads(json.dumps(original))
+                    (d / "prompt.md").write_bytes(snapshot)
+                    if corruption == "missing":
+                        (d / "prompt.md").unlink()
+                    elif corruption == "wrong_sha":
+                        c["prompt_sha256"] = "0" * 64
+                    elif corruption == "wrong_bytes":
+                        (d / "prompt.md").write_bytes(snapshot + b"\nchanged")
+                    elif corruption in ("wrong_header", "no_header"):
+                        text = snapshot.decode().replace("agent-v4", "agent-v5") if corruption == "wrong_header" else "No version header\nbody"
+                        (d / "prompt.md").write_text(text)
+                        c["prompt_sha256"] = ec.prompt_sha(text)
+                    else:
+                        c.pop("prompt_sha256")
+                    ec.save(d, c)
+                    before = (d / "campaign.json").read_bytes()
+                    with mock.patch.object(ec.claim_registry, "opened") as registry, \
+                         mock.patch.object(ax, "runtime_preflight") as preflight, \
+                         mock.patch.object(ax, "_http") as post:
+                        with self.assertRaisesRegex(SystemExit, "frozen_prompt_"):
+                            if consumer == "rules":
+                                ec.rules_text(d, c)
+                            elif consumer == "sheet":
+                                ec.cmd_quality_sheet("t1", bid, str(output))
+                            elif consumer == "check":
+                                ec.cmd_quality_check("t1", bid, str(review))
+                            elif consumer == "claim":
+                                self.claim("DeepSeek-Flash")
+                            elif consumer == "mark_empty":
+                                ec.cmd_mark_empty("t1", url="http://fake", token=None, post=post)
+                            elif consumer == "submit":
+                                ec.cmd_submit("t1", bid, dry_run=False, url="http://fake", token=None, post=post)
+                            else:
+                                ec.main(["claim", "--id", "t1", "--model", "DeepSeek-Flash"])
+                        registry.assert_not_called()
+                        preflight.assert_not_called()
+                        post.assert_not_called()
+                    self.assertEqual((d / "campaign.json").read_bytes(), before)
+                    self.assertFalse(output.exists())
+        (d / "prompt.md").write_bytes(snapshot)
+        ec.save(d, original)
+        self.assertEqual(ec.frozen_prompt_text(d, original), snapshot.decode())
+        self.assertEqual(original["prompt_version"], "agent-v4")
+        # Verified legacy rules remain v4 and keep their original admission.
+        posted = []
+        ec.cmd_submit("t1", bid, dry_run=True, url="http://fake", token=None,
+            post=lambda m, u, body, t: (posted.append(body), (200, {"status": "dry_run"}))[1])
+        self.assertTrue(posted)
+        self.assertTrue(all(body["prompt_version"] == "agent-v4" for body in posted))
+        self.assertEqual(ec.load(d)["admission"], original["admission"])
 
     def test_release_requeues_and_frees_quota(self):
         a = self.claim("DeepSeek-Flash")
@@ -487,7 +556,7 @@ class NoSelfObservationTest(unittest.TestCase):
         log = [{"id": 1, "status": "ok", "batch": "M-001", "model": "M", "run_id": "g2-M"},
                {"id": 2, "status": "empty", "batch": "M-001", "model": "M", "run_id": "g2-M", "executor": "codex"},
                {"id": 3, "status": "empty", "batch": "M-001", "model": "M", "run_id": "g2-M", "executor": "codex",
-                "empty_recorded": True},                                                  # 新版提交时已记过
+                "empty_recorded": True, "http": 200},                                     # 新版提交时已记过
                {"id": 9, "status": "empty", "batch": "M-404", "model": "M"}]              # 批次文件找不到
         (d / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in log))
         posted = []
@@ -548,6 +617,7 @@ class DeviceWideClaimsTest(unittest.TestCase):
         camp = set(self.ids_of(o))
         sd = _Path(self.tmp.name) / "next-state"
         with mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(sd)}), \
+                mock.patch.object(ax, "runtime_preflight", lambda *a, **k: {"ok": True}), \
                 mock.patch.object(ax, "fetch_remote_pending", fake_fetch), \
                 mock.patch.object(ax, "check_existing", lambda idents, url, token: {}), \
                 mock.patch.object(ax, "api_token", lambda *a, **k: "t"), \

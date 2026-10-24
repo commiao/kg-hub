@@ -190,6 +190,13 @@ class GatherBatchTest(unittest.TestCase):
 
 
 class SubmitTest(unittest.TestCase):
+    def setUp(self):
+        # These fixtures exercise the pre-v5 transport contract. New receipts have
+        # separate end-to-end tests, without weakening the production default.
+        patch = unittest.mock.patch.object(ax, "PROMPT_VERSION", "agent-v4")
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_dry_run_accumulates_entities_new_in_this_batch(self):
         """2026-10-22 补交 b0024：dry-run 逐条把前面条目会新建的实体带给服务端，同批内误并才看得见。"""
         batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS), ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}
@@ -270,6 +277,10 @@ class SubmitTest(unittest.TestCase):
 
 class ProvenanceAndRunTest(unittest.TestCase):
     """框架 §8-1/§8-2：executor / run_id 随 payload 入图并记进 log；运行清单 run start/end。"""
+    def setUp(self):
+        patch = unittest.mock.patch.object(ax, "PROMPT_VERSION", "agent-v4")
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_submit_carries_executor_and_run_id_and_status_groups_by_them(self):
         batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS)]}
@@ -337,7 +348,7 @@ class ProvenanceAndRunTest(unittest.TestCase):
             self.assertEqual(m["knobs"]["gateway.max_tokens"], 8192)
             self.assertEqual(m["knobs"]["batch_size"], 20)
             self.assertIsNone(m["ended_at"])
-            self.assertEqual(json.loads(p.read_text())["self_reported"], {"input_tokens": 0, "output_tokens": 0, "wall_s": 0})
+            self.assertEqual(json.loads(p.read_text())["self_reported"], {"input_tokens": None, "output_tokens": None, "wall_s": None})
             with self.assertRaises(FileExistsError):
                 ax.run_start("r1", executor="x", model="y", path=p, known_knobs=known)
             with self.assertRaises(ValueError):   # 没登记的旋钮：与 checkpoint 同一道闸
@@ -377,6 +388,10 @@ class ProvenanceAndRunTest(unittest.TestCase):
 
 class DryRunGateTest(unittest.TestCase):
     """四条红线之 2「每批先 dry-run」由工具自己执行：--dry-run 记标记，正式提交逐 id 核对，没预览过的拒绝。"""
+    def setUp(self):
+        patch = unittest.mock.patch.object(ax, "PROMPT_VERSION", "agent-v4")
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _files(self, d):
         b, r = Path(d) / "b.json", Path(d) / "r.json"

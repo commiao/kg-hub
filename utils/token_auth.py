@@ -38,7 +38,7 @@ from pathlib import Path
 ACCESS_CONTROL_PATH = Path(
     os.environ.get("KG_HUB_ACCESS_CONTROL", "/access-control/read-tokens.json"))
 
-# 只读设备能打的端点。**显式**列出，且只允许 GET。
+# 只读设备能打的端点。**显式**列出；仅 repair/preview 的 POST 也严格只读。
 # 这六个正是 mcp_server.py 用到的那六个（kg_search 走 search / search_semantic，
 # kg_node_neighbors、kg_path_between、kg_episode_search、kg_stats 各一个）。
 READ_SCOPE = "read"
@@ -51,6 +51,9 @@ SCOPE_ALLOWLIST: dict[str, frozenset[tuple[str, str]]] = {
         ("GET", "/api/path_between"),
         ("GET", "/api/episode_search"),
         ("GET", "/api/episode"),
+        ("GET", "/api/extraction/capabilities"),
+        ("POST", "/api/extraction/repair/preview"),  # no mutation; same episode-read scope
+        ("GET", "/api/extraction/repair"),
     }),
 }
 

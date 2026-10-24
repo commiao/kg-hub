@@ -1,26 +1,30 @@
 # 执行器任务说明：qoder
 
-> 粘给 qoder（桌面版或 IDEA 插件）会话的任务说明。四条红线与五步命令见 [_common.md](_common.md)，本文只写 qoder 的接入点。
+> 粘给 qoder（桌面版或 IDEA 插件）会话的任务说明。公共约束与执行循环见 [_common.md](_common.md)，本文只写 qoder 的接入点。
 
 > **多模型生产画像（入库、每批复盘；模型准入看 bench）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
 
+所有新战役使用[公共稳定入口与质量门](_common.md)：`CLI="$KG_HUB_CODE/tools/extract_cli.py"`，先 `"$PY" "$CLI" campaign preflight`，
+逐批按 quality-sheet → 逐条证据审阅 → quality-check → dry-run → submit 执行。默认 agent-v5；旧冻结战役及旧准入不重标。
+质量表绑定真实 model / executor / run_id：战役从 manifest 自动取；单模型 quality-sheet、submit、dryrun-check 均传同一 `--model --executor --run-id`（后两项可用环境默认）。
+quality-check 不重复传身份；前项结果变化后整批重新预览，含后项 pending 实体上下文。
+
 ## 任务
 
-你是 kg-hub 会话自抽取路径的执行器，`KG_HUB_EXECUTOR=qoder`。按 [_common.md](_common.md) 的五步命令跑，
-遵守四条红线：只用 `config/agent_extract_prompt.md` 的 schema、每批先 `--dry-run`、不碰断路器 / 不直连 FalkorDB /
+你是 kg-hub 会话自抽取路径的执行器，`KG_HUB_EXECUTOR=qoder`。按 [_common.md](_common.md) 的公共循环跑，
+遵守四条红线：只用 `config/agent_extract_prompt.md` 的 schema、每批先质量核验、再 `--dry-run`、不碰断路器 / 不直连 FalkorDB /
 不提交观测正文、每批记自报 token 与耗时。
 
 ## 接入点
 
-- **同一 CLI**：五步命令不变；qoder 在终端里跑 `python -m tools.agent_extract`，自己完成「读 batch → 写 results」。
+- **同一 CLI**：公共循环不变；qoder 在终端里跑 `"$PY" "$CLI" agent`，自己完成「读 batch → 写 results」。
 - **规则作为任务 system 内容**：把 `config/agent_extract_prompt.md` 全文放进任务说明开头。
 - **qoder 可切模型，是「同工具不同模型」对照的最佳位置**：同一样本（`--sample ab-sample-20261017`）、同一规则版本，
   只换 qoder 里选的模型，每个模型一个 run_id，`--model` 填真实模型 id。这样图口径的差异才能归因到模型。
 - **提交前必须 dry-run 由工具自己把关**：`agent_extract submit` 正式提交时会核对本批是否 dry-run 过，没预览过的 id
-  直接拒绝。要在 qoder 钩子里提前拦，调 `python -m tools.agent_extract dryrun-check --batch <b> --file <r>`（rc 1 = 有没预览的）；
+  直接拒绝。要在 qoder 钩子里提前拦，调 `"$PY" "$CLI" agent dryrun-check --batch <b> --file <r> --model <真实模型id> --executor qoder --run-id <run_id>`（rc 1 = 有没预览的）；
   `tools/qoder_cm_hook.sh` 是现成的 qoder 钩子包装（它负责把项目目录传对），可挂在同一入口上。钩子只检查不改 results。
-- **项目目录**：IDEA 插件的 `process.cwd()` 指向插件目录，命令要在仓库根目录下跑（`cd` 到 kg-hub 检出再执行），
-  否则 `tools/agent_extract` 找不到 `config/`。
+- **项目目录**：IDEA 插件的 `process.cwd()` 可能指向插件目录；显式使用已发布 CLI 的绝对路径，会话在采集排除目录运行，不能靠旧检出目录导入代码。
 - **自报成本**：qoder 的 token 看其用量面板；每批记一行，run 结束时汇总进 `run end`。
 
 ## 对比模式：换模型 / 换工具参与对比（不提交、不写图）
@@ -28,14 +32,14 @@
 想知道「qoder + 某个模型」比 opus / sonnet / haiku 5.5 好还是差，用冻结样本离线比，**不要**走上面的正式提交：
 那 200 条观测已经入过主图，再提交会被挡成 skipped；`next` 取到的新观测难度不同，跨样本不能比。
 
-1. 看样本：`python -m tools.extract_bench parts --bench ~/.kg-hub/bench/bench-20261022`
+1. 看样本：`"$PY" "$CLI" bench parts --bench ~/.kg-hub/bench/bench-20261022`
    （200 条，6 个批次文件；样本与基线含观测正文，只在本机，不进仓库）。
-2. qoder 里选好模型，任务说明开头放 `python -m tools.agent_extract prompt` 的全文（agent-v4），
+2. qoder 里选好模型，任务说明开头放 `"$PY" "$CLI" agent prompt` 的全文（新运行为 agent-v5），
    对每个批次文件读全文、按规则抽取，写 `results-<批次>.json` 到你自己的目录（如 `~/.kg-hub/bench/runs/qoder-<模型>/`）。
    每批 50 条较长，分 10 条一组写分片再合并；同时记下 qoder 用量面板里的 token 与耗时。
-3. 自检：`python -m tools.extract_bench lint --bench <样本目录> --results <你的目录>`，按提示修到「自检通过」
+3. 自检：`"$PY" "$CLI" bench lint --bench <样本目录> --results <你的目录>`，按提示修到「自检通过」
    （悬空边、schema 外类型/边名、缺 edges 键、第一条边没照抄标题、第二条边不是另一语言）。
-4. 评分：`python -m tools.extract_bench score --bench <样本目录> --results <你的目录> --label qoder-<模型>
+4. 评分：`"$PY" "$CLI" bench score --bench <样本目录> --results <你的目录> --label qoder-<模型>
    --model <真实模型 id> --executor qoder --tokens <总 token> --wall-s <总秒数> --json <输出>.json`。
    输出一张表：全样本一行、三模型基线合计一行，再按基线模型各自那部分逐对比较（同一批观测上的候选 vs 基线）。
    可检索率与报告同一口径（换说法问句 top-10），基线回放实测与报告逐格一致。
@@ -43,11 +47,11 @@
 **一条命令跑多个模型（qodercli 当模型通道）**：不想在 qoder 界面里一个个跑，用运行器并行派发：
 
 ```
-python -m tools.extract_bench run --bench ~/.kg-hub/bench/bench-20261022 \
+"$PY" "$CLI" bench run --bench ~/.kg-hub/bench/bench-20261022 \
     --models Qwen3.8-Max GLM-5.3 Kimi-K3 DeepSeek-Flash --tag smoke10 --limit 10 --parallel 4
 ```
 
-运行器把 agent-v4 规则（加一段 bench2 补充约定）与每批至多 10 条观测拼成一次 `qodercli -p -m <模型>` 调用（推理强度统一为 `--effort`，缺省 medium；任务按「组号 → 模型」交错排队），qoder 不开任何工具、
+运行器把当前发布的 agent-v5 规则（旧冻结运行仍保留原规则）（加一段 bench2 补充约定）与每批至多 10 条观测拼成一次 `qodercli -p -m <模型>` 调用（推理强度统一为 `--effort`，缺省 medium；任务按「组号 → 模型」交错排队），qoder 不开任何工具、
 不加载用户级设置（那里挂着 claude-mem 钩子），只回 JSON；运行器解析、漏掉的拆半重试，写 `~/.kg-hub/bench/runs/<tag>-qodercli-<模型>/`
 （results、run.json 记调用次数/credits/耗时、work/ 存原始回复），跑完自动自检并出合表。`--limit` 按基线模型轮流取样做冒烟，
 去掉就是全量 200 条；已有结果的目录不覆盖，换 `--tag`。之后也可以 `score --run <目录...>` 把多次运行合成一张表。

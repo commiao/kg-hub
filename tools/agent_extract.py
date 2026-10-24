@@ -50,9 +50,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.ingest_filter import evaluate, load_config  # noqa: E402
 from utils import obs_triage  # noqa: E402
 from tools import claim_registry  # noqa: E402
+from utils import extraction_quality as quality  # noqa: E402
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "config" / "agent_extract_prompt.md"
-PROMPT_VERSION = "agent-v4"   # v1→v2 第 1 轮（haiku）复盘；v2→v3 第 2 轮（opus）复盘；v3→v4 三模型 2000 条 chain-v8 定稿，见 config/agent_extract_prompt.md 末尾
+PROMPT_VERSION = "agent-v5"   # v5: source-bound pre-submit review, shared by all executors.
 DEFAULT_URL = "http://100.123.208.32:17171"
 DEFAULT_NAS = "commiao@100.123.208.32"
 DEFAULT_DB = "/volume2/4T/kg-hub-data/claude-mem/claude-mem.db"
@@ -325,14 +326,14 @@ def gather_batch(after: int, n: int, *, fetch, check, cfg: dict, held=frozenset(
 
 
 def build_payload(item: dict, result: dict, *, model: str, session: str | None,
-                  prompt_version: str = PROMPT_VERSION, dry_run: bool = False,
+                  prompt_version: str | None = None, dry_run: bool = False,
                   executor: str | None = None, run_id: str | None = None) -> dict:
     return {
         **({"dry_run": True} if dry_run else {}),
         "name": item["name"], "episode_body": item["episode_body"],
         "source_description": item["source_description"], "source_obs_id": item["source_obs_id"],
         "reference_time": item["reference_time"], "sync": True,
-        "extractor_model": model, "extractor_session": session, "prompt_version": prompt_version,
+        "extractor_model": model, "extractor_session": session, "prompt_version": prompt_version or PROMPT_VERSION,
         # 服务端把 None 当「未打标」，与旧 episode 一致；只在给了值时才有分组意义
         "extractor_tool": executor, "run_id": run_id,
         "entities": [{"name": e["name"], "type": e["type"], "summary": e.get("summary", "")}
@@ -346,11 +347,21 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    token: str | None, post=_http, log_path: Path | None = None,
                    dry_run: bool = False, names_path: Path | None = None,
                    executor: str | None = None, run_id: str | None = None,
-                   prompt_version: str = PROMPT_VERSION) -> list[dict]:
+                   prompt_version: str | None = None, quality_review: dict | None = None,
+                   prompt_text: str | None = None) -> list[dict]:
     """dry_run：只让服务端做消解不写图，返回每个实体会并到谁；不记 log。
     prompt_version：随 episode 入图的规则版本；对比战役传开局快照的版本（+ 补充约定版本），不随仓库变。
     names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。
     executor / run_id：随 payload 入图，也记进 log.jsonl，status / eval_report 按它们分组。"""
+    prompt_version = prompt_version or batch.get("prompt_version") or PROMPT_VERSION
+    prompt_text = PROMPT_PATH.read_text() if prompt_text is None else prompt_text
+    if quality.requires_quality(prompt_version):
+        problems = quality.validate_review(batch, results, quality_review, prompt_text)
+        expected_identity = quality.extraction_identity(model, executor, run_id)
+        if not quality.valid_identity(expected_identity) or (quality_review or {}).get("identity") != expected_identity:
+            problems.append("quality_identity_mismatch: use the reviewed model, executor and run_id")
+        if problems:
+            raise SystemExit("quality review failed:\n" + "\n".join(problems[:30]))
     by_id = {int(i["id"]): i for i in batch["items"]}
     out = []
     # dry-run 按提交顺序累积前面条目会新建的实体，让服务端把它们算进消解候选（同批内误并，2026-10-22 补交 b0024）
@@ -369,13 +380,22 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                 payload = build_payload(item, {"entities": [], "edges": []}, model=model, session=session,
                                         executor=executor, run_id=run_id, prompt_version=prompt_version)
                 payload["empty"] = True
+                if quality.requires_quality(prompt_version):
+                    payload.update(quality_review=quality_review, quality_context={
+                        "batch": batch, "results": results, "prompt_text": prompt_text,
+                        "prompt_version": prompt_version})
                 code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
                 st = d.get("status") or f"http_{code}"
-                rec.update(status="empty" if st == "empty_recorded" else st, http=code,
-                           empty_recorded=st == "empty_recorded", error=d.get("code") if code >= 400 else None)
+                confirmed = st == "empty_recorded" and code == 200
+                rec.update(status="empty" if confirmed else f"http_{code}" if code >= 400 else st, http=code,
+                           empty_recorded=confirmed, error=d.get("code") if code >= 400 else None)
         else:
             payload = build_payload(item, res, model=model, session=session, dry_run=dry_run,
                                     executor=executor, run_id=run_id, prompt_version=prompt_version)
+            if quality.requires_quality(prompt_version):
+                payload.update(quality_review=quality_review, quality_context={
+                    "batch": batch, "results": results, "prompt_text": prompt_text,
+                    "prompt_version": prompt_version})
             if dry_run and pending:
                 payload["dry_run_pending"] = list(pending)
             t0 = time.monotonic()
@@ -392,9 +412,11 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    "edges_new": d.get("edges_new"), "edges_reused": d.get("edges_reused"),
                    "reuse_mismatch": mismatch,
                    "stats": d.get("stats"), "error": d.get("code") if code >= 400 else None}
+            rec["payload_digest"] = extraction_payload_digest(item, res, prompt_version, prompt_text, batch=batch, results=results,
+                                                               identity=quality.extraction_identity(model, executor, run_id))
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
                     "project": item.get("project"), "type": item.get("type"),
-                    "executor": executor, "run_id": run_id})
+                    "executor": executor, "run_id": run_id, "prompt_version": prompt_version})
         out.append(rec)
         if dry_run:
             continue
@@ -415,31 +437,32 @@ def mark_empty_from_log(log_path: Path, load_batch, *, url: str, token: str | No
     所以重跑只会补还没补上的。"""
     if not log_path.exists():
         return {"candidates": 0, "recorded": 0, "by_status": {}}
-    recs = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
-    done = {int(r["id"]) for r in recs if r.get("empty_recorded")}
-    todo, seen = [], set()
-    for r in recs:
-        oid = int(r["id"])
-        if r.get("status") == "empty" and oid not in done and oid not in seen:
-            seen.add(oid)
-            todo.append(r)
+    recs = latest_records([json.loads(line) for line in log_path.read_text().splitlines() if line.strip()])
+    todo = [r for r in recs if r.get("status") == "empty" and not confirmed_empty(r)]
     batches: dict[str, dict] = {}
     counts: dict[str, int] = {}
     out = []
     for r in todo:
         bid = r.get("batch")
         if bid not in batches:
-            batches[bid] = {int(i["id"]): i for i in (load_batch(bid) or {}).get("items", [])}
-        item = batches[bid].get(int(r["id"]))
+            batches[bid] = load_batch(bid) or {}
+        source_batch = batches[bid]
+        version = r.get("prompt_version") or source_batch.get("prompt_version") or "agent-v4"
+        if quality.requires_quality(version):
+            counts["quality_review_required"] = counts.get("quality_review_required", 0) + 1
+            continue
+        item = next((i for i in source_batch.get("items", []) if int(i["id"]) == int(r["id"])), None)
         if item is None:
             counts["batch_missing"] = counts.get("batch_missing", 0) + 1
             continue
         payload = build_payload(item, {"entities": [], "edges": []}, model=r.get("model") or "unknown",
                                 session=None, executor=r.get("executor") or executor,
-                                run_id=r.get("run_id") or run_id)
+                                run_id=r.get("run_id") or run_id, prompt_version=version)
         payload["empty"] = True
         code, d = post("POST", f"{url}/api/ingest_extracted", payload, token)
         st = d.get("status") or f"http_{code}"
+        if code != 200 and st == "empty_recorded":
+            st = f"http_{code}"
         counts[st] = counts.get(st, 0) + 1
         out.append({**{k: r.get(k) for k in ("id", "batch", "model", "executor", "run_id", "project", "type")},
                     "status": "empty" if st == "empty_recorded" else st, "empty_recorded": st == "empty_recorded",
@@ -464,26 +487,114 @@ def dryrun_marker_path(sd: Path, batch_id: str) -> Path:
     return sd / f"dryrun-{batch_id}.json"
 
 
+def extraction_payload_digest(item: dict, result: dict, prompt_version: str, prompt_text: str, *,
+                              batch: dict, results: dict, identity: dict | None) -> str:
+    # Entity resolution depends on earlier items and lookahead. Any batch/result
+    # change invalidates every preview, including a later item's pending context.
+    return quality.digest({"source": item, "result": result, "prompt_version": prompt_version,
+                           "prompt_text": prompt_text, "batch": batch, "results": results,
+                           "identity": identity if quality.requires_quality(prompt_version) else None})
+
+
 def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = None) -> Path:
     """把这次 dry-run 预览过的 id（服务端真的回了 dry_run 的那些）追加进标记文件。
     同一批可以分几次 dry-run，取并集。"""
     p = dryrun_marker_path(sd, batch_id)
     seen: set[int] = set()
+    digests = {}
     if p.exists():
-        seen.update(int(x) for x in json.loads(p.read_text()).get("ids", []))
-    seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run")
+        old = json.loads(p.read_text())
+        seen.update(int(x) for x in old.get("ids", []))
+        digests.update(old.get("payload_digests", {}))
+    seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run" and r.get("http") in (None, 200))
+    for rec in recs:
+        if rec.get("status") == "dry_run" and rec.get("http") == 200 and rec.get("payload_digest"):
+            digests[str(rec["id"])] = rec["payload_digest"]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
+                             "payload_digests": digests,
                              "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
     return p
 
 
-def dryrun_missing(sd: Path, batch_id: str, results: dict) -> list[int]:
+def dryrun_missing(sd: Path, batch_id: str, results: dict, *, batch: dict | None = None,
+                   prompt_text: str | None = None, prompt_version: str | None = None,
+                   identity: dict | None = None) -> list[int]:
     """results 里带实体的 id 中，哪些还没在这一批的 dry-run 标记里。空 entities 的 id 不要求（它不会提交）。"""
     p = dryrun_marker_path(sd, batch_id)
-    seen = {int(x) for x in json.loads(p.read_text()).get("ids", [])} if p.exists() else set()
+    marker = json.loads(p.read_text()) if p.exists() else {}
+    seen = {int(x) for x in marker.get("ids", [])}
     items = results.get("items", [results] if "entities" in results else [])
+    if batch is not None:
+        version = prompt_version or batch.get("prompt_version") or PROMPT_VERSION
+        if quality.requires_quality(version) and not quality.valid_identity(identity):
+            return sorted(int(r["id"]) for r in items if r.get("entities"))
+        sources = {int(i["id"]): i for i in batch["items"]}
+        prompt = PROMPT_PATH.read_text() if prompt_text is None else prompt_text
+        expected = marker.get("payload_digests", {})
+        return sorted(int(r["id"]) for r in items if r.get("entities") and
+                      (int(r["id"]) not in sources or expected.get(str(r["id"])) !=
+                       extraction_payload_digest(sources[int(r["id"])], r, version, prompt,
+                                                 batch=batch, results=results, identity=identity)))
     return sorted({int(r["id"]) for r in items if r.get("entities")} - seen)
+
+
+def quality_file(sd: Path, batch_id: str) -> Path:
+    return sd / "reviews" / f"{batch_id}.json"
+
+
+def check_quality_file(batch: dict, results: dict, review_path: Path, prompt_text: str,
+                       destination: Path | None = None, expected_identity: dict | None = None) -> dict:
+    try:
+        review = json.loads(review_path.read_text())
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "errors": [f"quality_review_unreadable: {type(exc).__name__}"]}
+    problems = quality.validate_review(batch, results, review, prompt_text)
+    if expected_identity is not None and review.get("identity") != expected_identity:
+        problems.append("quality_identity_mismatch: campaign manifest changed")
+    if not problems and destination is not None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(review, ensure_ascii=False, indent=2))
+    return {"ok": not problems, "errors": problems}
+
+
+def runtime_preflight(url: str, token: str | None, get=None) -> dict:
+    """Read actual server capabilities, not just health=200; never claim readiness on unknowns."""
+    import importlib.util
+    from tools.extract_campaign import tracking_state
+    root = PROMPT_PATH.parent.parent
+    tracking = tracking_state()
+    dependencies = {name: importlib.util.find_spec(name) is not None for name in ("pydantic", "httpx")}
+    errors = []
+    if sys.version_info < (3, 10):
+        errors.append("python_requires_3_10")
+    if not all(dependencies.values()):
+        errors.append("missing_dependencies")
+    if tracking["tracked"]:
+        errors.append("extraction_session_is_recorded")
+    try:
+        revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
+                                  text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        revision = root.name if re_full_sha(root.name) else None
+    try:
+        code, capabilities = (get or _http)("GET", url.rstrip("/") + "/api/extraction/capabilities", None, token)
+    except (OSError, ValueError) as exc:
+        code, capabilities = 0, {"error": type(exc).__name__}
+    if (code != 200 or not isinstance(capabilities, dict)
+            or quality.QUALITY_VERSION not in capabilities.get("quality_versions", [])
+            or PROMPT_VERSION not in capabilities.get("prompt_versions", [])):
+        errors.append("server_quality_capability_unavailable: publish server before clients")
+    return {"ok": not errors, "errors": errors, "loaded_code_root": str(root), "revision": revision,
+            "python": sys.version.split()[0], "dependencies": dependencies,
+            "prompt_version": PROMPT_VERSION,
+            "prompt_sha256": __import__("hashlib").sha256(PROMPT_PATH.read_bytes()).hexdigest(),
+            "quality_version": quality.QUALITY_VERSION, "tracking": tracking, "server": capabilities}
+
+
+def re_full_sha(value: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[0-9a-f]{40}", value))
 
 
 SUMMARY_KEYS = ("model", "run_id", "executor")
@@ -491,12 +602,26 @@ SUMMARY_KEYS = ("model", "run_id", "executor")
 DONE_STATUSES = ("ok", "empty", "skipped")
 
 
+def confirmed_empty(rec: dict) -> bool:
+    return rec.get("status") == "empty" and rec.get("http") == 200 and rec.get("empty_recorded") is True
+
+
+def latest_records(records: list[dict]) -> list[dict]:
+    """Attempts are not observations; preserve independent models/runs/executors."""
+    last = {}
+    for index, rec in enumerate(records):
+        key = ((rec.get("batch"), rec.get("id"), rec.get("model"), rec.get("run_id"), rec.get("executor"))
+               if rec.get("id") is not None else ("unidentified", index))
+        last[key] = rec
+    return list(last.values())
+
+
 def summarize_log(records: list[dict], key: str = "model") -> dict:
     """按 key（model / run_id / executor）汇总提交口径。旧记录没有 run_id / executor 字段时归入 '?'。"""
     if key not in SUMMARY_KEYS:
         raise ValueError(f"key 只能是 {SUMMARY_KEYS}")
     by_model: dict[str, dict] = {}
-    for r in records:
+    for r in latest_records(records):
         m = by_model.setdefault(r.get(key) or "?", {"n": 0, "ok": 0, "empty": 0, "error": 0,
                                                    "latency": [], "offschema": [], "dirty": [],
                                                    "unknown_type": [], "entities": [], "edges": [],
@@ -514,7 +639,7 @@ def summarize_log(records: list[dict], key: str = "model") -> dict:
                 m["unknown_type"].append(s.get("unknown_type", 0) / s["entities_in"])
                 m["entities"].append(s.get("entities_out", 0))
                 m["edges"].append(s.get("edges_out", 0))
-        elif st == "empty":
+        elif st == "empty" and confirmed_empty(r):
             m["empty"] += 1
         elif st != "skipped":
             m["error"] += 1
@@ -571,7 +696,7 @@ def _parse_knobs(items: list[str]) -> dict:
 
 def run_start(run_id: str, *, executor: str, model: str, sample: str | None = None,
               server_commit: str | None = None, executor_version: str | None = None,
-              knobs: dict | None = None, prompt_version: str = PROMPT_VERSION,
+              knobs: dict | None = None, prompt_version: str | None = None,
               now: str | None = None, path: Path | None = None, known_knobs: set[str] | None = None) -> dict:
     """新建运行清单。旋钮名必须已在 digest_retro.KNOBS 登记（与 checkpoint 同一道闸：改了没登记的不算）。
     已存在同名 run 直接拒绝——一个 run_id 只对应一次实验。"""
@@ -590,10 +715,10 @@ def run_start(run_id: str, *, executor: str, model: str, sample: str | None = No
         raise FileExistsError(f"run 已存在：{p}（一个 run_id 只对应一次实验，改动请开新 run_id）")
     manifest = {
         "run_id": run_id, "executor": executor, "executor_version": executor_version,
-        "model": model, "prompt_version": prompt_version, "server_commit": server_commit,
+        "model": model, "prompt_version": prompt_version or PROMPT_VERSION, "server_commit": server_commit,
         "knobs": merged, "sample": sample,
         "started_at": now or datetime.now(tz=timezone.utc).isoformat(), "ended_at": None,
-        "self_reported": {"input_tokens": 0, "output_tokens": 0, "wall_s": 0},
+        "self_reported": {"input_tokens": None, "output_tokens": None, "wall_s": None},
     }
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -610,7 +735,7 @@ def run_end(run_id: str, *, input_tokens: int | None = None, output_tokens: int 
     manifest = json.loads(p.read_text())
     ended = now or datetime.now(tz=timezone.utc).isoformat()
     manifest["ended_at"] = ended
-    sr = manifest.setdefault("self_reported", {"input_tokens": 0, "output_tokens": 0, "wall_s": 0})
+    sr = manifest.setdefault("self_reported", {"input_tokens": None, "output_tokens": None, "wall_s": None})
     if input_tokens is not None:
         sr["input_tokens"] = int(input_tokens)
     if output_tokens is not None:
@@ -645,7 +770,8 @@ def _save_state(p: Path, st: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check", "mark-empty"])
+    ap.add_argument("cmd", choices=["next", "submit", "status", "prompt", "retro", "run", "dryrun-check", "mark-empty",
+                                    "quality-sheet", "quality-check", "preflight"])
     ap.add_argument("retro_args", nargs="*", help="retro：透传给 tools.digest_retro 的子命令与参数"
                     "（gate / status / final / checkpoint --adjust k=v --applied ...）；run：start / end")
     ap.add_argument("--executor", default=os.environ.get("KG_HUB_EXECUTOR") or None,
@@ -669,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="next：batch 文件路径（默认 状态目录/batch-<id>.json）")
     ap.add_argument("--batch", help="submit：next 写出的 batch 文件")
     ap.add_argument("--file", help="submit：会话写的抽取结果 JSON（{items:[{id, entities, edges}]}）")
+    ap.add_argument("--review", help="quality-check / submit: completed source-bound review JSON")
+    ap.add_argument("--prompt-file", help="frozen prompt text used for this batch, including chain rules")
     ap.add_argument("--model", help="submit：extractor_model，如 claude-fable-5-1")
     ap.add_argument("--session", help="submit：extractor_session（会话 id）")
     ap.add_argument("--url", default=os.environ.get("KG_HUB_URL", DEFAULT_URL))
@@ -681,6 +809,31 @@ def main(argv: list[str] | None = None) -> int:
     token = api_token()
     sd = state_dir()
     state_path, log_path = sd / "state.json", sd / "log.jsonl"
+
+    if a.cmd == "preflight":
+        out = runtime_preflight(a.url, token)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out["ok"] else 1
+    if a.cmd in ("quality-sheet", "quality-check"):
+        if not (a.batch and a.file):
+            raise SystemExit("quality-sheet/check require --batch and --file")
+        batch, results = json.loads(Path(a.batch).read_text()), json.loads(Path(a.file).read_text())
+        prompt = Path(a.prompt_file).read_text() if a.prompt_file else PROMPT_PATH.read_text()
+        if a.cmd == "quality-sheet":
+            if not a.out:
+                raise SystemExit("quality-sheet requires --out")
+            identity = quality.extraction_identity(a.model, a.executor, a.run_id)
+            if not quality.valid_identity(identity):
+                raise SystemExit("quality-sheet requires --model --executor --run-id (or their environment defaults)")
+            Path(a.out).write_text(json.dumps(quality.review_sheet(batch, results, prompt, identity), ensure_ascii=False, indent=2))
+            print(json.dumps({"review": a.out, "approved": False}))
+            return 0
+        if not a.review:
+            raise SystemExit("quality-check requires --review")
+        out = check_quality_file(batch, results, Path(a.review), prompt,
+                                 quality_file(sd, batch.get("batch_id") or "?"))
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out["ok"] else 1
 
     if a.cmd == "retro":
         lessons = Path(a.lessons_file).read_text() if a.lessons_file else None
@@ -714,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     if a.cmd == "next":
+        flight = runtime_preflight(a.url, token)
+        if not flight["ok"]:
+            raise SystemExit(json.dumps(flight, ensure_ascii=False))
         cfg = load_config()
         with claim_registry.opened() as reg:
             # 游标、批次号必须在登记锁里读：这把全设备锁让并发的 next 排队，后一个拿到前一个推进后的值。
@@ -764,7 +920,9 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("dryrun-check 需要 --batch --file")
         batch = json.loads(Path(a.batch).read_text())
         results = json.loads(Path(a.file).read_text())
-        missing = dryrun_missing(sd, batch.get("batch_id") or "?", results)
+        prompt = Path(a.prompt_file).read_text() if a.prompt_file else PROMPT_PATH.read_text()
+        missing = dryrun_missing(sd, batch.get("batch_id") or "?", results, batch=batch, prompt_text=prompt,
+                                 identity=quality.extraction_identity(a.model, a.executor, a.run_id))
         print(json.dumps({"batch": batch.get("batch_id"), "missing": missing, "ok": not missing}))
         return 1 if missing else 0
     # submit
@@ -773,15 +931,28 @@ def main(argv: list[str] | None = None) -> int:
     batch = json.loads(Path(a.batch).read_text())
     results = json.loads(Path(a.file).read_text())
     batch_id = batch.get("batch_id") or "?"
+    prompt = Path(a.prompt_file).read_text() if a.prompt_file else PROMPT_PATH.read_text()
+    version = batch.get("prompt_version") or PROMPT_VERSION
+    review = None
+    if quality.requires_quality(version):
+        path = Path(a.review) if a.review else quality_file(sd, batch_id)
+        try:
+            review = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise SystemExit("quality review required: run quality-sheet then quality-check")
+        if a.skip_dryrun_check:
+            raise SystemExit("v5 requires payload-bound dry-run; skipping is not supported")
     if not a.dry_run and not a.skip_dryrun_check:
-        missing = dryrun_missing(sd, batch_id, results)
+        missing = dryrun_missing(sd, batch_id, results, batch=batch, prompt_text=prompt, prompt_version=version,
+                                 identity=quality.extraction_identity(a.model, a.executor, a.run_id))
         if missing:
             raise SystemExit(f"本批 {batch_id} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}{'…' if len(missing) > 10 else ''}）；"
                              f"先 submit --dry-run，确需跳过加 --skip-dryrun-check 并写进 lessons")
     recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
                           token=token, log_path=log_path, dry_run=a.dry_run,
                           names_path=sd / f"names-{a.model}.tsv",
-                          executor=a.executor, run_id=a.run_id)
+                          executor=a.executor, run_id=a.run_id, prompt_version=version,
+                          quality_review=review, prompt_text=prompt)
     if a.dry_run:
         record_dryrun(sd, batch_id, recs)
     else:   # 入库（或别处已入库）的注销在途登记；没入库的留着，超时自动失效

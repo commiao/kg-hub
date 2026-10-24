@@ -103,6 +103,8 @@ from utils.extracted_ingest import (  # noqa: E402
     ExtractedEntity, ExtractedEdge, EXTRACTOR_MODEL_PATTERN, normalize_extraction,
     write_extraction, check_keys, check_names,
 )
+from utils.extraction_quality import validate_payload_quality  # noqa: E402
+from utils import extraction_repair  # noqa: E402
 from utils.gateway_post_normalize import post_ingest_normalize  # noqa: E402
 from utils.single_pass_extract import (  # noqa: E402
     EXTRACTION_MODE as SINGLE_PASS_EXTRACTION_MODE, INGEST_MODE_SINGLE_PASS,
@@ -1907,6 +1909,8 @@ class ExtractedIngestBody(IngestBody):
     # 否则这类观测在服务端没有任何记录，refinery 对账认不出、一直挂在「剩余」里，断路器恢复后还会被网关再抽一遍
     # （2026-10-24：codex 战役 300 条里 7 条空观测因此留在队列）。
     empty: bool = False
+    quality_review: dict | None = None
+    quality_context: dict | None = None
     # 仅 dry_run：同一批前面条目会新建的实体 [{name, type}]，由执行器按 dry-run 返回的 new_entities 累积。
     # 正式提交时它们已在图里、参与消解；不带上就看不见同批内的误并（2026-10-22 补交 b0024）。
     dry_run_pending: list[PendingEntity] = Field(default_factory=list, max_length=5000)
@@ -2009,6 +2013,10 @@ async def ingest_extracted(request: Request) -> JSONResponse:
         ref_time = datetime.fromisoformat(body.reference_time.replace("Z", "+00:00"))
     except Exception:  # noqa: BLE001
         return JSONResponse({"status": "error", "code": "bad_reference_time"}, status_code=400)
+    quality_errors = validate_payload_quality(raw)
+    if quality_errors:
+        return JSONResponse({"status": "error", "code": "quality_review_failed",
+                             "errors": quality_errors}, status_code=400)
     if body.empty:
         return await _record_empty(body)
     try:
@@ -2131,11 +2139,87 @@ async def _record_empty(body: ExtractedIngestBody) -> JSONResponse:
         await update_ingested_key_status(g, sd, sid, "empty")
         await g.driver.execute_query(
             "MATCH (k:IngestedKey {source_description: $sd, source_obs_id: $sid}) "
-            "SET k.empty_by_model = $model, k.empty_by_tool = $tool, k.empty_run_id = $run_id",
-            sd=sd, sid=sid, model=body.extractor_model, tool=body.extractor_tool, run_id=body.run_id)
+            "SET k.empty_by_model = $model, k.empty_by_tool = $tool, k.empty_run_id = $run_id, "
+            "k.empty_source_sha256 = $source_sha",
+            sd=sd, sid=sid, model=body.extractor_model, tool=body.extractor_tool, run_id=body.run_id,
+            source_sha=extraction_repair.source_digest(body.model_dump()))
         logger.info("[ingest_extracted:empty] sd=%s sid=%s model=%s", sd, sid, body.extractor_model)
     return JSONResponse({"status": "empty_recorded", "duplicate": st == "empty",
                          "extractor_model": body.extractor_model, "source_description": sd, "source_obs_id": sid})
+
+
+async def extraction_capabilities(request: Request) -> JSONResponse:
+    """Authenticated, model-free protocol probe used before campaign claims."""
+    import hashlib
+    from utils import extraction_quality
+    revision = hashlib.sha256(Path(__file__).read_bytes()
+        + Path(extraction_quality.__file__).read_bytes()
+        + Path(extraction_repair.__file__).read_bytes()).hexdigest()
+    return JSONResponse({"quality_versions": [extraction_quality.QUALITY_VERSION],
+        "prompt_versions": ["agent-v5"], "repair": True, "revision": revision,
+        "repair_paths": {"preview": "/api/extraction/repair/preview",
+                         "apply": "/api/extraction/repair", "status": "/api/extraction/repair"}})
+
+
+async def extraction_repair_preview(request: Request) -> JSONResponse:
+    """Read-only source/edge snapshot and optional reviewed repair preview."""
+    try:
+        raw = await request.json()
+        g = await get_graphiti()
+        result = await extraction_repair.preview(g, raw, GROUP_ID,
+                                                quality_validator=validate_payload_quality)
+        return JSONResponse(result)
+    except extraction_repair.RepairError as exc:
+        return JSONResponse({"status": "error", "code": exc.code, "message": str(exc)}, status_code=exc.status)
+    except (ValueError, TypeError):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    except Exception:
+        logger.exception("[extraction_repair:preview_failed]")
+        return JSONResponse({"status": "error", "code": "repair_preview_failed"}, status_code=503)
+
+
+async def extraction_repair_status(request: Request) -> JSONResponse:
+    rid = request.query_params.get("repair_id", "")
+    if not extraction_repair._ID.fullmatch(rid):
+        return JSONResponse({"status": "error", "code": "bad_repair_id"}, status_code=400)
+    try:
+        result = await extraction_repair.audit(get_status_driver(), rid)
+        if result is None:
+            return JSONResponse({"status": "error", "code": "repair_not_found"}, status_code=404)
+        return JSONResponse({"status": "ok", "repair": result})
+    except Exception:
+        logger.exception("[extraction_repair:status_failed]")
+        return JSONResponse({"status": "error", "code": "repair_status_failed"}, status_code=503)
+
+
+async def extraction_repair_apply(request: Request) -> JSONResponse:
+    """Admin-authenticated, locked and replayable episode-scoped correction."""
+    if drain_seconds_left() > 0:
+        return JSONResponse({"status": "error", "code": "draining"}, status_code=503)
+    try:
+        raw = await request.json()
+        parsed = extraction_repair.parse_request(raw)
+    except (ValueError, TypeError) as exc:
+        code = exc.code if isinstance(exc, extraction_repair.RepairError) else "bad_request"
+        return JSONResponse({"status": "error", "code": code, "message": str(exc)}, status_code=400)
+    _extraction_started()
+    try:
+        g = await get_graphiti()
+        async with _ingest_execution_lock(owner="extraction-repair", timeout_seconds=INGEST_LOCK_TIMEOUT_SEC):
+            result = await extraction_repair.apply(g, parsed, GROUP_ID,
+                                                  quality_validator=validate_payload_quality)
+        return JSONResponse(result)
+    except extraction_repair.RepairError as exc:
+        return JSONResponse({"status": "error", "code": exc.code, "message": str(exc)}, status_code=exc.status)
+    except WriterLockBusy:
+        return JSONResponse({"status": "error", "code": "writer_lock_busy"}, status_code=503)
+    except Exception:
+        logger.exception("[extraction_repair:apply_failed] id=%s", parsed["repair_id"])
+        return JSONResponse({"status": "error", "code": "repair_apply_failed",
+                             "repair_id": parsed["repair_id"],
+                             "message": "retry the exact request with the same repair_id"}, status_code=503)
+    finally:
+        _extraction_finished()
 
 
 async def ingest_extracted_check(request: Request) -> JSONResponse:
@@ -6414,6 +6498,10 @@ app = Starlette(
         Route("/health", health, methods=["GET"]),
         Route("/api/model-readiness", model_readiness, methods=["GET"]),
         Route("/api/ingest", ingest, methods=["POST"]),
+        Route("/api/extraction/capabilities", extraction_capabilities, methods=["GET"]),
+        Route("/api/extraction/repair/preview", extraction_repair_preview, methods=["POST"]),
+        Route("/api/extraction/repair", extraction_repair_status, methods=["GET"]),
+        Route("/api/extraction/repair", extraction_repair_apply, methods=["POST"]),
         Route("/api/ingest_extracted", ingest_extracted, methods=["POST"]),
         Route("/api/ingest_extracted/check", ingest_extracted_check, methods=["POST"]),
         Route("/api/ingest/check_names", ingest_check_names, methods=["POST"]),
