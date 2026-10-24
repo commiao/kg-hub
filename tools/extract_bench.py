@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils import bench_reference as reference
+from utils import cli_runtime as runtime
 
 TOOL = "extract_bench"
 DEFAULT_ROOT = Path.home() / ".kg-hub" / "bench"
@@ -520,28 +521,35 @@ def parse_items(text: str, want: list[int]) -> dict[int, dict]:
 
 
 def qodercli_call(model: str, system: str, query: str, *, cwd: Path, effort: str | None = DEFAULT_EFFORT,
-                  timeout: int = 900) -> dict:
+                  timeout: int = 900, env: dict | None = None, proxy_mode: str = "auto") -> dict:
     """qodercli 非交互单轮调用。--setting-sources local：不加载用户级设置——那里挂着 claude-mem 钩子，
     会把评测请求记成观测、在会话开始注入无关上下文；--tools ""：不给工具，只当模型用。"""
     import subprocess
     cmd = ["qodercli", "-p", "-m", model, "-o", "json", "--no-session-persistence", "--setting-sources", "local",
            "--tools", "", *(["--reasoning-effort", effort] if effort else []), "--system-prompt", system, "--", query]
     try:
-        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+                           env=env if env is not None else runtime.cli_environment(proxy_mode=proxy_mode)[0])
     except subprocess.TimeoutExpired:
-        return {"text": "", "error": "timeout", "stop": None, "credits": 0.0, "ms": timeout * 1000}
+        return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0,
+                "tokens_known": False, "ms": timeout * 1000}
+    except OSError as exc:
+        return {"text": "", "error": type(exc).__name__, "error_kind": "configuration", "stop": None,
+                "credits": None, "tokens": 0, "tokens_known": False, "ms": 0}
     try:
         d = json.loads(r.stdout)
     except ValueError:
         return {"text": r.stdout[-2000:], "error": f"rc={r.returncode} 非 JSON 输出：{r.stderr[-300:]}",
-                "stop": None, "credits": 0.0, "ms": 0}
-    return {"text": d.get("result") or "", "error": d.get("is_error") and (d.get("result") or "is_error"),
-            "stop": d.get("stop_reason"), "credits": float(d.get("total_credits") or 0),
+                "stop": None, "credits": None, "tokens": 0, "tokens_known": False, "ms": 0}
+    return {"text": d.get("result") or "", "error": runtime.cli_error(d, r.returncode),
+            "status_code": runtime.error_status(d) if runtime.cli_error(d, r.returncode) else None,
+            "stop": d.get("stop_reason"), "credits": float(d["total_credits"]) if d.get("total_credits") is not None else None,
+            "tokens": None, "tokens_known": False,
             "ms": int(d.get("duration_ms") or 0)}
 
 
 def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | None = DEFAULT_EFFORT,
-               timeout: int = 900) -> dict:
+               timeout: int = 900, env: dict | None = None, proxy_mode: str = "auto") -> dict:
     """codex exec 非交互单轮调用（2026-10-23 codex 会话自写脚本的做法收进来）：不加载用户配置、不留会话、
     只读沙箱、关 shell 工具与钩子、不读项目文档；系统提示经 developer_instructions 传入（codex 没有整体替换
     系统提示的入口），观测走标准输入；回复写到 -o 文件，用量从 --json 事件流的 turn.completed 取。
@@ -557,10 +565,16 @@ def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | 
            "-c", "developer_instructions=" + json.dumps(system, ensure_ascii=False), "--json", "-o", out, "-"]
     t0 = time.monotonic()
     try:
-        r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+                           env=env if env is not None else runtime.cli_environment(proxy_mode=proxy_mode)[0])
     except subprocess.TimeoutExpired:
+        Path(out).unlink(missing_ok=True)
         return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0,
                 "tokens_known": False, "ms": timeout * 1000}
+    except OSError as exc:
+        Path(out).unlink(missing_ok=True)
+        return {"text": "", "error": type(exc).__name__, "error_kind": "configuration", "stop": None,
+                "credits": None, "tokens": 0, "tokens_known": False, "ms": 0}
     ms = int((time.monotonic() - t0) * 1000)
     usage, errors = {}, []
     for line in (r.stdout or "").splitlines():
@@ -577,13 +591,14 @@ def codex_call(model: str, system: str, query: str, *, cwd: Path, effort: str | 
     failed = r.returncode != 0 or (not text and errors)
     return {"text": text, "error": (f"rc={r.returncode} {json.dumps(errors[-1:], ensure_ascii=False)[:300]}"
                                     if failed else None),
+            "status_code": runtime.error_status(errors) if failed else None,
             "stop": None, "credits": None, "ms": ms,
             "tokens_known": bool(usage),
             "tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)}
 
 
 def claude_call(model: str, system: str, query: str, *, cwd: Path, effort: str | None = DEFAULT_EFFORT,
-                timeout: int = 900) -> dict:
+                timeout: int = 900, env: dict | None = None, proxy_mode: str = "auto") -> dict:
     """claude -p（Claude Code 命令行）非交互单轮调用，与 qodercli / codex 同一套外壳：
     --safe-mode 关掉 CLAUDE.md、skill、插件、钩子、MCP 等一切自定义（--bare 只认 API key、不读订阅登录，用不了；
     2026-10-23 实测 safe-mode 下整次调用上下文只有系统提示本身，全局 CLAUDE.md 的「小结」不会混进回复）；
@@ -593,10 +608,14 @@ def claude_call(model: str, system: str, query: str, *, cwd: Path, effort: str |
     cmd = ["claude", "-p", "--safe-mode", "--model", model, *(["--effort", effort] if effort else []),
            "--tools", "", "--no-session-persistence", "--output-format", "json", "--system-prompt", system]
     try:
-        r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, input=query, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+                           env=env if env is not None else runtime.cli_environment(proxy_mode=proxy_mode)[0])
     except subprocess.TimeoutExpired:
         return {"text": "", "error": "timeout", "stop": None, "credits": None, "tokens": 0,
                 "tokens_known": False, "ms": timeout * 1000}
+    except OSError as exc:
+        return {"text": "", "error": type(exc).__name__, "error_kind": "configuration", "stop": None,
+                "credits": None, "tokens": 0, "tokens_known": False, "ms": 0}
     try:
         d = json.loads(r.stdout)
     except ValueError:
@@ -606,47 +625,89 @@ def claude_call(model: str, system: str, query: str, *, cwd: Path, effort: str |
     tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
                                                 "cache_read_input_tokens", "output_tokens"))
     used = list((d.get("modelUsage") or {}).keys())
-    err = d.get("is_error") and (d.get("result") or "is_error")
-    identity_error = not err and set(used) != {model}
+    err = runtime.cli_error(d, r.returncode)
+    identity_error = (not err or bool(used)) and set(used) != {model}
     if identity_error:
         err = f"实际模型 {used} 不是 {model}"
     return {"text": d.get("result") or "", "error": err, "stop": d.get("stop_reason"), "credits": None,
-            "actual_models": used, "retryable": not identity_error, "tokens_known": bool(u),
+            "status_code": runtime.error_status(d) if err else None,
+            "actual_models": used, "retryable": not identity_error,
+            "error_kind": "identity" if identity_error else None, "tokens_known": bool(u),
             "tokens": tokens, "ms": int(d.get("duration_ms") or 0)}
 
 
 ADAPTERS = {"qodercli": qodercli_call, "codex": codex_call, "claude": claude_call}
 
 
-def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0) -> tuple[dict, dict]:
-    """一组观测调一次；漏掉或解析失败的再拆半重试（最多两层），仍拿不到的记 failed。"""
+def run_chunk(call, items: list[dict], lookahead: list, log, depth: int = 0, *,
+              stop_event=None, service_retries: int = 2, sleep=None) -> tuple[dict, dict]:
+    """Only output parsing/missing items split; access errors stop the run.
+
+    Temporary service failures retry the *same* query with bounded backoff.
+    Already started calls may finish after cancellation; no new calls are sent.
+    """
+    import time
     want = [i["id"] for i in items]
     query = build_query(items, lookahead)
-    res = {**call(query), "query_sha256": hashlib.sha256(query.encode()).hexdigest()}
-    got, err = {}, res["error"]
-    if not err:
-        try:
-            got = parse_items(res["text"], want)
-        except ValueError as exc:
-            err = str(exc)
-    log(want, res, err)
-    st = {"calls": 1, "credits": res["credits"] or 0.0, "credits_known": res["credits"] is not None,
-          "tokens": res.get("tokens") or 0, "tokens_known": res.get("tokens_known", res.get("tokens") is not None),
-          "actual_models": res.get("actual_models") or [], "ms": res["ms"], "failed": []}
+    st = {"calls": 0, "credits": 0.0, "credits_known": True, "tokens": 0, "tokens_known": True,
+          "actual_models": [], "ms": 0, "failed": [], "infrastructure_failure": None}
+
+    def add(other):
+        for key in ("calls", "credits", "tokens", "ms"):
+            st[key] += other[key]
+        for key in ("credits_known", "tokens_known"):
+            st[key] = st[key] and other[key]
+        st["actual_models"] = sorted(set(st["actual_models"]) | set(other.get("actual_models") or []))
+        st["infrastructure_failure"] = st["infrastructure_failure"] or other.get("infrastructure_failure")
+
+    got = {}
+    for retry in range(service_retries + 1):
+        if stop_event is not None and stop_event.is_set():
+            st["failed"] = want
+            st["canceled"] = True
+            return got, st
+        res = {**runtime.invoke(call, query), "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+               "native_evidence_version": runtime.NATIVE_EVIDENCE_VERSION}
+        err = res.get("error")
+        failure = runtime.classify_failure(res)
+        outcome = "service_error" if err else "generated"
+        if not err:
+            try:
+                got = parse_items(res.get("text") or "", want)
+            except ValueError as exc:
+                err, outcome = str(exc), "output_error"
+                failure = {"kind": "output", "retryable": False, "terminal": False}
+        res.update(outcome=outcome, error_kind=failure["kind"], retryable=failure["retryable"])
+        log(want, res, err)
+        add({**runtime.result_cost(res), "actual_models": res.get("actual_models") or []})
+        if failure["terminal"] or (failure["retryable"] and retry == service_retries):
+            st["infrastructure_failure"] = {"kind": failure["kind"], "error": str(err),
+                                             "model_identity": res.get("actual_models") or []}
+            if stop_event is not None:
+                stop_event.set()
+            st["failed"] = [i for i in want if i not in got]
+            return got, st
+        if failure["retryable"]:
+            delay = min(2 ** retry, 8)
+            if sleep is not None:
+                sleep(delay)
+            elif stop_event is not None:
+                stop_event.wait(delay)
+            else:
+                time.sleep(delay)
+            continue
+        break
     missing = [i for i in items if i["id"] not in got]
-    if missing and depth < 2 and res.get("retryable", True):
+    if missing and depth < 2 and not (stop_event is not None and stop_event.is_set()):
         halves = [missing[:len(missing) // 2], missing[len(missing) // 2:]] if len(missing) > 1 else [missing]
-        for h in (x for x in halves if x):
-            g2, s2 = run_chunk(call, h, lookahead, log, depth + 1)
+        for half in (x for x in halves if x):
+            g2, s2 = run_chunk(call, half, lookahead, log, depth + 1, stop_event=stop_event,
+                               service_retries=service_retries, sleep=sleep)
             got.update(g2)
-            for k in ("calls", "credits", "tokens", "ms"):
-                st[k] += s2[k]
-            st["credits_known"] = st["credits_known"] and s2["credits_known"]
-            st["tokens_known"] = st["tokens_known"] and s2["tokens_known"]
-            st["actual_models"] = sorted(set(st["actual_models"]) | set(s2["actual_models"]))
-            st["failed"] += s2["failed"]
-    elif missing:
-        st["failed"] = [i["id"] for i in missing]
+            add(s2)
+            if st["infrastructure_failure"]:
+                break
+    st["failed"] = [i for i in want if i not in got]
     return got, st
 
 
@@ -662,13 +723,15 @@ def interleave(per_model: list[list]) -> list:
 
 def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: Path, tag: str,
                limit: int | None, chunk: int, parallel: int, effort: str | None = DEFAULT_EFFORT,
-               call_factory=None) -> list[Path]:
+               call_factory=None, proxy_mode: str = "auto", service_retries: int = 2) -> list[Path]:
     """每个模型一个目录 <out_root>/<tag>-<执行器>-<模型>/：results-<批次>.json、run.json、work/（原始回复）。
     所有执行器统一：同一份系统提示、每次调用按批次分组且至多 chunk 条、同一推理强度、同一套拆半重试。"""
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Lock
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+    from threading import Lock, Event
     reference.need(type(chunk) is int and chunk > 0 and type(parallel) is int and parallel > 0,
                    "chunk and parallel must be positive")
+    reference.need(type(service_retries) is int and 0 <= service_retries <= 5, "service retries must be 0..5")
+    reference.need(executor in ADAPTERS and len(models) == len(set(models)), "unsupported executor or duplicate models")
     rows, _ = _bench_items(p, m)
     ids = reference.selected_ids(rows, m, limit, select_ids)
     keep = set(ids)
@@ -698,11 +761,52 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
                             for b, (its, la) in parts.items() for k in range(0, len(its), chunk)]
     tasks = interleave([per_model[x] for x in models])
     adapter = ADAPTERS[executor]
+    env, route = runtime.cli_environment(proxy_mode=proxy_mode)
+    stopped = Event()
+    preflights = {}
+
+    def state(d, status, **extra):
+        temporary = d / "execution-state.json.tmp"
+        temporary.write_text(json.dumps({"version": "native-execution-state-v1", "state": status,
+                         "model": next(model for model, target in dirs.items() if target == d),
+                         "executor": executor, "tag": tag, "pid": os.getpid(),
+                         "updated_at": datetime.now(timezone.utc).isoformat(), **extra}, ensure_ascii=False))
+        temporary.replace(d / "execution-state.json")
+
+    # All models must answer a public nonce before any private batch is sent.
+    for model, d in dirs.items():
+        state(d, "preflight", model=model, executor=executor, tag=tag)
+        if call_factory:
+            receipt = {"version": "test-adapter-preflight-v1", "status": "test_not_applicable",
+                       "cost": {"calls": 0, "tokens": 0, "tokens_known": True, "credits": 0,
+                                "credits_known": True, "ms": 0}}
+        else:
+            receipt = runtime.probe(lambda sys, q: adapter(model, sys, q, cwd=d / "work", effort=effort, env=env),
+                                    executor=executor, model=model, effort=effort, proxy_mode=proxy_mode,
+                                    environ=env, route=route)
+        reference.write(d / "preflight.json", receipt)
+        preflights[model] = {"path": "preflight.json", "sha256": reference.sha(d / "preflight.json"),
+                             "cost": receipt["cost"]}
+        if receipt["status"] not in {"ready", "test_not_applicable"}:
+            aborted = {"version": "native-run-abort-v1", "status": "infrastructure_failed",
+                       "model": model, "executor": executor, "tag": tag,
+                       "failure": receipt.get("failure"), "preflight": preflights[model],
+                       "extraction_cost": {"calls": 0, "tokens": 0, "tokens_known": True,
+                                           "credits": 0, "credits_known": True, "ms": 0},
+                       "queued_not_started": len(tasks), "inflight_finished": 0}
+            for target_model, target in dirs.items():
+                individual = {**aborted, "model": target_model, "failed_preflight_model": model,
+                              "preflight": preflights.get(target_model, {"status": "not_started", "cost": {
+                                  "calls": 0, "tokens": 0, "tokens_known": True,
+                                  "credits": 0, "credits_known": True, "ms": 0}})}
+                reference.write(target / "run-aborted.json", individual)
+                state(target, "infrastructure_failed", failure=aborted["failure"])
+            raise runtime.InfrastructureFailure(aborted)
 
     def make_call(model, d):
         if call_factory:
             return call_factory(model, system)
-        return lambda q: adapter(model, system, q, cwd=d / "work", effort=effort)
+        return lambda q: adapter(model, system, q, cwd=d / "work", effort=effort, env=env)
 
     def do(task):
         model, b, k, its, la = task
@@ -715,8 +819,11 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
                  "error": err, "stop": res["stop"], "credits": res["credits"], "tokens": res.get("tokens"),
                  "tokens_known": res.get("tokens_known", res.get("tokens") is not None),
                  "actual_models": res.get("actual_models"),
+                 "native_evidence_version": 2, "outcome": res.get("outcome"),
+                 "error_kind": res.get("error_kind"), "status_code": res.get("status_code"),
+                 "response_error": res.get("error"),
                  "ms": res["ms"], "text": res["text"]}, ensure_ascii=False))
-        got, st = run_chunk(make_call(model, d), its, la, log)
+        got, st = run_chunk(make_call(model, d), its, la, log, stop_event=stopped, service_retries=service_retries)
         with lock:
             cost = (f"{st['credits']:.2f} credits" if st["credits_known"] else
                     f"{st['tokens']} token" if st["tokens_known"] else "token 未知/仅部分可见")
@@ -725,8 +832,25 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
         return model, b, its, got, st
 
     started = datetime.now(timezone.utc).isoformat()
+    done, submitted = [], 0
+    for d in dirs.values():
+        state(d, "running")
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
-        done = list(ex.map(do, tasks))
+        pending = set()
+        while submitted < len(tasks) or pending:
+            while not stopped.is_set() and submitted < len(tasks) and len(pending) < parallel:
+                pending.add(ex.submit(do, tasks[submitted]))
+                submitted += 1
+            if not pending:
+                break
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+            done.extend(future.result() for future in finished if not future.cancelled())
+            if stopped.is_set():
+                for future in pending:
+                    future.cancel()
+                for d in dirs.values():
+                    state(d, "infrastructure_failed")
+    failure = next((x[4]["infrastructure_failure"] for x in done if x[4]["infrastructure_failure"]), None)
     for model, d in dirs.items():
         mine = [x for x in done if x[0] == model]
         by_part = {}
@@ -737,7 +861,17 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
         tot = {k: sum(x[4][k] for x in mine) for k in ("calls", "credits", "tokens", "ms")}
         tot["credits_known"] = all(x[4]["credits_known"] for x in mine)
         tot["tokens_known"] = all(x[4]["tokens_known"] for x in mine)
+        if failure:
+            aborted = {"version": "native-run-abort-v1", "status": "infrastructure_failed", "failure": failure,
+                       "model": model, "executor": executor, "tag": tag,
+                       "preflight": preflights[model], "extraction_cost": tot,
+                       "queued_not_started": len(tasks) - sum(x[4]["calls"] > 0 for x in done),
+                       "inflight_finished": sum(x[4]["calls"] > 0 for x in done)}
+            reference.write(d / "run-aborted.json", aborted)
+            state(d, "infrastructure_failed", failure=failure)
+            continue
         metadata = {
+            "native_evidence_version": 2, "status": "complete", "preflight": preflights[model],
             "tool": TOOL, "label": f"{executor}-{model}", "executor": executor, "model": model, "tag": tag,
             "bench": m["bench_id"], "prompt_version": version, "prompt_sha256": rule_hash, "ids": ids, "chunk": chunk, "limit": limit,
             "system_prompt_sha256": reference.sha(d / "system-prompt.txt"),
@@ -752,6 +886,13 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
             "failed": [i for x in mine for i in x[4]["failed"]], **tot,
             "started_at": started, "ended_at": datetime.now(timezone.utc).isoformat()}
         (d / "run.json").write_text(json.dumps(reference.seal_run(d, metadata), ensure_ascii=False, indent=1))
+        state(d, "complete", run_sha256=reference.sha(d / "run.json"))
+        if metadata["execution_mode"] == "native_adapter":
+            from utils import evaluation_receipts
+            evaluation_receipts.write_json(d / "evaluation-index.json", evaluation_receipts.build_index(
+                {"entries": [{"phase": "extraction", "run": str(d)}]}))
+    if failure:
+        raise runtime.InfrastructureFailure(aborted)
     return [dirs[x] for x in models]
 
 
@@ -777,7 +918,8 @@ def register_run(p: Path, m: dict, results_dir: Path, *, model: str, executor: s
 
 
 def load_run(d: Path) -> dict:
-    r = json.loads((d / "run.json").read_text())
+    reference.need(not (d / "run-aborted.json").exists(), "infrastructure/canceled run cannot be scored or admitted")
+    r = reference.read(d / "run.json")
     if r.get("tool") != TOOL:
         raise SystemExit(f"{d} 不是 {TOOL} 的运行目录")
     if r.get("evidence"):
@@ -927,7 +1069,11 @@ def admission_checks(row: dict, pairs: list[tuple[dict, dict]], *, run_prompt: s
     return checks, "pass"
 
 
-def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, write: bool = True) -> dict:
+def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, write: bool = True,
+          semantic_review=None) -> dict:
+    from utils import semantic_regression as semantic
+    reference.need(run.get("native_evidence_version") != 2 or run.get("status") == "complete",
+                   "native v2 run is not complete; no model verdict or admission record written")
     ref = reference.verify_reference(p, m)
     baseline_version = base_version(ref["prompt_version"]) if ref else BASELINE_EQUIV.get(m.get("chain"))
     current_system, current_version = bench_system_prompt()
@@ -950,6 +1096,19 @@ def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, 
             write = False
     if sheet is not None or key is not None:
         validate_blind_sheet(p, m, run, sheet, key)
+    # Supplement an existing run without invoking an extractor or fresh probe.
+    # Missing/invalid semantic evidence is pending, never a new model-fail entry.
+    semantic_receipt = None
+    semantic_pending = None
+    semantic_required = ref is not None or base_version(run.get("prompt_version")) == "agent-v5"
+    if semantic_required:
+        try:
+            suite = semantic.active_suite(bench_root(), m["bench_id"])
+            semantic.need(semantic_review is not None, semantic.PENDING)
+            semantic_receipt = semantic.validate_receipt(p, m, run, suite, semantic_review)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            semantic_pending = str(exc)
+            write = False
     rows = score_many(p, m, [(run["label"], run["results"], run.get("cost") or {})], ids=run["ids"], cache_dir=cache_dir)
     full = rows[0]
     by = {r["label"]: r for r in rows}
@@ -974,6 +1133,18 @@ def admit(p: Path, m: dict, run: dict, *, sheet=None, key=None, cache_dir=None, 
                                                 "second_other_lang_pct", "ent_per_obs", "edge_per_obs",
                                                 "credits_per_obs", "sec_per_obs")},
            "decided_at": datetime.now(timezone.utc).isoformat()}
+    if semantic_required:
+        rec["admission_version"] = semantic.ADMISSION_VERSION
+        rec["semantic_review"] = semantic_receipt
+        rec["semantic_regression"] = {"verdict": semantic_receipt["verdict"] if semantic_receipt else "pending",
+                                      "why": semantic_pending, "denominator": "fixed-critical-suite"}
+        checks.append({"check": "独立语义回归", "pass": bool(semantic_receipt and semantic_receipt["verdict"] == "pass"),
+                       "value": rec["semantic_regression"]["verdict"], "want": "全部固定关键案例通过"})
+        if semantic_pending:
+            rec["verdict"] = "pending_semantic_regression"
+            rec["pending_reason"] = semantic.PENDING + "；" + semantic_pending
+        elif semantic_receipt["verdict"] == "fail":
+            rec["verdict"] = "semantic_regression_fail"
     if write:
         rec["record_file"] = append_admission(run["model"], rec)
     return rec
@@ -1040,6 +1211,7 @@ def main(argv=None) -> int:
             s.add_argument("--run", nargs="+", required=True)
             s.add_argument("--n", type=int, default=BLIND_N)
             s.add_argument("--out", required=True, help="评审表（不含模型名）；对照表另存为 <out>.key.json")
+            s.add_argument("--review-destination", help="拟发送的评审服务/入口；不填则出站清单标为目的地待补")
         if name == "revoke":
             s.add_argument("--model", required=True)
             s.add_argument("--reason", required=True)
@@ -1053,6 +1225,7 @@ def main(argv=None) -> int:
             s.add_argument("--run", required=True, help="一个运行目录（建议 30–50 条）")
             s.add_argument("--sheet", help="填好 verdict 的盲评表；对照表默认取 <sheet>.key.json")
             s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
+            s.add_argument("--semantic-review", help="regression check 生成的完整独立语义评审凭据；原输出无需重抽")
         if name in ("score", "run"):
             s.add_argument("--json", help="另存 JSON")
             s.add_argument("--cache-dir", help="fastembed 模型缓存目录")
@@ -1069,6 +1242,8 @@ def main(argv=None) -> int:
             s.add_argument("--limit", type=int, help="冒烟：只取这么多条（按基线模型轮流取）")
             s.add_argument("--chunk", type=int, default=10, help="每次调用的观测数")
             s.add_argument("--parallel", type=int, default=3, help="同时在跑的调用数")
+            s.add_argument("--proxy-mode", choices=("auto", "env-only", "none"), default="auto")
+            s.add_argument("--service-retries", type=int, default=2, help="429/5xx/transport 的同批重试次数（0–5）")
             s.add_argument("--effort", default=DEFAULT_EFFORT,
                            help=f"推理强度，所有执行器统一（缺省 {DEFAULT_EFFORT}）；none 表示不传、用各模型默认")
             s.add_argument("--out-root", default=str(DEFAULT_ROOT / "runs"))
@@ -1109,7 +1284,16 @@ def main(argv=None) -> int:
         out = Path(a.out).expanduser()
         out.write_text(json.dumps(sheet, ensure_ascii=False, indent=1))
         Path(str(out) + ".key.json").write_text(json.dumps(key, ensure_ascii=False, indent=1))
+        from utils import evaluation_receipts
+        scope = evaluation_receipts.create_scope({
+            "artifacts": [str(out)], "records": len(sheet),
+            "data_classes": ["observation_body", "lookahead", "entities", "edges"],
+            "destination": ({"service": a.review_destination} if a.review_destination else {"status": "unspecified"}),
+            "purpose": "factual_blind_review", "anonymization": "model_identity_only; source body is not redacted",
+        })
+        evaluation_receipts.write_json(str(out) + ".scope.json", scope)
         print(f"评审表 {out}（{len(sheet)} 条，不含模型名）；对照表 {out}.key.json——评完之前不要打开对照表。")
+        print(f"出站范围清单 {out}.scope.json：pending，只是材料证据，不表示已获授权；目的地未填时须先补齐。")
         return 0
     if a.cmd == "register":
         run = register_run(p, m, Path(a.results).expanduser(), model=a.model, executor=a.executor,
@@ -1125,16 +1309,20 @@ def main(argv=None) -> int:
             sheet, key = json.loads(sp.read_text()), json.loads(Path(str(sp) + ".key.json").read_text())
         # 不带盲评表只预览、不写记录：否则一次随手的预览（pending_blind）会压过此前的 pass，战役随即开不了
         rec = admit(p, m, run, sheet=sheet, key=key, cache_dir=Path(a.cache_dir) if a.cache_dir else None,
-                    write=sheet is not None)
+                    write=sheet is not None,
+                    semantic_review=json.loads(Path(a.semantic_review).expanduser().read_text()) if a.semantic_review else None)
         print(f"{rec['model']}：{rec['verdict']}（{rec['items']} 条，bench {rec['bench']}，规则 {rec['prompt_version']}）")
         for c in rec["checks"]:
             print(f"  {'✓' if c['pass'] else '✗'} {c['check']}：{c['value']}（要求 {c['want']}）")
+        if rec.get("pending_reason"):
+            print(rec["pending_reason"])
         print(f"准入记录：{rec['record_file']}" if "record_file" in rec else "（预览，未写准入记录；带 --sheet 才记录）")
         return 0 if rec["verdict"] == "pass" else 1
     if a.cmd == "run":
         dirs = run_models(p, m, a.models, executor=a.executor, out_root=Path(a.out_root).expanduser(), tag=a.tag,
                           limit=a.limit, chunk=a.chunk, parallel=a.parallel,
-                          effort=None if a.effort == "none" else a.effort)
+                          effort=None if a.effort == "none" else a.effort,
+                          proxy_mode=a.proxy_mode, service_retries=a.service_retries)
         runs = [load_run(d) for d in dirs]
     elif a.run:
         runs = [load_run(Path(d).expanduser()) for d in a.run]
@@ -1157,8 +1345,11 @@ def main(argv=None) -> int:
         rows = score_many(p, m, [(r["label"], r["results"], r["cost"]) for r in runs], ids=ids, cache_dir=cache)
         print(f"样本 {m['bench_id']}：比较 {len(ids)} 条（问句口径同报告）；"
               + "；".join(f"{r['label']} 调用 {r['calls']} 次、失败 {len(r['failed'])} 条" for r in runs))
-        meta = {"runs": [{k: r[k] for k in ("label", "model", "executor", "tag", "prompt_version", "calls",
-                                            "credits", "ms", "failed")} for r in runs]}
+        meta = {"runs": [{**{k: r.get(k) for k in ("label", "model", "executor", "tag", "prompt_version", "calls",
+                                            "credits", "credits_known", "tokens", "tokens_known", "ms", "failed")},
+                          "run_dir": r["dir"], "run_sha256": reference.sha(Path(r["dir"]) / "run.json"),
+                          "ids_sha256": reference.digest(r["ids"]), "prompt_sha256": r.get("prompt_sha256"),
+                          "system_prompt_sha256": r.get("system_prompt_sha256")} for r in runs]}
     else:
         if not a.label:
             raise SystemExit("单个候选要给 --label")

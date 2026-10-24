@@ -365,7 +365,9 @@ class EndToEndTest(unittest.TestCase):
         p, m = xb._bench(str(self.bench))
         seen = []
 
-        def fake_adapter(model, system, query, *, cwd, effort):
+        def fake_adapter(model, system, query, *, cwd, effort, env):
+            if "观测：" not in query:
+                return {"text": query, "error": None, "stop": None, "credits": None, "tokens": 2, "ms": 1}
             seen.append((model, effort, cwd.name))
             obs = json.loads(query.split("观测：", 1)[1])
             return {"text": json.dumps({"items": [{"id": o["id"], "entities": []} for o in obs]}), "error": None,
@@ -468,7 +470,7 @@ class RunnerPureTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--system-prompt") + 1], "SYS")
         self.assertEqual(cmd[-2:], ["--", "Q"])
         self.assertEqual(seen["kw"]["cwd"], "/tmp")
-        self.assertEqual((res["text"], res["error"], res["credits"], res["ms"]), ('{"items": []}', False, 3.5, 1200))
+        self.assertEqual((res["text"], res["error"], res["credits"], res["ms"]), ('{"items": []}', None, 3.5, 1200))
         R.stdout = "not json"
         with mock.patch("subprocess.run", fake_run):
             self.assertTrue(xb.qodercli_call("m", "S", "Q", cwd=_Path("/tmp"))["error"])
@@ -500,7 +502,7 @@ class RunnerPureTest(unittest.TestCase):
         self.assertIn("--no-session-persistence", cmd)
         self.assertEqual(seen["kw"]["input"], "Q")                          # 观测走标准输入，不进命令行
         self.assertEqual((res["text"], res["error"], res["credits"], res["tokens"], res["ms"]),
-                         ('{"items": []}', False, None, 1060, 1500))       # 不报 credits；token 含缓存读写
+                         ('{"items": []}', None, None, 1060, 1500))        # 不报 credits；token 含缓存读写
         R.stdout = json.dumps({"result": "{}", "is_error": False, "modelUsage": {"claude-haiku-5-5": {}}})
         with mock.patch("subprocess.run", fake_run):
             self.assertIn("不是 claude-fable-5-1", xb.claude_call("claude-fable-5-1", "S", "Q", cwd=_Path("/tmp"))["error"])
@@ -531,7 +533,7 @@ class RunnerPureTest(unittest.TestCase):
             _Path(out).write_text('{"items": []}')
             return R()
         with tempfile.TemporaryDirectory() as d, mock.patch("subprocess.run", fake_run):
-            res = xb.codex_call("gpt-6-luna", "SYS", "Q", cwd=_Path(d), effort="medium")
+            res = xb.codex_call("gpt-6-luna", "SYS", "Q", cwd=_Path(d), effort="medium", env={})
             left = list(_Path(d).iterdir())
         cmd = seen["cmd"]
         self.assertEqual(cmd[:2], ["codex", "exec"])
@@ -549,7 +551,7 @@ class RunnerPureTest(unittest.TestCase):
         self.assertEqual(left, [])                                          # 回复文件读完就删
         R.returncode = 1
         with tempfile.TemporaryDirectory() as d, mock.patch("subprocess.run", fake_run):
-            self.assertTrue(xb.codex_call("m", "S", "Q", cwd=_Path(d))["error"])
+            self.assertTrue(xb.codex_call("m", "S", "Q", cwd=_Path(d), env={})["error"])
 
     def test_load_run_hides_unknown_credits_and_shows_tokens(self):
         with tempfile.TemporaryDirectory() as d:
@@ -573,9 +575,9 @@ class RunnerPureTest(unittest.TestCase):
                 _Path(cmd[cmd.index("-o") + 1]).write_text("{}")
             return R()
         with tempfile.TemporaryDirectory() as d, mock.patch("subprocess.run", fake_run):
-            xb.qodercli_call("M", "S", "Q", cwd=_Path(d), effort="high")
-            xb.qodercli_call("M", "S", "Q", cwd=_Path(d), effort=None)
-            xb.codex_call("M", "S", "Q", cwd=_Path(d), effort=None)
+            xb.qodercli_call("M", "S", "Q", cwd=_Path(d), effort="high", env={})
+            xb.qodercli_call("M", "S", "Q", cwd=_Path(d), effort=None, env={})
+            xb.codex_call("M", "S", "Q", cwd=_Path(d), effort=None, env={})
         self.assertEqual(cmds[0][cmds[0].index("--reasoning-effort") + 1], "high")
         self.assertNotIn("--reasoning-effort", cmds[1])
         self.assertFalse(any("model_reasoning_effort" in x for x in cmds[2]))

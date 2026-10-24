@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -13,6 +14,7 @@ import numpy as np
 from tools import extract_bench as xb
 from tools import extract_campaign as campaign
 from utils import bench_reference as ref
+from utils import semantic_regression as semantic
 
 
 def dump(path, value):
@@ -38,6 +40,9 @@ def answer(obs):
 
 
 def fake_adapter(model, system, query, **kwargs):
+    if "观测：" not in query:
+        return {"text": query, "error": None, "stop": None, "credits": None, "tokens": 2,
+                "tokens_known": True, "ms": 1, "actual_models": [model]}
     obs = json.loads(query.split("观测：", 1)[1])
     return {"text": json.dumps({"items": [answer(it) for it in obs]}, ensure_ascii=False),
             "error": None, "stop": "end_turn", "credits": None, "tokens": 100, "tokens_known": True,
@@ -93,6 +98,27 @@ class ReferenceLifecycleTest(unittest.TestCase):
             return xb.run_models(p, m, [model], executor="codex", out_root=self.root / "candidates",
                 tag=model + str(limit), limit=limit, chunk=10, parallel=1)[0]
 
+    def semantic_receipt(self, p, m, run):
+        """Isolated synthetic native lifecycle; no real policy or model review."""
+        suite = semantic.create_suite(p, m, {"suite_id": "synthetic-native", "revision": 1,
+            "scope": "private-production", "selection_rationale": "Fixed synthetic relationship criterion.",
+            "cases": [{"case_id": "source-supported-relationship", "obs_id": run["ids"][0], "critical": True,
+                       "known_failure_run": run["dir"],
+                       "rationale": "Keep the synthetic relationship's source and target.", "criteria": [
+                           {"criterion_id": "relationship", "requirement": "A relates to B as recorded in the source."}]}]})
+        path = self.root / "native-suite.json"
+        dump(path, suite)
+        semantic.activate(self.root / "state", path, reviewer="synthetic fixture declaration", confirm_suite_sha=suite["suite_sha256"])
+        review = semantic.review_sheet(p, m, run, suite)
+        review["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        review["reviewer"] = {"name": "synthetic independent reviewer", "method": "human", "identity_evidence": "self-declared",
+                              "independence_declaration": "Synthetic judgment supplied only for an isolated test fixture."}
+        review["cases"][0]["judgments"][0].update({"verdict": "pass", "source_quote": "A relates to B because this synthetic observation",
+            "claim_pointer": "/edges/2/fact", "claim_quote": "A relates to B because this synthetic observation",
+            "responsibility_judgment": "A is the source and B is the target of the relationship.",
+            "explanation": "This synthetic output preserves the complete source-supported relationship."})
+        return semantic.check_review(p, m, run, suite, review)
+
     def test_public_cli_native_reference_to_admission_and_campaign_gate(self):
         p, m = self.freeze()
         self.assertEqual(ref.verify_reference(p, m)["prompt_version"], "agent-v5+bench2")
@@ -110,6 +136,9 @@ class ReferenceLifecycleTest(unittest.TestCase):
         self.assertEqual(smoke["ids"], expected[:10])
         candidate = self.candidate(p, m)
         loaded = xb.load_run(candidate)
+        semantic_receipt = self.semantic_receipt(p, m, loaded)
+        semantic_file = self.root / "semantic-receipt.json"
+        dump(semantic_file, semantic_receipt)
         sheet, key = xb.blind_sheet(p, m, [loaded], n=10)
         for row in sheet:
             row["verdict"] = "ok"
@@ -117,7 +146,8 @@ class ReferenceLifecycleTest(unittest.TestCase):
         dump(sheet_file, sheet); dump(Path(str(sheet_file) + ".key.json"), key)
         with mock.patch.object(xb, "embed", fake_embed), mock.patch.dict("os.environ", {"KG_HUB_BENCH_ROOT": str(self.root / "state")}), mock.patch("sys.stdout"):
             xb._corpus_cache.clear()
-            self.assertEqual(xb.main(["admit", "--bench", str(p), "--run", str(candidate), "--sheet", str(sheet_file)]), 0)
+            self.assertEqual(xb.main(["admit", "--bench", str(p), "--run", str(candidate), "--sheet", str(sheet_file),
+                                     "--semantic-review", str(semantic_file)]), 0)
             record = xb.latest_admission("gpt-candidate")
             self.assertEqual(record["verdict"], "pass")
             self.assertEqual(sum("不低于基线" in check["check"] for check in record["checks"]), 6)
@@ -196,8 +226,9 @@ class ReferenceLifecycleTest(unittest.TestCase):
         for row in rows:
             row["hit_zh_pct"] = row["hit_en_pct"] = 100
         rows[2]["hit_zh_pct"] = 94
-        with mock.patch.object(xb, "score_many", return_value=rows):
-            record = xb.admit(p, m, run, write=False)
+        receipt = self.semantic_receipt(p, m, run)
+        with mock.patch.object(xb, "score_many", return_value=rows), mock.patch.object(xb, "bench_root", return_value=self.root / "state"):
+            record = xb.admit(p, m, run, write=False, semantic_review=receipt)
         self.assertEqual(record["verdict"], "fail")
         self.assertEqual(sum("不低于基线" in check["check"] for check in record["checks"]), 6)
 
@@ -278,6 +309,8 @@ class ReferenceLifecycleTest(unittest.TestCase):
         real_prompt = xb.bench_system_prompt
         seen = []
         def mutating(model, system, query, **kwargs):
+            if "观测：" not in query:
+                return fake_adapter(model, system, query, **kwargs)
             seen.append(system)
             rules.write_bytes(original + b"\nUnrelated later edit.\n")
             return fake_adapter(model, system, query, **kwargs)

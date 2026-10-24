@@ -39,7 +39,7 @@ def good_item(i):
 
 
 def PASS(model):
-    return {"verdict": "pass", "prompt_version": ax.PROMPT_VERSION + "+bench1", "bench": "b", "decided_at": "t",
+    return {"model": model, "verdict": "pass", "prompt_version": ax.PROMPT_VERSION + "+bench1", "bench": "b", "decided_at": "t",
             "prompt_sha256": ec.prompt_sha(ax.PROMPT_PATH.read_text())}
 
 
@@ -57,7 +57,12 @@ class CampaignTest(unittest.TestCase):
         self.patches = [mock.patch.object(ax, "PROMPT_VERSION", "agent-v4"),
                         mock.patch.object(ax, "PROMPT_PATH", legacy_prompt),
                         mock.patch.object(ax, "select_batch", fake_select),
-                        mock.patch.object(ax, "load_config", lambda: {})]
+                        mock.patch.object(ax, "load_config", lambda: {}),
+                        # These legacy batch/claim fixtures test frozen campaigns.
+                        # New start-v2 gates are exercised without mocks in
+                        # test_semantic_regression, not fabricated in this helper.
+                        mock.patch("utils.semantic_regression.validate_admission", return_value={}),
+                        mock.patch.object(ec, "model_readiness", return_value={})]
         for p in self.patches:
             p.start()
         ec.cmd_start("t1", ["DeepSeek-Flash", "Qwen3.8-Max"], executor="qoder", quota=60, batch=25, after_id=0, lookup=PASS)
@@ -277,7 +282,11 @@ class CampaignTest(unittest.TestCase):
         binary, code = root / "bin", root / "code space"
         binary.mkdir(); (code / "tools").mkdir(parents=True)
         entry = code / "tools/extract"
-        entry.write_text("#!/bin/sh\nprintf '%s' 'synthetic brief'\n"); entry.chmod(0o755)
+        entry.write_text("#!" + sys.executable + "\nimport sys,os\n"
+                         "if sys.argv[1]=='campaign': print('synthetic brief',end='')\n"
+                         "else: os.execv(sys.executable,[sys.executable,'-S'," +
+                         repr(str(ec.REPO / "tools/extract_cli.py")) + "]+sys.argv[1:])\n")
+        entry.chmod(0o755)
         worker = binary / "worker"
         worker.write_text("#!" + sys.executable + "\nimport sys,json,os\nprint(json.dumps({'cwd':os.getcwd(),'args':sys.argv[1:],'internal':os.environ.get('CLAUDE_MEM_INTERNAL')}))\n")
         worker.chmod(0o755)
@@ -555,6 +564,11 @@ class NoSelfObservationTest(unittest.TestCase):
     """抽取会话不产生新观测（2026-10-24：跑战役的 codex 会话 2 小时产生 214 条观测，抽取工作又进了待抽队列）。"""
 
     def setUp(self):
+        # Isolate tracking behavior from independently tested start-v2 gates.
+        for patch in (mock.patch("utils.semantic_regression.validate_admission", return_value={}),
+                      mock.patch.object(ec, "model_readiness", return_value={})):
+            patch.start()
+            self.addCleanup(patch.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = _Path(self.tmp.name)
         self.settings = self.root / "cm" / "settings.json"

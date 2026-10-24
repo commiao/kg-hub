@@ -16,6 +16,9 @@ from tools import extract_bench as xb
 from tools import extract_campaign as ec
 from tools import agent_extract as ax
 from tools import extraction_repair as er
+from tools import extract_runtime as rt
+from tools import extract_regression as regression
+from tools import extract_evaluation as evaluation
 
 SKILL = _Path(__file__).resolve().parent.parent / "skills" / "kg-model-eval"
 
@@ -106,11 +109,14 @@ class SkillDocTest(unittest.TestCase):
 
     def test_every_mentioned_subcommand_exists(self):
         have = {"bench": subcommands(xb.main), "campaign": subcommands(ec.main),
-                "agent": flat_commands(ax.main), "repair": flat_commands(er.main)}
+                "agent": flat_commands(ax.main), "repair": flat_commands(er.main),
+                "runtime": subcommands(rt.main), "regression": subcommands(regression.main),
+                "eval": subcommands(evaluation.main)}
         self.assertIn("register", have["bench"])
         reference = (SKILL / "references" / "quality.md").read_text()
-        mentioned = set(re.findall(r'\$CLI"\s+(bench|campaign|agent|repair)\s+([a-z-]+)',
-                                   self.text + "\n" + reference + "\n" + "\n".join(
+        workflow = (SKILL / "references" / "evaluation-workflow.md").read_text()
+        mentioned = set(re.findall(r'\$CLI"\s+(bench|campaign|agent|repair|runtime|regression|eval)\s+([a-z-]+)',
+                                   self.text + "\n" + reference + "\n" + workflow + "\n" + "\n".join(
                                        p.read_text() for p in (SKILL.parent.parent / "docs" / "executors").glob("*.md"))))
         self.assertTrue(mentioned)
         for tool, sub in sorted(mentioned):
@@ -123,6 +129,19 @@ class SkillDocTest(unittest.TestCase):
         for sub in sorted(bare):
             with self.subTest(bare=sub):
                 self.assertIn(sub, set().union(*have.values()))
+
+    def test_new_workflow_is_in_distributed_skill_and_generated_brief(self):
+        brief = ec.brief({"id": "synthetic-campaign", "models": {"fixture": {}}}, "fixture")
+        for commands in ("runtime probe", "regression sheet", "regression check", "bench admit --semantic-review",
+                         "eval scope", "eval scope-check", "eval index", "eval report", "campaign start --model-preflight"):
+            with self.subTest(command=commands):
+                self.assertIn(commands, brief)
+        self.assertIn("followup_task", brief)
+        self.assertIn("idle/completed", brief)
+        self.assertIn("pending", brief)
+        self.assertIn("未验证", brief)
+        self.assertIn("references/evaluation-workflow.md", self.text)
+        self.assertIn("pending_semantic_regression", self.text)
 
     def test_default_prompt_and_distributed_reference_match_runtime(self):
         prompt = ax.PROMPT_PATH.read_text()
