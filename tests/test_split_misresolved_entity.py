@@ -75,5 +75,78 @@ class EndpointTest(unittest.TestCase):
                 self.assertEqual(((cs, cd), (ts, td)), (applied, (mv["src"], mv["dst"])))
 
 
+class ProvenanceTest(unittest.TestCase):
+    """2026-10-24 opus/fable 战役：fable 抽出的 036063e2 被并进 opus 建的 d2091eac，拆分时新节点的来源
+    抄了误并节点的（opus），差点把这个实体记到 opus 名下，只能手改清单纠正。"""
+    FABLE = {"extractor_model": "m-fable", "extraction_mode": "agent", "extractor_tool": "claude-code",
+             "run_id": "camp-m-fable"}
+    # (uuid, name, labels, group_id, extractor_model, extraction_mode, extractor_tool, run_id)
+    WRONG = ("u-w", W, ["Entity", "Concept"], "g", "m-opus", "agent", "claude-code", "camp-m-opus")
+    ERR2 = {"id": 2, "status": "error", "model": "m-fable", "executor": "codex", "run_id": "stale-run"}
+    LOG = [{"id": 1, "status": "ok", "model": "m-opus", "executor": "claude-code", "run_id": "camp-m-opus"},
+           {"id": 2, "status": "ok", "model": "m-fable", "executor": "claude-code", "run_id": "camp-m-fable"},
+           ERR2,   # 成功之后又失败的一次重提：不算
+           {"id": 3, "status": "ok", "model": "m-fable", "executor": "claude-code", "run_id": "camp-m-fable-later"}]
+
+    def test_plan_takes_provenance_from_the_first_ok_log_entry_of_the_entity(self):
+        spec = sp.plan_from_results(RESULTS, {**BATCH, "model": "m-fable"}, W, P, log=self.LOG)
+        # 实体最早出现在观测 2（观测 3 的 run 不同）；同一观测失败的那次提交不算
+        self.assertEqual(spec["entity"]["provenance"], self.FABLE)
+        self.assertEqual(spec["batch_model"], "m-fable")
+
+    def test_plan_without_log_or_ok_entry_leaves_provenance_out(self):
+        self.assertNotIn("provenance", sp.plan_from_results(RESULTS, BATCH, W, P)["entity"])
+        self.assertNotIn("provenance", sp.plan_from_results(RESULTS, BATCH, W, P, log=[self.LOG[0], self.ERR2])["entity"])
+
+    def test_dry_run_prefers_spec_provenance_over_the_wrong_node(self):
+        spec = {"entity": {"name": P, "provenance": self.FABLE}, "batch_model": "m-fable"}
+        self.assertEqual(sp.entity_provenance(spec, self.WRONG), (self.FABLE, "spec"))
+
+    def test_without_spec_provenance_copies_wrong_node_only_when_models_agree(self):
+        same = sp.entity_provenance({"entity": {"name": P}, "batch_model": "m-opus"}, self.WRONG)
+        self.assertEqual(same, ({"extractor_model": "m-opus", "extraction_mode": "agent",
+                                 "extractor_tool": "claude-code", "run_id": "camp-m-opus"}, "wrong_node"))
+        self.assertEqual(sp.entity_provenance({"entity": {"name": P}}, self.WRONG)[1], "wrong_node")
+        with self.assertRaises(SystemExit):   # 跨模型误并：抄过来就记错了，要求 --log
+            sp.entity_provenance({"entity": {"name": P}, "batch_model": "m-fable"}, self.WRONG)
+
+    def test_dry_run_manifest_carries_the_chosen_provenance(self):
+        class FakeGraph:   # 按查询语句返回固定结果，只认 dry_run 用到的只读查询
+            def __init__(self, rows):
+                self.rows = rows
+
+            def ro_query(self, q, p, timeout=None):
+                if q == sp.FIND_NODE:
+                    rows = [ProvenanceTest.WRONG] if p["lname"] == sp._key(W) else []
+                else:
+                    rows = self.rows.get(q, [])
+                return type("R", (), {"result_set": [list(r) for r in rows]})()
+        g = FakeGraph({sp.NODE_EDGES: [("e1", "u-w", "u-c", "pre feeds canary", ["ep-2"])],
+                       sp.EPISODES: [("ep-2", "obs-2")], sp.EPISODES_BY_NAME: [("ep-2", "obs-2")],
+                       sp.MENTIONS: [("ep-2", "m-1", "g", "t0")]})
+        spec = sp.plan_from_results(RESULTS, {**BATCH, "model": "m-fable"}, W, P, log=self.LOG)
+        spec["episodes"], spec["edges"] = spec["episodes"][:1], spec["edges"][:1]
+        m = sp.dry_run(g, spec)
+        self.assertEqual((m["entity"]["provenance"], m["entity"]["provenance_source"]), (self.FABLE, "spec"))
+        self.assertEqual([x["uuid"] for x in m["edges"]], ["e1"])
+        spec["entity"].pop("provenance")
+        with self.assertRaises(SystemExit):
+            sp.dry_run(g, spec)
+
+    def test_cli_plan_reads_the_log_file(self):
+        import contextlib, io, json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = {"r.json": json.dumps(RESULTS), "b.json": json.dumps({**BATCH, "model": "m-fable"}),
+                     "log.jsonl": "\n".join(json.dumps(r) for r in self.LOG) + "\n\n"}
+            for name, text in files.items():
+                _Path(d, name).write_text(text)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = sp.main(["--plan", f"{d}/r.json", "--batch", f"{d}/b.json", "--wrong", W, "--entity", P,
+                              "--log", f"{d}/log.jsonl"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["entity"]["provenance"], self.FABLE)
+
+
 if __name__ == "__main__":
     unittest.main()
