@@ -125,11 +125,12 @@ class QualityReviewTest(unittest.TestCase):
                         quality_review=approved(batch, bad), prompt_text=PROMPT)
                 post.assert_not_called()
 
-    def test_rule21_correction_requires_lookahead_and_mixed_names_can_translate(self):
+    def test_rule21_correction_requires_evidence_and_mixed_names_can_translate(self):
         batch, results, _ = fixture()
         results["items"][0]["edges"][0]["fact"] = TITLE + "（后被推翻：dispatch boundary clarified）"
         review = approved(batch, results)
-        self.assertTrue(any("lookahead" in e for e in q.validate_review(batch, results, review, PROMPT)))
+        self.assertIn("obs 1: corrected_title_requires_correction_evidence",
+                      q.validate_review(batch, results, review, PROMPT))
         review["items"][0]["edges"][0].update(source="lookahead", quote=batch["lookahead"][0]["title"])
         self.assertEqual(q.validate_review(batch, results, review, PROMPT), [])
         for title, translation in (("飞书 Worker retries before dispatch", "飞书工作线程在分发前重试"),
@@ -141,6 +142,80 @@ class QualityReviewTest(unittest.TestCase):
             self.assertEqual(q.validate_review(batch, results, approved(batch, results), PROMPT), [])
             results["items"][0]["edges"][1]["fact"] = title
             self.assertTrue(any("translation_identical" in e for e in q.validate_review(batch, results, approved(batch, results), PROMPT)))
+
+    def correction_fixture(self):
+        batch, results, _ = fixture()
+        correction = "Correction: dispatch retries are disabled after the provider accepts the request."
+        batch["items"].append({**copy.deepcopy(batch["items"][0]), "id": 3,
+                               "source_obs_id": "source-3", "episode_body": "[DISCOVERY] Dispatch correction\n" + correction})
+        results["items"].append({"id": 3, "entities": [], "edges": []})
+        results["items"][0]["edges"][0]["fact"] += "（后被推翻：provider acceptance ends retries）"
+        review = approved(batch, results)
+        proof = {"source": "batch_item", "source_id": 3, "quote": correction}
+        review["items"][0]["title_correction"] = proof
+        return batch, results, review
+
+    def test_frozen_same_batch_correction_supports_title_facts_summaries_and_payload(self):
+        batch, results, review = self.correction_fixture()
+        self.assertEqual(q.validate_review(batch, results, review, PROMPT), [])
+        self.assertEqual(q.validate_payload_quality(payload(batch, results, review)), [])
+        proof = review["items"][0]["title_correction"]
+        review["items"][0]["edges"][2].update(proof)
+        review["items"][0]["summaries"][0].update(proof)
+        self.assertEqual(q.validate_review(batch, results, review, PROMPT), [])
+        results["items"][0]["edges"][2]["fact"] += " Changed."
+        self.assertTrue(any("context_changed" in e for e in q.validate_review(batch, results, review, PROMPT)))
+
+    def test_correction_in_own_body_requires_explicit_quote_and_rejects_fabrication(self):
+        batch, results, _ = fixture()
+        correction = "Correction: the title omits the provider acceptance boundary."
+        batch["items"][0]["episode_body"] += "\n" + correction
+        results["items"][0]["edges"][0]["fact"] += "（后被推翻：provider acceptance boundary）"
+        review = approved(batch, results)
+        review["items"][0]["title_correction"] = {"source": "body", "quote": correction}
+        self.assertEqual(q.validate_review(batch, results, review, PROMPT), [])
+        review["items"][0]["title_correction"]["quote"] = "A correction never present in this observation."
+        self.assertIn("obs 1: corrected_title_requires_correction_evidence",
+                      q.validate_review(batch, results, review, PROMPT))
+
+    def test_cross_batch_unknown_self_or_malformed_correction_sources_are_rejected(self):
+        for change in ("unknown_id", "lookahead_id", "self", "bool_id", "missing_id", "fake_quote", "bad_source", "not_object"):
+            with self.subTest(change=change):
+                batch, results, review = self.correction_fixture()
+                proof = review["items"][0]["title_correction"]
+                if change == "unknown_id": proof["source_id"] = 999
+                elif change == "lookahead_id": proof["source_id"] = 2
+                elif change == "self": proof["source_id"] = 1
+                elif change == "bool_id": proof["source_id"] = True
+                elif change == "missing_id": proof.pop("source_id")
+                elif change == "fake_quote": proof["quote"] = "A fabricated correction absent from the frozen batch."
+                elif change == "bad_source": proof["source"] = "external"
+                else: review["items"][0]["title_correction"] = []
+                self.assertTrue(q.validate_review(batch, results, review, PROMPT))
+                self.assertTrue(q.validate_payload_quality(payload(batch, results, review)))
+
+    def test_editing_referenced_batch_body_invalidates_existing_review(self):
+        batch, results, review = self.correction_fixture()
+        batch["items"][1]["episode_body"] += " Changed after approval."
+        self.assertIn("obs 1: quality_context_changed: regenerate and re-review",
+                      q.validate_review(batch, results, review, PROMPT))
+
+    def test_other_batch_body_and_recording_metadata_cannot_prove_ownership(self):
+        batch, results, _ = self.correction_fixture()
+        batch["items"][1]["episode_body"] += "\nThe worker belongs to wrong-project.\nProject: metadata-project"
+        row = results["items"][0]
+        row["entities"].append({"name": "wrong-project", "type": "Project"})
+        row["edges"].append({"source": "Worker", "target": "wrong-project", "name": "belongs_to",
+                             "fact": "Worker belongs to wrong-project."})
+        review = approved(batch, results)
+        review["items"][0]["title_correction"] = {"source": "batch_item", "source_id": 3,
+            "quote": "Correction: dispatch retries are disabled after the provider accepts the request."}
+        review["items"][0]["edges"][-1].update(source="batch_item", source_id=3,
+            quote="The worker belongs to wrong-project.")
+        errors = q.validate_review(batch, results, review, PROMPT)
+        self.assertTrue(any("ownership_body_evidence_required" in e for e in errors))
+        review["items"][0]["edges"][-1].update(quote="Project: metadata-project")
+        self.assertTrue(any("source_quote_required" in e for e in q.validate_review(batch, results, review, PROMPT)))
 
     def test_review_identity_is_fixed_before_approval_and_cannot_be_reused(self):
         batch, results, review = fixture()
