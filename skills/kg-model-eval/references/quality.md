@@ -3,6 +3,16 @@
 新运行共用 `agent-v5` / `extraction-quality-v1`。本页说明质量表的含义；命令与字段以发布产物的 `--help` 及
 `utils/extraction_quality.py` 为准。表只证明证据覆盖、审核对象及版本一致，不证明评审者的语义判断必然正确。
 
+## 默认 peer 只消费冻结批次
+
+默认 frozen-batch consumer 无需服务 API 凭据，不调用 HTTP 预检、next/claim 或 submit；Mac 协调器统一领取源观测、HTTP 能力预检、整批 dry-run、正式提交及权威 registry/log/score。
+Mac 交付冻结 batch、完整 prompt SHA256、manifest model/tool/run 身份与最新成功 preflight/capabilities 回执；peer 核对本地 tracking 排除、代码/规则/协议版本和受控产物 hash，再离线 quality-sheet/check、逐条审核并回传 results 与质量 receipt。
+回执是受控产物 hash 证据，不是密码学签名，不代表 peer 自己通过 HTTP 预检。peer dryrun-check 还必须使用 Mac 对同一整批结果真实预览成功生成的 payload-bound marker；缺失或结果改变须返回 missing，不能拿能力回执替代预览。
+Mac 在同一 campaign 重新核验回传 receipt 和结果后才执行 HTTP 整批预览及正式提交，服务端 v5 质量门继续强制。
+peer 独立 API 预检/提交是尚未开通的可选扩展，需另有明确授权和专用 credential；默认路径不签发新 secret、不借 master，不声称独立源领取或本地 bench/score 已验证。
+
+下面 campaign 的联网预览/提交命令由 Mac 协调器执行；peer 只运行明确离线的 agent 文件命令。
+
 ## 每批先核质量，再预览，再提交
 
 使用已发布的 `CLI="$KG_HUB_CODE/tools/extract"`，会话目录保持采集排除。
@@ -107,3 +117,10 @@ preview 是只读计划，不代表已修复；apply 要写权限。快照变化
 网络超时或 pending 先用同一 repair_id 查 status；确认审计状态后需要重放时，仅用原请求和同一 repair_id，不能换ID盲目重放。
 报告分别标注候选已备、预览通过、应用成功及审计读回；只有服务核实来源键、纠正事实和episode关联后返回 verified=true，才记修复成功。
 确认成功后也保留旧战役原结果/错误记录，修复作为另一条可追溯审计，不回写历史评测分数来抹掉错误。
+
+
+### 修复计划中的全局事实边复用
+
+`plan.materialization_version=edge-origin-v1` 区分本来源时间 `source_reference_time` 和全局事实边首来源时间。每条 replacement edge 的 `write_mode` 为 `new` 或 `reused`。`reused` 的平铺时间、模型、repair_id 等字段显示实际保留的首来源值；`stored_origin` 保存其原始属性及端点。复用只追加本 episode 的背书，不能用后来源的时间或修复编号覆盖首来源。UUID 丢失、不可变属性变更或原有来源背书丢失会拒绝成功回执。
+
+新协议成功回执的 `replacement_edge_verification` 返回 `version=edge-origin-v1`、本来源时间，以及各事实边的写入模式、首来源元数据、属性摘要和原背书集合摘要（列表最多 120 项，完整集合另有摘要）。新边验证拟写属性和 float32 物化向量，复用边验证原始全部不可变属性（包括向量）及原背书子集。`shared_edge_verification` 继续核验原错误边的其他来源。旧 applied 审计原样保留；旧 pending 计划恢复后明确标 `legacy_plan`，不能当作新协议证明。preview 只呈现当时图状态；正式 apply 在 writer lock 内重新解析并持久化计划，恢复严格复用该冻结计划。

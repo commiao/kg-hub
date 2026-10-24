@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import json
+import struct
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -46,12 +47,13 @@ class Driver:
                      "episodes": ["episode"]}}
         self.mentions = set() if empty else {"component", "wrong-project", "right-project"}
         self.audits, self.mutations = {}, []
+        self.explicit_edge_props = set()
         self.fail_at = None
 
     async def execute_query(self, query, **p):
         import re
         tag = (re.search(r"/\* (repair:[^ ]+) \*/", query) or [None, None])[1]
-        if tag and tag not in {"repair:snapshot-key", "repair:snapshot-episode", "repair:snapshot-edges", "repair:snapshot-entities", "repair:source-counts", "repair:shared-readback", "repair:audit-read"}:
+        if tag and tag not in {"repair:snapshot-key", "repair:snapshot-episode", "repair:snapshot-edges", "repair:snapshot-entities", "repair:source-counts", "repair:shared-readback", "repair:edge-origin", "repair:audit-read"}:
             self.mutations.append(tag)
         if self.fail_at is not None and self.fail_at == tag:
             self.fail_at = None
@@ -61,15 +63,18 @@ class Driver:
         elif tag == "repair:snapshot-episode":
             result = [{"props": deepcopy(self.episode)}] if self.episode and self.episode["uuid"] == p["ep"] else []
         elif tag == "repair:snapshot-edges":
-            result = [{"props": {k: deepcopy(v) for k, v in e.items() if k not in {"source_uuid", "target_uuid"}},
+            result = [{"props": self.edge_properties(e),
                        "source_uuid": e["source_uuid"], "target_uuid": e["target_uuid"],
                        "source_name": self.nodes[e["source_uuid"]]["name"],
                        "target_name": self.nodes[e["target_uuid"]]["name"]}
                       for e in sorted(self.edges.values(), key=lambda x: x["uuid"]) if p["ep"] in e["episodes"]]
+        elif tag == "repair:edge-origin":
+            e = self.edges.get(p["uid"])
+            result = [{"props": self.edge_properties(e), "source_uuid": e["source_uuid"], "target_uuid": e["target_uuid"]}] if e else []
         elif tag == "repair:shared-readback":
             self.assert_guard(query, "e.uuid IN $ids")
             self.assert_guard(query, "e.group_id=$group_id")
-            result = [{"props": {k: deepcopy(v) for k, v in e.items() if k not in {"source_uuid", "target_uuid"}},
+            result = [{"props": self.edge_properties(e),
                        "source_uuid": e["source_uuid"], "target_uuid": e["target_uuid"]}
                       for e in self.edges.values() if e["uuid"] in p["ids"]]
         elif tag == "repair:snapshot-entities":
@@ -100,11 +105,26 @@ class Driver:
             self.assert_guard(query, "MERGE (e)-[m:MENTIONS]->(n) ON CREATE SET m.uuid=$mid")
             self.mentions.add(p["node"])
             result = [{"uuid": p["mid"]}]
+        elif tag == "repair:edge-reuse":
+            self.assert_guard(query, "MATCH (a:Entity {uuid:$src})-[e:RELATES_TO {uuid:$uid}]->(b:Entity {uuid:$dst})")
+            if "MERGE" in query or "ON CREATE" in query:
+                raise AssertionError("reuse must never recreate a missing global edge")
+            e = self.edges.get(p["uid"])
+            if e and (e["source_uuid"], e["target_uuid"], e["name"], e["fact"]) == (p["src"], p["dst"], p["name"], p["fact"]):
+                if p["ep"] not in e["episodes"]:
+                    e["episodes"].append(p["ep"])
+                result = [{"uuid": p["uid"]}]
+            else:
+                result = []
         elif tag == "repair:edge":
             if p["src"] not in self.nodes or p["dst"] not in self.nodes:
                 result = []
             else:
-                e = self.edges.setdefault(p["uid"], deepcopy(p["props"]))
+                if p["uid"] not in self.edges:
+                    self.explicit_edge_props.add(p["uid"])
+                if p["uid"] not in self.edges:
+                    self.edges[p["uid"]] = {**deepcopy(p["props"]), "fact_embedding": [struct.unpack("!f", struct.pack("!f", x))[0] for x in p["embedding"]]}
+                e = self.edges[p["uid"]]
                 if p["ep"] not in e["episodes"]:
                     e["episodes"].append(p["ep"])
                 result = [{"uuid": p["uid"]}]
@@ -163,6 +183,10 @@ class Driver:
             raise AssertionError(query)
         return result, None, None
 
+    def edge_properties(self, edge):
+        return {key: deepcopy(value) for key, value in edge.items()
+                if edge["uuid"] in self.explicit_edge_props or key not in {"source_uuid", "target_uuid"}}
+
     @staticmethod
     def assert_guard(query, guard):
         if guard not in query:
@@ -187,6 +211,77 @@ class RepairTests(unittest.IsolatedAsyncioTestCase):
                 "expected_snapshot_sha256": snap["snapshot_sha256"], "reason": "Correct recording-label attribution",
                 "reviewer": "independent reviewer", "remove_edge_uuids": [] if snap["key"]["status"] == "empty" else ["wrong"],
                 "replacement": payload}
+
+    async def reused_fixture(self):
+        g = self.graph()
+        request = await self.request(g)
+        fact = request["replacement"]["edges"][0]["fact"]
+        g.driver.edges["first-origin"] = {"uuid": "first-origin", "source_uuid": "component", "target_uuid": "right-project",
+            "name": "belongs_to", "fact": fact, "group_id": "kg_hub", "episodes": ["earlier-source"],
+            "valid_at": "2026-10-06T13:21:29.858Z", "reference_time": "2026-10-06T13:21:29.858Z",
+            "created_at": "2026-10-06T13:22:00Z", "repair_id": "earlier-repair", "extractor_model": "earlier-model",
+            "extractor_tool": "codex", "run_id": "earlier-run", "fact_embedding": [1.0, 0.0, 0.0], "custom": "immutable"}
+        return g, request
+
+    async def test_reused_preview_and_readback_keep_first_origin(self):
+        g, request = await self.reused_fixture()
+        preview = await repair.preview(g, request, "kg_hub", quality_validator=lambda p: [])
+        edge = preview["plan"]["edges"][0]
+        self.assertEqual(edge["write_mode"], "reused")
+        self.assertEqual(edge["valid_at"], "2026-10-06T13:21:29.858Z")
+        self.assertEqual(edge["repair_id"], "earlier-repair")
+        self.assertEqual(preview["plan"]["source_reference_time"], request["replacement"]["reference_time"])
+        result = await repair.apply(g, request, "kg_hub", quality_validator=lambda p: [])
+        self.assertTrue(result["verified"])
+        proof = result["replacement_edge_verification"]
+        self.assertEqual(proof["version"], "edge-origin-v1")
+        self.assertEqual(proof["edges"][0]["origin"]["repair_id"], "earlier-repair")
+        self.assertEqual(g.driver.edges["first-origin"]["episodes"], ["earlier-source", "episode"])
+        self.assertEqual(g.driver.episode["valid_at"], "2026-10-07T00:00:00+00:00")
+
+    async def test_legacy_applied_receipt_is_not_rewritten_or_upgraded(self):
+        g = self.graph()
+        request = await self.request(g)
+        parsed = repair.parse_request(request)
+        receipt = {"status": "repaired", "verified": True, "repair_id": request["repair_id"]}
+        g.driver.audits[request["repair_id"]] = {"repair_id": request["repair_id"], "state": "applied",
+            "request_sha256": repair.digest(parsed), "result_json": repair.encoded(receipt)}
+        result = await repair.apply(g, request, "kg_hub", quality_validator=lambda p: [])
+        self.assertTrue(result["duplicate"])
+        self.assertNotIn("replacement_edge_verification", result)
+        self.assertEqual(g.driver.audits[request["repair_id"]]["result_json"], repair.encoded(receipt))
+
+    async def test_legacy_pending_plan_replays_without_new_origin_claim(self):
+        g = self.graph()
+        request = await self.request(g)
+        before = await repair.snapshot(g.driver, "source", "one", "kg_hub")
+        parsed = repair.parse_request(request)
+        plan = await repair.prepare_plan(g, parsed, before, "kg_hub")
+        plan.pop("materialization_version")
+        plan.pop("source_reference_time")
+        for edge in plan["edges"]:
+            edge.pop("write_mode"); edge.pop("stored_origin")
+        await repair._persist_prepared(g.driver, parsed, before, plan)
+        frozen_plan = g.driver.audits[request["repair_id"]]["plan_json"]
+        result = await repair.apply(g, request, "kg_hub", quality_validator=lambda p: [])
+        self.assertEqual(result["replacement_edge_verification"], {"status": "legacy_plan", "version": "legacy"})
+        self.assertEqual(g.driver.audits[request["repair_id"]]["plan_json"], frozen_plan)
+
+    async def test_reused_origin_or_endorsement_drift_blocks_replay(self):
+        for field in ("valid_at", "repair_id", "extractor_model", "custom", "episodes", "source_uuid", "missing"):
+            with self.subTest(field=field):
+                g, request = await self.reused_fixture()
+                g.driver.fail_at = "repair:claim"
+                with self.assertRaises(RuntimeError):
+                    await repair.apply(g, request, "kg_hub", quality_validator=lambda p: [])
+                if field == "missing":
+                    del g.driver.edges["first-origin"]
+                else:
+                    g.driver.edges["first-origin"][field] = [] if field == "episodes" else "tampered"
+                with self.assertRaisesRegex(repair.RepairError, "reused edge"):
+                    await repair.apply(g, request, "kg_hub", quality_validator=lambda p: [])
+                self.assertEqual(g.driver.audits["repair-one"]["state"], "pending")
+                self.assertNotIn("result_json", g.driver.audits["repair-one"])
 
     async def test_preview_is_readonly_and_contains_original_and_edges(self):
         g = self.graph()

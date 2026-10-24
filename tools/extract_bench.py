@@ -652,7 +652,8 @@ def run_models(p: Path, m: dict, models: list[str], *, executor: str, out_root: 
             parts[b] = (its, batch.get("lookahead") or [])
     dirs, per_model, lock = {}, {}, Lock()
     for model in models:
-        d = out_root / f"{tag}-{executor}-{re.sub(r'[^\w.-]+', '_', model)}"
+        model_slug = re.sub(r"[^\w.-]+", "_", model)
+        d = out_root / f"{tag}-{executor}-{model_slug}"
         if d.exists():
             raise SystemExit(f"{d} 已存在：换个 --tag，不覆盖已有结果")
         (d / "work").mkdir(parents=True)
