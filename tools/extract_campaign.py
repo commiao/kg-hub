@@ -443,7 +443,13 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None,
     native_prefix = f"{public_entry} runtime exec --proxy-mode {quote(settings['proxy_mode'])} -- "
     # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
     reg_dir = claim_registry.claims_dir()
-    adds = f"--add-dir {quote(st)}" + ("" if reg_dir.resolve().is_relative_to(Path(st).resolve()) else f" --add-dir {quote(reg_dir)}")
+    from tools import nas_gate
+    gate_dir = Path(nas_gate.load_settings()["lock_dir"]).expanduser()
+    writable = []
+    for directory in (Path(st), reg_dir, gate_dir):
+        if not any(directory.resolve().is_relative_to(parent.resolve()) for parent in writable):
+            writable.append(directory)
+    adds = " ".join(f"--add-dir {quote(directory)}" for directory in writable)
     # The public shell entry chooses the current HOME runtime. Quote each shell argument.
     brief_cmd = f'"$({cli_command()} brief --id {quote(cid)} --model {quote(model)})"'
     if tool == "codex":

@@ -55,11 +55,16 @@ quality-check 读取表内身份，无需重复输入。dryrun-check 只核对�
 - `facts_complete`：其余 fact 是否为完整句，方向、数字、条件和历史时点是否保真；禁止截断到固定字符数。
 - `core_covered`：核心机制和新增信息是否已覆盖；不能靠删除核心事实让格式指标通过。真正无知识的空项也要明确核对没有漏抽。
 - `ownership_checked`：全部归属边和 summary 是否有正文支持；记录标签、来源描述及 `Project:` 元数据本身不是实现归属证据。
-- `edges` 为每个实际边的 `index` 提供 `source`（`body` 或 `lookahead`）与原样 `quote`。
+- `edges` 为每个实际边的 `index` 提供 `source`（`body`、`lookahead` 或 `batch_item`）与原样 `quote`。
   引文必须能在对应输入中找到；标题译文可引用原始标题，后续更正可引用实际 lookahead。
+  `batch_item` 必须同时给整数 `source_id`，引用本冻结批次中另一条观测的正文；跨批、未知编号和伪造引文会被拒绝。
   `belongs_to` 只接受正文归属证据，不能只用 lookahead 或外层记录项目标签。
-  第一条 fact 可为原始标题，或 `原始标题（后被推翻：…）`；后一种必须由该边的实际 lookahead 引文支持。
-- `summaries` 按实体 `name` 提供原样 `quote`；不能把“实体名出现过”当成 summary 全部断言有据。
+  第一条 fact 可为原始标题，或 `原始标题（后被推翻：…）`。更正说明在该条审核中单独填
+  `title_correction={"source":"batch_item","source_id":<本批观测整数ID>,"quote":"真实更正原文"}`；
+  也可用 `body` 或 `lookahead` 的真实引文。第一条边自身仍要提供标题证据。
+  旧表以第一条边的实际 lookahead 引文支持更正的写法继续兼容。引文存在不等于更正成立，审阅者须核对完整断言。
+- `summaries` 按实体 `name` 提供原样 `quote`；需要引用同批更正时也填写 `source="batch_item"` 和 `source_id`。
+  没有 `source` 的旧写法仍在本条正文与 lookahead 中核验。不能把“实体名出现过”当成 summary 全部断言有据。
 
 自环、重复边、悬空边等导致真实入库归一化丢失结构时，质量核验会拒绝；先改候选，不能只靠服务悄悄丢边。
 
