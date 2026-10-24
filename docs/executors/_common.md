@@ -10,7 +10,9 @@
 ```bash
 export KG_HUB_CODE=${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}
 CLI="$KG_HUB_CODE/tools/extract"
+# Mac 协调器或已开通独立 API 权限的执行器才运行 HTTP 预检：
 "$CLI" agent preflight
+# 默认 peer frozen-batch consumer 按下文读取协调器成功回执，不发 API。
 ```
 
 公共入口先使用显式 `KG_HUB_PYTHON`，否则检测当前 `$HOME/.local/share/kg-hub/venv/bin/python`（Python ≥3.10 且能导入 pydantic 2 的 model_validator 与 httpx），合格就用它，最后回退 `python3`。
@@ -76,17 +78,29 @@ export KG_HUB_RUN_ID=<run_id>
 ## 发布产物上的会话目录
 
 NAS/DSH/VPS 只有发布产物时运行 `"$CLI" campaign workspace --session-only`，不需要 Git、fetch 或源码 checkout。
-它创建 `~/work-ai/kg-hub-campaign` 并备份追加 claude-mem 排除名单；随后必须在该目录打开真实工具会话，再运行 preflight。
+它创建 `~/work-ai/kg-hub-campaign` 并备份追加 claude-mem 排除名单；随后必须在该目录打开真实工具会话，核对本地 tracking 排除状态。
+Mac 协调器执行 HTTP preflight；默认 peer 读取其最新成功 preflight/capabilities 回执，不自行发 API。
 `CLAUDE_PROJECT_DIR` 如存在也必须命中排除规则；不要用 `CLAUDE_MEM_INTERNAL=1` 代替实际排除验收。
 代码仍从已发布 `current` 加载，发布产物与会话目录都不用于源码修改；开发改动另走 Git 工作树。
 
-peer 专用 extract-scope 凭据安装在当前 HOME 的 `~/.config/kg-hub/extraction-token`，必须本人拥有且权限 0600；可用 `KG_HUB_TOKEN_FILE` 指向其他专用文件。
-凭据读取顺序为显式 token 环境变量、专用文件、已有个人配置；文件缺失（显式指定）、不安全或为空会拒绝，值不打印。
+默认 peer frozen-batch consumer 不需要服务 API 凭据。peer 独立发 API 预检或提交属于可选扩展，当前未开通；
+必须另有用户明确授权和专用 extract-scope 凭据，不借 master 或已有全权凭据，不把没有凭据的 HTTP 预检标绿。
+已获授权的独立模式才使用本人拥有、0600 的 `~/.config/kg-hub/extraction-token`（或显式 `KG_HUB_TOKEN_FILE`）；默认离线模式不签发也不登记新 secret。
 
-## 远端工具与源观测领取
+## 默认远端模式：frozen-batch consumer
 
-`agent next` / `campaign claim` 仍需 `KG_HUB_NAS_SSH` 对 NAS 观测库的读取权限；capabilities 预检通过不代表这个源访问已验证。
-DSH/VPS 尚未验证源 SSH 时，采用协调器分发模式：Mac 领取并保存冻结 batch、完整规则及其 SHA256 与 manifest 的 model/tool/run 身份，传给已排除目录中的工具抽取和逐条审核；工具回传 results 和 review。
-Mac 协调器的 campaign 状态与 claim_registry 目录是唯一权威目录；peer 不在独立同 id 目录自行 claim，也不修改 canonical logs。
-Mac 使用原 campaign 的冻结 batch、prompt SHA、manifest model/tool/run 身份核对回传结果和 receipt，再执行 quality-check、整批 dry-run 和正式提交，统一领取登记、日志与报告。远端也可用 agent 的 file 参数离线核验质量表；该路径不需要 NAS SSH。
-没有既有只读源访问证明时，不让远端自行 next/claim，不复制 NAS 全权 SSH 密钥，不把预检绿色写成全链路领取已通过。
+Mac 协调器的 campaign 状态与 claim_registry 是唯一权威目录。默认 peer 不调用服务 API，不自行 next/claim/submit，不修改 canonical logs。
+Mac 统一执行 source claim、HTTP preflight、HTTP 整批 dry-run、正式 submit、registry 与 bench/score；
+`agent next` / `campaign claim` 仍需已验证的 NAS 观测库 SSH 读取权限，不向 peer 复制全权密钥。
+
+Mac 交付冻结 batch、完整 prompt 及 SHA256、manifest 的 model/tool/run 身份，以及最新成功 preflight/capabilities 回执。
+回执记录真实检查时间、服务能力、代码/规则/协议版本及受控产物 hash；它是受控产物证据，不是密码学签名，也不证明 peer 自己通过了 HTTP 预检。
+peer 核对这些产物与本地加载版本、实际会话 cwd/CLAUDE_PROJECT_DIR 排除规则；缺回执、失败或版本/hash 不一致时由 Mac 重查，不能手改回执为绿。
+
+peer 使用 agent 的 file 参数运行离线 quality-sheet/check，完整读原文和 lookahead 后回传 results 与 quality receipt。
+Mac 用原 campaign 的冻结输入与 manifest 身份重新 quality-check，再作真实 HTTP 整批预览和正式提交，服务端 v5 质量门始终保留。
+若 peer 要离线运行 dryrun-check，还须接收 Mac 对这份整批结果真实预览成功后生成的 payload-bound dryrun marker，并在自己的状态目录中原样保存；
+只有 preflight/capabilities 回执不能代替该 marker，预览未做或结果有改动时应返回 missing，不补造 marker。
+
+当前 Mac 五工具完整预检已验证；DSH/VPS 的离线 12 项检查、实际 tracking 排除和 skill hash 已验证。
+这些证据不代表两 peer 有 API 凭据、独立 source claim 或本地 bench/score；这些可选能力均未开通/未验证。

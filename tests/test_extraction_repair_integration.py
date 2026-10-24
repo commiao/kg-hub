@@ -129,6 +129,130 @@ class RealRepairTests(unittest.IsolatedAsyncioTestCase):
         edges = await self.rows("MATCH ()-[r]->() RETURN count(r) AS n")
         return nodes[0]["n"], edges[0]["n"]
 
+    async def seed_first_origin(self, request):
+        props = {"uuid": "cross-source-edge", "group_id": GROUP, "name": "belongs_to",
+                 "fact": request["replacement"]["edges"][0]["fact"], "episodes": ["first-source"],
+                 "valid_at": "2026-10-06T13:21:29.858Z", "reference_time": "2026-10-06T13:21:29.858Z",
+                 "created_at": "2026-10-06T14:00:00Z", "extractor_model": "first-origin-model",
+                 "extractor_tool": "codex", "run_id": "first-origin-run", "repair_id": "first-origin-repair",
+                 "custom_origin": "keep this original metadata"}
+        await self.rows("CREATE (e:Episodic) SET e=$props", props={"uuid": "first-source", "group_id": GROUP,
+            "name": "earlier observation", "content": BODY, "valid_at": props["valid_at"],
+            "extractor_model": "first-origin-model", "entity_edges": [props["uuid"]]})
+        await self.rows("MATCH (a:Entity {uuid:'component'}),(b:Entity {uuid:'right-project'}) "
+            "CREATE (a)-[r:RELATES_TO]->(b) SET r=$props,r.fact_embedding=vecf32($v)", props=props, v=VECTOR)
+        return await repair.edge_origin(self.driver, props["uuid"], GROUP)
+
+    async def test_reused_global_fact_preview_materialization_retains_first_origin(self):
+        import json
+        await self.fixture()
+        request = await self.request("later-source-repair")
+        first = await self.seed_first_origin(request)
+        preview = await repair.preview(self.g, request, GROUP, quality_validator=lambda payload: [])
+        edge = preview["plan"]["edges"][0]
+        self.assertEqual(preview["plan"]["materialization_version"], "edge-origin-v1")
+        self.assertEqual(edge["write_mode"], "reused")
+        self.assertEqual(edge["stored_origin"], first)
+        self.assertEqual(edge["valid_at"], first["props"]["valid_at"])
+        self.assertEqual(edge["repair_id"], "first-origin-repair")
+        self.assertEqual(edge["extractor_model"], "first-origin-model")
+        self.assertEqual(preview["plan"]["source_reference_time"], request["replacement"]["reference_time"])
+        self.assertNotEqual(edge["valid_at"], preview["plan"]["source_reference_time"])
+        json.dumps(preview, allow_nan=False)  # stored Falkor vecf32 properties must be serializable
+        interrupted = SimpleNamespace(driver=FaultDriver(self.driver, "repair:edge-reuse"), embedder=Embedder())
+        with self.assertRaises(RuntimeError):
+            await repair.apply(interrupted, request, GROUP, quality_validator=lambda payload: [])
+        # Recovery loads the frozen plan from audit JSON, including vecf32 data.
+        result = await repair.apply(self.g, request, GROUP, quality_validator=lambda payload: [])
+        self.assertTrue(result["verified"])
+        actual = await repair.edge_origin(self.driver, edge["uuid"], GROUP)
+        self.assertEqual(repair._immutable_props(actual["props"]), repair._immutable_props(first["props"]))
+        self.assertEqual(set(actual["props"]["episodes"]), {"first-source", "episode"})
+        proof = result["replacement_edge_verification"]
+        self.assertEqual(proof["status"], "verified")
+        self.assertEqual(proof["edges"][0]["origin"]["repair_id"], "first-origin-repair")
+        self.assertEqual(proof["edges"][0]["original_episodes_count"], 1)
+        self.assertNotIn("fact_embedding", proof["edges"][0])
+        after = await repair.snapshot(self.driver, "fixture-source", "one", GROUP)
+        self.assertEqual(after["episode"]["valid_at"], "2026-10-07T00:00:00+00:00")
+        self.assertEqual(after["episode"]["extractor_model"], "original-fixture-model")
+        self.assertTrue((await repair.apply(self.g, request, GROUP, quality_validator=lambda payload: []))["duplicate"])
+
+    async def test_new_fact_readback_compares_materialized_float32_vector(self):
+        await self.fixture()
+        request = await self.request("non-exact-float-vector", observer=True)
+        class WiderFloatEmbedder:
+            async def create_batch(self, texts):
+                return [[0.123456789, 0.333333333] + [0.0] * 382 for _ in texts]
+        graph = self.driver.client.select_graph(self.database)
+        await graph.create_node_vector_index("Entity", "name_embedding", dim=384, similarity_function="cosine")
+        g = SimpleNamespace(driver=self.driver, embedder=WiderFloatEmbedder())
+        result = await repair.apply(g, request, GROUP, quality_validator=lambda payload: [])
+        self.assertTrue(result["verified"])
+        saved = await repair.audit(self.driver, request["repair_id"])
+        actual = await repair.edge_origin(self.driver, saved["plan"]["edges"][0]["uuid"], GROUP)
+        self.assertNotEqual(actual["props"]["fact_embedding"][0], 0.123456789)
+
+    async def test_reused_global_origin_drift_before_replay_is_refused(self):
+        changes = {
+            "time": "SET r.valid_at='2035-01-01T00:00:00Z'",
+            "repair_id": "SET r.repair_id='forged-repair'",
+            "model": "SET r.extractor_model='forged-model'",
+            "custom": "SET r.custom_origin='changed'",
+            "episodes": "SET r.episodes=[]",
+            "missing": "DELETE r",
+        }
+        for label, mutation in changes.items():
+            with self.subTest(label=label):
+                await self.fixture()
+                request = await self.request("drift-" + label)
+                await self.seed_first_origin(request)
+                interrupted = SimpleNamespace(driver=FaultDriver(self.driver, "repair:claim"), embedder=Embedder())
+                with self.assertRaises(RuntimeError):
+                    await repair.apply(interrupted, request, GROUP, quality_validator=lambda payload: [])
+                await self.rows("MATCH ()-[r:RELATES_TO {uuid:'cross-source-edge'}]->() " + mutation)
+                with self.assertRaisesRegex(repair.RepairError, "reused edge"):
+                    await repair.apply(self.g, request, GROUP, quality_validator=lambda payload: [])
+                saved = await repair.audit(self.driver, request["repair_id"])
+                self.assertEqual(saved["state"], "pending")
+                self.assertNotIn("result", saved)
+
+    async def test_new_edge_origin_tamper_after_write_blocks_success(self):
+        for field in ("extractor_model", "repair_id", "valid_at"):
+            with self.subTest(field=field):
+                await self.fixture()
+                request = await self.request("tampered-new-" + field)
+                driver = self.driver
+                class TamperNewEdge:
+                    async def execute_query(self, query, **params):
+                        result = await driver.execute_query(query, **params)
+                        if "/* repair:edge */" in query:
+                            await driver.execute_query("MATCH ()-[r:RELATES_TO {uuid:$uid}]->() SET r." + field + "='tampered-origin'", uid=params["uid"])
+                        return result
+                g = SimpleNamespace(driver=TamperNewEdge(), embedder=Embedder())
+                with self.assertRaisesRegex(repair.RepairError, "new fact origin metadata"):
+                    await repair.apply(g, request, GROUP, quality_validator=lambda payload: [])
+                saved = await repair.audit(self.driver, request["repair_id"])
+                self.assertEqual(saved["state"], "pending")
+                self.assertNotIn("result", saved)
+
+    async def test_reused_global_origin_drift_after_endorsement_fails_readback(self):
+        await self.fixture()
+        request = await self.request("drift-after-endorsement")
+        await self.seed_first_origin(request)
+        driver = self.driver
+        class DriftAfterEndorsement:
+            async def execute_query(self, query, **params):
+                result = await driver.execute_query(query, **params)
+                if "/* repair:edge-reuse */" in query:
+                    await driver.execute_query("MATCH ()-[r:RELATES_TO {uuid:'cross-source-edge'}]->() "
+                                               "SET r.repair_id='tampered-after-append'")
+                return result
+        g = SimpleNamespace(driver=DriftAfterEndorsement(), embedder=Embedder())
+        with self.assertRaisesRegex(repair.RepairError, "reused edge origin"):
+            await repair.apply(g, request, GROUP, quality_validator=lambda payload: [])
+        self.assertEqual((await repair.audit(self.driver, request["repair_id"]))["state"], "pending")
+
     async def test_preview_is_read_only_on_real_graph(self):
         await self.fixture()
         before = await self.counts()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import struct
 import uuid
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ from utils.extracted_ingest import (
 )
 
 VERSION = "extraction-repair-v1"
+MATERIALIZATION_VERSION = "edge-origin-v1"
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -137,6 +139,33 @@ async def shared_edge_readback(driver, before: dict, group_id: str) -> list[dict
     return rows
 
 
+async def edge_origin(driver, uid: str, group_id: str) -> dict:
+    rows = await _rows(driver,
+        "/* repair:edge-origin */ MATCH (a:Entity)-[e:RELATES_TO {uuid:$uid}]->(b:Entity) "
+        "WHERE e.group_id=$group_id RETURN properties(e) AS props, "
+        "a.uuid AS source_uuid,b.uuid AS target_uuid",
+        uid=uid, group_id=group_id)
+    if len(rows) != 1:
+        raise RepairError("repair_edge_origin_changed", "reused edge is missing or its UUID is ambiguous", 503)
+    return rows[0]
+
+
+def _immutable_props(props: dict) -> dict:
+    return {key: value for key, value in props.items() if key != "episodes"}
+
+
+def _assert_origin(found: dict, original: dict) -> None:
+    if (any(found.get(key) != original.get(key) for key in ("source_uuid", "target_uuid"))
+            or _immutable_props(found["props"]) != _immutable_props(original["props"])
+            or not set(original["props"].get("episodes") or []).issubset(set(found["props"].get("episodes") or []))):
+        raise RepairError("repair_edge_origin_changed", "reused edge origin or original endorsements changed", 503)
+
+
+def _write_props(edge: dict) -> dict:
+    return {key: value for key, value in edge.items()
+            if key not in ("fact_embedding", "write_mode", "stored_origin") and value is not None}
+
+
 async def audit(driver, repair_id: str) -> dict | None:
     rows = await _rows(driver,
         "/* repair:audit-read */ MATCH (r:ExtractionRepair {repair_id:$rid}) RETURN properties(r) AS props", rid=repair_id)
@@ -221,6 +250,8 @@ async def prepare_plan(g, request: dict, before: dict, group_id: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     ep_uuid = before["key"].get("episode_uuid") or str(uuid.uuid5(uuid.NAMESPACE_URL, f"{VERSION}:{rid}:episode"))
     plan = {"episode_uuid": ep_uuid, "created_at": now, "nodes": [], "edges": [],
+            "materialization_version": MATERIALIZATION_VERSION,
+            "source_reference_time": payload["reference_time"] if payload else (before["episode"] or {}).get("valid_at"),
             "remove": [e for e in before["edges"] if e["props"]["uuid"] in request["remove_edge_uuids"]]}
     if not payload:
         return plan
@@ -246,8 +277,20 @@ async def prepare_plan(g, request: dict, before: dict, group_id: str) -> dict:
         # Never bind the replacement to a selected incorrect edge, even if a caller
         # accidentally sends the exact old triple back as its purported correction.
         rows = [r for r in rows if r["uuid"] not in request["remove_edge_uuids"]]
-        uid = rows[0]["uuid"] if rows else str(uuid.uuid5(uuid.NAMESPACE_URL, f"{VERSION}:{rid}:edge:{index}"))
-        plan["edges"].append({"uuid": uid, "source_uuid": src, "target_uuid": dst,
+        if rows:
+            stored = await edge_origin(g.driver, rows[0]["uuid"], group_id)
+            if (stored["source_uuid"] != src or stored["target_uuid"] != dst
+                    or stored["props"].get("name") != ed.name or stored["props"].get("fact") != ed.fact):
+                raise RepairError("repair_edge_origin_changed", "deduplicated edge no longer matches the reviewed fact", 503)
+            properties = dict(stored["props"])
+            properties["episodes"] = list(properties.get("episodes") or [])
+            if ep_uuid not in properties["episodes"]:
+                properties["episodes"].append(ep_uuid)
+            plan["edges"].append({**properties, "source_uuid": src, "target_uuid": dst,
+                                  "write_mode": "reused", "stored_origin": stored})
+            continue
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{VERSION}:{rid}:edge:{index}"))
+        plan["edges"].append({"write_mode": "new", "stored_origin": None, "uuid": uid, "source_uuid": src, "target_uuid": dst,
             "name": ed.name, "fact": ed.fact, "raw_name": ed.raw_name, "group_id": group_id,
             "fact_embedding": [float(x) for x in vectors[len(normal.entities) + index]],
             "episodes": [ep_uuid], "created_at": now, "valid_at": payload["reference_time"],
@@ -292,6 +335,10 @@ async def _apply_plan(driver, request, before, plan):
         "SET k.repair_pending_id=$rid RETURN k.source_obs_id AS sid", sd=sd, sid=sid, rid=rid)
     if len(claimed) != 1:
         raise RepairError("repair_pending", "source repair ownership changed")
+    for edge in plan["edges"]:
+        if edge.get("write_mode") == "reused":
+            original = edge["stored_origin"]
+            _assert_origin(await edge_origin(driver, edge["uuid"], original["props"]["group_id"]), original)
     for node in plan["nodes"]:
         if not node["new"]:
             continue
@@ -324,7 +371,19 @@ async def _apply_plan(driver, request, before, plan):
             g=node["group_id"], now=plan["created_at"])
     new_ids = []
     for edge in plan["edges"]:
-        data = {k: v for k, v in edge.items() if k != "fact_embedding" and v is not None}
+        if edge.get("write_mode") == "reused":
+            rows = await _rows(driver,
+                "/* repair:edge-reuse */ MATCH (a:Entity {uuid:$src})-[e:RELATES_TO {uuid:$uid}]->(b:Entity {uuid:$dst}) "
+                "WHERE e.group_id=$group_id AND e.name=$name AND e.fact=$fact "
+                "SET e.episodes=CASE WHEN $ep IN coalesce(e.episodes,[]) THEN e.episodes "
+                "ELSE coalesce(e.episodes,[])+[$ep] END RETURN e.uuid AS uuid",
+                src=edge["source_uuid"], dst=edge["target_uuid"], uid=edge["uuid"], group_id=edge["group_id"],
+                name=edge["name"], fact=edge["fact"], ep=ep)
+            if len(rows) != 1:
+                raise RepairError("repair_edge_origin_changed", "reused edge disappeared before endorsement", 503)
+            new_ids.append(edge["uuid"])
+            continue
+        data = _write_props(edge)
         rows = await _rows(driver,
             "/* repair:edge */ MATCH (a:Entity {uuid:$src}), (b:Entity {uuid:$dst}) "
             "MERGE (a)-[e:RELATES_TO {uuid:$uid}]->(b) "
@@ -404,6 +463,17 @@ def verify_materialization(current: dict, before: dict, request: dict, plan: dic
         if not found or any(found["props"].get(k) != edge[k] for k in ("name", "fact")) or any(
                 found.get(k) != edge[k] for k in ("source_uuid", "target_uuid")):
             raise RepairError("repair_not_materialized", "corrected fact is missing or differs", 503)
+        if edge.get("write_mode") == "reused":
+            _assert_origin(found, edge["stored_origin"])
+        elif edge.get("write_mode") == "new":
+            expected_props = _immutable_props(_write_props(edge))
+            # Falkor vecf32 materializes IEEE float32, while the embedder may
+            # return wider Python floats. Compare the exact stored precision.
+            expected_props["fact_embedding"] = [struct.unpack("!f", struct.pack("!f", value))[0]
+                                                for value in edge["fact_embedding"]]
+            actual_props = _immutable_props(found["props"])
+            if actual_props != expected_props:
+                raise RepairError("repair_edge_origin_changed", "new fact origin metadata differs from its prepared plan", 503)
     expected = ({edge["props"]["uuid"] for edge in before["edges"]}
                 - set(request["remove_edge_uuids"])) | {edge["uuid"] for edge in plan["edges"]}
     if not expected.issubset(set(episode.get("entity_edges") or [])):
@@ -438,6 +508,30 @@ def verify_materialization(current: dict, before: dict, request: dict, plan: dic
             "truncated": len(proof) > 120}
 
 
+def replacement_edge_proof(current: dict, plan: dict) -> dict:
+    if plan.get("materialization_version") != MATERIALIZATION_VERSION:
+        # Old prepared plans remain replayable without pretending they carried
+        # the stronger origin contract. Applied historical audits are untouched.
+        return {"status": "legacy_plan", "version": "legacy"}
+    actual = {row["props"]["uuid"]: row for row in current["edges"]}
+    proof = []
+    for edge in plan["edges"]:
+        found = actual[edge["uuid"]]
+        props = found["props"]
+        original = edge.get("stored_origin")
+        other = sorted(set(original["props"].get("episodes") or []) - {plan["episode_uuid"]}) if original else []
+        proof.append({"uuid": edge["uuid"], "write_mode": edge["write_mode"],
+                      "source_uuid": found["source_uuid"], "target_uuid": found["target_uuid"],
+                      "fact_sha256": digest(props["fact"]), "immutable_origin_sha256": digest(_immutable_props(props)),
+                      "original_episodes_count": len(other), "original_episodes_sha256": digest(other),
+                      "origin": {key: props[key] for key in ("name", "group_id", "created_at", "valid_at", "reference_time",
+                                 "extractor_model", "extractor_tool", "run_id", "extraction_mode", "repair_id") if key in props}})
+    proof.sort(key=lambda edge: edge["uuid"])
+    return {"status": "verified", "version": MATERIALIZATION_VERSION,
+            "source_reference_time": plan["source_reference_time"], "count": len(proof),
+            "proof_sha256": digest(proof), "edges": proof[:120], "truncated": len(proof) > 120}
+
+
 async def apply(g, document: dict, group_id: str, *, quality_validator) -> dict:
     """Caller MUST hold the shared cross-process writer lock for this whole call."""
     request = parse_request(document)
@@ -468,6 +562,7 @@ async def apply(g, document: dict, group_id: str, *, quality_validator) -> dict:
         current = await snapshot(g.driver, request["source_description"], request["source_obs_id"], group_id)
         shared_edges = await shared_edge_readback(g.driver, before, group_id)
         result["shared_edge_verification"] = verify_materialization(current, before, request, plan, shared_edges)
+        result["replacement_edge_verification"] = replacement_edge_proof(current, plan)
         result["verified"] = True
     except Exception as exc:
         try:

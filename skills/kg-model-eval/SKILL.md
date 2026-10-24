@@ -17,7 +17,7 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 - 解释器：`tools/extract` 自动选择解释器（要装好 kg-hub 依赖；冒烟 / 准入评分还要 numpy、fastembed 与 MiniLM 缓存）。
   所有设备默认使用当前 HOME 的合格 venv，无需设置 Mac 专用绝对路径；只有显式覆盖才设 `KG_HUB_PYTHON`。
 - 只有发布产物、没有 Git 的设备先 `"$CLI" campaign workspace --session-only`，再在创建的已排除目录打开会话；不要修改发布产物源码或用 INTERNAL 环境变量代替真实排除验收。
-- 新战役先 `"$CLI" campaign preflight`：核对实际加载的代码目录/版本、规则哈希、Python 依赖、采集排除状态与服务能力。
+- Mac 协调器新战役先 `"$CLI" campaign preflight`；默认 peer frozen-batch consumer 不发 API，读取协调器最新成功 preflight/capabilities 回执并核对产物 hash/版本：核对实际加载的代码目录/版本、规则哈希、Python 依赖、采集排除状态与服务能力。
   新运行默认 agent-v5、质量协议 extraction-quality-v1；检查失败先修环境，不花钱领批。不用旧副本的自检代替实际公共入口。
 - **冒烟与准入只能在存放冻结样本的机器上跑**（`~/.kg-hub/bench/bench-20261022`，目前只在 mac-office）；远端源 SSH 未验证时由 Mac 协调器 claim 并分发冻结 batch/规则/身份，peer 只抽取审核并回传，Mac 统一预览提交；不得把 preflight 通过当作源领取已验证。
 - 执行器名（`--executor`）按当前所在工具：`claude-code` / `qoder` / `codex` / `cursor` / `dsh`。模型名用该工具里的准确写法
@@ -130,6 +130,10 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 - 冒烟 / 准入不入库；战役的 `submit` 必须先过逐条质量核验与 dry-run，正规修复使用公共入口 `repair preview` → 核对 → `repair apply` → `repair status` 读回，不手写数据库命令。
 - 用户讨论方案时只答不跑；要跑先给计划、等确认。
 
-远端执行模式见 docs/executors/_common.md「远端工具与源观测领取」：消费已分发 batch 不依赖 NAS SSH；自行 next/claim 必须另有已验证的只读源访问，不复制全权密钥。
-
-Mac 协调器的 campaign 状态和 claim_registry 是唯一权威目录；peer 不在独立同 id 目录自行 claim 或修改 canonical logs。分发冻结 batch、prompt SHA256 和 manifest model/tool/run 身份，回传 results 与质量 receipt 供原 campaign 校验及提交。
+默认远端执行模式为 **frozen-batch consumer**，见 docs/executors/_common.md 与 references/quality.md：peer 不需要服务 API 凭据，不发 HTTP 预检或 submit。
+Mac 的 campaign 状态与 claim_registry 是唯一权威目录；Mac 统一 source claim、HTTP preflight、整批 HTTP dry-run、正式 submit、registry 与 bench/score。
+分发冻结 batch、prompt SHA256、manifest model/tool/run 身份与最新成功 preflight/capabilities 回执；peer 离线 quality-sheet/check 后回传 results 和 receipt。
+dryrun-check 还需 Mac 对同一整批结果实际预览成功生成的绑定 marker；只有能力回执不能替代预览，结果改动即失效。
+回执为受控产物 hash 证据，不是密码学签名；没有 peer API 凭据时不得把其 HTTP 预检写绿，服务端 v5 质量门不能跳过。
+Mac 五工具完整预检、两 peer 离线 12 项检查/tracking/skill hash 已验证；peer 独立 API、source claim、本地 bench/score 未开通/未验证。
+独立 API 提交只是需专门授权与 credential 的可选扩展，默认 consumer 路径不签发新 secret，不借 master，也不复制 NAS 全权 SSH 密钥。
