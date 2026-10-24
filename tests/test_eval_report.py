@@ -29,7 +29,7 @@ def _log_records():
     base = {"status": "ok", "model": "claude-fable-5-1", "latency_s": 2.0, "stats": {"entities_in": 5, "edges_in": 4},
             "executor": "claude-code"}
     return ([dict(base, id=i, run_id="runA", reuse_mismatch=["a → b"] if i % 2 else []) for i in range(10)]
-            + [dict(base, id=100, run_id="runA", status="empty")]
+            + [dict(base, id=100, run_id="runA", status="empty", http=200, empty_recorded=True)]
             + [dict(base, id=200, run_id="runB", executor="script", model="deepseek", reuse_mismatch=[])]
             + [dict(base, id=300, status="ok")])   # 旧记录：没有 run_id
 

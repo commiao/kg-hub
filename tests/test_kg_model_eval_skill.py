@@ -13,6 +13,8 @@ from unittest import mock
 
 from tools import extract_bench as xb
 from tools import extract_campaign as ec
+from tools import agent_extract as ax
+from tools import extraction_repair as er
 
 SKILL = _Path(__file__).resolve().parent.parent / "skills" / "kg-model-eval"
 
@@ -31,6 +33,26 @@ def subcommands(main) -> set[str]:
         sp.add_parser = add_parser
         return sp
     with mock.patch.object(argparse.ArgumentParser, "add_subparsers", spy), \
+            mock.patch.object(argparse.ArgumentParser, "parse_args", side_effect=SystemExit(0)):
+        try:
+            main([])
+        except SystemExit:
+            pass
+    return seen
+
+
+def flat_commands(main) -> set[str]:
+    """Read the actual flat parser choices without invoking API/config actions."""
+    seen = set()
+    real = argparse.ArgumentParser.add_argument
+
+    def spy(self, *args, **kwargs):
+        if args and args[0] in ("cmd", "command"):
+            seen.update(kwargs.get("choices", []))
+        return real(self, *args, **kwargs)
+
+    with mock.patch.object(argparse.ArgumentParser, "add_argument", spy), \
+            mock.patch.object(argparse.ArgumentParser, "parse_known_args", side_effect=SystemExit(0)), \
             mock.patch.object(argparse.ArgumentParser, "parse_args", side_effect=SystemExit(0)):
         try:
             main([])
@@ -70,20 +92,37 @@ class SkillDocTest(unittest.TestCase):
                 self.assertIn(f"**{mode}**", self.text)
 
     def test_every_mentioned_subcommand_exists(self):
-        have = {"extract_bench": subcommands(xb.main), "extract_campaign": subcommands(ec.main)}
-        self.assertIn("register", have["extract_bench"])
-        mentioned = set(re.findall(r"tools\.(extract_bench|extract_campaign)\s+([a-z]+)", self.text))
+        have = {"bench": subcommands(xb.main), "campaign": subcommands(ec.main),
+                "agent": flat_commands(ax.main), "repair": flat_commands(er.main)}
+        self.assertIn("register", have["bench"])
+        reference = (SKILL / "references" / "quality.md").read_text()
+        mentioned = set(re.findall(r'\$CLI"\s+(bench|campaign|agent|repair)\s+([a-z-]+)',
+                                   self.text + "\n" + reference + "\n" + "\n".join(
+                                       p.read_text() for p in (SKILL.parent.parent / "docs" / "executors").glob("*.md"))))
         self.assertTrue(mentioned)
         for tool, sub in sorted(mentioned):
             with self.subTest(tool=tool, sub=sub):
                 self.assertIn(sub, have[tool])
         # 步骤里只写子命令名的（`report --id`、`review --batch` 这类）：反引号里「单词 --参数」都当子命令核对，外部命令除外
-        external = {"qodercli", "git", "dsh", "codex"}
-        bare = set(re.findall(r"`([a-z]+) --[a-z]", self.text)) - external
+        external = {"qodercli", "git", "dsh", "codex", "cursor-agent"}
+        bare = set(re.findall(r"`([a-z][a-z-]*) --[a-z]", self.text)) - external
         self.assertIn("review", bare)
         for sub in sorted(bare):
             with self.subTest(bare=sub):
-                self.assertIn(sub, have["extract_campaign"] | have["extract_bench"])
+                self.assertIn(sub, set().union(*have.values()))
+
+    def test_default_prompt_and_distributed_reference_match_runtime(self):
+        prompt = ax.PROMPT_PATH.read_text()
+        self.assertIn(f"prompt_version = {ax.PROMPT_VERSION}", prompt)
+        self.assertIn(ax.PROMPT_VERSION, self.text)
+        reference = SKILL / "references" / "quality.md"
+        self.assertTrue(reference.is_file())
+        self.assertIn("references/quality.md", self.text)
+        for tool in ("claude-code", "codex", "qoder", "cursor", "dsh"):
+            doc = SKILL.parent.parent / "docs" / "executors" / f"{tool}.md"
+            with self.subTest(tool=tool):
+                self.assertIn("_common.md", doc.read_text())
+                self.assertIn("quality-check", doc.read_text())
 
     def test_thresholds_written_in_skill_match_code(self):
         t = xb.THRESHOLDS
@@ -95,7 +134,7 @@ class SkillDocTest(unittest.TestCase):
         self.assertIn(f"盲评 {xb.BLIND_N} 条错误 ≤{t['blind_max_errors']}", self.text)
         self.assertIn(f"≥{xb.ADMISSION_MIN_ITEMS} 条", self.text)
         self.assertIn(f"空观测率不比基线高出 {t['empty_extra_pts']:.0f} 点以上", self.text)
-        self.assertIn("extract_bench revoke", self.text)
+        self.assertIn('"$CLI" bench revoke', self.text)
 
 
 if __name__ == "__main__":
