@@ -144,6 +144,8 @@ _CONTRAST_PAIRS = (
     ("前", "后"), ("before", "after"), ("成功", "失败"), ("success", "failure"), ("开", "关"),
     ("open", "close"), ("入", "出"), ("in", "out"), ("加", "减"), ("增", "删"), ("主", "备"),
     ("primary", "replica"), ("本地", "远端"), ("local", "remote"),
+    # 2026-10-24 战役：`人工闭合 … 断路器` 与 `人工断开 … 断路器` 只差这一组
+    ("闭合", "断开"), ("打开", "关闭"), ("开启", "关闭"),
 )
 
 
@@ -207,12 +209,75 @@ def _differ_only_in_numbers(a: str, b: str) -> bool:
     return _lex(_NUM_EXPR.sub("#", la)) == _lex(_NUM_EXPR.sub("#", lb))
 
 
+# 2026-10-24 opus/fable 战役 dry-run：子代理逐批改名才挡住的近名，归成三类（另一对发布物 hash 已并进图）。
+# 三条都看「两边各有一个对方没有的东西」——只一边多出来的是修饰语（`X 结果`、`X（kg-hub）`），照旧交给包含/相似度。
+#
+# 一、带数字的词：md2 ↔ md3、release4 ↔ release5、v4 ↔ v5、短 hash（b28fd06 ↔ 7a9b6c1）、时间 21:02 ↔ 14:07。
+#     数字本身一样、只是贴的字母不同不在这里判：T-0195 ↔ T0195 是同一个；plan2 ↔ release2 交给第二条。
+_ALNUM_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _differ_in_numbered_words(a: str, b: str) -> bool:
+    wa = {w for w in _ALNUM_WORD.findall(a.lower()) if any(c.isdigit() for c in w)}
+    wb = {w for w in _ALNUM_WORD.findall(b.lower()) if any(c.isdigit() for c in w)}
+    only_a, only_b = wa - wb, wb - wa
+    if not only_a or not only_b:
+        return False
+    digits = lambda ws: "".join(re.sub(r"\D", "", w) for w in sorted(ws))  # noqa: E731
+    return digits(only_a) != digits(only_b)
+
+
+# 二、复合名里的英文词替换：adopt ↔ prepare、readonly ↔ backoff、wal ↔ scenario、with ↔ write。
+#     只看用 - _ . / 连起来的复合名（命令、分支、工作树、标识符）里的词：空格隔开的英文短语换个说法
+#     （reconciliation endpoints ↔ reconciliation API）多半还是同一个东西，同批正式提交里核对为正确复用。
+#     两边多出来的词都不是对方（去分隔符后）的一部分才算替换——单复数、粘连写法（performgracefulshutdown ↔
+#     performGracefulShutdown）还能对上。
+_COMPOUND = re.compile(r"[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+)+")
+_EN_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
+
+
+def _compound_words(name: str) -> set[str]:
+    return {w.lower() for c in _COMPOUND.findall(name) for w in _EN_WORD.findall(c) if len(w) >= 2}
+
+
+def _differ_by_word_swap(a: str, b: str) -> bool:
+    wa, wb = _compound_words(a), _compound_words(b)
+    only_a, only_b = wa - wb, wb - wa
+    if not only_a or not only_b:
+        return False
+    xa, xb = _lex(a), _lex(b)
+    return not (all(w in xb for w in only_a) or all(w in xa for w in only_b))
+
+
+# 三、主名里的代码标识符：`RequestQueue.cancel` 被 `RequestQueue` 吸走、`claim()` → `RequestQueue`、
+#     `_submit` → `SUBMIT_ATTEMPTS`。括号里的限定（所在文件、所属类）不算主名；标识符指带 _ / . / () 或驼峰的词，
+#     比较时去掉 ()、分隔符并忽略大小写（`_model_stage` = `model_stage`、`reconcile_due()` = `reconcile_due`、
+#     `kg_hub_default` = `kg-hub_default`）。两边都有、却一个也对不上 → 是两个符号。
+_QUALIFIER = re.compile(r"[（(](?=[^)）])[^（）()]*[)）]")
+_IDENT = re.compile(r"[A-Za-z_](?:[A-Za-z0-9_.\-]*[A-Za-z0-9_])?(?:\(\))?")
+
+
+def _main_identifiers(name: str) -> set[str]:
+    out = set()
+    for t in _IDENT.findall(_QUALIFIER.sub(" ", name)):
+        # 点号后跟字母才是成员/模块访问；v0.29.0 这类版本号不算标识符
+        if "_" in t or re.search(r"\.[A-Za-z_]", t) or t.endswith("()") or re.search(r"[a-z][A-Z]", t):
+            out.add(_lex(t.removesuffix("()")))
+    return out
+
+
+def _differ_in_identifiers(a: str, b: str) -> bool:
+    ia, ib = _main_identifiers(a), _main_identifiers(b)
+    return bool(ia) and bool(ib) and not ia & ib
+
+
 def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     """向量召回的候选必须在词面上也站得住。
 
     - 去分隔符后完全相等 → 同一对象（大小写/空格/标点差异）。
     - 只在数字上不同（phase1m/phase1p 不算数字，但 19–22 / 26–28、相邻日期算）→ 不是同一对象。
-    - 代码类名字（标识符、路径）或 File/Config 类型 → 只认完全相等。
+    - 代码类名字（标识符、路径）或 File/Config 类型 → 只认完全相等（末尾 `()` 不算差异）。
+    - 两边各有一个对方没有的带数字词 / 英文词 / 主名标识符 → 不是同一对象（2026-10-24 战役）。
     - 其余：一方包含另一方且短名占长名 ≥ CONTAIN_MIN_SHARE，或 difflib ≥ LEXICAL_MIN_RATIO。
     """
     import difflib
@@ -222,7 +287,8 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
         # 第 3 轮复盘：`:` 不能算边界——规则 16 用 `仓库:路径` 区分跨仓库同名文件，
         # `credvault:tests/x.py` 若在 `:` 上放行就会并回 kg-hub 的 `tests/x.py`。
         la, lb = " ".join(a.split()).lower(), " ".join(b.split()).lower()
-        if la == lb:
+        # 2026-10-24 战役：`summarize_attempts()` 与 `summarize_attempts` 是同一个函数
+        if la == lb or la.removesuffix("()") == lb.removesuffix("()"):
             return True
         # 2026-10-22 三模型对比第 1 轮：`report-portal:tests/test_deployment_standard.py` 并进了不带仓库前缀的
         # `test_deployment_standard.py`（kg-hub 也有同名文件）——冒号后的路径里有 `/`，后缀照样成立。
@@ -247,6 +313,8 @@ def _lexically_same(a: str, b: str, entity_type: str | None = None) -> bool:
     if re.sub(r"\d+", "#", x) == re.sub(r"\d+", "#", y) or _differ_only_in_numbers(a, b):
         return False
     if _differ_by_contrast(x, y) or _differ_by_prefix(a, b):
+        return False
+    if _differ_in_numbered_words(a, b) or _differ_by_word_swap(a, b) or _differ_in_identifiers(a, b):
         return False
     short, long_ = (x, y) if len(x) <= len(y) else (y, x)
     if len(short) >= 4 and short in long_ and len(short) / len(long_) >= CONTAIN_MIN_SHARE:
