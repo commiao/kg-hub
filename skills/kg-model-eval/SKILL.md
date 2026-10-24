@@ -105,7 +105,8 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 5. 每一轮回来后：`report --id <战役>`；每个模型固定随机抽 3 条对照完整原文，`review --batch --obs --verdict ok|error --kind random --note`；
    系统性归属错误全量核对归属边，高空率批次额外核对判空，专项用 `--kind targeted`，与随机分母分开；旧无 kind 记录单列 legacy，不当随机；说明评审者及模型名是否可见。
    子代理成本记 `cost --batch`，编排者自己的开销记 `cost --overhead`；看不到的 tokens/seconds/credits 写未知，缓存 token 不重复加。
-   有新教训才 `chain --file`，最新补充约定必须保留仍有效的前版内容，没有新问题就记录沿用，不叠加重复规则。
+   有新教训才 `chain --file`，补充约定是累加的（`rules` 依次输出 c1…cN），新文件只写本轮新增或改动，不重抄前版；没有新问题就记录沿用。
+   `status` 里 `chain_mode` 不是 cumulative 的旧战役只认当前一版，这时新约定仍须合并保留仍有效的前版内容。
 6. 子代理失败：能续就用同一批次号续跑；做坏了 `release --batch --reason`（条目回队列、还配额）。不要手改 `campaign.json`。
 7. 收尾同时核对 `claim` 返回 done 与每模型实际提交终态：按 `(batch,id)` 最新日志去重、剔除 released；
    非空 ok 与服务正式记录的 empty 分列，claimed/skipped/失败不算本模型成功。已处理不等于全部事实正确。

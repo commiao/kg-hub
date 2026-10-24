@@ -379,12 +379,18 @@ def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
     return lint_items([(r[0], r[1], r[2]) for r in rows], results)
 
 
+SUMMARY_MIN = 30   # 规则 24：summary 至少 30 字
+
+
 def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict], *, chain_rules: bool = True,
-               missing: bool = True) -> list[str]:
+               missing: bool = True, new_names: dict[int, list[str]] | None = None) -> list[str]:
     """rows: [(观测 id, 标题, 批次)]。对比样本与生产战役（tools/extract_campaign）共用这一份自检。
     执行者自检要全报（chain_rules / missing 都开）；准入判定只要硬错误（schema、悬空边、缺 edges 键）——
-    规则 21/22 交给照抄标题 / 译文边的比例门槛，没交的交给「未交 = 0」，否则错 1 条就等于要求 100%。"""
+    规则 21/22 交给照抄标题 / 译文边的比例门槛，没交的交给「未交 = 0」，否则错 1 条就等于要求 100%。
+    new_names：{观测 id: 会新建的实体名}（战役取自 dry-run 的 new_entities）；给了才查这些实体的 summary 长度，
+    复用旧实体、同批前面已出现的实体不查。2026-10-24 战役里子代理每批自己写脚本查这两项、每批手改 20–55 条超长 fact。"""
     from schema import EDGE_TYPES, ENTITY_TYPES
+    from utils.extracted_ingest import _norm_key
     probs = []
     for i, title, part in rows:
         it = results.get(i)
@@ -413,6 +419,18 @@ def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict], *, ch
             probs.append(f"{part} {i}: 第一条边没有照抄标题（规则 21）")
         if not mm["second_other_lang"]:
             probs.append(f"{part} {i}: 第二条边不是标题的另一语言译文（规则 22）")
+        # 与复盘表「其余长度合规%」同一口径：第 3 条边起、空白归一后计字符
+        for k, g in enumerate(it["edges"][2:], start=3):
+            n = len(" ".join((g.get("fact") or "").split()))
+            if n > REST_LEN_MAX:
+                probs.append(f"{part} {i}: 第 {k} 条边 fact {n} 字符，超过 {REST_LEN_MAX}（规则 23/31：一句一事实，"
+                             f"拆成几条边或重写，不要截断）：{g.get('source')} → {g.get('target')}")
+        if new_names is not None and i in new_names:
+            fresh = {_norm_key(x) for x in new_names[i]}
+            for e in it["entities"]:
+                n = len((e.get("summary") or "").strip())
+                if _norm_key(e.get("name") or "") in fresh and n < SUMMARY_MIN:
+                    probs.append(f"{part} {i}: 新建实体 summary {n} 字，少于 {SUMMARY_MIN}（规则 24）：{e.get('name')}")
     return probs
 
 

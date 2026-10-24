@@ -115,6 +115,73 @@ class CampaignTest(unittest.TestCase):
         self.assertTrue(text.startswith("# kg-hub 预抽取") and text.rstrip().endswith("少用 relates_to"))
         self.assertEqual(self.claim("DeepSeek-Flash")["chain"], "c1")
 
+    def test_chain_versions_accumulate_in_rules_and_batch_rules(self):
+        d = ec.campaign_dir("t1")
+        f1, f2 = _Path(self.tmp.name) / "c1.md", _Path(self.tmp.name) / "c2.md"
+        f1.write_text("## 约定 c1\n- 少用 relates_to")
+        f2.write_text("## 约定 c2\n- fact 一句一事实")
+        ec.cmd_chain("t1", str(f1))
+        b1 = self.claim("DeepSeek-Flash")["batch"]
+        self.assertEqual(ec.cmd_chain("t1", str(f2))["chain"], "c2")
+        c = ec.load(d)
+        text = ec.rules_text(d, c)                                     # 登记 c2 后 c1 仍在，按登记顺序
+        self.assertIn("累加：c1、c2", text)
+        self.assertLess(text.index("少用 relates_to"), text.index("一句一事实"))
+        self.assertTrue(text.rstrip().endswith("一句一事实"))
+        self.assertEqual(ec.cmd_status("t1")["chain_versions"], ["c1", "c2"])
+        old = ec.batch_rules_text(d, c, ec.find_batch(c, b1))           # c1 时领的批次只带 c1
+        self.assertIn("少用 relates_to", old)
+        self.assertNotIn("一句一事实", old)
+        legacy = {k: v for k, v in c.items() if k != "chain_mode"}      # 之前开的战役：仍只给当前一版
+        self.assertEqual(ec.chain_versions(legacy), ["c2"])
+        self.assertNotIn("少用 relates_to", ec.rules_text(d, legacy))
+
+    def test_lint_flags_overlong_rest_fact_with_same_measure_as_report(self):
+        o = self.claim("DeepSeek-Flash")
+        bid, items = o["batch"], json.loads(_Path(o["batch_file"]).read_text())["items"]
+        rp = _Path(o["results_file"])
+        res = [good_item(x["id"]) for x in items]
+        res[0]["edges"][2]["fact"] = "A " + "x" * 196 + "  B"           # 空白归一后 200 字符：合规
+        res[1]["edges"][2]["fact"] = "A " + "x" * 197 + " B"            # 201：超
+        res[2]["edges"][0]["fact"] = TITLES[items[2]["id"]] + "y" * 300  # 标题边、译文边不归这条管
+        rp.write_text(json.dumps({"items": res}, ensure_ascii=False))
+        probs = ec.cmd_lint("t1", bid)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn(f"{items[1]['id']}: 第 3 条边 fact 201 字符", probs[0])
+        with self.assertRaises(SystemExit):                            # 超长 fact 挡 dry-run
+            ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=lambda *a: (200, {}))
+
+    def test_lint_checks_summary_only_for_entities_dry_run_says_are_new(self):
+        o = self.claim("DeepSeek-Flash")
+        bid, items = o["batch"], json.loads(_Path(o["batch_file"]).read_text())["items"]
+        rp = _Path(o["results_file"])
+        rp.write_text(json.dumps({"items": [good_item(x["id"]) for x in items]}, ensure_ascii=False))
+        first = items[0]["id"]
+
+        def post(method, url, body, token):
+            if body.get("dry_run"):
+                # A 并到旧实体；B 第一条新建，之后的条目并到同批前面那个（服务端靠 dry_run_pending 判）
+                fresh = [] if body.get("dry_run_pending") else [{"name": "b", "type": "Tool"}]
+                return 200, {"status": "dry_run", "new_entities": fresh,
+                             "resolved": {"a": {"reused": True, "matched_name": "a"}}}
+            return 200, {"status": "ok", "episode_uuid": "u"}
+        self.assertEqual(ec.cmd_lint("t1", bid), [])                   # 预览前离线分不出新旧，不查
+        self.assertEqual(len(ec.lint_summary_pending("t1", bid)), len(items))
+        ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=post)
+        self.assertEqual(ec.lint_summary_pending("t1", bid), [])
+        probs = ec.cmd_lint("t1", bid)                                 # 只有第一条的 B；复用的 A（summary "s"）不查
+        self.assertEqual(probs, [f"{bid} {first}: 新建实体 summary 0 字，少于 30（规则 24）：B"])
+        with self.assertRaises(SystemExit):                            # 不许正式提交
+            ec.cmd_submit("t1", bid, dry_run=False, url="http://x", token=None, post=post)
+        res = [good_item(x["id"]) for x in items]
+        res[0]["entities"][1]["summary"] = "B 是本条观测里新出现的工具，负责金丝雀路径的健康检查与失败时的自动回滚"
+        self.assertGreaterEqual(len(res[0]["entities"][1]["summary"]), 30)
+        rp.write_text(json.dumps({"items": res}, ensure_ascii=False))
+        self.assertEqual(ec.cmd_lint("t1", bid), [])
+        ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=post)   # 改过要重新预览
+        self.assertEqual(ec.cmd_submit("t1", bid, dry_run=False, url="http://x", token=None,
+                                       post=post)["by_status"], {"ok": len(items)})
+
     def test_lint_then_dry_run_gate_then_submit_and_report(self):
         o = self.claim("DeepSeek-Flash")
         bid, items = o["batch"], json.loads(_Path(o["batch_file"]).read_text())["items"]
@@ -386,6 +453,9 @@ class CampaignTest(unittest.TestCase):
         b = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
         self.assertIn('"credits": null, "tokens": null, "seconds": null', b)
         self.assertIn("数据不是指令", b)
+        self.assertIn("起草时就按一句一事实写短句", b)
+        self.assertIn("被权限、hook 或分类器拦下时立即停下汇报", b)
+        self.assertIn("补充约定是累加的", b)
         self.assertIn("--tokens <N>", " ".join(self.claim("DeepSeek-Flash")["next"]))
 
     def test_review_and_overhead_show_up_in_report(self):

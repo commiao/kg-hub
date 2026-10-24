@@ -430,6 +430,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    "edges_new": d.get("edges_new"), "edges_reused": d.get("edges_reused"),
                    "reuse_mismatch": mismatch,
                    "stats": d.get("stats"), "error": d.get("code") if code >= 400 else None}
+            if dry_run:   # 战役 lint 据此只查新建实体的 summary（tools/extract_campaign.cmd_lint）
+                rec["new_entities"] = [e.get("name") for e in d.get("new_entities") or []]
             rec["payload_digest"] = extraction_payload_digest(item, res, prompt_version, prompt_text, batch=batch, results=results,
                                                                identity=quality.extraction_identity(model, executor, run_id))
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
@@ -519,18 +521,21 @@ def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = N
     同一批可以分几次 dry-run，取并集。"""
     p = dryrun_marker_path(sd, batch_id)
     seen: set[int] = set()
-    digests = {}
+    digests, new_names = {}, {}
     if p.exists():
         old = json.loads(p.read_text())
         seen.update(int(x) for x in old.get("ids", []))
         digests.update(old.get("payload_digests", {}))
+        new_names.update(old.get("new_entities", {}))
     seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run" and r.get("http") in (None, 200))
     for rec in recs:
         if rec.get("status") == "dry_run" and rec.get("http") == 200 and rec.get("payload_digest"):
             digests[str(rec["id"])] = rec["payload_digest"]
+        if rec.get("status") == "dry_run" and rec.get("http") == 200 and "new_entities" in rec:
+            new_names[str(rec["id"])] = rec["new_entities"]   # 每次预览覆盖这条上一次的
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
-                             "payload_digests": digests,
+                             "payload_digests": digests, "new_entities": new_names,
                              "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
     return p
 
