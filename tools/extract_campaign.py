@@ -28,7 +28,11 @@
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边、其余 fact 超 200 字符；
           dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交
-  submit  --batch <批次 id> [--dry-run]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）
+  namesync --batch <批次 id> [--apply] [--graph]   命名同步（tools/campaign_namesync.py 的锚点键规则）：
+          同键异名的自动改成规范名（--apply 改写结果文件，质量表之前做）；退出码 0 干净 / 2 还有要改的或会分裂
+  namesync-replay                    回放本战役各批会被抓到的同键异名与分裂（只读，统计用）
+  submit  --batch <批次 id> [--dry-run] [--allow-split 原因]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）；
+          两者都先过 NAS 重操作闸门（tools/nas_gate.py：全机锁、间隔、测温），正式提交前另查 dry-run 判出的命名分裂
   release --batch <批次 id> --reason <原因>   回收：没提交的整批、已提交的只回收没入库的条目，放回队列并还给配额，
           下次 claim 优先领。子代理中途挂掉想接着做，不用回收：用同一个批次号继续 lint / submit 即可
   review  --batch <批次> --obs <观测 id> --verdict ok|error [--note]   编排者正确性抽查（复盘表出「抽查 / 抽查错误」列）
@@ -52,6 +56,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import agent_extract as ax  # noqa: E402
+from tools import campaign_namesync as ns  # noqa: E402
 from tools import claim_registry  # noqa: E402
 
 TOOL = "extract_campaign"
@@ -224,11 +229,19 @@ SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}�
    **起草时就按一句一事实写短句**：第 3 条边起每条 fact 只写一件事、不超过 200 字符，装不下就拆成几条边，
    不要先写长句再回头删改或截断；新建实体的 summary 写够 30 字。
 4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」（超长 fact 由 lint 逐条列出，不用自己写脚本查）。
+   命名同步（自检通过后、质量表之前）：$PY -m tools.extract_campaign namesync --id {cid} --batch <批次> --apply --graph
+   它按锚点键（文件=仓库+相对路径、纯标识符、工作树目录名）把同物异名统一成图里或更早批次的写法，不用你判断；
+   review 里的 core / pr / head 只是提示，自己判断要不要改；graph_hints 说图里已有同名短节点的，优先用那个短名。
+   退出码 0 干净；2 还有没改掉的（看 auto 与 skipped，手动改后再跑一次）。改过名要重新 lint。
 5. 预览：$PY -m tools.extract_campaign submit --id {cid} --batch <批次> --dry-run
    逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
    标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
    dry-run 之后再 lint 一次：这时才查新建实体的 summary（少于 30 字的补全；复用的实体不查），改过就再预览。
 6. 入库：$PY -m tools.extract_campaign submit --id {cid} --batch <批次>（逐条写图，可能超过 2 分钟，给足超时）。
+   dry-run 与入库都先过 NAS 闸门：排队等锁、留间隔、测温，可能要等几分钟到几十分钟，命令放后台跑、给足超时，不要中途杀掉重来。
+   退出码：0 成功；1 自检 / 质量表 / 没 dry-run 等原有拒绝；2 命名分裂（dry-run 会新建的名字在图里已有同键节点：
+   跑 namesync --apply、重新 lint、重做质量表和 dry-run 再提交）；3 dry-run 太旧判不了分裂（重新 dry-run）；
+   75 读不到 NAS 温度、76 闸门等待超时（都是没提交，停下汇报，不要绕过闸门）。
 7. 汇报（只输出这个 JSON）：
    {{"batch": "<批次>", "model": "{model}", "submitted": {{"ok": 0, "empty": 0, "error": 0}},
     "dryrun_mismatch_seen": 0, "renamed_after_dryrun": 0,
@@ -537,6 +550,7 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
     return {"done": False, "batch": bid, "model": model, "run_id": run_id, "chain": c["chain"],
             "items": len(picked), "batch_file": str(bpath), "results_file": str(rpath),
             "next": [f"{cli_command()} lint --id {cid} --batch {bid}",
+                     f"{cli_command()} namesync --id {cid} --batch {bid} --apply --graph",
                      f"{cli_command()} quality-sheet --id {cid} --batch {bid} --out <审核表>",
                      f"{cli_command()} quality-check --id {cid} --batch {bid} --review <审核表>",
                      f"{cli_command()} submit --id {cid} --batch {bid} --dry-run",
@@ -622,7 +636,138 @@ def cmd_quality_check(cid: str, bid: str, review: str) -> dict:
                                  ax.quality_file(d, bid), expected_identity=batch_identity(c, b))
 
 
-def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None, post=None) -> dict:
+# ---------- 命名同步与提交前分裂判据（tools/campaign_namesync.py） ----------
+# 2026-10-24 opus2000 战役两路并行时，同一事物在相邻批次起了不同名字，图里留下重复节点。
+# 锚点键规则不靠模型判断同物；子代理在质量表之前跑 namesync --apply，正式提交时 split_guard 再按 dry-run 兜底。
+
+EXIT_SPLIT = 2        # 命名分裂：dry-run 会新建的名字，同键在图里已有节点
+EXIT_DRYRUN_STALE = 3  # dry-run 标记判不了分裂（缺 new_entities，旧版本预览）
+
+
+class SubmitRefused(SystemExit):
+    """带退出码的拒绝：main 把 message 写到 stderr，按 code 退出。"""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(code)
+        self.message = message
+
+
+@contextlib.contextmanager
+def no_gate(kind: str):
+    yield {"kind": kind, "gate": None}
+
+
+def dryrun_state(d: Path, c: dict, b: dict) -> tuple[str, dict[str, set[str]]]:
+    """最近一次 dry-run 的 new_entities 能不能用来判分裂：
+    ok（每条带实体的结果都按当前内容预览过、且记了 new_entities）/ no_dryrun / stale（结果或规则改过、或旧版本标记）。"""
+    bid = b["id"]
+    marker = ns.load_json(ax.dryrun_marker_path(d, bid))
+    if marker is None or not (d / "results" / f"{bid}.json").exists():
+        return "no_dryrun", {}
+    batch, results = json.loads((d / "batches" / f"{bid}.json").read_text()), _results(d, bid)
+    missing = ax.dryrun_missing(d, bid, results, batch=batch, prompt_text=batch_rules_text(d, c, b),
+                                prompt_version=episode_prompt_version(c, b["chain"]), identity=batch_identity(c, b))
+    known = marker.get("new_entities") or {}
+    if missing or any(str(it["id"]) not in known for it in results.get("items", []) if it.get("entities")):
+        return "stale", {}
+    return "ok", {k: set(v) for k, v in known.items()}
+
+
+def split_guard(d: Path, c: dict, b: dict, batch: dict, results: dict, *, allow_split: str | None = None,
+                layout: ns.Layout | None = None) -> list[dict]:
+    """正式提交前的分裂判据：dry-run 的 new_entities 里有名字、而同键在图里已有别名节点 → 拒绝（退出码 2）。
+    allow_split 给了原因就放行，原因与被放行的行记进批次（split_exceptions）。"""
+    state, new = dryrun_state(d, c, b)
+    if state != "ok":
+        raise SubmitRefused(EXIT_DRYRUN_STALE, f"{b['id']} 的 dry-run 标记判不了命名分裂（{state}：旧版本预览没记 new_entities，"
+                                               "或结果改过），重新 submit --dry-run 再提交")
+    rep, _ = ns.batch_report(d.parent, c["id"], b["id"], layout or ns.Layout.from_disk(), new)
+    rows = rep["splits"]
+    if rows and not allow_split:
+        lines = [f"  #{r['item']} {r['name']}（{r['kind']} {'/'.join(map(str, r['key']))}）→ 图里已有 {'、'.join(r['graph_names'])}"
+                 for r in rows[:20]]
+        raise SubmitRefused(EXIT_SPLIT, f"{b['id']} 有 {len(rows)} 个名字提交后会在图里分裂成重复节点：\n" + "\n".join(lines) +
+                            f"\n修法：{cli_command()} namesync --id {c['id']} --batch {b['id']} --apply，重新 lint、质量表、"
+                            "dry-run 后再提交；确属不同事物用 --allow-split \"原因\"（记进批次）")
+    if rows:
+        with locked(d):
+            cc = load(d)
+            find_batch(cc, b["id"]).setdefault("split_exceptions", []).append(
+                {"at": _now(), "reason": allow_split, "rows": rows})
+            save(d, cc)
+    return rows
+
+
+def graph_lookup(url: str, token: str | None, get=None):
+    """--graph 用的只读查询：kg-hub 的 /api/node_neighbors（不直连 FalkorDB）。"""
+    from urllib.parse import quote
+    get = get or ax._http
+
+    def look(ident: str) -> dict:
+        code, j = get("GET", f"{url}/api/node_neighbors?name={quote(ident)}&limit=1", None, token)
+        if code != 200:
+            raise RuntimeError(f"http {code}")
+        return j
+    return look
+
+
+def cmd_namesync(cid: str, bid: str, *, apply: bool = False, lookup=None,
+                 layout: ns.Layout | None = None) -> tuple[dict, int]:
+    """命名同步一批：报告 auto / review / 分裂；apply 时把 auto 写回结果文件（质量表之前做）。
+    lookup 给了就对「标识符 + 短后缀」名问图里有没有同名短节点（--graph）。
+    返回 (报告, 退出码)：0 干净；2 还有没改掉的 auto，或按当前 dry-run 会分裂。"""
+    d = campaign_dir(cid)
+    c = load(d)
+    b = find_batch(c, bid)
+    if b["status"] in ("submitted", "released"):
+        raise SystemExit(f"{bid} 已{'正式提交' if b['status'] == 'submitted' else '回收'}，不再同步命名")
+    layout = layout or ns.Layout.from_disk()
+    state, new = dryrun_state(d, c, b)
+    rep, mine = ns.batch_report(d.parent, cid, bid, layout, new if state == "ok" else None)
+    rep["dryrun"] = state
+    if lookup is not None:
+        rep["graph_hints"] = ns.graph_hints(mine, lookup)
+    if apply and rep["auto"]:
+        p = d / "results" / f"{bid}.json"
+        data = ns.load_json(p)
+        if data is None:
+            raise SystemExit(f"{p} 不存在：先把分片合并成结果文件再 --apply")
+        skipped = ns.apply_renames(data, rep["auto"])
+        tmp = p.with_name(p.name + ".namesync-tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+        tmp.replace(p)
+        after, _ = ns.batch_report(d.parent, cid, bid, layout)
+        rep.update(applied=rep["renames"], skipped=skipped, auto=after["auto"], renames=after["renames"],
+                   splits=[], dryrun="stale" if state != "no_dryrun" else state,
+                   redo="结果已改：重新 lint，再做质量表与 dry-run（旧的都已失效）")
+    code = EXIT_SPLIT if rep["auto"] or rep["splits"] else 0
+    return rep, code
+
+
+def cmd_namesync_replay(cid: str, *, layout: ns.Layout | None = None) -> dict:
+    """回放本战役各批（只读，统计用）：每批按当时的先后次序会被抓到的 auto / review / 分裂。
+    分裂用各批最近一次 dry-run 标记里的 new_entities；结果文件比标记新（预览后又改过）的批不判分裂。"""
+    d = campaign_dir(cid)
+    load(d)
+
+    def new_entities_of(bid):
+        mp, rp = ax.dryrun_marker_path(d, bid), d / "results" / f"{bid}.json"
+        marker = ns.load_json(mp)
+        if marker is None or "new_entities" not in marker or (rp.exists() and rp.stat().st_mtime > mp.stat().st_mtime):
+            return None
+        return {k: set(v) for k, v in marker["new_entities"].items()}
+    rows = ns.replay(d.parent, cid, layout or ns.Layout.from_disk(), new_entities_of)
+    submitted = [r for r in rows if r["status"] == "submitted"]
+    return {"campaign": cid, "batches": len(rows), "submitted": len(submitted),
+            "submitted_with_splits": [r["batch"] for r in submitted if r["splits"]],
+            "splits": sum(r["splits"] for r in submitted), "auto": sum(r["auto"] for r in submitted),
+            "review": sum(r["review"] for r in submitted), "rows": rows}
+
+
+def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None, post=None, gate=None,
+               allow_split: str | None = None, layout: ns.Layout | None = None) -> dict:
+    """gate(kind) 是 NAS 重操作闸门的上下文管理器（命令行传 tools.nas_gate.hold；不传就不经闸门，只给测试用）。
+    正式提交前另查命名分裂（split_guard）；allow_split 写原因可放行，原因记进批次。"""
     d = campaign_dir(cid)
     initial = load(d)
     batch_rules_text(d, initial, find_batch(initial, bid))
@@ -650,11 +795,13 @@ def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None
                                     identity=batch_identity(c, b))
         if missing:
             raise SystemExit(f"{bid} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}），先 --dry-run")
+        split_guard(d, c, b, batch, results, allow_split=allow_split, layout=layout)
     model, run_id = b["model"], c["models"][b["model"]]["run_id"]
-    recs = ax.submit_results(batch, results, model=model, session=cid, url=url, token=token,
-                             post=post or ax._http, log_path=None if dry_run else d / "log.jsonl",
-                             dry_run=dry_run, executor=c["executor"], run_id=run_id,
-                             prompt_version=version, quality_review=review, prompt_text=prompt)
+    with (gate or no_gate)("dryrun" if dry_run else "submit"):
+        recs = ax.submit_results(batch, results, model=model, session=cid, url=url, token=token,
+                                 post=post or ax._http, log_path=None if dry_run else d / "log.jsonl",
+                                 dry_run=dry_run, executor=c["executor"], run_id=run_id,
+                                 prompt_version=version, quality_review=review, prompt_text=prompt)
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -1037,7 +1184,8 @@ def main(argv=None) -> int:
     flight = sub.add_parser("preflight", help="read-only loaded-code, dependency, tracking and server capability checks")
     flight.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "review",
-                 "cost", "status", "report", "mark-empty", "quality-sheet", "quality-check"):
+                 "cost", "status", "report", "mark-empty", "quality-sheet", "quality-check", "namesync",
+                 "namesync-replay"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -1060,8 +1208,12 @@ def main(argv=None) -> int:
         if name == "agents":
             s.add_argument("--format", choices=("qodercli", "md"), default="qodercli")
             s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
-        if name in ("lint", "submit", "release", "review", "quality-sheet", "quality-check"):
+        if name in ("lint", "submit", "release", "review", "quality-sheet", "quality-check", "namesync"):
             s.add_argument("--batch", required=True)
+        if name == "namesync":
+            s.add_argument("--apply", action="store_true", help="把 auto 类改名写回结果文件（质量表之前做）")
+            s.add_argument("--graph", action="store_true",
+                           help="另对「标识符 + 短后缀」名问图里有没有同名短节点（只读，至多 20 次）")
         if name == "quality-sheet":
             s.add_argument("--out", required=True)
         if name == "quality-check":
@@ -1075,6 +1227,8 @@ def main(argv=None) -> int:
             s.add_argument("--reason", required=True, help="为什么回收（记进战役，复盘时看）")
         if name == "submit":
             s.add_argument("--dry-run", action="store_true")
+            s.add_argument("--allow-split", metavar="原因",
+                           help="命名分裂判据拦下的名字确属不同事物时照样提交（原因记进批次）")
         if name == "cost":
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--batch", help="子代理这一批的消耗")
@@ -1085,7 +1239,7 @@ def main(argv=None) -> int:
             s.add_argument("--seconds", type=float)
         if name == "report":
             s.add_argument("--json")
-        if name in ("start", "claim", "submit", "mark-empty"):
+        if name in ("start", "claim", "submit", "mark-empty", "namesync"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
     if a.cmd == "workspace":
@@ -1153,7 +1307,15 @@ def main(argv=None) -> int:
                   "dry-run 后再 lint 一次", file=sys.stderr)
         return 1 if probs else 0
     elif a.cmd == "submit":
-        out = cmd_submit(a.id, a.batch, dry_run=a.dry_run, url=a.url, token=ax.api_token())
+        from tools import nas_gate
+        try:
+            out = cmd_submit(a.id, a.batch, dry_run=a.dry_run, url=a.url, token=ax.api_token(),
+                             gate=nas_gate.hold, allow_split=a.allow_split)
+        except SystemExit as e:
+            if getattr(e, "message", None) is None:
+                raise
+            print(e.message, file=sys.stderr)
+            return e.code
         if not a.dry_run:
             # 战役打满就推一条分诊摘要到飞书（每条战役一次）；推不出去不影响提交，每周任务会补推
             try:
@@ -1161,6 +1323,13 @@ def main(argv=None) -> int:
                 triage_notify.notify_if_full(a.id)
             except Exception as exc:  # noqa: BLE001
                 print(f"[triage-notify] skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+    elif a.cmd == "namesync-replay":
+        out = cmd_namesync_replay(a.id)
+    elif a.cmd == "namesync":
+        lookup = graph_lookup(a.url, ax.api_token()) if a.graph else None
+        out, code = cmd_namesync(a.id, a.batch, apply=a.apply, lookup=lookup)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return code
     elif a.cmd == "quality-sheet":
         out = cmd_quality_sheet(a.id, a.batch, a.out)
     elif a.cmd == "quality-check":

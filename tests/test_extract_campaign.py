@@ -5,6 +5,7 @@
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import contextlib
 import json
 import os
 import tempfile
@@ -741,7 +742,9 @@ class DeviceWideClaimsTest(unittest.TestCase):
                          else {"status": "ok", "episode_uuid": "u"})
         args = ["--batch", str(sd / "batch-b0001.json"), "--file", str(sd / "results.json"), "--model", "m",
                 "--session", "s"]
+        # 闸门换成空的：不 ssh 测温、不碰本机真实的全机锁
         with mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": str(sd)}), \
+                mock.patch("tools.nas_gate.hold", lambda kind: contextlib.nullcontext()), \
                 mock.patch.object(ax, "api_token", lambda *a, **k: "t"), mock.patch("sys.stdout"):
             real = ax.submit_results
             with mock.patch.object(ax, "submit_results", lambda *a, **kw: real(*a, **{**kw, "post": http})):
@@ -778,6 +781,114 @@ class FillBatchTest(unittest.TestCase):
         self.assertTrue(all(i % 13 == 0 for i in ids))
         self.assertGreater(json.loads(_Path(o["batch_file"]).read_text())["stats"]["rounds"], 1)
         self.assertEqual(ec.load(ec.campaign_dir("t1"))["cursor"], ids[-1])
+
+
+class NameSyncSubmitTest(unittest.TestCase):
+    """命名同步接进战役：namesync 子命令、正式提交前的 dry-run 分裂判据、dry-run / 提交都经 NAS 闸门。
+    「图里已有」用同一状态目录下另一个已提交的战役表示；路径布局用临时目录，不读本机 ~/work-ai。"""
+    setUp, tearDown, claim = CampaignTest.setUp, CampaignTest.tearDown, CampaignTest.claim
+
+    def prepare(self):
+        from tools import campaign_namesync as ns
+        self.layout = ns.Layout(workai=os.path.join(self.tmp.name, "work-ai"), home=self.tmp.name)
+        old = ec.campaign_dir("t1").parent / "old"
+        for sub in ("batches", "results"):
+            (old / sub).mkdir(parents=True)
+        (old / "campaign.json").write_text(json.dumps({"tool": "extract_campaign", "id": "old", "batches": [
+            {"id": "o-001", "status": "submitted", "submitted_at": "2026-10-24T00:00:00+00:00"}]}))
+        (old / "batches" / "o-001.json").write_text(json.dumps({"items": [{"id": 1, "episode_body": ""}]}))
+        (old / "results" / "o-001.json").write_text(json.dumps({"items": [{"id": 1, "entities": [
+            {"name": "reconcile_due（QueueDispatcher）", "type": "Concept", "summary": "s"}], "edges": []}]},
+            ensure_ascii=False))
+        o = self.claim("DeepSeek-Flash")
+        ids = [i["id"] for i in json.loads(_Path(o["batch_file"]).read_text())["items"]]
+        items = [good_item(i) for i in ids]
+        self.first = ids[0]
+        items[0]["entities"].append({"name": "reconcile_due", "type": "Concept",
+                                     "summary": "QueueDispatcher 里按到期时间对账的入口函数，每个调度周期都会调用一次。"})
+        items[0]["edges"].append({"source": "reconcile_due", "name": "depends_on", "target": "B",
+                                  "fact": "reconcile_due depends on B because the dispatcher checks it on every tick"})
+        _Path(o["results_file"]).write_text(json.dumps({"items": items}, ensure_ascii=False))
+        self.gated = []
+        return o["batch"]
+
+    def gate(self, kind):
+        self.gated.append(kind)
+        return contextlib.nullcontext()
+
+    def submit(self, bid, *, dry_run, new=("reconcile_due",), **kw):
+        def post(method, url, body, token):
+            if body.get("dry_run"):
+                names = list(new) if body["source_obs_id"] == f"h{self.first}" else []
+                return 200, {"status": "dry_run", "resolved": {}, "new_entities": [{"name": n} for n in names]}
+            return 200, {"status": "ok", "episode_uuid": "u"}
+        return ec.cmd_submit("t1", bid, dry_run=dry_run, url="http://x", token="t", post=post, gate=self.gate,
+                             layout=self.layout, **kw)
+
+    def test_split_blocks_submit_until_namesync_apply_and_fresh_dry_run(self):
+        bid = self.prepare()
+        rep, code = ec.cmd_namesync("t1", bid, layout=self.layout)
+        self.assertEqual((code, rep["dryrun"]), (2, "no_dryrun"))
+        self.assertEqual([(a["from"], a["to"]) for a in rep["auto"]], [("reconcile_due", "reconcile_due（QueueDispatcher）")])
+        self.submit(bid, dry_run=True)
+        rep, code = ec.cmd_namesync("t1", bid, layout=self.layout)
+        self.assertEqual((rep["dryrun"], [s["name"] for s in rep["splits"]]), ("ok", ["reconcile_due"]))
+        with self.assertRaises(ec.SubmitRefused) as cm:
+            self.submit(bid, dry_run=False)
+        self.assertEqual(cm.exception.code, ec.EXIT_SPLIT)
+        self.assertIn("reconcile_due（QueueDispatcher）", cm.exception.message)
+        self.assertEqual(self.gated, ["dryrun"])                   # 被分裂判据拦下的没去排 NAS 闸门
+        self.assertEqual(ec.load(ec.campaign_dir("t1"))["batches"][0]["status"], "dry_run")
+        rep, code = ec.cmd_namesync("t1", bid, apply=True, layout=self.layout)
+        self.assertEqual((code, rep["applied"], rep["auto"], rep["dryrun"]), (0, 1, [], "stale"))
+        res = json.loads((ec.campaign_dir("t1") / "results" / f"{bid}.json").read_text())
+        self.assertIn("reconcile_due（QueueDispatcher）", [e["name"] for e in res["items"][0]["entities"]])
+        with self.assertRaises(SystemExit) as cm:                  # 结果改了：旧 dry-run 失效，先重新预览
+            self.submit(bid, dry_run=False)
+        self.assertIn("还没 dry-run", str(cm.exception))
+        self.submit(bid, dry_run=True, new=())                     # 改名后服务端复用图中节点，不再新建
+        out = self.submit(bid, dry_run=False)
+        self.assertEqual(out["by_status"], {"ok": len(res["items"])})
+        self.assertEqual(self.gated, ["dryrun", "dryrun", "submit"])
+
+    def test_allow_split_records_reason_and_old_marker_needs_new_dry_run(self):
+        bid = self.prepare()
+        self.submit(bid, dry_run=True)
+        marker = ax.dryrun_marker_path(ec.campaign_dir("t1"), bid)
+        data = json.loads(marker.read_text())
+        marker.write_text(json.dumps({k: v for k, v in data.items() if k != "new_entities"}))   # 旧版本预览
+        with self.assertRaises(ec.SubmitRefused) as cm:
+            self.submit(bid, dry_run=False)
+        self.assertEqual(cm.exception.code, ec.EXIT_DRYRUN_STALE)
+        marker.write_text(json.dumps(data))
+        self.submit(bid, dry_run=False, allow_split="核对过：两者是不同函数")
+        b = ec.load(ec.campaign_dir("t1"))["batches"][0]
+        self.assertEqual(b["status"], "submitted")
+        self.assertEqual(b["split_exceptions"][0]["reason"], "核对过：两者是不同函数")
+        self.assertEqual(b["split_exceptions"][0]["rows"][0]["name"], "reconcile_due")
+
+    def test_cli_exit_codes_and_gate_wiring(self):
+        from tools import campaign_namesync as ns
+        bid = self.prepare()
+        self.submit(bid, dry_run=True)
+        with mock.patch.object(ns.Layout, "from_disk", classmethod(lambda cls, *a, **k: self.layout)), \
+                mock.patch("tools.nas_gate.hold", self.gate), mock.patch.object(ax, "api_token", lambda *a, **k: "t"), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(ec.main(["namesync", "--id", "t1", "--batch", bid]), 2)
+            self.assertEqual(ec.main(["submit", "--id", "t1", "--batch", bid]), ec.EXIT_SPLIT)
+            from tools import nas_gate
+
+            def refuse(kind):
+                raise nas_gate.GateRefused(nas_gate.EXIT_NO_TEMP, "读不到温度")
+            with mock.patch("tools.nas_gate.hold", refuse):
+                self.assertEqual(ec.main(["submit", "--id", "t1", "--batch", bid, "--dry-run"]), nas_gate.EXIT_NO_TEMP)
+        self.assertEqual(self.gated, ["dryrun"])
+
+    def test_brief_and_claim_name_the_new_steps(self):
+        text = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
+        for needle in ("namesync --id t1 --batch <批次> --apply --graph", "2 命名分裂", "75 读不到 NAS 温度", "76 闸门等待超时"):
+            self.assertIn(needle, text)
+        self.assertTrue(any(" namesync " in c for c in self.claim("DeepSeek-Flash")["next"]))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+{
+  "_comment": "NAS 重操作闸门（tools/nas_gate.py）：dry-run 与正式提交前的全机锁、最小间隔、测温门槛。环境变量 KG_HUB_NAS_TEMP_SSH / KG_HUB_NAS_TEMP_SENSOR / KG_HUB_NAS_GATE_DIR 覆盖对应项，KG_HUB_NAS_GATE_CONFIG 换整份配置。",
+  "ssh_target": "commiao@100.123.208.32",
+  "sensor_path": "/sys/class/hwmon/hwmon0/temp1_input",
+  "sensor_divisor": 1000,
+  "max_c": 90,
+  "samples": 3,
+  "sample_interval_s": 2,
+  "gap_s": {"dryrun": 60, "submit": 180},
+  "recheck_s": 120,
+  "max_misses": 5,
+  "max_wait_s": 3600,
+  "lock_dir": "~/.kg-hub/campaign-tools"
+}

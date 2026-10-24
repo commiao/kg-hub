@@ -118,10 +118,18 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 3. 派子代理（方式二）或每个模型一个会话（退路），按 `docs/executors/campaign.md` 的「各工具怎么派」：
    - Claude Code / qoder / cursor：方式二已验证；`agents --id <战役>` 生成各模型的子代理定义，或用 `brief` 输出当任务说明。
    - codex / DSH：方式二未确认，用 `launch --id <战役> --tool codex|dsh` 打印每个模型的启动命令。
-4. **每批提交前先过语义门**：`quality-sheet --id <战役> --batch <批次> --out <质量表>` 生成待评表，身份自动取 manifest（真实模型/工具/run_id）。
+   - 并行多路（最多 4 路）时错开约 5 分钟派出，让先落盘的分片名字被后面的批次查到；命名冲突与 NAS 升温都由工具管，不靠子代理自觉（见第 4 步）。
+4. **命名同步**（lint 通过后、质量表之前）：`"$CLI" campaign namesync --id <战役> --batch <批次> --apply --graph`。
+   按锚点键（文件 = 仓库 + 相对路径、纯标识符、工作树目录名）把同物异名统一成图里挂得最多的干净节点名 > 更早的待提交批次 > 本批首次写法；
+   core / pr / head 三类只报告，子代理自己判断。退出码 0 干净、2 还有没改掉的；改过名要重新 lint。编排者用 `namesync-replay --id <战役>` 回放统计。
+   **每批提交前先过语义门**：`quality-sheet --id <战役> --batch <批次> --out <质量表>` 生成待评表，身份自动取 manifest（真实模型/工具/run_id）。
    逐条读完整原文与 lookahead，为 fact、summary、归属提供真实引文；核对译文、完整句与核心信息覆盖，空项写理由，重复项引用前文覆盖。
    不把待填项批量改成 true，不把格式合规当事实正确。`quality-check --id <战役> --batch <批次> --review <质量表>` 通过后，
    再 `submit --dry-run` 判读每个复用候选，最后正式 `submit`。原文、规则、身份或结果改变后重做质量核验和整批预览；前项变化会影响后项 pending 实体，不能沿用旧凭据。
+   dry-run 与正式 `submit` 都先过 NAS 闸门（全机一把锁、间隔 60 / 180 秒、连读 3 次温度均值 ≤90°C，配置 `config/nas_gate.json`），
+   可能排队十几分钟：后台跑、给足超时，不中途杀掉重来。正式 `submit` 另按 dry-run 的 `new_entities` 查命名分裂。
+   `submit` 退出码：0 成功；1 原有拒绝（lint、质量表、没 dry-run 等）；2 会分裂（namesync --apply → lint → 质量表 → dry-run 再交；
+   确属不同事物经编排者同意加 `--allow-split "原因"`）；3 dry-run 太旧，重新 dry-run；75 读不到 NAS 温度、76 闸门等超时——都没提交，停下汇报，不绕过闸门。
 5. 每一轮回来后：`report --id <战役>`；每个模型固定随机抽 3 条对照完整原文，`review --batch --obs --verdict ok|error --kind random --note`；
    系统性归属错误全量核对归属边，高空率批次额外核对判空，专项用 `--kind targeted`，与随机分母分开；旧无 kind 记录单列 legacy，不当随机；说明评审者及模型名是否可见。
    子代理成本记 `cost --batch`，编排者自己的开销记 `cost --overhead`；看不到的 tokens/seconds/credits 写未知，缓存 token 不重复加。
