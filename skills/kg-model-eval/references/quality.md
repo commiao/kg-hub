@@ -5,25 +5,25 @@
 
 ## 每批先核质量，再预览，再提交
 
-使用已发布的 `CLI="$KG_HUB_CODE/tools/extract_cli.py"`，会话目录保持采集排除。
+使用已发布的 `CLI="$KG_HUB_CODE/tools/extract"`，会话目录保持采集排除。
 
 ```bash
-"$PY" "$CLI" campaign quality-sheet --id <战役> --batch <批次> --out <质量表.json>
+"$CLI" campaign quality-sheet --id <战役> --batch <批次> --out <质量表.json>
 # 评审者逐条读原文、完整lookahead与实际结果，再填写质量表。
-"$PY" "$CLI" campaign quality-check --id <战役> --batch <批次> --review <质量表.json>
-"$PY" "$CLI" campaign submit --id <战役> --batch <批次> --dry-run
+"$CLI" campaign quality-check --id <战役> --batch <批次> --review <质量表.json>
+"$CLI" campaign submit --id <战役> --batch <批次> --dry-run
 # 每个复用候选按语义判读，必要时修改结果并重审、重预览。
-"$PY" "$CLI" campaign submit --id <战役> --batch <批次>
+"$CLI" campaign submit --id <战役> --batch <批次>
 ```
 
 战役从 manifest 自动取得该批真实模型、执行工具和 run_id，不手填或替换身份。单模型入口显式固定三者：
 
 ```bash
-"$PY" "$CLI" agent quality-sheet --batch <batch.json> --file <results.json> --out <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
-"$PY" "$CLI" agent quality-check --batch <batch.json> --file <results.json> --review <质量表.json>
-"$PY" "$CLI" agent submit --batch <batch.json> --file <results.json> --review <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id> --dry-run
-"$PY" "$CLI" agent dryrun-check --batch <batch.json> --file <results.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
-"$PY" "$CLI" agent submit --batch <batch.json> --file <results.json> --review <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
+"$CLI" agent quality-sheet --batch <batch.json> --file <results.json> --out <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
+"$CLI" agent quality-check --batch <batch.json> --file <results.json> --review <质量表.json>
+"$CLI" agent submit --batch <batch.json> --file <results.json> --review <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id> --dry-run
+"$CLI" agent dryrun-check --batch <batch.json> --file <results.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
+"$CLI" agent submit --batch <batch.json> --file <results.json> --review <质量表.json> --model <真实模型id> --executor <工具名> --run-id <run_id>
 ```
 
 `--executor` / `--run-id` 可分别由 `KG_HUB_EXECUTOR` / `KG_HUB_RUN_ID` 提供；模型必须显式传 `--model`。
@@ -84,13 +84,13 @@ claimed、skipped、预览和失败不能冒充成功。模型抽不同新样本
 
 ```bash
 # selector.json只定位原始来源：source_description与source_obs_id，不换键、不改原文。
-"$PY" "$CLI" repair preview --file <selector.json> --out <snapshot.json> --request-out <pending-request.json>
+"$CLI" repair preview --file <selector.json> --out <snapshot.json> --request-out <pending-request.json>
 # 读取完整快照，逐条核对边uuid、原文和其他来源；填写真实reason/reviewer及稳定repair_id。
 # reviewed-request.json保留expected_snapshot_sha256，选择remove_edge_uuids及replacement。
-"$PY" "$CLI" repair preview --file <reviewed-request.json> --out <plan.json>
+"$CLI" repair preview --file <reviewed-request.json> --out <plan.json>
 # 对照只读计划确认无误后再应用同一份请求。
-"$PY" "$CLI" repair apply --file <reviewed-request.json> --out <apply.json>
-"$PY" "$CLI" repair status --repair-id <repair_id> --out <audit.json>
+"$CLI" repair apply --file <reviewed-request.json> --out <apply.json>
+"$CLI" repair status --repair-id <repair_id> --out <audit.json>
 ```
 
 初次 selector 为 `{"source_description":"<原来源>","source_obs_id":"<原来源键>"}`。

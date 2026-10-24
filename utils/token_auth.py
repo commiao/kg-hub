@@ -1,4 +1,4 @@
-"""可撤销的 scoped Token —— 给「只能读」的设备用。
+"""可撤销的 scoped Token —— read 设备只读，extract 设备仅受审预抽取。
 
 ## 为什么要有
 
@@ -12,7 +12,7 @@
 中间件整体豁免（含 12 条 POST），**2026-09-21 用户明确决定维持现状**：这台只在
 内网、单人使用，不为面板按钮引入身份校验。所以：
 
-    scoped token 的保证是「经 /api/* 写不进去」，**不是**「这个端口上写不进去」。
+    read scoped token 的保证是「经 /api/* 写不进去」，**不是**「这个端口上写不进去」。
 
 好在 `mcp_server.py` 只调 `/api/*` 六个读端点，所以一台只跑 MCP 的设备确实写不了。
 任何对外说明都按这个口径写，别把它说成端口级的只读。
@@ -42,7 +42,13 @@ ACCESS_CONTROL_PATH = Path(
 # 这六个正是 mcp_server.py 用到的那六个（kg_search 走 search / search_semantic，
 # kg_node_neighbors、kg_path_between、kg_episode_search、kg_stats 各一个）。
 READ_SCOPE = "read"
+EXTRACT_SCOPE = "extract"
 SCOPE_ALLOWLIST: dict[str, frozenset[tuple[str, str]]] = {
+    EXTRACT_SCOPE: frozenset({
+        ("GET", "/api/extraction/capabilities"),
+        ("POST", "/api/ingest_extracted/check"),
+        ("POST", "/api/ingest_extracted"),  # server also requires v5+ source-bound review
+    }),
     READ_SCOPE: frozenset({
         ("GET", "/api/stats"),
         ("GET", "/api/search"),

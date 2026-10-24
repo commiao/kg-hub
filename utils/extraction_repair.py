@@ -122,6 +122,21 @@ async def snapshot(driver, sd: str, sid: str, group_id: str) -> dict:
     return out
 
 
+async def shared_edge_readback(driver, before: dict, group_id: str) -> list[dict]:
+    """Read only original shared UUIDs, including edges detached from this source."""
+    ep = (before.get("episode") or {}).get("uuid")
+    ids = sorted(edge["props"]["uuid"] for edge in before["edges"]
+                 if set(edge["props"].get("episodes") or []) - {ep})
+    rows = []
+    for start in range(0, len(ids), 120):
+        rows.extend(await _rows(driver,
+            "/* repair:shared-readback */ MATCH (a:Entity)-[e:RELATES_TO]->(b:Entity) "
+            "WHERE e.group_id=$group_id AND e.uuid IN $ids "
+            "RETURN properties(e) AS props,a.uuid AS source_uuid,b.uuid AS target_uuid ORDER BY e.uuid",
+            group_id=group_id, ids=ids[start:start + 120]))
+    return rows
+
+
 async def audit(driver, repair_id: str) -> dict | None:
     rows = await _rows(driver,
         "/* repair:audit-read */ MATCH (r:ExtractionRepair {repair_id:$rid}) RETURN properties(r) AS props", rid=repair_id)
@@ -365,7 +380,7 @@ async def _apply_plan(driver, request, before, plan):
             "historical_source_attested": before["key"].get("status") == "empty" and not before["key"].get("empty_source_sha256")}
 
 
-def verify_materialization(current: dict, before: dict, request: dict, plan: dict) -> None:
+def verify_materialization(current: dict, before: dict, request: dict, plan: dict, shared_edges: list[dict]) -> dict:
     """Read back actual facts before issuing a success receipt."""
     if current["key"].get("status") != "ok" or current["key"].get("episode_uuid") != plan["episode_uuid"]:
         raise RepairError("repair_not_materialized", "source key does not confirm corrected episode", 503)
@@ -395,6 +410,32 @@ def verify_materialization(current: dict, before: dict, request: dict, plan: dic
         raise RepairError("repair_not_materialized", "episode edge references are incomplete", 503)
     if set(request["remove_edge_uuids"]) & set(episode.get("entity_edges") or []):
         raise RepairError("repair_not_materialized", "episode retains removed edge references", 503)
+    ep = plan["episode_uuid"]
+    by_uuid = {}
+    for edge in shared_edges:
+        uid = edge["props"]["uuid"]
+        if uid in by_uuid:
+            raise RepairError("repair_shared_edge_changed", "shared edge UUID is no longer unique", 503)
+        by_uuid[uid] = edge
+    proof = []
+    for old in before["edges"]:
+        other = sorted(set(old["props"].get("episodes") or []) - {ep})
+        if not other:
+            continue
+        uid = old["props"]["uuid"]
+        found = by_uuid.get(uid)
+        if (not found or any(found["props"].get(k) != old["props"].get(k) for k in ("name", "fact"))
+                or any(found.get(k) != old.get(k) for k in ("source_uuid", "target_uuid"))
+                or not set(other).issubset(set(found["props"].get("episodes") or []))):
+            raise RepairError("repair_shared_edge_changed", "original shared fact or other source endorsement changed", 503)
+        proof.append({"uuid": uid, "name": old["props"]["name"],
+                      "fact_sha256": digest(old["props"]["fact"]),
+                      "source_uuid": old["source_uuid"], "target_uuid": old["target_uuid"],
+                      "other_episodes_count": len(other), "other_episodes_sha256": digest(other)})
+    proof.sort(key=lambda edge: edge["uuid"])
+    return {"status": "verified", "before_snapshot_sha256": before["snapshot_sha256"],
+            "count": len(proof), "proof_sha256": digest(proof), "edges": proof[:120],
+            "truncated": len(proof) > 120}
 
 
 async def apply(g, document: dict, group_id: str, *, quality_validator) -> dict:
@@ -425,7 +466,8 @@ async def apply(g, document: dict, group_id: str, *, quality_validator) -> dict:
     try:
         result = await _apply_plan(g.driver, request, before, plan)
         current = await snapshot(g.driver, request["source_description"], request["source_obs_id"], group_id)
-        verify_materialization(current, before, request, plan)
+        shared_edges = await shared_edge_readback(g.driver, before, group_id)
+        result["shared_edge_verification"] = verify_materialization(current, before, request, plan, shared_edges)
         result["verified"] = True
     except Exception as exc:
         try:

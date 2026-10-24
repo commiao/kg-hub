@@ -11,7 +11,7 @@
 1. **提供方先发布**：按 kg-hub 受控 NAS 发布流程发布已合入主干且通过完整测试的同一 SHA。
    核对运行镜像 ID、健康和 `/api/extraction/capabilities`，包含 `agent-v5` / `extraction-quality-v1` 与正式修复能力。
 2. **本机代码产物后发布**：用 fleet-ops 的 `mac-release.py kg-hub --repo <Git仓库> --ref <同一SHA>` 更新稳定 `current/`。
-   比对发布内容和 SHA；每个新 CLI 进程使用 `"$PY" "$KG_HUB_CODE/tools/extract_cli.py"`，不靠旧工作区或 `PYTHONPATH` 抢导入。
+   比对发布内容和 SHA；每个新 CLI 进程使用 `"$KG_HUB_CODE/tools/extract"`，不靠旧工作区或 `PYTHONPATH` 抢导入。
    其他设备使用当地已发布的产物路径与依赖环境。若实际改动了常驻 MCP 模块，还须按 `deploy/mac/README.md` 重载并直接验证服务；
    CLI 文件更新不能证明常驻进程已重新导入，反过来也一样。
 3. **安装并发布 skill**：先核对安装副本未被他人修改，再用下面的正式安装/共享发布命令。

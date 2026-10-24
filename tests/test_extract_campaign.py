@@ -159,7 +159,7 @@ class CampaignTest(unittest.TestCase):
         c = ec.load(ec.campaign_dir("t1"))
         b = ec.brief(c, "Qwen3.8-Max")
         self.assertIn("claim --id t1 --model Qwen3.8-Max", b)
-        self.assertIn("解释器用 ${KG_HUB_PYTHON:-python3}", b)                # 模板花括号转义正确
+        self.assertIn("当前 HOME 下合格的 ~/.local/share/kg-hub/venv/bin/python", b)                # 模板花括号转义正确
         self.assertIn('{"items": [{"id"', b)                         # 模板里的花括号渲染成 JSON 原样
         self.assertNotIn("{cid}", b)
         with self.assertRaises(SystemExit):
@@ -194,12 +194,42 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("qodercli -p -m DeepSeek-Flash -w /r", q)
         dsh = ec.launch_command("dsh", "t1", "deepseek-v4-pro", repo=_Path("/r"), state=st)
         self.assertIn("切到 deepseek-v4-pro", dsh)                            # dsh 没有模型参数，先在设置里切
-        self.assertIn("cd /r && CLAUDE_MEM_INTERNAL=1 dsh --profile headless", dsh)
+        self.assertIn("cd /r && dsh --profile headless", dsh)
         for cmd in (codex, cur, q, dsh):                                      # 解释器不写死某台机器的路径
-            self.assertIn('"${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract_cli.py" campaign brief', cmd)
+            self.assertIn('"${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract" campaign brief', cmd)
             self.assertNotIn("-m tools.extract_campaign", cmd)
         with self.assertRaises(SystemExit):
             ec.launch_command("vim", "t1", "m")
+
+    def test_launch_shell_preserves_spaces_and_metacharacters_as_literal_paths(self):
+        import subprocess
+        import sys
+        root = _Path(self.tmp.name)
+        session, state, registry = [root / name for name in ("session ;literal", "state $literal", "registry 'literal")]
+        session.mkdir(); state.mkdir(); registry.mkdir()
+        binary, code = root / "bin", root / "code space"
+        binary.mkdir(); (code / "tools").mkdir(parents=True)
+        entry = code / "tools/extract"
+        entry.write_text("#!/bin/sh\nprintf '%s' 'synthetic brief'\n"); entry.chmod(0o755)
+        worker = binary / "worker"
+        worker.write_text("#!" + sys.executable + "\nimport sys,json,os\nprint(json.dumps({'cwd':os.getcwd(),'args':sys.argv[1:],'internal':os.environ.get('CLAUDE_MEM_INTERNAL')}))\n")
+        worker.chmod(0o755)
+        for binary_name in ("codex", "cursor-agent", "qodercli", "dsh"):
+            (binary / binary_name).symlink_to(worker)
+        env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ.get("PATH", ""), KG_HUB_CODE=str(code))
+        env.pop("CLAUDE_MEM_INTERNAL", None)
+        with mock.patch.object(ec.claim_registry, "claims_dir", return_value=registry):
+            for tool in ec.LAUNCH_TOOLS:
+                cmd = ec.launch_command(tool, "t1", "model", repo=session, state=state)
+                result = json.loads(subprocess.run(["/bin/sh", "-c", cmd], env=env, text=True,
+                    capture_output=True, check=True).stdout)
+                self.assertEqual(_Path(result["cwd"]).resolve(), session.resolve())
+                self.assertIsNone(result["internal"])
+                self.assertIn("synthetic brief", result["args"])
+                if tool != "dsh":
+                    self.assertIn(str(session), result["args"])
+                    self.assertIn(str(state), result["args"])
+                    self.assertIn(str(registry), result["args"])
 
     def test_start_requires_bench_admission(self):
         none = lambda m: None                                                # noqa: E731
@@ -484,7 +514,7 @@ class NoSelfObservationTest(unittest.TestCase):
     def test_guard_refuses_tracked_session_and_accepts_excluded_or_internal(self):
         with self.assertRaises(SystemExit) as cm:
             ec.tracking_guard(cwd=str(self.ws))
-        self.assertIn("extract_campaign workspace", str(cm.exception))
+        self.assertIn("tools/extract\" campaign workspace", str(cm.exception))
         self.settings.parent.mkdir(parents=True)
         self.settings.write_text(json.dumps({"CLAUDE_MEM_EXCLUDED_PROJECTS": f"13.*,{self.ws},{self.ws}/**"}))
         self.assertFalse(ec.tracking_guard(cwd=str(self.ws / "tools"))["tracked"])
@@ -542,7 +572,8 @@ class NoSelfObservationTest(unittest.TestCase):
         for tool in ec.LAUNCH_TOOLS:
             cmd = ec.launch_command(tool, "t1", "m")
             with self.subTest(tool=tool):
-                self.assertIn(f"cd {self.ws} && CLAUDE_MEM_INTERNAL=1 ", cmd)
+                self.assertIn(f"cd {self.ws} && ", cmd)
+                self.assertNotIn("CLAUDE_MEM_INTERNAL=1", cmd)
         self.assertIn("--ignore-user-config", ec.launch_command("codex", "t1", "m"))
         self.assertIn("--setting-sources local", ec.launch_command("qodercli", "t1", "m"))
 

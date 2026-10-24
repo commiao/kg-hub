@@ -4,7 +4,7 @@
 
 > **多模型生产画像（入库、每批复盘；模型准入看 bench）**：用 [campaign.md](campaign.md) 的编排者 + 子代理流程（`tools/extract_campaign.py`），领批加锁、各模型抽不同的新观测。
 
-所有新战役使用[公共稳定入口与质量门](_common.md)：`CLI="$KG_HUB_CODE/tools/extract_cli.py"`，先 `"$PY" "$CLI" campaign preflight`，
+所有新战役使用[公共稳定入口与质量门](_common.md)：`CLI="$KG_HUB_CODE/tools/extract"`，先 `"$CLI" campaign preflight`，
 逐批按 quality-sheet → 逐条证据审阅 → quality-check → dry-run → submit 执行。默认 agent-v5；旧冻结战役及旧准入不重标。
 质量表绑定真实 model / executor / run_id：战役从 manifest 自动取；单模型 quality-sheet、submit、dryrun-check 均传同一 `--model --executor --run-id`（后两项可用环境默认）。
 quality-check 不重复传身份；前项结果变化后整批重新预览，含后项 pending 实体上下文。
@@ -17,7 +17,7 @@ quality-check 不重复传身份；前项结果变化后整批重新预览，含
 
 ## 接入点
 
-- **同一 CLI**：`"$PY" "$CLI" agent` 的公共循环与 Claude Code 完全一样；codex 只负责「读 batch → 写 results」。
+- **同一 CLI**：`"$CLI" agent` 的公共循环与 Claude Code 完全一样；codex 只负责「读 batch → 写 results」。
 - **规则作为 system 内容**：把 `config/agent_extract_prompt.md` 全文放进任务的 system / developer 消息，
   而不是让模型从对话里「记得」规则；规则版本以 `tools/agent_extract.PROMPT_VERSION` 为准。
 - **模型**：`--model` 填 codex 实际使用的模型 id（如 gpt-5-codex）；codex 的工具与模型绑定，
@@ -29,7 +29,7 @@ quality-check 不重复传身份；前项结果变化后整批重新预览，含
 ## 冒烟与准入（不入库）
 
 codex 的模型直接走运行器，**不要自己写脚本**：
-`"$PY" "$CLI" bench run --bench ~/.kg-hub/bench/bench-20261022 --executor codex --models gpt-6-luna gpt-6-sol --tag <标签> --limit 10`。
+`"$CLI" bench run --bench ~/.kg-hub/bench/bench-20261022 --executor codex --models gpt-6-luna gpt-6-sol --tag <标签> --limit 10`。
 运行器用 `codex exec --ignore-user-config --ephemeral -s read-only` 单轮调用：关 shell 工具与钩子、不读项目文档，
 系统提示经 `developer_instructions` 传入（与 qodercli 的逐字相同），观测走标准输入；推理强度用 `--effort`（缺省 medium）。
 codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex 会话自写脚本，每个模型一次发 10 条、推理强度 medium、
@@ -39,7 +39,7 @@ codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex �
 
 - **方式二未确认**（2026-10-22）：codex 的派生工具自报有 `model` 参数，但 `codex exec --json` 两次实测事件流里都没有派生记录，
   不能确认子代理真按指定模型跑。先用「每个模型一个会话」：
-  `"$PY" "$CLI" campaign launch --id <战役> --tool codex` 打印
+  `"$CLI" campaign launch --id <战役> --tool codex` 打印
   具体命令由已发布的 `campaign launch` 生成，不复制旧的 `codex exec` 参数。会话在采集排除目录打开；代码从稳定入口加载。
 - 子代理必须能写战役状态和领取登记目录、访问 NAS/kg-hub；保留真实工具错误，不能把沙箱网络失败当服务端已经处理成功。
 - 模型名用 `codex debug models` 里 `visibility=list` 的那些（如 gpt-6-astra、gpt-6-luna、gpt-5.6-sol）。
@@ -48,3 +48,5 @@ codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex �
 
 与 Claude Code 相同：本 run error 为 0、`reuse_mismatch_per_obs` ≤ 0.2、运行清单有 `ended_at` 与自报成本、
 每 500 条有 lessons 并登记。
+
+公共命令通过 `tools/extract` 执行：显式 `KG_HUB_PYTHON` 优先，否则当前 HOME 的合格 `~/.local/share/kg-hub/venv/bin/python` 优先于系统 `python3`。

@@ -89,6 +89,25 @@ class ScopeTests(_Bed):
         self.assertFalse(token_auth.allows(p, "GET", "/api/stats"))
 
 
+class ExtractScopeTests(_Bed):
+    def test_extract_grants_only_actual_preflight_check_and_submission_paths(self):
+        self.register(scopes=("extract",))
+        principal = token_auth.principal_for("win-secret")
+        expected = {("GET", "/api/extraction/capabilities"), ("POST", "/api/ingest_extracted/check"),
+                    ("POST", "/api/ingest_extracted")}
+        self.assertEqual(token_auth.SCOPE_ALLOWLIST["extract"], expected)
+        for method, path in expected:
+            self.assertTrue(token_auth.allows(principal, method, path))
+        for method, path in (("POST", "/api/ingest"), ("POST", "/api/extraction/repair"),
+                             ("POST", "/api/extraction/repair/preview"), ("GET", "/api/extraction/repair"),
+                             ("GET", "/api/stats"), ("POST", "/api/drain"), ("GET", "/api/topology/latest")):
+            self.assertFalse(token_auth.allows(principal, method, path), (method, path))
+        self.register(scopes=("read",))
+        principal = token_auth.principal_for("win-secret")
+        self.assertFalse(token_auth.allows(principal, "POST", "/api/ingest_extracted"))
+        self.assertFalse(token_auth.allows(principal, "POST", "/api/ingest_extracted/check"))
+
+
 class RevocationTests(_Bed):
     def test_disabled_takes_effect_without_a_restart(self):
         self.register()

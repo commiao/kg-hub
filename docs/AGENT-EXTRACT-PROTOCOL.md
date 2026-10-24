@@ -14,7 +14,7 @@
 
 本页保留原实验背景。所有新运行按 [公共执行器契约](executors/_common.md) 与
 [质量表/修复协议](executors/quality.md) 执行；默认 agent-v5，旧战役仍读自己的冻结快照，不重标旧准入。
-使用 `CLI="$KG_HUB_CODE/tools/extract_cli.py"` 的稳定发布入口，先 preflight，再逐条质量核验、dry-run 和正式提交。
+使用 `CLI="$KG_HUB_CODE/tools/extract"` 的稳定发布入口，先 preflight，再逐条质量核验、dry-run 和正式提交。
 原文/结果/规则变化后凭据失效，需要重审；已提交错误用正规 repair，不换来源键或直连数据库。
 
 ## 1. 数据流
@@ -43,15 +43,15 @@ tools/agent_extract.py submit --model <本会话模型>
 loop:
   python -m tools.digest_retro gate --state $RETRO --journal $JOURNAL --every 500   # 在 kg-hub-server 容器内或 NAS 上
   rc==2 → 先复盘（§3），再继续
-  "$PY" "$CLI" agent next --n 20          # 得到 batch 文件；picked=0 且「游标之后没有观测」→ 结束
+  "$CLI" agent next --n 20          # 得到 batch 文件；picked=0 且「游标之后没有观测」→ 结束
   读 batch 文件，按 prompt 抽取，写 results-bNNNN.json
-  "$PY" "$CLI" agent quality-sheet --batch <batch> --file <results> --out <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID"
+  "$CLI" agent quality-sheet --batch <batch> --file <results> --out <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID"
   逐条审阅原文/lookahead/结果，填写真实证据与判空覆盖，不自动全选通过
-  "$PY" "$CLI" agent quality-check --batch <batch> --file <results> --review <质量表>
-  "$PY" "$CLI" agent submit --batch <batch> --file <results> --review <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID" --dry-run
+  "$CLI" agent quality-check --batch <batch> --file <results> --review <质量表>
+  "$CLI" agent submit --batch <batch> --file <results> --review <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID" --dry-run
   判读复用候选；前项改变也影响后项pending实体，改动后重审并整批重预览
-  "$PY" "$CLI" agent dryrun-check --batch <batch> --file <results> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID"
-  "$PY" "$CLI" agent submit --batch <batch> --file <results> --review <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID" --session "$SESSION"
+  "$CLI" agent dryrun-check --batch <batch> --file <results> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID"
+  "$CLI" agent submit --batch <batch> --file <results> --review <质量表> --model "$MODEL" --executor "$KG_HUB_EXECUTOR" --run-id "$KG_HUB_RUN_ID" --session "$SESSION"
   看输出：error/http_4xx 立即停下查原因；stats 里 offschema/dirty/unknown_type 偏高就回头改自己的抽取
 ```
 

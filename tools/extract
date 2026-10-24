@@ -1,0 +1,17 @@
+#!/bin/sh
+# Stable entry: the calling HOME selects its own published dependency runtime.
+set -eu
+code_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -n "${KG_HUB_PYTHON:-}" ]; then
+    kg_python=$KG_HUB_PYTHON
+elif [ -x "$HOME/.local/share/kg-hub/venv/bin/python" ] &&
+     "$HOME/.local/share/kg-hub/venv/bin/python" -c 'import sys, httpx; from pydantic import model_validator; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+    kg_python=$HOME/.local/share/kg-hub/venv/bin/python
+else
+    kg_python=python3
+fi
+if ! "$kg_python" -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+    echo "kg-hub requires Python >=3.10; install the current HOME kg-hub venv or set KG_HUB_PYTHON" >&2
+    exit 2
+fi
+exec "$kg_python" "$code_root/tools/extract_cli.py" "$@"

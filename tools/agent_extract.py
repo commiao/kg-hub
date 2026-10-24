@@ -67,7 +67,7 @@ def state_dir() -> Path:
     return Path(os.environ.get("KG_HUB_AGENT_EXTRACT_DIR", "~/.kg-hub/agent-extract")).expanduser()
 
 
-# token 依次找：环境变量 → ~/.claude-mem/.env → ~/.openclaw/env.sh（与 kg-use skill 同一顺序）。
+# token 依次找：环境变量 → 专用 extraction-token (0600) → ~/.claude-mem/.env → ~/.openclaw/env.sh（与 kg-use skill 同一顺序）。
 # 在 Python 里读而不是在 shell 里 grep，是因为本机的 Bash 钩子会拦截任何提到 .env 的命令；
 # 值只用于 Authorization 头，不打印、不落日志、不进 batch/results 文件。
 _TOKEN_FILES = ("~/.claude-mem/.env", "~/.openclaw/env.sh")
@@ -78,6 +78,24 @@ def api_token(env: dict | None = None, files: tuple[str, ...] = _TOKEN_FILES) ->
     for key in ("KG_HUB_API_TOKEN", "KG_HUB_TOKEN"):
         if env.get(key):
             return env[key].strip()
+    # Peer credentials are dedicated extract-scope tokens, never paid-provider keys.
+    # Fail closed for an explicitly configured, missing or unsafe credential file.
+    dedicated = Path(env.get("KG_HUB_TOKEN_FILE") or "~/.config/kg-hub/extraction-token").expanduser()
+    if dedicated.exists() or dedicated.is_symlink() or env.get("KG_HUB_TOKEN_FILE"):
+        import stat
+        try:
+            fd = os.open(dedicated, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd) as token_file:
+                info = os.fstat(token_file.fileno())
+                if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                        or info.st_uid != os.getuid()):
+                    raise SystemExit("KG_HUB_TOKEN_FILE must be an owned regular file with mode 0600")
+                value = token_file.read().strip()
+        except OSError as exc:
+            raise SystemExit("KG_HUB_TOKEN_FILE is unreadable; restore the dedicated extraction credential") from exc
+        if not value:
+            raise SystemExit("KG_HUB_TOKEN_FILE is empty")
+        return value
     for f in files:
         p = Path(f).expanduser()
         try:
