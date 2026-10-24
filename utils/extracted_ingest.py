@@ -391,13 +391,13 @@ def normalize_extraction(entities: list[ExtractedEntity], edges: list[ExtractedE
 
 _FIND_EXACT = (
     "MATCH (n:Entity) WHERE n.group_id = $g AND toLower(n.name) = $lname "
-    "RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels LIMIT 1")
+    "RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, n.summary AS summary LIMIT 1")
 _FIND_SIMILAR = (
     "MATCH (n:Entity) WHERE n.group_id = $g AND n.name_embedding IS NOT NULL "
     "WITH n, (2 - vec.cosineDistance(n.name_embedding, vecf32($v)))/2 AS score "
     # 第 3 轮复盘：候选顺序要确定，否则 dry-run 与正式提交会并到不同节点；同分按 uuid 定序，
     # 取前 5 个再过词面/类型校验，而不是只看最相似的那一个。
-    "WHERE score > $min RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, score "
+    "WHERE score > $min RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, n.summary AS summary, score "
     "ORDER BY score DESC, n.uuid ASC LIMIT 5")
 _SAVE_NODE = (
     "MERGE (n:Entity {uuid: $entity_data.uuid}) SET n:{labels} SET n = $entity_data "
@@ -461,6 +461,20 @@ async def _embed_cached(embedder, names: list[str]) -> list:
     return [cache.get(n) for n in names]
 
 
+MATCHED_SUMMARY_MAX = 100   # dry-run 回显被复用节点的 summary 开头，够看出是哪个仓库 / 哪件事
+
+
+def _match_info(row: dict, how: str) -> dict:
+    """被复用节点的回显：名字、类型（labels 去掉 Entity）、怎么命中的（exact 同名 / similar 向量近名）、summary 开头。
+    2026-10-25 opus2000 战役：throttle 与 sd-server 的同名 Java 文件被精确同名并到一起，只给名字看不出来。"""
+    types = sorted(lb for lb in (row.get("labels") or []) if lb and lb != "Entity")
+    out = {"matched_name": row.get("name"), "matched_type": "/".join(types) or None, "match": how}
+    summary = " ".join(str(row.get("summary") or "").split())
+    if summary:
+        out["matched_summary"] = summary[:MATCHED_SUMMARY_MAX]
+    return out
+
+
 @dataclass
 class WriteResult:
     episode_uuid: str
@@ -468,7 +482,8 @@ class WriteResult:
     nodes_reused: int
     edges_new: int
     edges_reused: int
-    resolved: dict  # key -> {"uuid", "reused": bool, "matched_name"}
+    # key -> {"uuid", "reused": bool, "matched_name"}；复用的另有 matched_type / match / matched_summary（_match_info）
+    resolved: dict
 
 
 async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *,
@@ -509,10 +524,12 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
     nodes_new = nodes_reused = 0
     for ent, vec in zip(extraction.entities, name_vecs):
         rows, _, _ = await driver.execute_query(_FIND_EXACT, g=group_id, lname=ent.key)
+        how = "exact"
         if not rows and dry_run:
             rows = [{"uuid": None, "name": v["name"], "labels": ["Entity", v["type"]], "in_batch": True}
                     for v in virtual if v["key"] == ent.key][:1]
         if not rows:
+            how = "similar"
             rows, _, _ = await driver.execute_query(
                 _FIND_SIMILAR, g=group_id, v=[float(x) for x in vec], min=node_match_min)
             if dry_run and virtual:
@@ -526,8 +543,7 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
                     if _lexically_same(ent.name, r.get("name") or "", ent.type)
                     and (not type_guard or ent.type in (r.get("labels") or []))]
         if rows:
-            resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True,
-                                 "matched_name": rows[0].get("name")}
+            resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True, **_match_info(rows[0], how)}
             if rows[0].get("in_batch"):
                 resolved[ent.key]["in_batch"] = True
             nodes_reused += 1

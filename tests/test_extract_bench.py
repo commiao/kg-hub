@@ -162,6 +162,55 @@ class AdmissionChecksTest(unittest.TestCase):
         self.assertTrue(any("haiku 那部分" in c["check"] and not c["pass"] for c in checks))
 
 
+class EdgeDirectionLintTest(unittest.TestCase):
+    ENTS = [{"name": "超时", "type": "Issue"}, {"name": "调大超时", "type": "Fix"},
+            {"name": "README.md", "type": "KnowledgeDoc"}, {"name": "重试原则", "type": "Concept"},
+            {"name": "先看基线", "type": "Lesson"}, {"name": "kg-hub", "type": "Project"},
+            {"name": "app.py", "type": "File"}]
+
+    def lint(self, *extra):
+        rows = [(1, TITLE, "b")]
+        res = {1: item([edge(TITLE, "超时", "调大超时", "fixed_by"), edge("English", "超时", "调大超时", "fixed_by"),
+                        *extra], entities=self.ENTS)}
+        return xb.lint_items(rows, res)
+
+    def test_conventional_directions_pass(self):
+        self.assertEqual(self.lint(edge("x", "重试原则", "README.md", "documented_in"),
+                                   edge("x", "先看基线", "超时", "derived_from"),
+                                   edge("x", "app.py", "kg-hub", "belongs_to")), [])
+
+    def test_reversed_edges_are_reported_with_index_and_endpoints(self):
+        probs = self.lint(edge("x", "调大超时", "超时", "fixed_by"),
+                          edge("x", "README.md", "重试原则", "Documented_In"),
+                          edge("x", "超时", "先看基线", "derived_from"),
+                          edge("x", "kg-hub", "app.py", "belongs_to"))
+        self.assertEqual(probs, [
+            "b 1: 第 3 条边 fixed_by 方向反了：调大超时（Fix）→ 超时（Issue），约定是 Issue → Fix；对调 source / target",
+            "b 1: 第 4 条边 Documented_In 方向反了：README.md（KnowledgeDoc）→ 重试原则（Concept），"
+            "约定是 Concept → KnowledgeDoc；对调 source / target",
+            "b 1: 第 5 条边 derived_from 方向反了：超时（Issue）→ 先看基线（Lesson），约定是 Lesson → Issue；对调 source / target",
+            "b 1: 第 6 条边 belongs_to 方向反了：kg-hub（Project）→ app.py（File），约定是 File → Project；对调 source / target"])
+
+    def test_edges_without_reliable_convention_are_not_checked(self):
+        # caused_by 两个方向都有合理写法；类型不在约定里的（Tool→Issue）只是类型松，不算反
+        self.assertEqual(self.lint(edge("x", "调大超时", "超时", "caused_by"),
+                                   edge("x", "超时", "调大超时", "caused_by"),
+                                   edge("x", "重试原则", "超时", "fixed_by"),
+                                   edge("x", "kg-hub", "kg-hub", "relates_to")), [])
+
+    def test_direction_is_a_chain_rule_not_an_admission_hard_error(self):
+        rows = [(1, TITLE, "b")]
+        res = {1: item([edge(TITLE, "调大超时", "超时", "fixed_by")], entities=self.ENTS)}
+        self.assertEqual(xb.lint_items(rows, res, chain_rules=False, missing=False), [])
+
+    def test_checked_pairs_follow_schema(self):
+        from schema import EDGE_TYPE_MAP
+        for name, pairs in xb.DIRECTED_PAIRS.items():
+            for p in pairs:
+                with self.subTest(edge=name, pair=p):
+                    self.assertIn(name, EDGE_TYPE_MAP[p])
+
+
 class AdmissionLintScopeTest(unittest.TestCase):
     def test_admission_lint_counts_only_hard_errors(self):
         rows = [(1, TITLE, "b"), (2, TITLE, "b"), (3, TITLE, "b")]

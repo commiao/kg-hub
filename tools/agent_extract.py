@@ -441,6 +441,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    "stats": d.get("stats"), "error": d.get("code") if code >= 400 else None}
             if dry_run:   # 战役 lint 据此只查新建实体的 summary（tools/extract_campaign.cmd_lint）
                 rec["new_entities"] = [e.get("name") for e in d.get("new_entities") or []]
+                rec["resolution"] = resolution_rows(res, d)
+                rec["reuse_cross_type"] = [reuse_line(r) for r in rec["resolution"] if cross_type(r)]
             rec["payload_digest"] = extraction_payload_digest(item, res, prompt_version, prompt_text, batch=batch, results=results,
                                                                identity=quality.extraction_identity(model, executor, run_id))
         rec.update({"ts": datetime.now(tz=timezone.utc).isoformat(), "batch": batch.get("batch_id"),
@@ -457,6 +459,43 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                 for e in res.get("entities", []):
                     f.write(f"{e.get('type')}\t{e.get('name')}\n")
     return out
+
+
+def resolution_rows(res: dict, d: dict) -> list[dict]:
+    """dry-run 每个实体的消解结果：新建还是复用、复用到的节点名 / 类型 / 怎么命中 / summary 开头、是否同批新建。
+    服务端（2026-10-25 起）在 entities 里直接给；旧服务端只有 resolved（按归一键、没有类型），退回用它拼，matched_type 为 None。"""
+    keep = ("name", "type", "reused", "matched_name", "matched_type", "match", "matched_summary", "in_batch")
+    if isinstance(d.get("entities"), list):
+        return [{k: e[k] for k in keep if k in e} for e in d["entities"]]
+    from utils.extracted_ingest import _norm_key
+    resolved, out, seen = d.get("resolved") or {}, [], set()
+    for e in res.get("entities") or []:
+        key = _norm_key(" ".join(str(e.get("name") or "").split()))
+        if key in seen or key not in resolved:
+            continue
+        seen.add(key)
+        v = resolved[key]
+        row = {"name": e.get("name"), "type": e.get("type"), "reused": bool(v.get("reused"))}
+        if row["reused"]:
+            row.update(matched_name=v.get("matched_name"), matched_type=None)
+            if v.get("in_batch"):
+                row["in_batch"] = True
+        out.append(row)
+    return out
+
+
+def cross_type(r: dict) -> bool:
+    """复用到的节点类型和抽出的类型不同（服务端精确同名不看类型，这类误并只有在这里看得见）。"""
+    return bool(r.get("reused") and r.get("matched_type") and r.get("type") not in r["matched_type"].split("/"))
+
+
+def reuse_line(r: dict, oid=None) -> str:
+    """一行看完一个复用：抽出名（类型）→ 复用到的节点名（类型）［标记］「被复用节点 summary 开头」。"""
+    tags = [t for t, on in (("同批新建", r.get("in_batch")), ("近名", r.get("match") == "similar"),
+                            ("类型不同", cross_type(r))) if on]
+    head = f"{oid}: " if oid is not None else ""
+    return (f"{head}{r.get('name')}（{r.get('type')}）→ {r.get('matched_name')}（{r.get('matched_type') or '类型未知'}）"
+            + "".join(f"［{t}］" for t in tags) + (f"「{r['matched_summary']}」" if r.get("matched_summary") else ""))
 
 
 def mark_empty_from_log(log_path: Path, load_batch, *, url: str, token: str | None, post=_http,
@@ -530,21 +569,24 @@ def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = N
     同一批可以分几次 dry-run，取并集。"""
     p = dryrun_marker_path(sd, batch_id)
     seen: set[int] = set()
-    digests, new_names = {}, {}
+    digests, new_names, resolution = {}, {}, {}
     if p.exists():
         old = json.loads(p.read_text())
         seen.update(int(x) for x in old.get("ids", []))
         digests.update(old.get("payload_digests", {}))
         new_names.update(old.get("new_entities", {}))
+        resolution.update(old.get("resolution", {}))
     seen.update(int(r["id"]) for r in recs if r.get("status") == "dry_run" and r.get("http") in (None, 200))
     for rec in recs:
         if rec.get("status") == "dry_run" and rec.get("http") == 200 and rec.get("payload_digest"):
             digests[str(rec["id"])] = rec["payload_digest"]
         if rec.get("status") == "dry_run" and rec.get("http") == 200 and "new_entities" in rec:
             new_names[str(rec["id"])] = rec["new_entities"]   # 每次预览覆盖这条上一次的
+        if rec.get("status") == "dry_run" and rec.get("http") == 200 and "resolution" in rec:
+            resolution[str(rec["id"])] = rec["resolution"]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
-                             "payload_digests": digests, "new_entities": new_names,
+                             "payload_digests": digests, "new_entities": new_names, "resolution": resolution,
                              "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
     return p
 
@@ -1060,8 +1102,11 @@ def main(argv: list[str] | None = None) -> int:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print(json.dumps({"submitted": len(recs), "by_status": counts, "dry_run": a.dry_run,
                       "executor": a.executor, "run_id": a.run_id,
-                      "items": [{k: r.get(k) for k in ("id", "status", "nodes_new", "nodes_reused",
-                                                        "edges_new", "edges_reused", "reuse_mismatch", "error")}
+                      "items": [{**{k: r.get(k) for k in ("id", "status", "nodes_new", "nodes_reused",
+                                                           "edges_new", "edges_reused", "reuse_mismatch", "error")},
+                                 **({"reused": [reuse_line(x) for x in r["resolution"] if x.get("reused")],
+                                     "reuse_cross_type": r.get("reuse_cross_type") or []}
+                                    if "resolution" in r else {})}
                                 for r in recs]},
                      ensure_ascii=False, indent=1))
     return 0

@@ -275,7 +275,8 @@ class LexicalTest(unittest.TestCase):
                                     ENTITY_TYPES, EDGE_TYPES)
         r = run(n, [{"name": "Writer Lock", "type": "Concept"}])
         self.assertEqual(r.resolved["writer_lock"],
-                         {"uuid": None, "reused": True, "matched_name": "Writer Lock", "in_batch": True})
+                         {"uuid": None, "reused": True, "matched_name": "Writer Lock", "matched_type": "Concept",
+                          "match": "similar", "in_batch": True})
         self.assertFalse(r.resolved["brand new thing"]["reused"])
         # 精确同名也算（与 _FIND_EXACT 一样不看类型）；向量候选的类型守卫照旧：同批的 Tool 不能被 Concept 复用
         r = run(n, [{"name": "Writer Lock", "type": "Tool"}, {"name": "brand new thing", "type": "Issue"}])
@@ -289,6 +290,34 @@ class LexicalTest(unittest.TestCase):
         self.assertFalse(r.resolved["prevalidate 阶段相似度计数"]["reused"])
         self.assertEqual(r.resolved["validate 阶段相似度计数 统计"]["matched_name"], "validate 阶段相似度计数")
         self.assertEqual((r.nodes_new, r.nodes_reused), (2, 1))
+
+    def test_dry_run_reports_matched_node_type_and_summary(self):
+        """2026-10-25 opus2000：throttle 与 sd-server 的同名 Java 文件精确同名并到一起，dry-run 只给名字看不出来。
+        复用要回显被复用节点的类型、怎么命中的（exact / similar）和 summary 开头。"""
+        class Driver(FakeDriver):
+            async def execute_query(self, cypher, **params):
+                if cypher.startswith("MATCH (n:Entity) WHERE n.group_id = $g AND toLower(n.name)"):
+                    self.calls.append((cypher, params))
+                    if params["lname"] == "ratelimiter.java":
+                        return [{"uuid": "u-rl", "name": "RateLimiter.java", "labels": ["Entity", "File"],
+                                 "summary": "throttle 仓库的令牌桶限流器，\n按租户配额" + "长" * 200}], None, None
+                    return [], None, None
+                return await super().execute_query(cypher, **params)
+        n = xi.normalize_extraction(ents(("RateLimiter.java", "Concept", ""), ("redis lock", "Tool", ""),
+                                         ("Brand New Thing", "Concept", "")), [], ENTITY_TYPES, EDGE_TYPES)
+        d = Driver(similar={"redis lock": ("u-lock", "Redis Lock")})
+        r = asyncio.run(xi.write_extraction(d, FakeEmbedder(), n, name="x", episode_body="b", source_description="sd",
+                                            reference_time=datetime(2026, 10, 17, tzinfo=timezone.utc),
+                                            extractor_model="m", group_id="kg_hub", dry_run=True))
+        rl = r.resolved["ratelimiter.java"]
+        self.assertEqual((rl["uuid"], rl["matched_name"], rl["matched_type"], rl["match"]),
+                         ("u-rl", "RateLimiter.java", "File", "exact"))   # 精确同名不看类型：Concept 并进了 File
+        self.assertTrue(rl["matched_summary"].startswith("throttle 仓库的令牌桶限流器， 按租户配额"))
+        self.assertEqual(len(rl["matched_summary"]), xi.MATCHED_SUMMARY_MAX)
+        lock = r.resolved["redis lock"]
+        self.assertEqual((lock["matched_name"], lock["matched_type"], lock["match"]), ("Redis Lock", "Tool", "similar"))
+        self.assertNotIn("matched_summary", lock)
+        self.assertEqual(r.resolved["brand new thing"], {"uuid": None, "reused": False, "matched_name": None})
 
     def test_pending_is_ignored_outside_dry_run(self):
         n = xi.normalize_extraction(ents(("writer_lock", "Concept", "")), [], ENTITY_TYPES, EDGE_TYPES)
@@ -353,7 +382,8 @@ class WriteTest(unittest.TestCase):
                        existing_edges={("u-kghub", "depends_on", "u-falkor"): "e-old"})
         r = self._write(d, n)
         self.assertEqual((r.nodes_new, r.nodes_reused, r.edges_new, r.edges_reused), (1, 2, 1, 1))
-        self.assertEqual(r.resolved["kg-hub"], {"uuid": "u-kghub", "reused": True, "matched_name": "kg-hub"})
+        self.assertEqual(r.resolved["kg-hub"], {"uuid": "u-kghub", "reused": True, "matched_name": "kg-hub",
+                                                "matched_type": None, "match": "exact"})
         self.assertEqual(r.resolved["falkordb"]["uuid"], "u-falkor")
         saved_nodes = [p for c, p in d.calls if c.startswith("MERGE (n:Entity")]
         self.assertEqual(len(saved_nodes), 1)

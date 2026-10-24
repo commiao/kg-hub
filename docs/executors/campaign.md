@@ -68,19 +68,42 @@
 
 ## 自检（lint）查什么
 
-`lint` 不过不许 dry-run、不许正式提交（`submit` 先跑一遍 lint）。子代理不用再自己写脚本查下面两项长度：
+`lint` 不过不许 dry-run、不许正式提交（`submit` 先跑一遍 lint）。子代理不用再自己写脚本查下面几项：
 
 | 检查 | 口径 | 何时查 |
 |---|---|---|
 | 悬空边、实体类型 / 边名越界、缺 `edges` 键 | schema 硬错误 | 一直查 |
 | 第一条边照抄标题、第二条边是标题译文 | 规则 21、22 | 一直查 |
 | 其余 fact 超长 | 第 3 条边起，空白归一后**超过 200 字符**（与复盘表「其余长度合规%」同一量法）；逐条列出边序号与两端实体。按规则 31 拆成几条边或重写，不截断 | 一直查 |
+| 有向边写反方向 | 两端类型恰好是 `schema.EDGE_TYPE_MAP` 约定的反方向：`fixed_by` Fix→Issue（应 Issue→Fix）、`documented_in` KnowledgeDoc→Concept、`derived_from` Issue→Lesson、`belongs_to` Project→File / Project→Session；逐条列出边序号与两端实体（含类型），对调 source / target。只是类型不在约定里（如 `fixed_by` Issue→Tool）不报。准入判定不计这一项（与规则 21/22 同属执行者自检） | 一直查 |
 | 新建实体 summary 过短 | 少于 **30 字**（`strip` 后的字符数，规则 24）；只查 dry-run 返回的 `new_entities` 里的实体——并到图里旧实体的、并到同批前面条目新建实体的（`dry_run_pending`）都不查 | dry-run 之后 |
 
 新建与否离线分不出来（哪些名字会并到旧实体要服务端消解才知道），所以 summary 这一项取**最近一次 dry-run** 的结果：
 每次 dry-run 把各条的 `new_entities` 记进批次的 dry-run 标记文件（`dryrun-<批次>.json`），同一条再预览就覆盖。
 还没 dry-run 的条目这一项不查，`lint` 会在标准错误提示「dry-run 后再 lint 一次」；正式提交要求每条都 dry-run 过，
 所以提交前那次自检一定查得到。改了 summary 结果就变了，要重新 dry-run（与改名同一规矩）。
+
+**方向检查只查有把握的那几对**（2026-10-25 盘点全部战役结果 716 个文件、11,684 条后定的，清单在
+`tools/extract_bench.DIRECTED_PAIRS`，每一对都必须在 `schema.EDGE_TYPE_MAP` 里）：上表四种反向命中逐条看全是写反
+（`fixed_by` 16 条、`documented_in` 9 条、`derived_from` 1 条；`belongs_to` 没出现过，但「项目属于文件」不可能对）。
+不查的：`caused_by`（Concept→Issue 的 25 条反向命中里多数方向是对的，只是把「停机」「提案撤回」这类结果标成了 Concept；
+Issue→Fix「改动引起回归」与 Fix→Issue「因故障采取的操作」都是合理写法）、`derived_from` Concept↔Observation（反向命中都是方向对、类型松）、
+`depends_on`（Config→Tool 读成「配置依赖执行它的工具」也说得通）、两端同类型的边（看不出方向），以及 Capsule / Observation
+相关的几对（自抽取几乎不出这两类实体，没有数据判断）。要加新的一对，先用同样的盘点确认反向命中都是真写反。
+
+## dry-run 的复用回显
+
+`submit --dry-run` 的输出除了 `reuse_mismatch`（抽出名 → 会并到的不同名字，口径不变，仍是 ≤ 0.2/条那个指标）还有两项：
+
+| 字段 | 内容 | 怎么用 |
+|---|---|---|
+| `reused` | 每个会复用旧节点的实体一行（**同名复用也列**）：`条目: 抽出名（类型）→ 被复用节点名（类型）［同批新建］［近名］［类型不同］「被复用节点 summary 开头」` | 同名也看 summary 是不是同一个仓库 / 同一件事：不同仓库的同名文件（2026-10-25 throttle 与 sd-server 的同名 Java 文件）要带仓库前缀改名 |
+| `reuse_cross_type` | 复用到的节点类型和抽出类型不同的那几行 | 服务端精确同名不看类型（只有向量近名才查类型），这类误并只能在这里看见；逐条确认 |
+
+来源是服务端 dry-run 响应新增的 `entities`：每个实体给 `reused`、`matched_name`、`matched_type`（节点标签去掉 `Entity`，
+没有类型标签的旧节点为 null）、`match`（`exact` 精确同名 / `similar` 向量近名）、`matched_summary`（被复用节点 summary 前 100 字；
+同批新建的没有）、`in_batch`。`submit` 把它按条记进 dry-run 标记文件的 `resolution`，同一条再预览就覆盖。
+旧版服务端没有 `entities` 时退回用 `resolved` 拼（`matched_type` 为 null、不判跨类型），这一改动要先发服务端（提供方）再发客户端。
 
 ## 并行批次的命名同步与 NAS 闸门
 
