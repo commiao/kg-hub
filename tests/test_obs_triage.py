@@ -234,6 +234,9 @@ class SelectBatchTriageTest(unittest.TestCase):
         picked, st = ax.select_batch(self.ROWS, FCFG, 10, {}, triage_cfg=shadow)
         self.assertEqual([p["id"] for p in picked], [1, 2, 4])
         self.assertEqual((st["rejected_by_filter"], st["triage_drop"], st["triage_dropped"]), (1, 2, 0))
+        self.assertEqual(st["triaged"], 3)
+        # 影子模式下判丢的照样领走，但条目上记着档位，打满后从这里抽样复查
+        self.assertEqual({p["id"]: p.get("triage_tier") for p in picked}, {1: "drop", 2: None, 4: "drop"})
 
     def test_enforce_skips_drop_tier(self):
         picked, st = ax.select_batch(self.ROWS, FCFG, 10, {}, triage_cfg=dict(TCFG, enabled=True))
