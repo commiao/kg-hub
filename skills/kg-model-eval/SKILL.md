@@ -19,7 +19,7 @@ description: kg-hub 抽取模型对比的统一入口（冒烟、准入、盲测
 - 只有发布产物、没有 Git 的设备先 `"$CLI" campaign workspace --session-only`，再在创建的已排除目录打开会话；不要修改发布产物源码或用 INTERNAL 环境变量代替真实排除验收。
 - Mac 协调器新战役先 `"$CLI" campaign preflight`；默认 peer frozen-batch consumer 不发 API，读取协调器最新成功 preflight/capabilities 回执并核对产物 hash/版本：核对实际加载的代码目录/版本、规则哈希、Python 依赖、采集排除状态与服务能力。
   新运行默认 agent-v5、质量协议 extraction-quality-v1；检查失败先修环境，不花钱领批。不用旧副本的自检代替实际公共入口。
-- **冒烟与准入只能在存放冻结样本的机器上跑**（`~/.kg-hub/bench/bench-20261022`，目前只在 mac-office）；远端源 SSH 未验证时由 Mac 协调器 claim 并分发冻结 batch/规则/身份，peer 只抽取审核并回传，Mac 统一预览提交；不得把 preflight 通过当作源领取已验证。
+- **冒烟与准入只能在存放冻结样本的机器上跑**（目前是 mac-office）；先按下面步骤选择与当前规则兼容的 `V5_BENCH`。旧 `~/.kg-hub/bench/bench-20261022` 只是参考采样输入和 v4 历史对照；远端源 SSH 未验证时由 Mac 协调器 claim 并分发冻结 batch/规则/身份，peer 只抽取审核并回传，Mac 统一预览提交；不得把 preflight 通过当作源领取已验证。
 - 执行器名（`--executor`）按当前所在工具：`claude-code` / `qoder` / `codex` / `cursor` / `dsh`。模型名用该工具里的准确写法
   （`qodercli --list-models`、`cursor-agent --list-models`、`codex debug models`；Claude 用 Claude Code 的模型 id，
   如 claude-fable-5-1、claude-opus-5-5、claude-sonnet-5-5、claude-haiku-5-5）。
@@ -42,11 +42,30 @@ GLM-5.3 ≈2.35、Kimi-K3 ≈4.24 credits/条，qoder 计费；codex 与 Claude 
 没有实测数就写「未知，先冒烟」；其他模型同样写「未知，先冒烟」）、预计时长、要用到的命令。
 **用户确认前不跑任何花钱或写图的命令。** 成本不设门槛，条数就是成本上限。
 
+### 1.1 先选择当前规则的真实参考
+
+只读检查本机 bench 根目录中的 `manifest.json`：选择 `reference_version=bench-reference-v1`、`reference.prompt_version` 等于已发布公共入口 `tools.extract_bench.bench_system_prompt()` 的完整版本、`reference.prompt_sha256` 等于当前 `rules_sha()`，且 `reference-run.json` 的 `system_prompt_sha256` 等于该入口完整 system 提示 SHA256 的参考。不能只比 `agent-v5` 标签或规则正文而忽略 bench 补充提示。
+把候选目录设为 `V5_BENCH`，执行 `"$CLI" bench parts --bench "$V5_BENCH"` 验证冻结文件及 native 证据；此命令检查文件完整性，当前版本/正文/system 三项匹配仍需上述比对。只有全部通过才在后续冒烟、准入、盲评复用它；不要默认选最新目录，也不要用旧 c8 代替。新参考保留原三来源样本组及每组不落后 5 点的门槛。
+
+找不到兼容参考时，计划必须额外列出 **Claude Opus 真实参考 50 条** 的 token/时长预算（未知就写未知），取得用户确认后才执行以下公共 CLI；已经确认的同一预算不用重复询问。旧样本只用于收集当前规则真实参考运行，不能给旧目录改版本：
+
+```bash
+SOURCE_BENCH="$HOME/.kg-hub/bench/bench-20261022"
+"$CLI" bench run --bench "$SOURCE_BENCH" --executor claude --models claude-opus-5-5 \
+  --tag reference-v5-<唯一标签> --limit 50 --chunk 10 --parallel 4 --effort medium
+"$CLI" bench baseline --bench "$SOURCE_BENCH" --run <上一步真实Claude运行目录> \
+  --bench-id <新的唯一参考名称> --root "$HOME/.kg-hub/bench"
+V5_BENCH="$HOME/.kg-hub/bench/<新的唯一参考名称>"
+"$CLI" bench parts --bench "$V5_BENCH"
+```
+
+新目录不可覆盖，`baseline` 不调用模型、不写图。没有身份/完整 native 证据、漏交、失败、版本或输入不一致都会拒绝；不能用 `register` 或旧 v4 结果重标凑参考。保留原抽样顺序，50 条前 10 条仍为同一冒烟子集，part/lookahead、问句、背景、语料向量不变。完整操作与证据边界见 `docs/executors/bench-reference.md`。配置失败先修配置，不写候选模型失败记录；不自动增加模型调用来补齐。
+
 ## 2. 冒烟
 
 ```bash
-"$CLI" bench run   --bench ~/.kg-hub/bench/bench-20261022 --executor qodercli|codex|claude --models A B C --tag smoke<日期> --limit 10 --parallel 4
-"$CLI" bench admit --bench ~/.kg-hub/bench/bench-20261022 --run ~/.kg-hub/bench/runs/smoke<日期>-<执行器>-A   # 每个模型一次
+"$CLI" bench run   --bench "$V5_BENCH" --executor qodercli|codex|claude --models A B C --tag smoke<日期> --limit 10 --chunk 10 --parallel 4 --effort medium
+"$CLI" bench admit --bench "$V5_BENCH" --run ~/.kg-hub/bench/runs/smoke<日期>-<执行器>-A   # 每个模型一次
 ```
 
 `run` 把 qodercli、codex 或 claude（Claude Code 命令行，`--safe-mode`）当模型通道（不开工具、不加载用户级设置与
@@ -56,20 +75,21 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
 那样调用条数、推理强度、系统提示会和别的执行器不一样，结果没法放进同一张表。
 冒烟的 `admit` 不带 `--sheet`，只预览、不写准入记录，10 条最多看到 `screen_pass`（筛选通过，不算准入）。
 不在 qoder、codex、claude 里的模型（cursor、DSH 等）：在对应工具会话里按 `docs/executors/qoder.md`「对比模式」手工抽，写进一个目录后登记：
-`"$CLI" bench register --bench <样本> --results <目录> --model <模型> --executor <工具>`，之后命令一样。
+`"$CLI" bench register --bench <样本> --results <目录> --model <模型> --executor <工具>`，只供历史评分；新 native 参考的正式准入要求公共运行器完整证据，不能以手工登记代替。
 
 ## 3. 准入（含盲测）
 
 ```bash
-"$CLI" bench run   --bench <样本> --models A B --tag adm<日期> --limit 50 --parallel 4
-"$CLI" bench blind --bench <样本> --run <运行目录A> <运行目录B> --n 10 --out <临时目录>/blind-<日期>.json
+"$CLI" bench run   --bench "$V5_BENCH" --executor qodercli|codex|claude --models A B --tag adm<日期> --limit 50 --chunk 10 --parallel 4 --effort medium
+"$CLI" bench blind --bench "$V5_BENCH" --run <运行目录A> <运行目录B> --n 10 --out <临时目录>/blind-<日期>.json
 # 评审（见下）把每条 verdict 填成 ok / error（error 写 note），然后：
-"$CLI" bench admit --bench <样本> --run <运行目录A> --sheet <临时目录>/blind-<日期>.json   # 每个模型一次
+"$CLI" bench admit --bench "$V5_BENCH" --run <运行目录A> --sheet <临时目录>/blind-<日期>.json   # 每个模型一次
 ```
 
 **盲评怎么做**（用户已指定由 Claude 评）：
 - 能派子代理的工具：派一个只拿到评审表路径的子代理去评，**不告诉它对照表**（`<评审表>.key.json`）的存在；评完自己再跑 `admit`。
   不能派子代理时：评审者全程不打开对照表。
+- Claude 只返回 `code` / `verdict` / `note`，合回原冻结评审表，不能改正文、lookahead、实体或边；核验实际 Claude 身份，缺少或不一致不能充作已完成评审。准入前验证 code/obs 唯一、完整判定与原运行内容相同，error 必须说明；非法评审表不落模型失败记录。
 - 判 `error` 的标准：事实方向写反、因果写反（如把「造成」写成「捕获」）、数字/版本/时间写错、把 A 的事说成 B 的、编造原文没有的结论。
   措辞、详略、实体粒度不同**不算错**。
 - 评审表每条带 `lookahead`：模型调用时看到的同批之后观测的标题（规则 19 要求参考，用于写「后被 X 推翻 / 更正」）。

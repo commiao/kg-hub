@@ -149,6 +149,23 @@ class SkillDocTest(unittest.TestCase):
         self.assertIn(f"空观测率不比基线高出 {t['empty_extra_pts']:.0f} 点以上", self.text)
         self.assertIn('"$CLI" bench revoke', self.text)
 
+    def test_current_reference_recipe_uses_native_baseline_and_verified_selection(self):
+        """Next-session defaults must not spend a candidate run on the legacy v4 reference."""
+        recipe = self.text[self.text.index("### 1.1"):self.text.index("## 2. 冒烟")]
+        self.assertIn('"$CLI" bench baseline', recipe)
+        self.assertIn("--executor claude --models claude-opus-5-5", recipe)
+        self.assertIn("--limit 50", recipe)
+        self.assertIn("取得用户确认后", recipe)
+        for contract in ("reference.prompt_version", "reference.prompt_sha256", "system_prompt_sha256"):
+            self.assertIn(contract, recipe)
+        for section in ("## 2. 冒烟", "## 3. 准入"):
+            content = self.text[self.text.index(section):].split("\n## ", 1)[0]
+            commands = re.findall(r'"\$CLI" bench (?:run|admit|blind)[^\n]+', content)
+            self.assertTrue(commands)
+            self.assertTrue(all('--bench "$V5_BENCH"' in command for command in commands))
+        self.assertIn('"$CLI" bench parts --bench "$V5_BENCH"', recipe)
+        self.assertTrue((SKILL.parent.parent / "docs/executors/bench-reference.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

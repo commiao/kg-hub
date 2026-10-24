@@ -21,6 +21,8 @@
 
 `start` 只接受有准入记录、结论为 `pass`、且规则正文版本与本战役一致的模型（确需例外用 `--skip-admission "原因"`，原因记进战役）。
 
+先确认参考与当前规则兼容；旧 c8 仅等价于 v4，v5 需按 [当前规则下建立新的 bench 参考](bench-reference.md) 生成真实参考。以下命令的样本目录应使用该兼容参考。
+
 ```
 "$CLI" bench run   --bench ~/.kg-hub/bench/bench-20261022 --models <模型> --tag adm50 --limit 50
 "$CLI" bench blind --bench <样本> --run <运行目录...> --n 10 --out <评审表>.json
