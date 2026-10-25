@@ -68,19 +68,42 @@
 
 ## 自检（lint）查什么
 
-`lint` 不过不许 dry-run、不许正式提交（`submit` 先跑一遍 lint）。子代理不用再自己写脚本查下面两项长度：
+`lint` 不过不许 dry-run、不许正式提交（`submit` 先跑一遍 lint）。子代理不用再自己写脚本查下面几项：
 
 | 检查 | 口径 | 何时查 |
 |---|---|---|
 | 悬空边、实体类型 / 边名越界、缺 `edges` 键 | schema 硬错误 | 一直查 |
 | 第一条边照抄标题、第二条边是标题译文 | 规则 21、22 | 一直查 |
 | 其余 fact 超长 | 第 3 条边起，空白归一后**超过 200 字符**（与复盘表「其余长度合规%」同一量法）；逐条列出边序号与两端实体。按规则 31 拆成几条边或重写，不截断 | 一直查 |
+| 有向边写反方向 | 两端类型恰好是 `schema.EDGE_TYPE_MAP` 约定的反方向：`fixed_by` Fix→Issue（应 Issue→Fix）、`documented_in` KnowledgeDoc→Concept、`derived_from` Issue→Lesson、`belongs_to` Project→File / Project→Session；逐条列出边序号与两端实体（含类型），对调 source / target。只是类型不在约定里（如 `fixed_by` Issue→Tool）不报。准入判定不计这一项（与规则 21/22 同属执行者自检） | 一直查 |
 | 新建实体 summary 过短 | 少于 **30 字**（`strip` 后的字符数，规则 24）；只查 dry-run 返回的 `new_entities` 里的实体——并到图里旧实体的、并到同批前面条目新建实体的（`dry_run_pending`）都不查 | dry-run 之后 |
 
 新建与否离线分不出来（哪些名字会并到旧实体要服务端消解才知道），所以 summary 这一项取**最近一次 dry-run** 的结果：
 每次 dry-run 把各条的 `new_entities` 记进批次的 dry-run 标记文件（`dryrun-<批次>.json`），同一条再预览就覆盖。
 还没 dry-run 的条目这一项不查，`lint` 会在标准错误提示「dry-run 后再 lint 一次」；正式提交要求每条都 dry-run 过，
 所以提交前那次自检一定查得到。改了 summary 结果就变了，要重新 dry-run（与改名同一规矩）。
+
+**方向检查只查有把握的那几对**（2026-10-25 盘点全部战役结果 716 个文件、11,684 条后定的，清单在
+`tools/extract_bench.DIRECTED_PAIRS`，每一对都必须在 `schema.EDGE_TYPE_MAP` 里）：上表四种反向命中逐条看全是写反
+（`fixed_by` 16 条、`documented_in` 9 条、`derived_from` 1 条；`belongs_to` 没出现过，但「项目属于文件」不可能对）。
+不查的：`caused_by`（Concept→Issue 的 25 条反向命中里多数方向是对的，只是把「停机」「提案撤回」这类结果标成了 Concept；
+Issue→Fix「改动引起回归」与 Fix→Issue「因故障采取的操作」都是合理写法）、`derived_from` Concept↔Observation（反向命中都是方向对、类型松）、
+`depends_on`（Config→Tool 读成「配置依赖执行它的工具」也说得通）、两端同类型的边（看不出方向），以及 Capsule / Observation
+相关的几对（自抽取几乎不出这两类实体，没有数据判断）。要加新的一对，先用同样的盘点确认反向命中都是真写反。
+
+## dry-run 的复用回显
+
+`submit --dry-run` 的输出除了 `reuse_mismatch`（抽出名 → 会并到的不同名字，口径不变，仍是 ≤ 0.2/条那个指标）还有两项：
+
+| 字段 | 内容 | 怎么用 |
+|---|---|---|
+| `reused` | 每个会复用旧节点的实体一行（**同名复用也列**）：`条目: 抽出名（类型）→ 被复用节点名（类型）［同批新建］［近名］［类型不同］「被复用节点 summary 开头」` | 同名也看 summary 是不是同一个仓库 / 同一件事：不同仓库的同名文件（2026-10-25 throttle 与 sd-server 的同名 Java 文件）要带仓库前缀改名 |
+| `reuse_cross_type` | 复用到的节点类型和抽出类型不同的那几行 | 服务端精确同名不看类型（只有向量近名才查类型），这类误并只能在这里看见；逐条确认 |
+
+来源是服务端 dry-run 响应新增的 `entities`：每个实体给 `reused`、`matched_name`、`matched_type`（节点标签去掉 `Entity`，
+没有类型标签的旧节点为 null）、`match`（`exact` 精确同名 / `similar` 向量近名）、`matched_summary`（被复用节点 summary 前 100 字；
+同批新建的没有）、`in_batch`。`submit` 把它按条记进 dry-run 标记文件的 `resolution`，同一条再预览就覆盖。
+旧版服务端没有 `entities` 时退回用 `resolved` 拼（`matched_type` 为 null、不判跨类型），这一改动要先发服务端（提供方）再发客户端。
 
 ## 并行批次的命名同步与 NAS 闸门
 
@@ -94,15 +117,31 @@
 
 | 键 | 怎么算 | 处理 |
 |---|---|---|
-| file | 仓库 + 仓库内相对路径（名字前缀 `仓库:`、括号里的仓库名、正文绝对路径；`recruitment-intel-service` 记为 `zhaopin`） | 自动改 |
+| file | 仓库 + 仓库内相对路径（名字前缀 `仓库:`、括号里的仓库名、正文绝对路径、正文「Files read/modified」里的相对路径；`recruitment-intel-service` 记为 `zhaopin`） | 自动改 |
 | id | 名字主体是纯标识符（含 `_ . -` 或驼峰，末尾 `()` 不算差异），括号里没指明别的仓库，类型类别相同 | 自动改（类型不同只报告 `id-type`） |
 | wt | 名字以「工作树 / worktree」结尾，按正文里的 `.claude/worktrees/<名>`、已知工作树目录名、其前缀或 hash 后缀对上 | 自动改 |
 | core / pr / head | 同主体不同括号限定；同仓库同 PR 号的不同 Fix 名；「标识符 + 短后缀」对上全名标识符 | 只报告，执行者判断 |
+| xrepo | 本批文件确定在仓库 A，服务端会复用的图中**裸**同名节点（无仓库前缀）在已提交记录里只属于仓库 B | 只报告，建议改成 `A:相对路径` |
+
+另有 `server` 一栏：服务端会自己把这个名字并进图里的哪个节点（「服务端会合并到 X」）。判据直接调服务端的
+`utils/extracted_ingest._lexically_same`（带实体类型，再核对图中节点的类型标签），不在工具里另抄规则——
+以前只抄了「全路径与短名、只差 `()`」，`feature/course-benefit-freetimes（libtv）` 这种只比裸名多一个短括号、
+服务端按包含占比（`CONTAIN_MIN_SHARE`）会并进裸名节点的写法就只被列成 review。`server` 只报告、不改名，也不影响退出码；
+「并过去」不对（其实是不同的东西）时按规则 14 改名。向量召回这一步工具算不了，按「近名都召回得到」假定。
+
+仓库从哪里认：`~/work-ai` 下的目录，加上 `~/workspace` 下带 `.git` 的目录（公司仓库 sd-server、throttle 等在那里；
+`KG_HUB_NAMESYNC_ROOTS` 用路径分隔符给别的目录，给空串就不看）。观测正文的「Project: X」只是会话标签，
+「Files read」里的相对路径只有在本机仓库 X 里**真有这个文件**时才算 X 的（opus2000 战役里标 fleet-ops 的会话读的多是
+kg-hub、credvault 的文件）。`~`、`nas`、`vps` 这类位置不算仓库，不参与 xrepo。
+xrepo 不自动加前缀：正文路径可能是暂存或部署副本（回放里 `credvault_dashboard.py` 的路径在 fleet-ops/scratchpad 下），自动改会把一个文件拆成两个节点。
 
 规范名：图里已有同键节点时，取**挂得最多的干净节点名**（按各战役 `log.jsonl` 的服务端复用映射换算；不是绝对路径、不以任务号开头）；
-服务端本来就会自己合并的写法（不带前缀和括号的全路径与短名、只差 `()`）不改；图里没有时取本战役**更早的待提交批次**的写法
+写了 `仓库:` 前缀的名字不往没前缀的写法上改（裸名常是混了几个仓库的泛名节点，如 `pom.xml`），提交前也不算分裂；
+服务端本来就会自己合并的写法不改、列进 `server`；图里没有时取本战役**更早的待提交批次**的写法
 （并行批次之间按批次号先到先得，还没合并的分片也算）；都没有就本批内部统一成首次出现的写法。
-参照物是本机状态目录下**全部战役**的已提交批次；不在任何战役里的旧图节点看不到，`--graph` 只对「标识符 + 短后缀」名问图（只读，至多 20 次）。
+参照物是本机状态目录下**全部战役**的已提交批次；不在任何战役里的旧图节点看不到。`--graph` 问图（只读，经 `/api/node_neighbors`，每类至多 20 次）：
+「标识符 + 短后缀」名问图里有没有同名短节点；本批确定仓库 A 的裸文件名问图里同名节点的邻居，邻居的名字或 fact 提到别的仓库就在
+`graph_hints` 里标 `xrepo`、给出 `suggest`（`A:相对路径`）——图里 `RedisCacheKeyConstants.java` 属 throttle 是旧图里的事，只能这样看到。
 
 ```
 "$CLI" campaign namesync --id <战役> --batch <批次>                  # 只看报告
@@ -111,6 +150,8 @@
 ```
 
 `--apply` 改写结果文件：实体名、边两端，以及第 3 条边起 fact 里整词出现的旧名（前两条照抄标题与译文不动）；改名后会成自环的边不改、列进 `skipped`。
+输出里 `auto` 是改之前算出的计划，`applied` 是**实际写回的每一条**（`item / from / to / kind / source`），`residual` 是改完再查仍没统一的
+（正常为空，不空时退出码 2）。以前 apply 后把 `auto` 换成残余、只留一个计数，022 批 `graphiti_core` 被改成「graphiti_core（Python 依赖包）」复查时看不出来。
 改过就要重新 lint、重做质量表与 dry-run（旧的都已失效，工具会按内容摘要拒绝）。
 
 **提交前的分裂判据**接在 `submit` 里（正式提交时自动查，不用另跑）：最近一次 dry-run 的 `new_entities` 里有这个名字（服务端会新建节点），
@@ -173,6 +214,54 @@
 （普通执行器的状态目录用 `"$CLI" agent mark-empty`）补记，可重跑。普通领批不会再抽正式记空的来源；若复核发现漏抽，使用正规修复入口将 empty 升级为非空，并保留原来源键和审计，不把它当成新增样本。
 
 ## 同一台设备上多个工具、多个战役同时跑
+
+### Codex 持久监督与提交回执
+
+新战役每个模型用公共入口启动一个监督器；命令作为长任务后台运行，原生抽取仍使用冻结模型、effort、代理和原 brief：
+
+```bash
+"$CLI" campaign supervise --id <战役> --model <模型>
+```
+
+已有原生会话必须交接其本次调用的唯一退出回执和 JSONL 事件，不中断仍在工作的会话：
+
+```bash
+"$CLI" campaign supervise --id <战役> --model <模型> --resume-session <原session> \
+  --adopt-exit <本次调用exit-status.json> --adopt-events <本次调用stdout.jsonl>
+```
+
+退出回执须含 `exit_code=0`、`ended_at`，事件须有相同 `thread.started` 身份及 `turn.completed`。
+监督器在旧调用真正结束前只等待，不另起 worker；没有历史调用终态凭据不能接管已有模型历史。
+以后每次原生调用由 `runtime exec --receipt-dir` 保存私有运行和退出回执，并用独占 lease 防止重复监督。
+可选诊断不可用或正常 turn 提前结束后，在同一 session 续跑到正式配额；默认每15秒检查，连续3个无正式进展的 turn 留待协调器，避免无界消耗。
+真实审批拒绝、NAS75/76、业务权限拒绝、未知提交终态不能自动重试。监督器不替模型抽取/审核，不自动提交、不发信号、不改变安全审批。
+
+提交和预览命令自动记录 `operations/<批次>/`，包含实际冻结输入摘要、来源键、等待/提交阶段与退出结果；另一同批请求或回收不能越过活跃 lease。
+诊断优先读取以下公共命令，不依赖 `ps`、`pgrep` 或向进程发信号：
+
+```bash
+"$CLI" campaign operation-status --id <战役> --batch <批次>
+"$CLI" campaign status --id <战役>
+"$CLI" runtime status --receipt-dir <原生调用回执目录>
+```
+
+退出73表示原操作仍活跃，应等待；74表示终态待核对。持锁只证明进程存活，CLI退出0也不代表所有条目成功。
+没有终态或HTTP结果不明时，协调器先用 `campaign reconcile-operation --id <战役> --batch <批次>` 查询全部原来源键。
+只有回执证明未启动写请求（或只是只读预览），且完整查询确认全部不存在，才解除重放阻止，之后仍须逐条审核和整批预览。
+已发出写请求时，键不存在也不能证明远端请求已结束，仍需协调器核对远端真实终态；任一来源已存在/进行中或服务核验响应缺项时均保持待核对，不能算成本模型成功。
+旧未受管提交没有 lease 回执时仍需宿主只读终态证据，不凭锁不存在猜测可以重交。退出75/76和真实平台拒绝保留原有处理规则。
+旧版调用明确退出76且未获NAS放行时，协调器可用以下兼容入口登记原始证据：
+
+```bash
+"$CLI" campaign reconcile-operation --id <战役> --batch <原批次> --resume-session <原session> \
+  --legacy-exit <唯一调用前缀-exit-status.json> --legacy-events <同前缀-stdout.jsonl>
+```
+
+入口核对同一次原生调用的身份与终态、最后一条精确公共提交命令的76退出、对应控制台的“未放行”终态及冻结批次，
+并重新完整查询全部原来源键。任何已存在、缺项、活动lease、未知终态或非闸门拒绝都不解除阻塞。
+只在全部通过后保存不可变的旧证据摘要和 `reconciled_not_written` 回执；保留原76，不自动提交。
+监督器只接受与该原生事件文件及命令编号绑定的恢复凭据，然后仍按原温度门、完整审核和整批预览恢复同一session。
+`campaign status.supervisors` 显示运行阶段及 `coordinator_required`；协调器须及时处理该状态，不因会话显示 idle/running 就推断业务进度。
 
 - **同一个战役**：领批、提交、记成本都在战役目录的文件锁里，多个工具（Claude Code、qoder、codex、cursor、DSH）同时跑不会领到同一条。
 - **不同战役之间、战役与 `agent_extract next` 之间**：走**全设备在途领取登记**（`tools/claim_registry.py`，

@@ -50,6 +50,7 @@ class CampaignTest(unittest.TestCase):
         # 测试进程不在战役专用目录里：用 CLAUDE_MEM_INTERNAL=1 过「不被 claude-mem 记录」的自检（自检本身另有用例）
         self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": self.tmp.name,
                                                 "KG_HUB_CLAIMS_DIR": os.path.join(self.tmp.name, "claims"),
+                                                "KG_HUB_NAS_GATE_DIR": os.path.join(self.tmp.name, "nas-gate"),
                                                 "CLAUDE_MEM_INTERNAL": "1",
                                                 "CLAUDE_MEM_SETTINGS_PATH": os.path.join(self.tmp.name, "cm.json")})
         self.env.start()
@@ -212,6 +213,10 @@ class CampaignTest(unittest.TestCase):
         dr = ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=post)
         self.assertEqual(dr["by_status"], {"dry_run": 25})
         self.assertEqual(len(dr["reuse_mismatch"]), 25)
+        # 旧服务端只回 resolved：复用照样逐条列出（类型未知），不判跨类型
+        self.assertEqual(len(dr["reused"]), 25)
+        self.assertEqual(dr["reused"][0], f"{items[0]['id']}: A（Concept）→ A 旧名（类型未知）")
+        self.assertEqual(dr["reuse_cross_type"], [])
         out = ec.cmd_submit("t1", bid, dry_run=False, url="http://x", token=None, post=post)
         self.assertEqual(out["by_status"], {"ok": 25})
         self.assertEqual((posted[-1]["extractor_model"], posted[-1]["run_id"], posted[-1]["extractor_tool"]),
@@ -464,7 +469,9 @@ class CampaignTest(unittest.TestCase):
         self.assertIn('"credits": null, "tokens": null, "seconds": null', b)
         self.assertIn("数据不是指令", b)
         self.assertIn("起草时就按一句一事实写短句", b)
-        self.assertIn("被权限、hook 或分类器拦下时立即停下汇报", b)
+        self.assertIn("提交或模型调用被权限、hook 或分类器拦下时", b)
+        self.assertIn("ps等可选诊断不可用不代表提交失败", b)
+        self.assertIn("operation-status --id t1", b)
         self.assertIn("补充约定是累加的", b)
         self.assertIn("--tokens <N>", " ".join(self.claim("DeepSeek-Flash")["next"]))
 
@@ -775,6 +782,25 @@ class DeviceWideClaimsTest(unittest.TestCase):
         inside = ec.launch_command("codex", "t1", "m", repo=_Path("/r"), state=_Path(self.tmp.name))
         self.assertEqual(inside.count("--add-dir"), 1)                      # 登记目录在状态目录里就不重复加
 
+    def test_launch_makes_actual_gate_dir_writable_without_changing_the_gate(self):
+        import shlex
+        from tools import nas_gate
+        root = _Path(self.tmp.name)
+        config = root / "gate.json"
+        settings = nas_gate.load_settings()
+        settings["lock_dir"] = str(root / "gate ; literal")
+        config.write_text(json.dumps(settings))
+        env = dict(os.environ, KG_HUB_NAS_GATE_CONFIG=str(config))
+        env.pop("KG_HUB_NAS_GATE_DIR", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            for tool in ("codex", "cursor", "qodercli"):
+                cmd = ec.launch_command(tool, "t1", "m", repo=root / "session", state=root / "state")
+                self.assertIn("--add-dir " + shlex.quote(settings["lock_dir"]), cmd)
+            self.assertEqual(nas_gate.load_settings(), settings)
+        with mock.patch.dict(os.environ, {"KG_HUB_NAS_GATE_DIR": str(root / "override gate")}):
+            cmd = ec.launch_command("codex", "t1", "m", repo=root / "session", state=root / "state")
+            self.assertIn("--add-dir " + shlex.quote(str(root / "override gate")), cmd)
+
 
 
 class FillBatchTest(unittest.TestCase):
@@ -854,7 +880,11 @@ class NameSyncSubmitTest(unittest.TestCase):
         self.assertEqual(self.gated, ["dryrun"])                   # 被分裂判据拦下的没去排 NAS 闸门
         self.assertEqual(ec.load(ec.campaign_dir("t1"))["batches"][0]["status"], "dry_run")
         rep, code = ec.cmd_namesync("t1", bid, apply=True, layout=self.layout)
-        self.assertEqual((code, rep["applied"], rep["auto"], rep["dryrun"]), (0, 1, [], "stale"))
+        self.assertEqual((code, rep["residual"], rep["dryrun"]), (0, [], "stale"))
+        # 实际写回的每一条都留在输出里（以前只剩计数 applied=1、auto 被换成空的残余）
+        self.assertEqual([(a["item"], a["from"], a["to"], a["kind"]) for a in rep["applied"]],
+                         [(1, "reconcile_due", "reconcile_due（QueueDispatcher）", "id")])
+        self.assertEqual([(a["from"], a["to"]) for a in rep["auto"]], [("reconcile_due", "reconcile_due（QueueDispatcher）")])
         res = json.loads((ec.campaign_dir("t1") / "results" / f"{bid}.json").read_text())
         self.assertIn("reconcile_due（QueueDispatcher）", [e["name"] for e in res["items"][0]["entities"]])
         with self.assertRaises(SystemExit) as cm:                  # 结果改了：旧 dry-run 失效，先重新预览

@@ -126,7 +126,8 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
    `"$CLI" campaign start --id <战役> --models A B C --executor <工具> --quota <每模型条数> --batch <每批> --model-preflight <A新探测凭据> <B新探测凭据> <C新探测凭据>`
 3. 派子代理（方式二）或每个模型一个会话（退路），按 `docs/executors/campaign.md` 的「各工具怎么派」：
    - Claude Code / qoder / cursor：方式二已验证；`agents --id <战役>` 生成各模型的子代理定义，或用 `brief` 输出当任务说明。
-   - codex / DSH：方式二未确认，用 `launch --id <战役> --tool codex|dsh` 打印每个模型的启动命令。
+   - codex：公共入口支持 `supervise` 时优先用 `campaign supervise --id <战役> --model <模型>` 持久监督每条原生执行线，具体恢复参数见 `docs/executors/campaign.md`。同一模型已有会话时先带其唯一 `--resume-session`、`--adopt-exit`、`--adopt-events` 交接，等待真实终态，不能重开重复执行线。旧客户端先升级公共 CLI；未升级前仍需人工协调，不能宣称已有持久监督能力。
+   - DSH：方式二未确认，用 `launch --id <战役> --tool dsh` 打印每个模型的启动命令。
    - 并行多路（最多 4 路）时错开约 5 分钟派出，让先落盘的分片名字被后面的批次查到；命名冲突与 NAS 升温都由工具管，不靠子代理自觉（见第 4 步）。
 4. **命名同步**（lint 通过后、质量表之前）：`"$CLI" campaign namesync --id <战役> --batch <批次> --apply --graph`。
    按锚点键（文件 = 仓库 + 相对路径、纯标识符、工作树目录名）把同物异名统一成图里挂得最多的干净节点名 > 更早的待提交批次 > 本批首次写法；
@@ -145,6 +146,9 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
    有新教训才 `chain --file`，补充约定是累加的（`rules` 依次输出 c1…cN），新文件只写本轮新增或改动，不重抄前版；没有新问题就记录沿用。
    `status` 里 `chain_mode` 不是 cumulative 的旧战役只认当前一版，这时新约定仍须合并保留仍有效的前版内容。
 6. 子代理失败：能续就用同一批次号续跑；做坏了 `release --batch --reason`（条目回队列、还配额）。不要手改 `campaign.json`。
+   `ps` 等可选诊断不可用时先读 `campaign operation-status --id <战役> --batch <批次>`，不能把诊断拒绝当成提交失败。
+   原命令持有 lease 就等待；缺终态回执时由协调器用 `reconcile-operation` 完整核对原来源键。只有回执证明未启动写请求、且完整查询均不存在，才可重新审核、预览后提交；已发出写请求时，“查不到键”不能证明远端请求已停止。任一来源已存在、进行中或服务核验响应缺项时，都不能直接重交或计入本模型成功。
+   `campaign status` 的 `supervisors` 是持久监督状态；提前结束的原生 turn 会在同一 session 续跑，真实审批拒绝、NAS75/76、业务权限拒绝、未知终态及连续无正式进展会留下 `coordinator_required`，由协调器及时接管，不等用户来问。
    宿主 Codex 子代理处于 idle/completed 时用 `followup_task` 触发下一轮，running 才用 `send_message` 追加指令；repo CLI 不能代替宿主任务控制。原生执行状态读取 `execution-state.json`，成功须有封存 `run.json`；基础设施失败只有 `run-aborted.json`，queued 未启动与已调用失败分开，不靠新时间戳或「开始了」认定运行。
 7. 收尾同时核对 `claim` 返回 done 与每模型实际提交终态：按 `(batch,id)` 最新日志去重、剔除 released；
    非空 ok 与服务正式记录的 empty 分列，claimed/skipped/失败不算本模型成功。已处理不等于全部事实正确。

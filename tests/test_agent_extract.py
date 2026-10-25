@@ -229,6 +229,47 @@ class SubmitTest(unittest.TestCase):
                           post=lambda m, u, b, t: (posted.append(b), (200, {"status": "ok"}))[1])
         self.assertFalse(any("dry_run_pending" in b for b in posted))
 
+    def test_dry_run_records_what_each_entity_reuses(self):
+        """2026-10-25 opus2000：跨仓库同名文件、跨类型的误复用，只给 new_entities 名字看不出来。"""
+        batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS)]}
+        results = {"items": [{"id": 29995, "edges": [], "entities": [
+            {"name": "RateLimiter.java", "type": "File", "summary": "s"},
+            {"name": "writer lock", "type": "Concept", "summary": "s"},
+            {"name": "全新的东西", "type": "Concept", "summary": "s"}]}]}
+        rows = [{"name": "RateLimiter.java", "type": "File", "reused": True, "matched_name": "RateLimiter.java",
+                 "matched_type": "File", "match": "exact", "matched_summary": "throttle 仓库的令牌桶限流器"},
+                {"name": "writer lock", "type": "Concept", "reused": True, "matched_name": "Writer Lock",
+                 "matched_type": "Tool", "match": "exact", "in_batch": True},
+                {"name": "全新的东西", "type": "Concept", "reused": False}]
+        post = lambda m, u, b, t: (200, {"status": "dry_run", "resolved": {}, "entities": rows,  # noqa: E731
+                                         "new_entities": [{"name": "全新的东西", "type": "Concept"}]})
+        rec = ax.submit_results(batch, results, model="m", session="s", url="http://x", token=None,
+                                post=post, dry_run=True)[0]
+        self.assertEqual(rec["resolution"], rows)
+        self.assertEqual(rec["reuse_cross_type"], ["writer lock（Concept）→ Writer Lock（Tool）［同批新建］［类型不同］"])
+        self.assertEqual(ax.reuse_line(rows[0], 29995),
+                         "29995: RateLimiter.java（File）→ RateLimiter.java（File）「throttle 仓库的令牌桶限流器」")
+        self.assertEqual(rec["reuse_mismatch"], [])        # 误并候选的口径（≤0.2/条）不变：不按类型加
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d)
+            ax.record_dryrun(sd, "b0001", [rec])
+            marker = json.loads(ax.dryrun_marker_path(sd, "b0001").read_text())
+            self.assertEqual(marker["resolution"], {"29995": rows})
+            ax.record_dryrun(sd, "b0001", [dict(rec, id=7)])                 # 再预览别的条目：取并集
+            self.assertEqual(sorted(json.loads(ax.dryrun_marker_path(sd, "b0001").read_text())["resolution"]),
+                             ["29995", "7"])
+
+    def test_resolution_falls_back_to_resolved_from_old_server(self):
+        res = {"entities": [{"name": "Writer  Lock", "type": "Concept"}, {"name": "new", "type": "Tool"},
+                            {"name": "writer lock", "type": "Concept"}]}
+        d = {"resolved": {"writer lock": {"reused": True, "matched_name": "writer_lock", "in_batch": True},
+                          "new": {"reused": False}}}
+        self.assertEqual(ax.resolution_rows(res, d), [
+            {"name": "Writer  Lock", "type": "Concept", "reused": True, "matched_name": "writer_lock",
+             "matched_type": None, "in_batch": True},
+            {"name": "new", "type": "Tool", "reused": False}])
+        self.assertFalse(ax.cross_type(ax.resolution_rows(res, d)[0]))   # 类型未知不算跨类型
+
     def test_submit_builds_payload_logs_and_summarizes(self):
         batch = {"batch_id": "b0001", "items": [ax.to_identity(OBS), ax.to_identity(dict(OBS, id=2, content_hash="h2"))]}
         results = {"items": [

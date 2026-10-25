@@ -1982,6 +1982,16 @@ async def _run_recorded_extracted(graphiti, body: ExtractedIngestBody, extractio
         _extraction_finished()
 
 
+def _dry_run_entity(ent, res: dict) -> dict:
+    out = {"name": ent.name, "type": ent.type, "reused": res["reused"]}
+    if res["reused"]:
+        out.update({k: res.get(k) for k in ("matched_name", "matched_type", "match")})
+        for k in ("matched_summary", "in_batch"):
+            if res.get(k):
+                out[k] = res[k]
+    return out
+
+
 async def ingest_extracted(request: Request) -> JSONResponse:
     """POST /api/ingest_extracted — 调用方自带实体/关系的入库（不调模型）。
 
@@ -2056,6 +2066,9 @@ async def ingest_extracted(request: Request) -> JSONResponse:
             "resolved": {k: {"uuid": v["uuid"], "reused": v["reused"], "matched_name": v["matched_name"],
                              **({"in_batch": True} if v.get("in_batch") else {})}
                          for k, v in preview.resolved.items()},
+            # 每个实体一行：新建还是复用、复用到的节点名 / 类型 / 怎么命中 / summary 开头（同批新建的标 in_batch）。
+            # 让执行者一眼看出跨仓库同名、跨类型的误复用（2026-10-25 opus2000 战役）
+            "entities": [_dry_run_entity(e, preview.resolved[e.key]) for e in extraction.entities],
             # 本条正式提交时会新建的实体：执行器累积进后续条目的 dry_run_pending
             "new_entities": [{"name": e.name, "type": e.type} for e in extraction.entities
                              if not preview.resolved[e.key]["reused"]],
