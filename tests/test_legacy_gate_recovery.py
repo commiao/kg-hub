@@ -145,6 +145,18 @@ class LegacyGateRecoveryTest(unittest.TestCase):
         self.rows.insert(-1, {'type': 'padding', 'text': 'x' * 300000}); self.write_events()
         self.assertEqual(supervision.events(self.events)['hard_stop'], 76)
 
+    def test_earlier_writer_failure_is_not_cleared_by_a_later_gate_timeout(self):
+        bid = self.prepare()
+        command = self.rows[2]['item']['command']
+        self.rows[2:2] = [
+            {'type': 'item.started', 'item': {'type': 'command_execution', 'id': 'earlier', 'command': command}},
+            {'type': 'item.completed', 'item': {'type': 'command_execution', 'id': 'earlier', 'command': command, 'exit_code': 1}}]
+        self.write_events()
+        check = mock.Mock(side_effect=AssertionError('absence cannot prove a previous writer stopped'))
+        with self.assertRaisesRegex(ValueError, 'earlier legacy write'):
+            self.reconcile(bid, check)
+        check.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
