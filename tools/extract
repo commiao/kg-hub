@@ -4,6 +4,10 @@ set -eu
 code_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 if [ -n "${KG_HUB_PYTHON:-}" ]; then
     kg_python=$KG_HUB_PYTHON
+elif [ -f "${LLM_EVAL_ACTIVE_BUNDLE:-$HOME/.local/share/llm-eval/active-bundle.json}" ]; then
+    # One installed composition selects core + business adapter together.
+    kg_bundle=${LLM_EVAL_ACTIVE_BUNDLE:-$HOME/.local/share/llm-eval/active-bundle.json}
+    kg_python=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "venv/bin/python")' "$kg_bundle")
 elif [ -x "$HOME/.local/share/kg-hub/venv/bin/python" ] &&
      "$HOME/.local/share/kg-hub/venv/bin/python" -c 'import sys, httpx; from pydantic import model_validator; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
     kg_python=$HOME/.local/share/kg-hub/venv/bin/python
