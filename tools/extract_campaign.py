@@ -1383,7 +1383,7 @@ def cmd_report(cid: str) -> dict:
         by_model.setdefault(r["model"], []).append(r)
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
-    from utils.evaluation_receipts import artifact, overhead_coverage
+    from kg_hub_eval.business.utils.evaluation_receipts import artifact, overhead_coverage
     evidence = [artifact(p) for p in [d / "campaign.json", d / "log.jsonl", d / "prompt.md",
                                       *sorted(d.glob("chain-*.md"))] if p.is_file()]
     return {"campaign": cid, "prompt_version": c["prompt_version"], "prompt_sha256": c.get("prompt_sha256"),
@@ -1448,7 +1448,7 @@ def triage_summary(d: Path, c: dict, since: str | None = None) -> dict:
 def cmd_status(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
-    from utils.evaluation_receipts import overhead_coverage
+    from kg_hub_eval.business.utils.evaluation_receipts import overhead_coverage
     from utils.process_receipts import status as process_status
     from tools.campaign_supervision import completed
     n = parallelism(c)
