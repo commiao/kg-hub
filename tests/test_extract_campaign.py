@@ -213,6 +213,10 @@ class CampaignTest(unittest.TestCase):
         dr = ec.cmd_submit("t1", bid, dry_run=True, url="http://x", token=None, post=post)
         self.assertEqual(dr["by_status"], {"dry_run": 25})
         self.assertEqual(len(dr["reuse_mismatch"]), 25)
+        # 旧服务端只回 resolved：复用照样逐条列出（类型未知），不判跨类型
+        self.assertEqual(len(dr["reused"]), 25)
+        self.assertEqual(dr["reused"][0], f"{items[0]['id']}: A（Concept）→ A 旧名（类型未知）")
+        self.assertEqual(dr["reuse_cross_type"], [])
         out = ec.cmd_submit("t1", bid, dry_run=False, url="http://x", token=None, post=post)
         self.assertEqual(out["by_status"], {"ok": 25})
         self.assertEqual((posted[-1]["extractor_model"], posted[-1]["run_id"], posted[-1]["extractor_tool"]),

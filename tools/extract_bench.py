@@ -385,6 +385,32 @@ def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
 
 SUMMARY_MIN = 30   # 规则 24：summary 至少 30 字
 
+# 有向边的方向检查只查这几对：两端类型按 schema.EDGE_TYPE_MAP 的约定、而且反过来读毫无意义。
+# 2026-10-25 盘点全部战役结果（716 个文件、11,684 条）：fixed_by Fix→Issue 16 条、documented_in
+# KnowledgeDoc→Concept 9 条、derived_from Issue→Lesson 1 条，逐条看全是写反；belongs_to Project→File/Session
+# 没出现过，但「项目属于文件」不可能对。不查的：caused_by（Concept→Issue 25 条里多数方向是对的，只是把「停机」
+# 「提案撤回」这类结果标成了 Concept；Issue↔Fix 两个方向都有合理写法）、derived_from Concept↔Observation
+# （2 条反向命中都是方向对、类型松）、depends_on（Config→Tool 读成「配置依赖执行它的工具」也说得通）、
+# 两端同类型的（看不出方向）以及 Capsule / Observation 那几对（自抽取几乎不出这两类实体，没有数据判断）。
+DIRECTED_PAIRS: dict[str, tuple[tuple[str, str], ...]] = {
+    "fixed_by": (("Issue", "Fix"),),
+    "documented_in": (("Concept", "KnowledgeDoc"),),
+    "derived_from": (("Lesson", "Issue"),),
+    "belongs_to": (("File", "Project"), ("Session", "Project")),
+}
+
+
+def reversed_edge(name: str, src_type: str | None, tgt_type: str | None) -> tuple[str, str] | None:
+    """边的两端恰好是约定的反方向（而正方向不是约定）时返回约定的 (源类型, 目标类型)；否则 None。"""
+    from schema import EDGE_TYPE_MAP
+    pairs = DIRECTED_PAIRS.get((name or "").lower(), ())
+    if (src_type, tgt_type) in pairs:
+        return None
+    for a, b in pairs:
+        if (tgt_type, src_type) == (a, b) and name.lower() in EDGE_TYPE_MAP.get((a, b), []):
+            return a, b
+    return None
+
 
 def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict], *, chain_rules: bool = True,
                missing: bool = True, new_names: dict[int, list[str]] | None = None) -> list[str]:
@@ -429,6 +455,13 @@ def lint_items(rows: list[tuple[int, str, str]], results: dict[int, dict], *, ch
             if n > REST_LEN_MAX:
                 probs.append(f"{part} {i}: 第 {k} 条边 fact {n} 字符，超过 {REST_LEN_MAX}（规则 23/31：一句一事实，"
                              f"拆成几条边或重写，不要截断）：{g.get('source')} → {g.get('target')}")
+        types = {e.get("name"): e.get("type") for e in it["entities"]}
+        for k, g in enumerate(it["edges"], start=1):
+            st, tt = types.get(g.get("source")), types.get(g.get("target"))
+            conv = reversed_edge(g.get("name") or "", st, tt)
+            if conv:
+                probs.append(f"{part} {i}: 第 {k} 条边 {g.get('name')} 方向反了：{g.get('source')}（{st}）→ "
+                             f"{g.get('target')}（{tt}），约定是 {conv[0]} → {conv[1]}；对调 source / target")
         if new_names is not None and i in new_names:
             fresh = {_norm_key(x) for x in new_names[i]}
             for e in it["entities"]:

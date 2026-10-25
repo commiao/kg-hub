@@ -148,7 +148,7 @@ class HandlerTest(unittest.TestCase):
             return WriteResult(episode_uuid="", nodes_new=1, nodes_reused=1, edges_new=0, edges_reused=0,
                       resolved={"kg-hub": {"uuid": None, "reused": False, "matched_name": None},
                                 "commit abc1234": {"uuid": None, "reused": True, "matched_name": "Commit ABC1234",
-                                                   "in_batch": True}})
+                                                   "matched_type": "Tool", "match": "exact", "in_batch": True}})
         payload = dict(GOOD, dry_run=True, dry_run_pending=[{"name": "Commit ABC1234", "type": "Tool"}])
         with mock.patch.object(srv, "write_extraction", fake_write):
             code, d = self._run(payload)
@@ -158,6 +158,27 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(d["new_entities"], [{"name": "kg-hub", "type": "Project"}])
         self.assertTrue(d["resolved"]["commit abc1234"]["in_batch"])
         self.assertNotIn("in_batch", d["resolved"]["kg-hub"])
+        # 每个实体一行：新建 / 复用到谁（名字、类型、怎么命中），同批新建的标 in_batch
+        self.assertEqual(d["entities"], [
+            {"name": "kg-hub", "type": "Project", "reused": False},
+            {"name": "commit abc1234", "type": "Tool", "reused": True, "matched_name": "Commit ABC1234",
+             "matched_type": "Tool", "match": "exact", "in_batch": True}])
+
+    def test_dry_run_entities_carry_cross_type_graph_match(self):
+        async def fake_write(driver, embedder, extraction, **kw):
+            return WriteResult(episode_uuid="", nodes_new=0, nodes_reused=2, edges_new=0, edges_reused=0, resolved={
+                "kg-hub": {"uuid": "u1", "reused": True, "matched_name": "kg-hub", "matched_type": "Tool",
+                           "match": "exact", "matched_summary": "另一个同名工具"},
+                "commit abc1234": {"uuid": "u2", "reused": True, "matched_name": "commit abc1234",
+                                   "matched_type": None, "match": "exact"}})
+        with mock.patch.object(srv, "write_extraction", fake_write):
+            code, d = self._run(dict(GOOD, dry_run=True))
+        self.assertEqual(code, 200)
+        self.assertEqual(d["new_entities"], [])
+        self.assertEqual(d["entities"][0], {"name": "kg-hub", "type": "Project", "reused": True, "matched_name": "kg-hub",
+                                            "matched_type": "Tool", "match": "exact", "matched_summary": "另一个同名工具"})
+        self.assertEqual(d["entities"][1]["matched_type"], None)       # 旧节点没有类型标签：照实给 None
+        self.assertNotIn("in_batch", d["entities"][1])
 
     def test_ok_response_carries_stats_and_model(self):
         code, d = self._run(GOOD)

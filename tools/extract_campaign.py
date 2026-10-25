@@ -228,7 +228,7 @@ SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}�
    "edges": [{{"source","name","target","fact"}}]}}]}}。没有知识的观测给 "entities": []。
    **起草时就按一句一事实写短句**：第 3 条边起每条 fact 只写一件事、不超过 200 字符，装不下就拆成几条边，
    不要先写长句再回头删改或截断；新建实体的 summary 写够 30 字。
-4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」（超长 fact 由 lint 逐条列出，不用自己写脚本查）。
+4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」（超长 fact、写反方向的有向边由 lint 逐条列出，不用自己写脚本查）。
    命名同步（自检通过后、质量表之前）：$PY -m tools.extract_campaign namesync --id {cid} --batch <批次> --apply --graph
    它按锚点键（文件=仓库+相对路径、纯标识符、工作树目录名）把同物异名统一成图里或更早批次的写法，不用你判断；
    review 里的 core / pr / head / xrepo 只是提示，自己判断要不要改；graph_hints 说图里已有同名短节点的，优先用那个短名，
@@ -238,6 +238,8 @@ SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}�
 5. 预览：$PY -m tools.extract_campaign submit --id {cid} --batch <批次> --dry-run
    逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
    标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
+   再看 reused（每个复用一行：抽出名（类型）→ 被复用节点名（类型）「它的 summary 开头」）：同名也要看 summary 是不是同一个
+   仓库 / 同一件事（不同仓库的同名文件要带仓库前缀改名）；reuse_cross_type 列的是复用到不同类型节点的，逐条确认。
    dry-run 之后再 lint 一次：这时才查新建实体的 summary（少于 30 字的补全；复用的实体不查），改过就再预览。
 6. 入库：$PY -m tools.extract_campaign submit --id {cid} --batch <批次>（逐条写图，可能超过 2 分钟，给足超时）。
    dry-run 与入库都先过 NAS 闸门：排队等锁、留间隔、测温，可能要等几分钟到几十分钟，命令放后台跑、给足超时，不要中途杀掉重来。
@@ -979,8 +981,13 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
     # 入库（或别处已入库）的注销全设备在途登记；没入库的留在本战役名下，等 release 后重领。
     # dry-run 的终态是 dry_run，不在 DONE_STATUSES 里，这里不会注销任何东西
     claim_registry.release([r["id"] for r in recs if r.get("status") in ax.DONE_STATUSES], campaign_owner(cid))
-    return {"batch": bid, "dry_run": dry_run, "by_status": counts, "reuse_mismatch": mismatch,
-            "errors": [{"id": r["id"], "error": r.get("error")} for r in recs if r.get("error")]}
+    out = {"batch": bid, "dry_run": dry_run, "by_status": counts, "reuse_mismatch": mismatch,
+           "errors": [{"id": r["id"], "error": r.get("error")} for r in recs if r.get("error")]}
+    if dry_run:
+        # 全部复用（含同名）逐条列出被复用节点的名字、类型、summary 开头：跨仓库同名、跨类型的误并在这里一眼可见
+        out["reused"] = [ax.reuse_line(x, r["id"]) for r in recs for x in r.get("resolution") or [] if x.get("reused")]
+        out["reuse_cross_type"] = [f"{r['id']}: {m}" for r in recs for m in r.get("reuse_cross_type") or []]
+    return out
 
 
 def failed_ids(d: Path, bid: str) -> list[int]:

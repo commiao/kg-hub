@@ -85,6 +85,8 @@ loop:
 - **消解误并要当场看。** `submit` 输出里的 `reuse_mismatch` 列出「抽出的名字 → 复用到的旧实体名」；
   服务端已加词面校验（向量阈值 0.95 + 去分隔符包含或 difflib ≥ 0.72），但仍可能并错。
   每批看一眼，误并的写进 lessons，连续出现就提高 `LEXICAL_MIN_RATIO`（服务端旋钮，需发布）。
+  2026-10-25 起 dry-run 另给每个复用的被复用节点类型与 summary 开头（`reused` / `reuse_cross_type`，
+  见 [executors/campaign.md](executors/campaign.md)「dry-run 的复用回显」）：同名、跨类型的误并也看得见。
 - **门禁按图计数。** 早先失败过的观测在账本里已有执行记录，重跑不再记行；`agent_extract retro`
   默认给 digest_retro 传 `--graph-count`，succeeded 数的是图里 `extraction_mode='agent'` 的 episode。
   账本口径的每条耗时对这条路为空，耗时看 `agent_extract status` 的 `latency_med_s`（服务端写图
