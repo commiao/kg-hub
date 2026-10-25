@@ -197,6 +197,43 @@ Issue→Fix「改动引起回归」与 Fix→Issue「因故障采取的操作」
 
 ## 同一台设备上多个工具、多个战役同时跑
 
+### Codex 持久监督与提交回执
+
+新战役每个模型用公共入口启动一个监督器；命令作为长任务后台运行，原生抽取仍使用冻结模型、effort、代理和原 brief：
+
+```bash
+"$CLI" campaign supervise --id <战役> --model <模型>
+```
+
+已有原生会话必须交接其本次调用的唯一退出回执和 JSONL 事件，不中断仍在工作的会话：
+
+```bash
+"$CLI" campaign supervise --id <战役> --model <模型> --resume-session <原session> \
+  --adopt-exit <本次调用exit-status.json> --adopt-events <本次调用stdout.jsonl>
+```
+
+退出回执须含 `exit_code=0`、`ended_at`，事件须有相同 `thread.started` 身份及 `turn.completed`。
+监督器在旧调用真正结束前只等待，不另起 worker；没有历史调用终态凭据不能接管已有模型历史。
+以后每次原生调用由 `runtime exec --receipt-dir` 保存私有运行和退出回执，并用独占 lease 防止重复监督。
+可选诊断不可用或正常 turn 提前结束后，在同一 session 续跑到正式配额；默认每15秒检查，连续3个无正式进展的 turn 留待协调器，避免无界消耗。
+真实审批拒绝、NAS75/76、业务权限拒绝、未知提交终态不能自动重试。监督器不替模型抽取/审核，不自动提交、不发信号、不改变安全审批。
+
+提交和预览命令自动记录 `operations/<批次>/`，包含实际冻结输入摘要、来源键、等待/提交阶段与退出结果；另一同批请求或回收不能越过活跃 lease。
+诊断优先读取以下公共命令，不依赖 `ps`、`pgrep` 或向进程发信号：
+
+```bash
+"$CLI" campaign operation-status --id <战役> --batch <批次>
+"$CLI" campaign status --id <战役>
+"$CLI" runtime status --receipt-dir <原生调用回执目录>
+```
+
+退出73表示原操作仍活跃，应等待；74表示终态待核对。持锁只证明进程存活，CLI退出0也不代表所有条目成功。
+没有终态或HTTP结果不明时，协调器先用 `campaign reconcile-operation --id <战役> --batch <批次>` 查询全部原来源键。
+只有回执证明未启动写请求（或只是只读预览），且完整查询确认全部不存在，才解除重放阻止，之后仍须逐条审核和整批预览。
+已发出写请求时，键不存在也不能证明远端请求已结束，仍需协调器核对远端真实终态；任一来源已存在/进行中或服务核验响应缺项时均保持待核对，不能算成本模型成功。
+旧未受管提交没有 lease 回执时仍需宿主只读终态证据，不凭锁不存在猜测可以重交。退出75/76和真实平台拒绝保留原有处理规则。
+`campaign status.supervisors` 显示运行阶段及 `coordinator_required`；协调器须及时处理该状态，不因会话显示 idle/running 就推断业务进度。
+
 - **同一个战役**：领批、提交、记成本都在战役目录的文件锁里，多个工具（Claude Code、qoder、codex、cursor、DSH）同时跑不会领到同一条。
 - **不同战役之间、战役与 `agent_extract next` 之间**：走**全设备在途领取登记**（`tools/claim_registry.py`，
   默认 `~/.kg-hub/claims/`，不随 `KG_HUB_AGENT_EXTRACT_DIR` 变）。领批时剔除别人正领着的观测，领到的登记到自己名下

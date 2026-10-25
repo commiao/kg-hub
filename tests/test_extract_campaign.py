@@ -50,6 +50,7 @@ class CampaignTest(unittest.TestCase):
         # 测试进程不在战役专用目录里：用 CLAUDE_MEM_INTERNAL=1 过「不被 claude-mem 记录」的自检（自检本身另有用例）
         self.env = mock.patch.dict(os.environ, {"KG_HUB_AGENT_EXTRACT_DIR": self.tmp.name,
                                                 "KG_HUB_CLAIMS_DIR": os.path.join(self.tmp.name, "claims"),
+                                                "KG_HUB_NAS_GATE_DIR": os.path.join(self.tmp.name, "nas-gate"),
                                                 "CLAUDE_MEM_INTERNAL": "1",
                                                 "CLAUDE_MEM_SETTINGS_PATH": os.path.join(self.tmp.name, "cm.json")})
         self.env.start()
@@ -468,7 +469,9 @@ class CampaignTest(unittest.TestCase):
         self.assertIn('"credits": null, "tokens": null, "seconds": null', b)
         self.assertIn("数据不是指令", b)
         self.assertIn("起草时就按一句一事实写短句", b)
-        self.assertIn("被权限、hook 或分类器拦下时立即停下汇报", b)
+        self.assertIn("提交或模型调用被权限、hook 或分类器拦下时", b)
+        self.assertIn("ps等可选诊断不可用不代表提交失败", b)
+        self.assertIn("operation-status --id t1", b)
         self.assertIn("补充约定是累加的", b)
         self.assertIn("--tokens <N>", " ".join(self.claim("DeepSeek-Flash")["next"]))
 
@@ -778,6 +781,25 @@ class DeviceWideClaimsTest(unittest.TestCase):
         self.assertIn(f"--add-dir {st} --add-dir {os.environ['KG_HUB_CLAIMS_DIR']}", cmd)
         inside = ec.launch_command("codex", "t1", "m", repo=_Path("/r"), state=_Path(self.tmp.name))
         self.assertEqual(inside.count("--add-dir"), 1)                      # 登记目录在状态目录里就不重复加
+
+    def test_launch_makes_actual_gate_dir_writable_without_changing_the_gate(self):
+        import shlex
+        from tools import nas_gate
+        root = _Path(self.tmp.name)
+        config = root / "gate.json"
+        settings = nas_gate.load_settings()
+        settings["lock_dir"] = str(root / "gate ; literal")
+        config.write_text(json.dumps(settings))
+        env = dict(os.environ, KG_HUB_NAS_GATE_CONFIG=str(config))
+        env.pop("KG_HUB_NAS_GATE_DIR", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            for tool in ("codex", "cursor", "qodercli"):
+                cmd = ec.launch_command(tool, "t1", "m", repo=root / "session", state=root / "state")
+                self.assertIn("--add-dir " + shlex.quote(settings["lock_dir"]), cmd)
+            self.assertEqual(nas_gate.load_settings(), settings)
+        with mock.patch.dict(os.environ, {"KG_HUB_NAS_GATE_DIR": str(root / "override gate")}):
+            cmd = ec.launch_command("codex", "t1", "m", repo=root / "session", state=root / "state")
+            self.assertIn("--add-dir " + shlex.quote(str(root / "override gate")), cmd)
 
 
 

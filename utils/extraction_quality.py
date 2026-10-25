@@ -55,6 +55,20 @@ def lookahead_evidence(batch: dict) -> str:
                      for row in batch.get("lookahead", []))
 
 
+def evidence_text(evidence: dict, item: dict, sources: dict[str, dict], future: str) -> str:
+    """Resolve only frozen input; a cross-item quote must name its exact source."""
+    source = evidence.get("source")
+    if source == "body":
+        return body_evidence(item)
+    if source == "lookahead":
+        return future
+    source_id = evidence.get("source_id")
+    if (source == "batch_item" and type(source_id) is int
+            and str(source_id) in sources and source_id != item["id"]):
+        return body_evidence(sources[str(source_id)])
+    return ""
+
+
 def review_sheet(batch: dict, results: dict, prompt_text: str, identity: dict | None = None) -> dict:
     """Unapproved template: no default true flags or automatically invented quotes."""
     out = {"schema": QUALITY_VERSION, "reviewer": "", "identity": identity, "items": []}
@@ -108,6 +122,7 @@ def _validate_review(batch: dict, results: dict, review: dict | None, prompt_tex
         return errors + ["quality_coverage_mismatch: source, result and review ids must match"]
     by_result = {str(x["id"]): x for x in rows}
     by_review = {str(x["id"]): x for x in receipts}
+    by_source = {str(x["id"]): x for x in sources}
     positions = {oid: n for n, oid in enumerate(ids)}
     future = lookahead_evidence(batch)
     for item in sources:
@@ -198,12 +213,20 @@ def _validate_review(batch: dict, results: dict, review: dict | None, prompt_tex
             errors.append(prefix + "every_edge_requires_unique_evidence")
             continue
         evidence = {e["index"]: e for e in evidence}
-        if corrected_title and evidence[0].get("source") != "lookahead":
-            errors.append(prefix + "corrected_title_requires_lookahead_evidence")
+        if corrected_title:
+            # Older receipts used the first edge's lookahead quote. Keep those
+            # valid; body/same-batch corrections need their own explicit proof.
+            correction_evidence = receipt.get("title_correction")
+            if correction_evidence is None and evidence[0].get("source") == "lookahead":
+                correction_evidence = evidence[0]
+            if (not isinstance(correction_evidence, dict)
+                    or not _quote_ok(correction_evidence.get("quote"),
+                                     evidence_text(correction_evidence, item, by_source, future))):
+                errors.append(prefix + "corrected_title_requires_correction_evidence")
         for n, edge in enumerate(edges):
             ev = evidence[n]
             source = ev.get("source")
-            text = body if source == "body" else future if source == "lookahead" else ""
+            text = evidence_text(ev, item, by_source, future)
             if not _quote_ok(ev.get("quote"), text):
                 errors.append(prefix + f"edge {n}: source_quote_required")
             if edge.get("name") == "belongs_to":
@@ -219,7 +242,9 @@ def _validate_review(batch: dict, results: dict, review: dict | None, prompt_tex
         if len(names) != len(set(names)) or set(names) != required:
             errors.append(prefix + "every_summary_requires_unique_evidence")
         for ev in summaries:
-            if not isinstance(ev, dict) or not _quote_ok(ev.get("quote"), body + "\n" + future):
+            text = (evidence_text(ev, item, by_source, future) if isinstance(ev, dict) and "source" in ev
+                    else body + "\n" + future)
+            if not isinstance(ev, dict) or not _quote_ok(ev.get("quote"), text):
                 errors.append(prefix + "summary_source_quote_required")
     return errors
 

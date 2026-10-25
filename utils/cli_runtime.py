@@ -32,7 +32,8 @@ def code_fingerprint() -> str:
     root = Path(__file__).resolve().parent.parent
     return _digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                     for name in ("utils/cli_runtime.py", "tools/extract_runtime.py", "tools/extract_bench.py",
-                                 "tools/extract_campaign.py", "tools/extract_cli.py", "tools/extract")})
+                                 "tools/extract_campaign.py", "tools/extract_cli.py", "tools/extract",
+                                 "tools/campaign_supervision.py", "utils/process_receipts.py")})
 
 
 def probe_context(*, executor: str, model: str, effort="medium", proxy_mode="auto", environ=None) -> dict:
