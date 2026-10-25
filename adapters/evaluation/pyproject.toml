@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kg-hub-eval"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.11"
-dependencies = ["llm-eval==0.1.0", "pydantic>=2"]
+dependencies = ["llm-eval>=0.1.0,<0.2", "pydantic>=2"]
 
 [project.optional-dependencies]
 retrieval = ["numpy", "fastembed"]

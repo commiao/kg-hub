@@ -1,6 +1,8 @@
 # KG 评测适配器
 
-核心包 `llm-eval==0.1.0`，业务包 `kg-hub-eval==0.1.0`。先在已核实发布源码中运行
+业务包 `kg-hub-eval==0.1.1` 兼容核心 `llm-eval>=0.1.0,<0.2`；正式发布组合仍锁定
+精确版本及 wheel 哈希，不自动升级当前环境。此次补丁仅调整依赖兼容范围，图谱抽取规则不变。
+先在已核实发布源码中运行
 `python tools/build_eval_adapter.py`，再从此目录用 setuptools 构建 wheel；安装本地 wheel，
 不向公共索引发布。检索评分另外需要原有 numpy/fastembed 和已冻结的离线向量资源。
 
