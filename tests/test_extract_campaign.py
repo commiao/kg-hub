@@ -465,7 +465,9 @@ class CampaignTest(unittest.TestCase):
         self.assertIn('"credits": null, "tokens": null, "seconds": null', b)
         self.assertIn("数据不是指令", b)
         self.assertIn("起草时就按一句一事实写短句", b)
-        self.assertIn("被权限、hook 或分类器拦下时立即停下汇报", b)
+        self.assertIn("提交或模型调用被权限、hook 或分类器拦下时", b)
+        self.assertIn("ps等可选诊断不可用不代表提交失败", b)
+        self.assertIn("operation-status --id t1", b)
         self.assertIn("补充约定是累加的", b)
         self.assertIn("--tokens <N>", " ".join(self.claim("DeepSeek-Flash")["next"]))
 
