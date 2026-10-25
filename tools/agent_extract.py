@@ -1034,10 +1034,11 @@ def main(argv: list[str] | None = None) -> int:
             tmp.write_text(json.dumps(results, ensure_ascii=False, indent=1))
             tmp.replace(Path(a.file))
             after = namesync_report(batch, results)
-            rep.update(applied=rep["renames"], skipped=skipped, auto=after["auto"], renames=after["renames"],
+            # 与 campaign namesync 一样：auto 是改之前的计划，applied 是实际写回的每一条，residual 是改完仍没统一的
+            rep.update(applied=ns.applied_rows(rep["auto"], skipped), skipped=skipped, residual=after["auto"],
                        redo="结果已改：重做质量表与 dry-run（旧的都已失效）")
         print(json.dumps(rep, ensure_ascii=False, indent=1))
-        return 2 if rep["auto"] else 0
+        return 2 if rep.get("residual", rep["auto"]) else 0
     if a.cmd == "dryrun-check":
         if not (a.batch and a.file):
             raise SystemExit("dryrun-check 需要 --batch --file")
