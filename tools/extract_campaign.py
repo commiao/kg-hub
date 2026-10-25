@@ -685,10 +685,13 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
     with locked(d):
         c = load(d)
         rules_text(d, c)
-        if (c.get('dispatch') or {}).get('state') == 'draining':
-            return {'done': False, 'paused': True, 'batch': None, 'model': model,
-                    'action': 'finish_current_batch_then_exit', 'message': '领取已冻结；完成当前批次后退出，不轮询或另开执行线。'}
+        from tools.campaign_dispatch import pause_reason, drain_spent_window
         slot = worker_slot(c, model, slot)
+        paused = pause_reason(c, model, slot)
+        if paused and paused != 'observation_budget_reached':
+            return {'done': False, 'paused': True, 'batch': None, 'model': model,
+                    'action': 'finish_current_batch_then_exit', 'reason': paused,
+                    'message': '领取已冻结；完成当前批次后退出，不轮询或另开执行线。'}
         if slot is not None:
             # An idempotent claim is also the only supported slot recovery path.
             pending = [b for b in c["batches"] if b["model"] == model and batch_slot(c, b) == slot
@@ -701,6 +704,9 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
                         "model": model, "run_id": c["models"][model]["run_id"], "chain": b["chain"],
                         "items": len(b["ids"]), "batch_file": str(d / "batches" / (b["id"] + ".json")),
                         "results_file": str(d / "results" / (b["id"] + ".json"))}
+        if paused:
+            return {'done': False, 'paused': True, 'batch': None, 'model': model,
+                    'reason': paused, 'action': 'finish_current_batch_then_exit'}
         with claim_registry.opened() as reg:
             if tracking["tracked"]:
                 c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "claim", "model": model,
@@ -747,6 +753,7 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
                                  **({"slot": slot} if slot is not None else {}),
                                  "status": "claimed", "claimed_at": _now(), "cost": {}})
             reg.reserve([i["id"] for i in picked], owner, info=bid)
+            drain_spent_window(c)
             save(d, c)
     run_id = c["models"][model]["run_id"]
     return {"done": False, "batch": bid, "model": model, "slot": slot, "run_id": run_id, "chain": c["chain"],
@@ -1523,6 +1530,12 @@ def _main(argv=None) -> int:
     drain = sub.add_parser('drain', help='freeze new claims, allow current batch to finish, never kill a worker')
     drain.add_argument('--id', required=True)
     drain.add_argument('--reason', required=True)
+    resume = sub.add_parser('resume', help='resume idle dispatch; optionally bound new batches per model to original slot 1')
+    resume.add_argument('--id', required=True)
+    resume.add_argument('--reason', required=True)
+    limit = resume.add_mutually_exclusive_group(required=True)
+    limit.add_argument('--batches-per-model', type=positive_int)
+    limit.add_argument('--all-remaining', action='store_true')
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -1617,6 +1630,10 @@ def _main(argv=None) -> int:
         if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
+    if a.cmd == 'resume':
+        from tools.campaign_dispatch import resume
+        print(json.dumps(resume(a.id, reason=a.reason, batches_per_model=a.batches_per_model), ensure_ascii=False, indent=2))
+        return 0
     if a.cmd == 'drain':
         from tools.campaign_migration import drain
         print(json.dumps(drain(a.id, a.reason), ensure_ascii=False, indent=2))
