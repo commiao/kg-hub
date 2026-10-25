@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from utils import extracted_ingest as xi
 from utils import extraction_repair as repair
 from tools import extraction_repair as cli
 
@@ -171,6 +172,8 @@ class Driver:
             if self.key.get("repair_pending_id") == p["rid"]:
                 self.key.pop("repair_pending_id")
             result = [{"sid": "one"}]
+        elif query in (xi._FIND_ALIAS, xi._FIND_RETIRED, xi._FOLLOW_RETIRED, xi._LIVE_BY_UUID):
+            result = []   # 节点治理旧名（repair 计划复用入图消解）：这张假图里没有合并/改名过的节点
         elif "toLower(n.name) = $lname" in query:
             result = [{"uuid": n["uuid"], "name": n["name"], "labels": ["Entity", n["type"]]}
                       for n in self.nodes.values() if n["name"].lower() == p["lname"]]

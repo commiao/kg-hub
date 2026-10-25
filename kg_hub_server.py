@@ -1986,9 +1986,13 @@ def _dry_run_entity(ent, res: dict) -> dict:
     out = {"name": ent.name, "type": ent.type, "reused": res["reused"]}
     if res["reused"]:
         out.update({k: res.get(k) for k in ("matched_name", "matched_type", "match")})
-        for k in ("matched_summary", "in_batch"):
+        for k in ("matched_summary", "in_batch", "matched_alias", "alias_via"):
             if res.get(k):
                 out[k] = res[k]
+    # 节点治理旧名的提示（utils/extracted_ingest._resolve_alias）：旧名指向多个节点而未复用 / 被同名现存节点挡住
+    for k in ("alias_ambiguous", "shadows_alias_of"):
+        if res.get(k):
+            out[k] = res[k]
     return out
 
 
