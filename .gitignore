@@ -31,4 +31,5 @@ adapters/evaluation/src/kg_hub_eval/business/config/
 adapters/evaluation/src/kg_hub_eval/business/utils/extracted_ingest.py
 adapters/evaluation/src/kg_hub_eval/business/utils/embedding_profile.py
 adapters/evaluation/src/kg_hub_eval/business/utils/single_pass_extract.py
+adapters/evaluation/src/kg_hub_eval/business/utils/extraction_structure.py
 adapters/evaluation/src/kg_hub_eval/assets/

@@ -2,6 +2,8 @@
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -313,6 +315,25 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(by["haiku（基线）"]["hit_zh_pct"], 100.0)            # 问句与标题 fact 前 6 字相同
         self.assertEqual(by["qoder-x｜opus 那部分"]["hit_zh_pct"], 0.0)       # 没交的那条不命中
         self.assertIn("| qoder-x（全样本） |", xb.render(rows))
+
+    def test_lint_thin_structure_warning_does_not_change_problems(self):
+        p, m = xb._bench(str(self.bench))
+        bf = p / "batch-b1.json"
+        batch = json.loads(bf.read_text())
+        batch["items"][0]["episode_body"] += "\n改了 `tools/extract_campaign.py`，提交 3d6f574。"
+        bf.write_text(json.dumps(batch, ensure_ascii=False))
+        res = xb.load_results([str(p / "baseline-b1.json"), str(p / "baseline-b2.json")])
+        self.assertEqual(xb.lint(p, m, res), [])                               # 自检问题不变
+        warns = xb.lint_structure_warnings(p, m, res)
+        self.assertEqual(len(warns), 1)
+        self.assertTrue(warns[0].startswith("b1 1: 结构过薄"))
+        self.assertEqual(xb.lint_structure_warnings(p, m, res, ids=[2]), [])  # 只查给定条目
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = xb.main(["lint", "--bench", str(p), "--results", str(p / "baseline-b1.json"),
+                          str(p / "baseline-b2.json")])
+        self.assertEqual(rc, 0)
+        self.assertIn("提醒（1 条，不阻断）", buf.getvalue())
 
     def test_blind_sheet_and_admit_writes_record(self):
         p, m = xb._bench(str(self.bench))
