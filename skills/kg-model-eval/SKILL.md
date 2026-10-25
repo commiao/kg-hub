@@ -145,6 +145,9 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
      每个槽位独立持有原生会话、lease、事件和批次；需要单槽恢复时加 `--slot <1起始序号>`，复用该槽位的唯一会话。
      旧单路战役仍用原路径；同一模型已有会话时先带其唯一 `--resume-session`、`--adopt-exit`、`--adopt-events` 交接，等待真实终态，不能重开重复执行线。
      现有无槽位战役不会自动迁移到多路，不能手改 manifest 或把未提交批次交给新执行者。旧客户端先升级公共 CLI。
+     用户明确授权在途迁移时，按 `docs/executors/campaign.md` 的受控迁移流程：先 `campaign drain` 冻结新领取、等待原执行线真实终态，
+     再 `campaign migrate --preview --parallel <组数> --proof <原会话证据> --out <新预览>`，核对原配额/历史后 `--apply <预览>`。
+     原会话保留为槽位1；至多一个未正式提交的原批次仍归它处理。迁移成功再启动各模型执行池，不能把配置数当实际活跃数。
    - DSH：方式二未确认，用 `launch --id <战役> --tool dsh` 打印每个模型的启动命令。
    - 多路按指定组数派发；Codex 池默认相邻槽位错开300秒，可用 `supervise --stagger-seconds <秒>` 指定。
      其他宿主按 `agents` 生成的每模型×槽位定义派发，`brief` / `claim` 都带 `--slot`。
