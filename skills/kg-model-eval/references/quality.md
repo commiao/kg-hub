@@ -124,3 +124,44 @@ preview 是只读计划，不代表已修复；apply 要写权限。快照变化
 `plan.materialization_version=edge-origin-v1` 区分本来源时间 `source_reference_time` 和全局事实边首来源时间。每条 replacement edge 的 `write_mode` 为 `new` 或 `reused`。`reused` 的平铺时间、模型、repair_id 等字段显示实际保留的首来源值；`stored_origin` 保存其原始属性及端点。复用只追加本 episode 的背书，不能用后来源的时间或修复编号覆盖首来源。UUID 丢失、不可变属性变更或原有来源背书丢失会拒绝成功回执。
 
 新协议成功回执的 `replacement_edge_verification` 返回 `version=edge-origin-v1`、本来源时间，以及各事实边的写入模式、首来源元数据、属性摘要和原背书集合摘要（列表最多 120 项，完整集合另有摘要）。新边验证拟写属性和 float32 物化向量，复用边验证原始全部不可变属性（包括向量）及原背书子集。`shared_edge_verification` 继续核验原错误边的其他来源。旧 applied 审计原样保留；旧 pending 计划恢复后明确标 `legacy_plan`，不能当作新协议证明。preview 只呈现当时图状态；正式 apply 在 writer lock 内重新解析并持久化计划，恢复严格复用该冻结计划。
+
+## 跨来源的重复节点走节点级治理
+
+`repair` 只能按单个来源修：删掉这条来源带进来的错边，或换一份抽取结果。同一个文件或概念在图里有两三个名字、
+裸名泛名节点混了多个仓库、节点类型标错，这些跨来源、跨战役的问题改走公共入口 `nodes`（`tools/graph_governance.py`，
+服务端 `/api/graph/governance`），协议与 repair 相同：只读 preview 出完整计划 → 人工核对 → apply 绑定快照摘要 → status 读回。
+
+```bash
+# scope.json 用名字或 uuid 指定节点，名字按入图规则（忽略大小写的精确匹配）解析，撞名会列出候选并拒绝。
+"$CLI" nodes preview --file <scope.json> --out <plan.json> --request-out <pending-request.json> --report <plan.md>
+# 逐条核对 plan.md：每条边迁到哪、哪些边去重并入、哪些自环被删、受影响的来源；填 governance_id / reason / reviewer。
+"$CLI" nodes preview --file <reviewed-request.json> --out <plan-reviewed.json>
+"$CLI" nodes apply --file <reviewed-request.json> --out <apply.json>
+"$CLI" nodes status --governance-id <governance_id> --out <audit.json>
+```
+
+四种操作（scope 的 `operation`）：
+
+| 操作 | 必填 | 效果 |
+|---|---|---|
+| `merge` | `canonical`、`merged`（1–20 个） | 被合并节点的全部边（不论来源、战役）迁到规范节点；可同时 `rename_to` / `retype_to` 规范节点 |
+| `rename` | `node`、`rename_to` | 改名并重算名字向量，旧名记进 `previous_names`；新名已被别的节点占用时拒绝（应改用 merge） |
+| `retype` | `node`、`retype_to` | 换类型标签（只接受 schema 里的类型），旧类型记进 `previous_types` |
+| `split` | `node`、`partitions` | 把混了多个仓库的泛名节点按来源拆开：每个分区并入已有节点（`target`）或新建节点（`new_node`），用 `episode_uuids` 按来源圈边、或用 `edge_uuids` 逐条指定；两边都背书的边必须用 `edge_uuids` 指定或放进 `keep_edge_uuids` 留在原节点；原节点可 `rename_to`，或在所有边都分走后 `retire_original` |
+
+不带 `partitions` 的 split preview 只列出原节点每条边及其来源，供设计分区，不能 apply。
+
+规则：
+
+- 迁移的边保留原 uuid 与全部属性（含向量、首来源时间/模型/run_id），只在单条查询内删旧建新，因为 FalkorDB 的关系不能换端点。
+- 迁移后端点、边名、fact、`invalid_at`、`expired_at` 都相同的边算重复：最早创建的那条存活、保留首来源元数据并获得所有来源背书的并集，
+  其余并入（absorb）后离开图；episode 的 `entity_edges` 同步改指存活边。有效期不同的同句事实不合并。
+- 迁移后两端变成同一节点的边（如「X 就是 Y」）是自环，删除；与被并入的边一样，完整属性（含向量）存进审计节点 `GraphGovernance.deleted_json`。
+- 被合并节点不删除：去掉 `Entity` 与类型标签、改为 `MergedEntity`，保留原属性并写 `merged_into` / `merged_by`；入图名字解析与检索都不再命中它。
+  规范节点记 `merged_from`、`merged_names`、`governance_ids`。MENTIONS 改指规范节点，已有提及的不重复。
+- 节点上若有 RELATES_TO / MENTIONS 以外的关系，或已有未完成的治理，preview 直接拒绝。单次最多 1500 条边、3000 个来源 episode。
+- preview 只读（只发 `_READ_TAGS` 里的查询），read scope token 可调；apply 只认管理员 token，持与入图共用的写锁，
+  在锁内重读快照，摘要不一致返回 `stale_snapshot`，不自动替换摘要重试。
+- apply 先把请求、快照、计划、名字向量与将删除的边全文持久化为 pending 审计，再逐步写图；每步按 uuid、端点和 fact 加守卫，
+  中断后用同一份请求与同一 `governance_id` 重放会沿用冻结计划续做；换内容复用同一 ID 返回 `governance_id_conflict`。
+- 成功回执的 `plan_sha256` 应等于核对时 preview 的值；`verification` 逐项读回边端点、不可变属性、提及、episode 引用和节点标签后才记 `verified=true`。
