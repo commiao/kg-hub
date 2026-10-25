@@ -148,6 +148,7 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
      用户明确授权在途迁移时，按 `docs/executors/campaign.md` 的受控迁移流程：先 `campaign drain` 冻结新领取、等待原执行线真实终态，
      再 `campaign migrate --preview --parallel <组数> --proof <原会话证据> --out <新预览>`，核对原配额/历史后 `--apply <预览>`。
      原会话保留为槽位1；至多一个未正式提交的原批次仍归它处理。迁移成功再启动各模型执行池，不能把配置数当实际活跃数。
+     需要先观察时，用 `campaign resume --id <战役> --reason <原因> --batches-per-model 1`，仅启动各原 `supervise --slot 1`；每模型新领一批后自动停止新领，旧未完成批不计观察预算。观察通过再用 `resume --all-remaining` 恢复剩余原配额，不手改冻结状态。
    - DSH：方式二未确认，用 `launch --id <战役> --tool dsh` 打印每个模型的启动命令。
    - 多路按指定组数派发；Codex 池默认相邻槽位错开300秒，可用 `supervise --stagger-seconds <秒>` 指定。
      其他宿主按 `agents` 生成的每模型×槽位定义派发，`brief` / `claim` 都带 `--slot`。

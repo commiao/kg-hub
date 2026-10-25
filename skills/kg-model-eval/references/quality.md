@@ -162,8 +162,14 @@ preview 是只读计划，不代表已修复；apply 要写权限。快照变化
 - 迁移后端点、边名、fact、`invalid_at`、`expired_at` 都相同的边算重复：最早创建的那条存活、保留首来源元数据并获得所有来源背书的并集，
   其余并入（absorb）后离开图；episode 的 `entity_edges` 同步改指存活边。有效期不同的同句事实不合并。
 - 迁移后两端变成同一节点的边（如「X 就是 Y」）是自环，删除；与被并入的边一样，完整属性（含向量）存进审计节点 `GraphGovernance.deleted_json`。
-- 被合并节点不删除：去掉 `Entity` 与类型标签、改为 `MergedEntity`，保留原属性并写 `merged_into` / `merged_by`；入图名字解析与检索都不再命中它。
+- 被合并节点不删除：去掉 `Entity` 与类型标签、改为 `MergedEntity`，保留原属性并写 `merged_into` / `merged_by`；检索不再命中它，入图名字解析只把它的名字当规范节点的旧名（见下条）。
   规范节点记 `merged_from`、`merged_names`、`governance_ids`。MENTIONS 改指规范节点，已有提及的不重复。
+- 合并与改名后，新观测仍用旧名入图时复用规范节点，不再新建同名节点：名字解析在当前名字精确匹配没命中后，按忽略大小写的
+  精确名查规范节点的 `merged_names` / `previous_names`，以及被合并节点自己的名字（连环合并顺 `merged_into` 走到活节点）。
+  dry-run 回执该行标 `match: "alias"`，并给出命中的旧名 `matched_alias` 与出处 `alias_via`（`merged_names` / `previous_names` / `merged_into`）。
+  旧名只做精确匹配，不参与向量近名复用，词面守卫不变；旧名指向多个节点时谁也不复用，回执列出 `alias_ambiguous`；
+  拆分退役的节点（`merged_into` 为空）不指向任何节点。现存 Entity 就叫这个名字时用现存节点，不让旧名抢它
+  （改名去歧义后别的对象可以用回旧名）；dry-run 用 `shadows_alias_of` 标出被挡住的规范节点——通常是合并后又长回来的重复，再走一次 merge。
 - 节点上若有 RELATES_TO / MENTIONS 以外的关系，或已有未完成的治理，preview 直接拒绝。单次最多 1500 条边、3000 个来源 episode。
 - preview 只读（只发 `_READ_TAGS` 里的查询），read scope token 可调；apply 只认管理员 token，持与入图共用的写锁，
   在锁内重读快照，摘要不一致返回 `stale_snapshot`，不自动替换摘要重试。

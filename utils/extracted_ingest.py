@@ -14,8 +14,9 @@ origin/kind 打标）都在 kg_hub_server 里复用；本模块只负责**纯逻
 kg_search / episode_search / normalize_edge_names / quality 画像都把它当普通数据。
 
 消解策略（不调模型，只用本地 bge-small 向量）：
-  实体  先按同 group 内名字大小写不敏感精确匹配；再按 name_embedding 余弦 ≥ NODE_MATCH_MIN
-        取最相似一个；都没有才建新节点。复用的旧节点**不改**其 summary/labels。
+  实体  先按同 group 内名字大小写不敏感精确匹配；没有就按节点治理留下的旧名（别名）精确匹配；
+        再按 name_embedding 余弦 ≥ NODE_MATCH_MIN 取最相似一个；都没有才建新节点。
+        复用的旧节点**不改**其 summary/labels。别名规则见 _resolve_alias。
   边    同 (源, 目标, 边名) 且 fact 原文相同的 RELATES_TO 已有 → 只把本 episode 追加进 e.episodes；
         否则建新边（同一对实体之间允许多条不同 fact 的边，与 graphiti 自身一致）。
 纪律度量在归一阶段就记下来（schema 外边名、未知实体类型、悬空边、重复三元组），
@@ -392,6 +393,29 @@ def normalize_extraction(entities: list[ExtractedEntity], edges: list[ExtractedE
 _FIND_EXACT = (
     "MATCH (n:Entity) WHERE n.group_id = $g AND toLower(n.name) = $lname "
     "RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, n.summary AS summary LIMIT 1")
+# 节点治理（utils/graph_governance.py，#261）留下的旧名。合并把被并节点改成 MergedEntity（不再是 Entity，
+# 上面两条都看不见它），只在规范节点上记 merged_names；改名只在节点上记 previous_names。不读这些，
+# 新观测只要还用旧名就会再建一个同名节点，合并白做（2026-10-26 T-0195 清理 opus2000 重复节点时发现）。
+_FIND_ALIAS = (
+    "MATCH (n:Entity) WHERE n.group_id = $g AND (n.merged_names IS NOT NULL OR n.previous_names IS NOT NULL) "
+    "AND any(x IN coalesce(n.merged_names, []) + coalesce(n.previous_names, []) WHERE toLower(x) = $lname) "
+    "RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, n.summary AS summary, "
+    "[x IN coalesce(n.merged_names, []) WHERE toLower(x) = $lname] AS via_merged, "
+    "[x IN coalesce(n.previous_names, []) WHERE toLower(x) = $lname] AS via_previous ORDER BY n.uuid")
+# 被并节点自己的名字 / 旧名：连环合并（X 并进 A，A 再并进 B）时 X 只记在 A 上，要顺 merged_into 走到活节点
+_FIND_RETIRED = (
+    "MATCH (n:MergedEntity) WHERE n.group_id = $g AND (toLower(n.name) = $lname "
+    "OR any(x IN coalesce(n.merged_names, []) + coalesce(n.previous_names, []) WHERE toLower(x) = $lname)) "
+    "RETURN n.uuid AS uuid, n.merged_into AS merged_into, CASE WHEN toLower(n.name) = $lname THEN n.name "
+    "ELSE head([x IN coalesce(n.merged_names, []) + coalesce(n.previous_names, []) WHERE toLower(x) = $lname]) "
+    "END AS alias ORDER BY n.uuid")
+_FOLLOW_RETIRED = (
+    "MATCH (n:MergedEntity) WHERE n.group_id = $g AND n.uuid IN $ids "
+    "RETURN n.uuid AS uuid, n.merged_into AS merged_into ORDER BY n.uuid")
+_LIVE_BY_UUID = (
+    "MATCH (n:Entity) WHERE n.group_id = $g AND n.uuid IN $ids "
+    "RETURN n.uuid AS uuid, n.name AS name, labels(n) AS labels, n.summary AS summary ORDER BY n.uuid")
+ALIAS_MAX_HOPS = 8
 _FIND_SIMILAR = (
     "MATCH (n:Entity) WHERE n.group_id = $g AND n.name_embedding IS NOT NULL "
     "WITH n, (2 - vec.cosineDistance(n.name_embedding, vecf32($v)))/2 AS score "
@@ -465,14 +489,54 @@ MATCHED_SUMMARY_MAX = 100   # dry-run 回显被复用节点的 summary 开头，
 
 
 def _match_info(row: dict, how: str) -> dict:
-    """被复用节点的回显：名字、类型（labels 去掉 Entity）、怎么命中的（exact 同名 / similar 向量近名）、summary 开头。
+    """被复用节点的回显：名字、类型（labels 去掉 Entity）、怎么命中的（exact 同名 / alias 节点治理留下的旧名 /
+    similar 向量近名）、summary 开头；alias 另给命中的旧名写法与出处（matched_alias / alias_via）。
     2026-10-25 opus2000 战役：throttle 与 sd-server 的同名 Java 文件被精确同名并到一起，只给名字看不出来。"""
     types = sorted(lb for lb in (row.get("labels") or []) if lb and lb != "Entity")
     out = {"matched_name": row.get("name"), "matched_type": "/".join(types) or None, "match": how}
     summary = " ".join(str(row.get("summary") or "").split())
     if summary:
         out["matched_summary"] = summary[:MATCHED_SUMMARY_MAX]
+    if how == "alias":
+        out.update({"matched_alias": row.get("alias"), "alias_via": row.get("via")})
     return out
+
+
+async def _resolve_alias(driver, group_id: str, lname: str) -> list[dict]:
+    """名字 lname（_norm_key 后）作为节点治理旧名指向的活 Entity，按 uuid 排序；每行带 alias（存着的旧名写法）
+    与 via（merged_names / previous_names / merged_into）。调用方只在恰好一个时复用。
+
+    规则（与 skills/kg-model-eval/references/quality.md「跨来源的重复节点走节点级治理」一致）：
+    - 只在当前名字精确匹配没命中时才查：活 Entity 就叫这个名字时用它，即使这个名字也是别的节点的旧名
+      ——别名不抢现存节点（改名去歧义后另一个对象用回旧名，应该是新节点；合并后又长回来的重复，
+      dry-run 用 shadows_alias_of 标出，交给节点治理再并）；
+    - 只认大小写不敏感的精确名。旧名不参与向量近名复用：被并节点已不带 Entity 标签，_FIND_SIMILAR 扫不到它，
+      规范节点的 merged_names / previous_names 也没有向量；词面守卫照旧只作用于向量候选；
+    - 指向不止一个活节点时谁也不复用（交给后面的常规消解），回执列出候选（alias_ambiguous）；
+    - 拆分退役的节点 merged_into 为空，不指向任何活节点；连环合并最多走 ALIAS_MAX_HOPS 跳。
+    """
+    hits: dict[str, dict] = {}
+    rows, _, _ = await driver.execute_query(_FIND_ALIAS, g=group_id, lname=lname)
+    for r in rows:
+        via = "merged_names" if r.get("via_merged") else "previous_names"
+        hits[r["uuid"]] = {**r, "alias": (r.get("via_merged") or r.get("via_previous") or [None])[0], "via": via}
+    retired, _, _ = await driver.execute_query(_FIND_RETIRED, g=group_id, lname=lname)
+    seen = {r["uuid"] for r in retired}
+    frontier = {r["merged_into"]: r.get("alias") for r in retired if r.get("merged_into")}
+    for _ in range(ALIAS_MAX_HOPS):
+        frontier = {u: a for u, a in frontier.items() if u not in seen}
+        if not frontier:
+            break
+        seen.update(frontier)
+        live, _, _ = await driver.execute_query(_LIVE_BY_UUID, g=group_id, ids=sorted(frontier))
+        for r in live:
+            hits.setdefault(r["uuid"], {**r, "alias": frontier[r["uuid"]], "via": "merged_into"})
+        rest = sorted(set(frontier) - {r["uuid"] for r in live})
+        if not rest:
+            break
+        tombs, _, _ = await driver.execute_query(_FOLLOW_RETIRED, g=group_id, ids=rest)
+        frontier = {t["merged_into"]: frontier[t["uuid"]] for t in tombs if t.get("merged_into")}
+    return [hits[u] for u in sorted(hits)]
 
 
 @dataclass
@@ -482,7 +546,8 @@ class WriteResult:
     nodes_reused: int
     edges_new: int
     edges_reused: int
-    # key -> {"uuid", "reused": bool, "matched_name"}；复用的另有 matched_type / match / matched_summary（_match_info）
+    # key -> {"uuid", "reused": bool, "matched_name"}；复用的另有 matched_type / match / matched_summary（_match_info）；
+    # 别名提示 alias_ambiguous / shadows_alias_of 见 write_extraction
     resolved: dict
 
 
@@ -528,6 +593,11 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         if not rows and dry_run:
             rows = [{"uuid": None, "name": v["name"], "labels": ["Entity", v["type"]], "in_batch": True}
                     for v in virtual if v["key"] == ent.key][:1]
+        aliased: list[dict] = []
+        if not rows or (dry_run and not rows[0].get("in_batch")):
+            aliased = await _resolve_alias(driver, group_id, ent.key)
+        if not rows and len(aliased) == 1:
+            rows, how = aliased, "alias"
         if not rows:
             how = "similar"
             rows, _, _ = await driver.execute_query(
@@ -542,15 +612,23 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
             rows = [r for r in rows
                     if _lexically_same(ent.name, r.get("name") or "", ent.type)
                     and (not type_guard or ent.type in (r.get("labels") or []))]
+        # 回执里的别名提示：旧名指向多个活节点（谁也没用）/ 精确同名的现存节点挡住了别的节点的旧名（dry-run 才查）
+        alias_note = {}
+        if how == "exact" and rows:
+            others = [{"uuid": a["uuid"], "name": a.get("name")} for a in aliased if a["uuid"] != rows[0]["uuid"]]
+            if others:
+                alias_note["shadows_alias_of"] = others
+        elif len(aliased) > 1:
+            alias_note["alias_ambiguous"] = [{"uuid": a["uuid"], "name": a.get("name")} for a in aliased]
         if rows:
-            resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True, **_match_info(rows[0], how)}
+            resolved[ent.key] = {"uuid": rows[0]["uuid"], "reused": True, **_match_info(rows[0], how), **alias_note}
             if rows[0].get("in_batch"):
                 resolved[ent.key]["in_batch"] = True
             nodes_reused += 1
             continue
         new_uuid = str(uuidlib.uuid4())
         if dry_run:
-            resolved[ent.key] = {"uuid": None, "reused": False, "matched_name": None}
+            resolved[ent.key] = {"uuid": None, "reused": False, "matched_name": None, **alias_note}
             virtual.append({"name": ent.name, "key": ent.key, "type": ent.type, "vec": vec})
             nodes_new += 1
             continue
@@ -562,7 +640,7 @@ async def write_extraction(driver, embedder, extraction: NormalizedExtraction, *
         }
         await driver.execute_query(_SAVE_NODE.replace("{labels}", f"{ent.type}:Entity"),
                                    entity_data=entity_data)
-        resolved[ent.key] = {"uuid": new_uuid, "reused": False, "matched_name": None}
+        resolved[ent.key] = {"uuid": new_uuid, "reused": False, "matched_name": None, **alias_note}
         nodes_new += 1
 
     if dry_run:

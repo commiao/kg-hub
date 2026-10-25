@@ -336,14 +336,44 @@ class FakeEmbedder:
 class FakeDriver:
     """按语句类型回放：存在的实体名 / 已有边由测试预置。"""
 
-    def __init__(self, existing_names=None, similar=None, existing_edges=None):
+    def __init__(self, existing_names=None, similar=None, existing_edges=None, governed=None):
         self.existing = {k.lower(): v for k, v in (existing_names or {}).items()}
         self.similar = similar or {}            # name_key -> (uuid, name)
         self.existing_edges = existing_edges or {}  # (src,name,dst) -> uuid
+        # 节点治理留下的节点：[{uuid, name, labels, merged_names?, previous_names?, merged_into?, group_id?}]
+        self.governed = governed or []
         self.calls = []
+
+    def _governed(self, label, group):
+        return [n for n in self.governed if label in n["labels"] and n.get("group_id", "kg_hub") == group]
+
+    def _alias_query(self, cypher, params):
+        """按 Cypher 的语义回放 xi 的四条别名查询（toLower 精确比较、coalesce 列表、group 过滤、按 uuid 排序）。"""
+        g, lname = params["g"], params.get("lname")
+        olds = lambda n: list(n.get("merged_names") or []) + list(n.get("previous_names") or [])  # noqa: E731
+        live = lambda n: {"uuid": n["uuid"], "name": n["name"], "labels": n["labels"],  # noqa: E731
+                          "summary": n.get("summary")}
+        if cypher == xi._FIND_ALIAS:
+            rows = [{**live(n), "via_merged": [x for x in n.get("merged_names") or [] if x.lower() == lname],
+                     "via_previous": [x for x in n.get("previous_names") or [] if x.lower() == lname]}
+                    for n in self._governed("Entity", g) if any(x.lower() == lname for x in olds(n))]
+        elif cypher == xi._FIND_RETIRED:
+            rows = [{"uuid": n["uuid"], "merged_into": n.get("merged_into"),
+                     "alias": n["name"] if n["name"].lower() == lname else
+                     next(x for x in olds(n) if x.lower() == lname)}
+                    for n in self._governed("MergedEntity", g)
+                    if n["name"].lower() == lname or any(x.lower() == lname for x in olds(n))]
+        elif cypher == xi._FOLLOW_RETIRED:
+            rows = [{"uuid": n["uuid"], "merged_into": n.get("merged_into")}
+                    for n in self._governed("MergedEntity", g) if n["uuid"] in params["ids"]]
+        else:
+            rows = [live(n) for n in self._governed("Entity", g) if n["uuid"] in params["ids"]]
+        return sorted(rows, key=lambda r: r["uuid"])
 
     async def execute_query(self, cypher, **params):
         self.calls.append((cypher, params))
+        if cypher in (xi._FIND_ALIAS, xi._FIND_RETIRED, xi._FOLLOW_RETIRED, xi._LIVE_BY_UUID):
+            return self._alias_query(cypher, params), None, None
         if cypher.startswith("MATCH (n:Entity) WHERE n.group_id = $g AND toLower(n.name)"):
             u = self.existing.get(params["lname"])
             return ([{"uuid": u, "name": params["lname"], "labels": ["Entity"]}] if u else []), None, None
@@ -463,6 +493,114 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(got, {("a", "1"): {"status": "ok", "episode_uuid": "u"}})
         self.assertEqual(asyncio.run(xi.check_keys(D(), [])), {})
 
+
+
+class GovernedAliasTest(unittest.TestCase):
+    """节点治理（utils/graph_governance.py）合并/改名后，新观测还用旧名时要复用规范节点，不能再长出同名重复。
+    2026-10-26 T-0195 清理重复节点时发现：消解只查 Entity，被并节点改成 MergedEntity 后旧名一来就新建。"""
+
+    CANON = {"uuid": "u-canon", "name": "monorepo workspace", "labels": ["Entity", "Concept"],
+             "summary": "多仓库根目录", "merged_names": ["Monorepo 工作区（多仓库根目录）"],
+             "merged_from": ["u-dup"]}
+    TOMB = {"uuid": "u-dup", "name": "Monorepo 工作区（多仓库根目录）", "labels": ["MergedEntity"],
+            "merged_into": "u-canon"}
+
+    def _run(self, driver, *names, dry_run=False, ent_type="Concept"):
+        n = xi.normalize_extraction(ents(*[(x, ent_type, "") for x in names]), [], ENTITY_TYPES, EDGE_TYPES)
+        return asyncio.run(xi.write_extraction(
+            driver, FakeEmbedder(), n, name="x", episode_body="b", source_description="sd",
+            reference_time=datetime(2026, 10, 26, tzinfo=timezone.utc), extractor_model="m",
+            group_id="kg_hub", episode_uuid="ep", dry_run=dry_run))
+
+    def test_merged_name_reuses_canonical_and_dry_run_marks_it(self):
+        d = FakeDriver(governed=[self.CANON, self.TOMB])
+        r = self._run(d, "Monorepo 工作区（多仓库根目录）", dry_run=True)
+        self.assertEqual(r.resolved["monorepo 工作区（多仓库根目录）"], {
+            "uuid": "u-canon", "reused": True, "matched_name": "monorepo workspace", "matched_type": "Concept",
+            "match": "alias", "matched_summary": "多仓库根目录",
+            "matched_alias": "Monorepo 工作区（多仓库根目录）", "alias_via": "merged_names"})
+        self.assertEqual((r.nodes_new, r.nodes_reused), (0, 1))
+        # 正式提交：不建节点，MENTIONS 指向规范节点
+        d = FakeDriver(governed=[self.CANON, self.TOMB])
+        r = self._run(d, "Monorepo 工作区（多仓库根目录）")
+        self.assertEqual([c for c, _ in d.calls if c.startswith("MERGE (n:Entity")], [])
+        self.assertEqual([p["entity_uuid"] for c, p in d.calls if "MERGE (episode)-[e:MENTIONS" in c], ["u-canon"])
+        self.assertEqual((r.nodes_new, r.nodes_reused), (0, 1))
+
+    def test_alias_match_ignores_case_and_whitespace(self):
+        r = self._run(FakeDriver(governed=[self.CANON, self.TOMB]), "MONOREPO   工作区（多仓库根目录）", dry_run=True)
+        hit = r.resolved["monorepo 工作区（多仓库根目录）"]
+        self.assertEqual((hit["uuid"], hit["match"], hit["matched_alias"]),
+                         ("u-canon", "alias", "Monorepo 工作区（多仓库根目录）"))
+
+    def test_alias_is_exact_only_no_near_name_reuse(self):
+        """旧名不参与近名复用：差一个字、去掉括号注释都不算；向量查询本身只看 Entity，扫不到被并节点。"""
+        d = FakeDriver(governed=[self.CANON, self.TOMB])
+        r = self._run(d, "Monorepo 工作区（多仓库根目录)", "Monorepo 工作区", dry_run=True)
+        self.assertEqual({k: v["reused"] for k, v in r.resolved.items()},
+                         {"monorepo 工作区（多仓库根目录)": False, "monorepo 工作区": False})
+        self.assertIn("MATCH (n:Entity)", xi._FIND_SIMILAR)
+        self.assertNotIn("MergedEntity", xi._FIND_SIMILAR)
+
+    def test_live_entity_with_the_name_wins_over_alias(self):
+        """选定：名字同时是现存 Entity 的名字和别的节点的旧名时，用现存 Entity（别名不抢现存节点）。
+        dry-run 用 shadows_alias_of 标出被挡住的规范节点；正式提交不额外查别名。"""
+        regrown = {"Monorepo 工作区（多仓库根目录）": "u-regrown"}
+        r = self._run(FakeDriver(existing_names=regrown, governed=[self.CANON, self.TOMB]),
+                      "Monorepo 工作区（多仓库根目录）", dry_run=True)
+        hit = r.resolved["monorepo 工作区（多仓库根目录）"]
+        self.assertEqual((hit["uuid"], hit["match"]), ("u-regrown", "exact"))
+        self.assertEqual(hit["shadows_alias_of"], [{"uuid": "u-canon", "name": "monorepo workspace"}])
+        d = FakeDriver(existing_names=regrown, governed=[self.CANON, self.TOMB])
+        r = self._run(d, "Monorepo 工作区（多仓库根目录）")
+        self.assertEqual(r.resolved["monorepo 工作区（多仓库根目录）"]["uuid"], "u-regrown")
+        self.assertNotIn("shadows_alias_of", r.resolved["monorepo 工作区（多仓库根目录）"])
+        self.assertFalse([c for c, _ in d.calls if c in (xi._FIND_ALIAS, xi._FIND_RETIRED)])
+
+    def test_renamed_previous_name_reuses_node(self):
+        renamed = {"uuid": "u-job", "name": "deploy/publication_jobs.py", "labels": ["Entity", "File"],
+                   "previous_names": ["publication_jobs.py"]}
+        r = self._run(FakeDriver(governed=[renamed]), "Publication_Jobs.py", dry_run=True, ent_type="File")
+        hit = r.resolved["publication_jobs.py"]
+        self.assertEqual((hit["uuid"], hit["match"], hit["alias_via"], hit["matched_alias"]),
+                         ("u-job", "alias", "previous_names", "publication_jobs.py"))
+
+    def test_chained_merge_follows_merged_into(self):
+        """X 并进 A、A 再并进 B：X 只记在 A（已是 MergedEntity）上，顺 merged_into 走到 B。"""
+        nodes = [{"uuid": "u-x", "name": "dsh im", "labels": ["MergedEntity"], "merged_into": "u-a"},
+                 {"uuid": "u-a", "name": "dsh_im", "labels": ["MergedEntity"], "merged_into": "u-b",
+                  "merged_names": ["dsh im"]},
+                 {"uuid": "u-b", "name": "DSH IM 通道", "labels": ["Entity", "Tool"], "merged_names": ["dsh_im"]}]
+        r = self._run(FakeDriver(governed=nodes), "DSH IM", dry_run=True, ent_type="Tool")
+        hit = r.resolved["dsh im"]
+        self.assertEqual((hit["uuid"], hit["match"], hit["alias_via"], hit["matched_alias"]),
+                         ("u-b", "alias", "merged_into", "dsh im"))
+        # 环（脏数据）不死循环，也不复用
+        loop = [{"uuid": "u-p", "name": "loop", "labels": ["MergedEntity"], "merged_into": "u-q"},
+                {"uuid": "u-q", "name": "loop2", "labels": ["MergedEntity"], "merged_into": "u-p"}]
+        self.assertFalse(self._run(FakeDriver(governed=loop), "loop", dry_run=True).resolved["loop"]["reused"])
+
+    def test_retired_split_node_and_other_group_do_not_resolve(self):
+        nodes = [{"uuid": "u-s", "name": "mixed pom.xml", "labels": ["MergedEntity"], "merged_into": None,
+                  "split_into": ["u-1", "u-2"]},
+                 {"uuid": "u-o", "name": "other", "labels": ["Entity", "Concept"], "group_id": "other_group",
+                  "merged_names": ["foreign alias"]}]
+        r = self._run(FakeDriver(governed=nodes), "mixed pom.xml", "foreign alias", dry_run=True)
+        self.assertEqual({k: v["reused"] for k, v in r.resolved.items()},
+                         {"mixed pom.xml": False, "foreign alias": False})
+
+    def test_alias_pointing_to_two_nodes_reuses_neither(self):
+        nodes = [{"uuid": "u-1", "name": "kg-hub release.sh", "labels": ["Entity", "File"],
+                  "previous_names": ["release.sh"]},
+                 {"uuid": "u-2", "name": "vault release.sh", "labels": ["Entity", "File"],
+                  "merged_names": ["release.sh"]}]
+        d = FakeDriver(governed=nodes)
+        r = self._run(d, "release.sh", dry_run=True, ent_type="File")
+        hit = r.resolved["release.sh"]
+        self.assertFalse(hit["reused"])
+        self.assertEqual(hit["alias_ambiguous"], [{"uuid": "u-1", "name": "kg-hub release.sh"},
+                                                  {"uuid": "u-2", "name": "vault release.sh"}])
+        self.assertTrue(any("cosineDistance" in c for c, _ in d.calls))   # 落回常规（向量+词面守卫）消解
 
 
 class ProvenanceFieldsTest(unittest.TestCase):
