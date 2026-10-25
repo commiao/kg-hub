@@ -39,25 +39,18 @@ def completed(c: dict, d: Path, model: str) -> int:
 
 
 def events(path: Path) -> dict:
-    """Read identity and terminal evidence without loading a huge native transcript."""
+    """Stream identity and all hard stops without loading the transcript in memory."""
     if not path.is_file():
         return {}
     result = {}
     with path.open("rb") as stream:
-        first = stream.readline()
-        try:
-            row = json.loads(first)
-            if row.get("type") == "thread.started":
-                result["session"] = row.get("thread_id")
-        except (ValueError, UnicodeError):
-            pass
-        stream.seek(0, os.SEEK_END)
-        stream.seek(max(0, stream.tell() - 262144))
         for line in stream:
             try:
                 row = json.loads(line)
             except (ValueError, UnicodeError):
                 continue
+            if row.get("type") == "thread.started":
+                result["session"] = row.get("thread_id")
             if row.get("type") in ("turn.completed", "turn.failed", "error"):
                 result["terminal"] = row["type"]
             item = row.get("item", {})
@@ -65,6 +58,8 @@ def events(path: Path) -> dict:
                     and item.get("exit_code") in (75, 76)
                     and re.search(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+campaign\s+submit\b", item.get("command", ""))):
                 result["hard_stop"] = item["exit_code"]
+                result.setdefault("hard_stops", []).append({"id": item.get("id"),
+                    "command": item.get("command", ""), "exit_code": item["exit_code"]})
             if item.get("type") == "agent_message":
                 try:
                     report = json.loads(item.get("text", ""))
@@ -133,7 +128,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     continue
                 terminal = receipts.read(adopt_exit)
                 outcome = events(adopt_events)
-                if outcome.get("hard_stop"):
+                from tools.campaign_recovery import stops_reconciled
+                cleared = bool(outcome.get("hard_stop")) and stops_reconciled(c, d, model, adopt_events, outcome)
+                if outcome.get("hard_stop") and not cleared:
                     update(phase="coordinator_required", exit_code=2, reason="nas_gate_refused", business_exit_code=outcome["hard_stop"])
                     return {"model": model, "state": "blocked", "reason": "nas_gate_refused",
                             "business_exit_code": outcome["hard_stop"]}
@@ -142,7 +139,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     update(phase="coordinator_required", exit_code=2, reason="adopted_worker_terminal_unverified")
                     return {"model": model, "state": "blocked", "reason": "adopted_worker_terminal_unverified"}
                 adopt_exit = None
-                if outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable"):
+                if (outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")
+                        and not (cleared and outcome.get("recovery_kind") == "nas_refused")):
                     update(phase="coordinator_required", exit_code=2, reason=outcome["recovery_kind"])
                     return {"model": model, "state": "blocked", "reason": outcome["recovery_kind"]}
             waiting = False
@@ -174,7 +172,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 child = None
             if saved.get("events"):
                 outcome = events(Path(saved["events"]))
-                if outcome.get("hard_stop"):
+                from tools.campaign_recovery import stops_reconciled
+                cleared = bool(outcome.get("hard_stop")) and stops_reconciled(c, d, model, Path(saved["events"]), outcome)
+                if outcome.get("hard_stop") and not cleared:
                     update(phase="coordinator_required", exit_code=2, reason="nas_gate_refused", business_exit_code=outcome["hard_stop"])
                     return {"model": model, "state": "blocked", "reason": "nas_gate_refused",
                             "business_exit_code": outcome["hard_stop"]}
@@ -183,7 +183,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     return {"model": model, "state": "blocked", "reason": "native_session_mismatch"}
                 session = outcome.get("session") or session
                 if (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
-                        or outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")):
+                        or (outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")
+                            and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")
                     return {"model": model, "state": "blocked", "reason": "native_worker_blocked"}
                 stalled = stalled + 1 if count <= baseline else 0

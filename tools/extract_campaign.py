@@ -882,17 +882,20 @@ def cmd_operation_status(cid: str, bid: str) -> dict:
     state = status(campaign_dir(cid) / "operations" / bid)
     action = ("wait_for_original" if state["state"] == "running" else
               "reconcile_service_before_replay" if state["state"] == "uncertain" or state.get("requires_reconciliation") else
+              "review_and_preview_before_submit" if state["state"] == "reconciled_not_written" else
               "stop_nas_gate_refusal" if state.get("exit_code") in (75, 76) else
               "inspect_formal_results" if state["state"] == "completed" else
               "coordinator_review" if state["state"] == "failed" else "legacy_terminal_unverified")
     return {"campaign": cid, "batch": bid, "batch_status": b["status"], "operation": state, "action": action}
 
 
-def cmd_reconcile_operation(cid: str, bid: str, *, url: str, token: str | None, check=None) -> dict:
+def cmd_reconcile_operation(cid: str, bid: str, *, url: str, token: str | None, check=None,
+                            legacy_exit: Path | None = None, legacy_events: Path | None = None,
+                            session: str | None = None) -> dict:
     from utils import process_receipts as receipts
     d = campaign_dir(cid)
     c = load(d)
-    find_batch(c, bid)
+    b = find_batch(c, bid)
     batch = json.loads((d / "batches" / f"{bid}.json").read_text())
     def verify(record):
         if record.get("identity", {}).get("campaign") != cid or record["identity"].get("batch") != bid:
@@ -916,6 +919,20 @@ def cmd_reconcile_operation(cid: str, bid: str, *, url: str, token: str | None, 
                 "action": "review_and_preview_before_submit" if safe else
                           "remote_terminal_still_unverified" if absent
                           else "reconcile_service_attribution; do not count or replay"}
+    if legacy_exit is not None or legacy_events is not None or session is not None:
+        if not legacy_exit or not legacy_events or not session:
+            raise ValueError("paired legacy exit/events and original native session required")
+        from tools import campaign_recovery as recovery
+        from utils.extraction_quality import digest
+        supervised = receipts.read(d / "supervisors" / slug(b["model"]) / "latest.json")
+        if supervised.get("identity") and supervised["identity"] != {"campaign": cid, "model": b["model"]}:
+            raise ValueError("legacy supervisor owner identity mismatch")
+        if supervised.get("session") and supervised["session"] != session:
+            raise ValueError("legacy native session differs from supervisor identity")
+        proof = recovery.legacy_proof(legacy_exit, legacy_events, session, cid, bid)
+        keys = [{k: item[k] for k in ("source_description", "source_obs_id")} for item in batch["items"]]
+        return recovery.adopt(d / "operations" / bid,
+            {"campaign": cid, "batch": bid, **batch_identity(c, b)}, digest(batch), keys, proof, verify)
     return receipts.reconcile(d / "operations" / bid, verify)
 
 
@@ -1419,6 +1436,10 @@ def _main(argv=None) -> int:
             s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
         if name in ("lint", "submit", "release", "review", "quality-sheet", "quality-check", "namesync", "operation-status", "reconcile-operation"):
             s.add_argument("--batch", required=True)
+        if name == "reconcile-operation":
+            s.add_argument("--legacy-exit", type=Path, help="original unique legacy invocation exit receipt")
+            s.add_argument("--legacy-events", type=Path, help="paired native events proving gate timeout before dispatch")
+            s.add_argument("--resume-session", help="original native session, must match recorded supervisor")
         if name == "namesync":
             s.add_argument("--apply", action="store_true", help="把 auto 类改名写回结果文件（质量表之前做）")
             s.add_argument("--graph", action="store_true",
@@ -1477,7 +1498,9 @@ def _main(argv=None) -> int:
     elif a.cmd == "operation-status":
         out = cmd_operation_status(a.id, a.batch)
     elif a.cmd == "reconcile-operation":
-        out = cmd_reconcile_operation(a.id, a.batch, url=a.url, token=ax.api_token())
+        out = cmd_reconcile_operation(a.id, a.batch, url=a.url, token=ax.api_token(),
+                                      legacy_exit=a.legacy_exit, legacy_events=a.legacy_events,
+                                      session=a.resume_session)
     elif a.cmd == "rules":
         d = campaign_dir(a.id)
         c = load(d)
