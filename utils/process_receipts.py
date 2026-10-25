@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import uuid
 
 
@@ -21,6 +22,18 @@ class Busy(RuntimeError):
 
 class Uncertain(RuntimeError):
     pass
+
+
+def exclusive_lock(stream) -> None:
+    """Allow a short read-only lease probe to finish, never wait on a worker."""
+    for attempt in range(6):
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if attempt == 5:
+                raise
+            time.sleep(0.01)
 
 
 def now() -> str:
@@ -62,6 +75,10 @@ def status(directory: Path) -> dict:
                 live = True
             else:
                 live = False
+                # The owner may have written its terminal receipt and released
+                # the lease after our first read. Re-read while holding the
+                # shared lock, or that normal exit looks like an orphan.
+                receipt = read(directory / "latest.json")
     except FileNotFoundError:
         live = False if not receipt else None
     except OSError:
@@ -117,7 +134,7 @@ def attempt(directory: Path, *, kind: str, identity: dict | None = None, allow_a
     fd = os.open(directory / "lease.lock", os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "r+") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            exclusive_lock(lock)
         except BlockingIOError as exc:
             raise Busy("original operation is live; read its receipt and wait") from exc
         previous = read(directory / "latest.json")

@@ -12,13 +12,16 @@ import re
 import subprocess
 import time
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from tools import agent_extract as ax, extract_campaign as ec, claim_registry, nas_gate
 from utils import process_receipts as receipts
 
 
-def completed(c: dict, d: Path, model: str) -> int:
-    batches = {b["id"]: b for b in c["batches"] if b["model"] == model}
+def completed(c: dict, d: Path, model: str, slot: int | None = None) -> int:
+    batches = {b["id"]: b for b in c["batches"] if b["model"] == model
+               and (slot is None or b.get("slot") == slot)}
     latest = {}
     log = d / "log.jsonl"
     if log.exists():
@@ -70,9 +73,26 @@ def events(path: Path) -> dict:
     return result
 
 
-def native_args(c: dict, model: str, session: str | None) -> list[str]:
+def bind_slot_session(d: Path, model: str, slot: int | None, session: str | None) -> None:
+    if slot is None or session is None:
+        return
+    with ec.locked(d):
+        c = ec.load(d)
+        bindings = c.setdefault("slot_sessions", {})
+        own = bindings.setdefault(model, {})
+        if own.get(str(slot)) not in (None, session):
+            raise ValueError("slot session differs from its recorded owner")
+        for other_model, slots in bindings.items():
+            for other_slot, existing in slots.items():
+                if existing == session and (other_model, other_slot) != (model, str(slot)):
+                    raise ValueError("native session already belongs to another slot")
+        own[str(slot)] = session
+        ec.save(d, c)
+
+
+def native_args(c: dict, model: str, session: str | None, slot: int | None = None) -> list[str]:
     # Reuse the launch contract's rejection of model/executor overrides.
-    ec.launch_command("codex", c["id"], model, cfg=c)
+    ec.launch_command("codex", c["id"], model, cfg=c, slot=slot)
     if c["executor"] != "codex":
         raise ValueError("managed supervision currently supports the codex executor")
     settings = ec.runtime_settings(c)
@@ -85,7 +105,7 @@ def native_args(c: dict, model: str, session: str | None) -> list[str]:
         args += ["--add-dir", str(directory)]
     if session:
         args += ["resume", session]
-    prompt = ec.brief(c, model)
+    prompt = ec.brief(c, model, slot)
     prompt += ("\n由公共supervise管理本执行线；先核对原批次与operation-status，复用未完成批次。"
                "不要重复领取或重交终态不明的请求。可选诊断不可用时读持久回执；真实审批拒绝不得换路径重试。"
                "若因真实审批拒绝、NAS75/76、基础设施失败、业务权限拒绝或提交终态不明结束，"
@@ -97,30 +117,34 @@ def native_args(c: dict, model: str, session: str | None) -> list[str]:
 
 def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | None = None,
         adopt_events: Path | None = None, poll: float = 15, max_stalled: int = 3, sleep=time.sleep,
-        spawn=subprocess.Popen, preflight=None) -> dict:
+        spawn=subprocess.Popen, preflight=None, slot: int | None = None, stop=None) -> dict:
     if poll <= 0 or max_stalled < 1 or bool(adopt_exit) != bool(adopt_events):
         raise ValueError("positive polling/stall limit and paired adoption receipts required")
     d = ec.campaign_dir(cid)
     c = ec.load(d)
-    native_args(c, model, session)
+    slot = ec.worker_slot(c, model, slot)
+    native_args(c, model, session, slot)
     ec.tracking_guard()
-    root = d / "supervisors" / ec.slug(model)
+    root = ec.supervisor_dir(d, model, slot)
     native = root / "native"
-    with receipts.attempt(root, kind="supervisor", identity={"campaign": cid, "model": model},
+    identity = {"campaign": cid, "model": model, **({"slot": slot} if slot is not None else {})}
+    with receipts.attempt(root, kind="supervisor", identity=identity,
                           allow_abandoned=True) as update:
         saved = receipts.read(root / "worker.json")
         if session and saved.get("session") and session != saved["session"]:
             raise ValueError("resume session differs from managed worker identity")
         session = saved.get("session") or session
-        baseline = completed(c, d, model)
+        bind_slot_session(d, model, slot, session)
+        baseline = completed(c, d, model, slot)
         if (baseline < c["quota"] and not saved and adopt_exit is None
-                and any(b["model"] == model for b in c["batches"])):
+                and any(b["model"] == model and (slot is None or b.get("slot") == slot) for b in c["batches"])):
             raise ValueError("existing model history requires its unique exit/event receipts; do not duplicate an unmanaged worker")
         stalled = 0
         child = None
         while True:
             c = ec.load(d)
             count = completed(c, d, model)
+            own_count = completed(c, d, model, slot)
             if adopt_exit is not None:
                 update(phase="waiting_existing_worker", success=count, session=session)
                 if not adopt_exit.is_file():
@@ -144,7 +168,10 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     update(phase="coordinator_required", exit_code=2, reason=outcome["recovery_kind"])
                     return {"model": model, "state": "blocked", "reason": outcome["recovery_kind"]}
             waiting = False
-            for batch in (b for b in c["batches"] if b["model"] == model and b["status"] not in ("submitted", "released")):
+            own_pending = [b for b in c["batches"] if b["model"] == model
+                           and (slot is None or b.get("slot") == slot)
+                           and b["status"] not in ("submitted", "released")]
+            for batch in own_pending:
                 op = ec.cmd_operation_status(cid, batch["id"])
                 if op["action"] == "wait_for_original":
                     waiting = True
@@ -182,13 +209,14 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     update(phase="coordinator_required", exit_code=2, reason="native_session_mismatch")
                     return {"model": model, "state": "blocked", "reason": "native_session_mismatch"}
                 session = outcome.get("session") or session
+                bind_slot_session(d, model, slot, session)
                 if (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
                         or (outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")
                             and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")
                     return {"model": model, "state": "blocked", "reason": "native_worker_blocked"}
-                stalled = stalled + 1 if count <= baseline else 0
-                baseline = count
+                stalled = stalled + 1 if own_count <= baseline else 0
+                baseline = own_count
                 update(stalled_turns=stalled, success=count, session=session)
                 if stalled >= max_stalled:
                     update(phase="coordinator_required", exit_code=2, reason="no_formal_progress", success=count)
@@ -196,6 +224,12 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             if count >= c["quota"]:
                 update(phase="quota_complete", success=count)
                 return {"model": model, "state": "complete", "success": count}
+            if slot is not None and ec.claimed_items(c, model) >= c["quota"] and not own_pending:
+                update(phase="slot_drained", success=count)
+                return {"model": model, "slot": slot, "state": "drained", "success": count}
+            if stop is not None and stop.is_set():
+                update(phase="coordinator_required", exit_code=2, reason="peer_slot_blocked")
+                return {"model": model, "slot": slot, "state": "blocked", "reason": "peer_slot_blocked"}
             flight = (preflight or ax.runtime_preflight)(os.environ.get("KG_HUB_URL", ax.DEFAULT_URL), ax.api_token())
             if not flight.get("ok"):
                 update(phase="coordinator_required", exit_code=2, reason="preflight_failed")
@@ -206,11 +240,15 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             receipts.write(root / "worker.json", saved)
             entry = Path(os.environ.get("KG_HUB_CODE", "~/.local/share/kg-hub/current")).expanduser() / "tools/extract"
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],
-                    "--receipt-dir", str(native), "--", *native_args(c, model, session)]
+                    "--receipt-dir", str(native), "--", *native_args(c, model, session, slot)]
+            env = {}
+            if slot is not None:
+                env["env"] = {**os.environ, "KG_HUB_CAMPAIGN_ID": cid,
+                              "KG_HUB_CAMPAIGN_MODEL": model, "KG_HUB_CAMPAIGN_SLOT": str(slot)}
             with os.fdopen(os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as out, \
                     os.fdopen(os.open(error, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as err:
                 child = spawn(args, cwd=ec.workspace_dir(), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                              start_new_session=True)
+                              start_new_session=True, **env)
             # A just-spawned wrapper has not acquired its lease yet. Do not
             # interpret the previous terminal receipt as this child's result.
             update(phase="starting_native", events=str(output), success=count, session=session)
@@ -220,3 +258,65 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     return {"model": model, "state": "blocked", "reason": "native_wrapper_start_failed"}
                 sleep(poll)
             sleep(poll)
+
+
+def run_pool(cid: str, model: str, *, poll: float = 15, max_stalled: int = 3,
+             stagger: float = 300, sleep=time.sleep, spawn=subprocess.Popen, preflight=None) -> dict:
+    """One model manager starts the configured independent, quota-sharing slots.
+
+    A blocked slot stops further dispatch. Already running native turns are
+    allowed to finish; their receipts remain authoritative after manager exit.
+    """
+    if poll <= 0 or max_stalled < 1 or stagger < 0:
+        raise ValueError("positive polling/stall limit and nonnegative stagger required")
+    d = ec.campaign_dir(cid)
+    c = ec.load(d)
+    n = ec.parallelism(c)
+    if n == 1:
+        return run(cid, model, poll=poll, max_stalled=max_stalled, sleep=sleep,
+                   spawn=spawn, preflight=preflight)
+    native_args(c, model, None, 1)
+    ec.tracking_guard()
+    root = ec.supervisor_dir(d, model)
+    if (root / "worker.json").exists() or any(
+            b["model"] == model and b.get("slot") not in range(1, n + 1) for b in c["batches"]):
+        raise ValueError("existing unslotted history requires explicit migration; cannot duplicate the original worker")
+    stop = threading.Event()
+
+    def work(slot):
+        remaining = stagger * (slot - 1)
+        while remaining > 0 and not stop.is_set():
+            step = min(poll, remaining)
+            sleep(step)
+            remaining -= step
+        if stop.is_set():
+            return {"model": model, "slot": slot, "state": "blocked", "reason": "peer_slot_blocked"}
+        try:
+            result = run(cid, model, slot=slot, poll=poll, max_stalled=max_stalled, sleep=sleep,
+                         spawn=spawn, preflight=preflight, stop=stop)
+        except (Exception, SystemExit) as exc:
+            # Preserve the slot's receipt; never turn an exception into success.
+            result = {"model": model, "slot": slot, "state": "blocked",
+                      "reason": type(exc).__name__, "message": str(exc)}
+        if result["state"] not in ("complete", "drained"):
+            stop.set()
+        return {**result, "slot": slot}
+
+    with receipts.attempt(root, kind="supervisor_pool", identity={"campaign": cid, "model": model},
+                          allow_abandoned=True) as update:
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futures = {slot: pool.submit(work, slot) for slot in range(1, n + 1)}
+            while not all(future.done() for future in futures.values()):
+                slots = {str(slot): receipts.status(ec.supervisor_dir(d, model, slot) / "native")
+                         for slot in futures}
+                update(phase="draining_after_slot_block" if stop.is_set() else "running_slots",
+                       configured_parallel=n, active_slots=sum(s["lease_held"] is True for s in slots.values()),
+                       success=completed(ec.load(d), d, model))
+                sleep(poll)
+            outcomes = [future.result() for future in futures.values()]
+        count = completed(ec.load(d), d, model)
+        good = all(o["state"] in ("complete", "drained") for o in outcomes) and count >= c["quota"]
+        update(phase="quota_complete" if good else "coordinator_required", exit_code=0 if good else 2,
+               success=count, configured_parallel=n, active_slots=0, slots=outcomes)
+        return {"model": model, "state": "complete" if good else "blocked", "success": count,
+                "parallel": n, "slots": outcomes}

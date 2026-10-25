@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -16,6 +17,60 @@ from tools import extract_runtime
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_brief_status_reader_does_not_make_native_start_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "lease.lock").touch()
+            ready = threading.Event()
+            def reader():
+                import fcntl
+                import time
+                with (root / "lease.lock").open() as lock:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                    ready.set()
+                    time.sleep(0.02)
+            thread = threading.Thread(target=reader)
+            thread.start()
+            self.assertTrue(ready.wait(5))
+            try:
+                with r.attempt(root, kind="native_cli"):
+                    pass
+                self.assertEqual(r.status(root)["state"], "completed")
+            finally:
+                thread.join(5)
+
+    def test_owner_finishing_between_receipt_read_and_lock_probe_is_not_an_orphan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ready, finish, ended = threading.Event(), threading.Event(), threading.Event()
+            def owner():
+                with r.attempt(root, kind="native_cli"):
+                    ready.set()
+                    self.assertTrue(finish.wait(5))
+                ended.set()
+            thread = threading.Thread(target=owner)
+            thread.start()
+            self.assertTrue(ready.wait(5))
+            original = r.read
+            first = True
+            def read(path):
+                nonlocal first
+                record = original(path)
+                if first:
+                    first = False
+                    finish.set()
+                    self.assertTrue(ended.wait(5))
+                return record
+            try:
+                with mock.patch.object(r, "read", side_effect=read):
+                    state = r.status(root)
+                self.assertEqual(state["state"], "completed")
+                self.assertEqual(state["exit_code"], 0)
+                self.assertFalse(state["lease_held"])
+            finally:
+                finish.set()
+                thread.join(5)
+
     def test_live_exit_and_single_owner_without_process_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
