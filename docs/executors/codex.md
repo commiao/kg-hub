@@ -38,9 +38,13 @@ codex 不报 credits，复盘表只显示 token/条。2026-10-23 那次 codex �
 ## 多模型战役（campaign.md）
 
 - **方式二未确认**（2026-10-22）：codex 的派生工具自报有 `model` 参数，但 `codex exec --json` 两次实测事件流里都没有派生记录，
-  不能确认子代理真按指定模型跑。先用「每个模型一个会话」：
-  `"$CLI" campaign launch --id <战役> --tool codex` 打印
-  具体命令由已发布的 `campaign launch` 生成，不复制旧的 `codex exec` 参数。会话在采集排除目录打开；代码从稳定入口加载。
+  不能确认子代理真按指定模型跑。使用公共原生执行池：开局 `--parallel <每模型并发组数>`，
+  每模型启动一次 `"$CLI" campaign supervise --id <战役> --model <模型>`。
+  监督器按配置创建独立槽位，原生参数由公共工具生成；每槽保留其会话和批次，恢复时用 `--slot <序号>`。
+  仍可用 `"$CLI" campaign launch --id <战役> --tool codex` 打印每模型每槽的启动命令，
+  不复制旧的 `codex exec` 参数。会话在采集排除目录打开；代码从稳定入口加载。
+  `--parallel 4 --batch 50 --quota 2000` 表示每模型并发4组、每组50条，所有组合计2000条。
+  报告须分别列出配置槽数和实际原生lease数；旧在途单路战役不自动扩容。
 - 子代理必须能写战役状态和领取登记目录、访问 NAS/kg-hub；保留真实工具错误，不能把沙箱网络失败当服务端已经处理成功。
 - 已有宿主子代理 idle/completed 时用 `followup_task` 触发后续任务；running 才用 `send_message`。repo campaign 状态不等于 App 的宿主任务状态，新开原生调用仍需真实探测回执。
 - 模型名用 `codex debug models` 里 `visibility=list` 的那些（如 gpt-6-astra、gpt-6-luna、gpt-5.6-sol）。
