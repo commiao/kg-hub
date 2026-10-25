@@ -180,6 +180,25 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(d["entities"][1]["matched_type"], None)       # 旧节点没有类型标签：照实给 None
         self.assertNotIn("in_batch", d["entities"][1])
 
+    def test_dry_run_entities_mark_governed_alias_hits(self):
+        """节点治理旧名命中要在 dry-run 每行里看得见：match=alias、命中的旧名与出处；未复用的别名歧义 / 被现存同名
+        节点挡住的规范节点也列出来（utils/extracted_ingest._resolve_alias）。"""
+        async def fake_write(driver, embedder, extraction, **kw):
+            return WriteResult(episode_uuid="", nodes_new=1, nodes_reused=1, edges_new=0, edges_reused=0, resolved={
+                "kg-hub": {"uuid": "u1", "reused": True, "matched_name": "kg hub", "matched_type": "Project",
+                           "match": "alias", "matched_alias": "KG-Hub", "alias_via": "merged_names",
+                           "shadows_alias_of": None},
+                "commit abc1234": {"uuid": None, "reused": False, "matched_name": None,
+                                   "alias_ambiguous": [{"uuid": "a", "name": "A"}, {"uuid": "b", "name": "B"}]}})
+        with mock.patch.object(srv, "write_extraction", fake_write):
+            code, d = self._run(dict(GOOD, dry_run=True))
+        self.assertEqual(code, 200)
+        self.assertEqual(d["entities"], [
+            {"name": "kg-hub", "type": "Project", "reused": True, "matched_name": "kg hub", "matched_type": "Project",
+             "match": "alias", "matched_alias": "KG-Hub", "alias_via": "merged_names"},
+            {"name": "commit abc1234", "type": "Tool", "reused": False,
+             "alias_ambiguous": [{"uuid": "a", "name": "A"}, {"uuid": "b", "name": "B"}]}])
+
     def test_ok_response_carries_stats_and_model(self):
         code, d = self._run(GOOD)
         self.assertEqual(code, 200, d)

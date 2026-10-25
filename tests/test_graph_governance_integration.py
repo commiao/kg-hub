@@ -16,6 +16,7 @@ import unittest
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from schema import EDGE_TYPES, ENTITY_TYPES
 from utils import graph_governance as gov
 
 
@@ -243,6 +244,59 @@ class RealGovernanceTests(unittest.IsolatedAsyncioTestCase):
             await gov.preview(self.g, {"operation": "rename", "node": {"uuid": "dup"},
                                        "rename_to": "Deploy-Standard skill"}, GROUP)
         self.assertEqual(caught.exception.code, "name_conflict")
+
+    async def ingest(self, *names, kind="File", dry_run=False):
+        from datetime import datetime, timezone
+        from utils import extracted_ingest as xi
+        extraction = xi.normalize_extraction([xi.ExtractedEntity(name=n, type=kind, summary="") for n in names], [],
+                                             set(ENTITY_TYPES), set(EDGE_TYPES))
+        return await xi.write_extraction(self.driver, Embedder(), extraction, name="obs-late", episode_body="b",
+                                         source_description="claude-mem:late",
+                                         reference_time=datetime(2026, 10, 26, tzinfo=timezone.utc),
+                                         extractor_model="unit", group_id=GROUP, episode_uuid="late",
+                                         dry_run=dry_run)
+
+    async def test_ingest_reuses_canonical_for_merged_and_renamed_names(self):
+        """合并 / 改名之后，入图消解（_FIND_ALIAS / _FIND_RETIRED 在真 FalkorDB 上）认旧名，不再长回重复节点。"""
+        await self.merge_fixture()
+        request, _ = await self.reviewed({"operation": "merge", "canonical": {"uuid": "canon"},
+                                          "merged": [{"uuid": "dup"}]})
+        await gov.apply(self.g, request, GROUP)
+        preview = await self.ingest("Reconciliation_Mailbox.py", dry_run=True)
+        hit = preview.resolved["reconciliation_mailbox.py"]
+        self.assertEqual((hit["uuid"], hit["match"], hit["alias_via"], hit["matched_alias"]),
+                         ("canon", "alias", "merged_names", "reconciliation_mailbox.py"))
+        # 近名不吃：被并节点的向量（与规范节点同向量）也不会被 _FIND_SIMILAR 看到
+        near = await self.ingest("reconciliation_mailboxes.py", dry_run=True)
+        self.assertFalse(near.resolved["reconciliation_mailboxes.py"]["reused"])
+        before = await self.rows("MATCH (n:Entity) RETURN count(n) AS c")
+        result = await self.ingest("reconciliation_mailbox.py")
+        self.assertEqual((result.nodes_new, result.nodes_reused), (0, 1))
+        self.assertEqual(await self.rows("MATCH (n:Entity) RETURN count(n) AS c"), before)
+        self.assertEqual(await self.rows("MATCH (:Episodic {uuid:'late'})-[:MENTIONS]->(n) RETURN n.uuid AS u"),
+                         [{"u": "canon"}])
+
+        # 改名留下的 previous_names；再把改过名的节点并掉，连环旧名顺 merged_into 走到最终规范节点
+        await self.node("job", "File", "Publication_Jobs.py")   # 存着的旧名带大写：两边都要 toLower
+        request, _ = await self.reviewed({"operation": "rename", "node": {"uuid": "job"},
+                                          "rename_to": "deploy/publication_jobs.py"}, gid="rename-job")
+        await gov.apply(self.g, request, GROUP)
+        hit = (await self.ingest("PUBLICATION_JOBS.PY", dry_run=True)).resolved["publication_jobs.py"]
+        self.assertEqual((hit["uuid"], hit["alias_via"], hit["matched_alias"]),
+                         ("job", "previous_names", "Publication_Jobs.py"))
+        await self.node("job2", "File", "deploy/publication-jobs module")
+        request, _ = await self.reviewed({"operation": "merge", "canonical": {"uuid": "job2"},
+                                          "merged": [{"uuid": "job"}]}, gid="merge-job")
+        await gov.apply(self.g, request, GROUP)
+        hit = (await self.ingest("publication_jobs.py", dry_run=True)).resolved["publication_jobs.py"]
+        self.assertEqual((hit["uuid"], hit["alias_via"], hit["matched_alias"]),
+                         ("job2", "merged_into", "Publication_Jobs.py"))
+
+        # 现存同名 Entity 优先于别名；dry-run 标出被挡住的规范节点
+        await self.node("regrown", "File", "reconciliation_mailbox.py")
+        hit = (await self.ingest("reconciliation_mailbox.py", dry_run=True)).resolved["reconciliation_mailbox.py"]
+        self.assertEqual((hit["uuid"], hit["match"], hit["shadows_alias_of"]),
+                         ("regrown", "exact", [{"uuid": "canon", "name": "credvault:reconciliation_mailbox.py"}]))
 
 
 if __name__ == "__main__":
