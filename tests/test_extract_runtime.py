@@ -6,11 +6,28 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+import subprocess
 from unittest import mock
 from tools import extract_runtime as command
 
 
 class RuntimeCLITest(unittest.TestCase):
+    def test_default_composition_is_exported_to_child_cli(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home=Path(temp)
+            composition=home/'composition'
+            interpreter=composition/'venv/bin/python'
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text('#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\nprintf "%s\\n" "$LLM_EVAL_ACTIVE_BUNDLE"\n')
+            interpreter.chmod(0o700)
+            (composition/'bundle.json').write_text('{}')
+            active=home/'.local/share/llm-eval/active-bundle.json'
+            active.parent.mkdir(parents=True);active.symlink_to(composition/'bundle.json')
+            env={k:v for k,v in os.environ.items() if k not in {'KG_HUB_PYTHON','LLM_EVAL_ACTIVE_BUNDLE'}}
+            env['HOME']=str(home)
+            result=subprocess.run(['sh',str(Path(__file__).resolve().parents[1]/'tools/extract'),'--runtime'],
+                                  env=env,capture_output=True,text=True,check=True)
+            self.assertEqual(result.stdout.strip(),str(active))
     def test_exec_preserves_argv_and_only_changes_child_environment(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "child.json"
@@ -59,3 +76,7 @@ class RuntimeCLITest(unittest.TestCase):
             self.assertEqual(receipt["actual_models"], [])
             self.assertEqual(receipt["cost"]["tokens"], 5)
             self.assertFalse(receipt["cost"]["credits_known"])
+
+
+if __name__ == '__main__':
+    unittest.main()
