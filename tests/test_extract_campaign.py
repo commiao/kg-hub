@@ -108,7 +108,8 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual((o["batch"], o["run_id"], o["chain"], len(b["items"])),
                          ("DeepSeek-Flash-001", "t1-DeepSeek-Flash", "c0", 25))
         self.assertTrue(b["lookahead"] and b["lookahead"][0]["id"] > b["items"][-1]["id"])
-        self.assertIn("submit --id t1 --batch DeepSeek-Flash-001 --dry-run", " ".join(o["next"]))
+        self.assertIn("prepare --id t1 --batch DeepSeek-Flash-001", o["next"][0])        # 写完结果先 prepare，再 submit
+        self.assertIn("submit --id t1 --batch DeepSeek-Flash-001", " ".join(o["next"]))
         with self.assertRaises(SystemExit):
             self.claim("没登记的模型")
 
@@ -930,9 +931,10 @@ class NameSyncSubmitTest(unittest.TestCase):
 
     def test_brief_and_claim_name_the_new_steps(self):
         text = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
-        for needle in ("namesync --id t1 --batch <批次> --apply --graph", "2 命名分裂", "75 读不到 NAS 温度", "76 闸门等待超时"):
+        for needle in ("prepare --id t1 --batch <批次>", "namesync --id t1 --batch <批次> --apply --graph", "2 命名分裂",
+                       "75 读不到 NAS 温度", "76 闸门等待超时"):
             self.assertIn(needle, text)
-        self.assertTrue(any(" namesync " in c for c in self.claim("DeepSeek-Flash")["next"]))
+        self.assertTrue(any(" prepare --id t1 " in c for c in self.claim("DeepSeek-Flash")["next"]))
 
 
 if __name__ == "__main__":
