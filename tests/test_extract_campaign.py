@@ -876,7 +876,11 @@ class NameSyncSubmitTest(unittest.TestCase):
         self.assertEqual(self.gated, ["dryrun"])                   # 被分裂判据拦下的没去排 NAS 闸门
         self.assertEqual(ec.load(ec.campaign_dir("t1"))["batches"][0]["status"], "dry_run")
         rep, code = ec.cmd_namesync("t1", bid, apply=True, layout=self.layout)
-        self.assertEqual((code, rep["applied"], rep["auto"], rep["dryrun"]), (0, 1, [], "stale"))
+        self.assertEqual((code, rep["residual"], rep["dryrun"]), (0, [], "stale"))
+        # 实际写回的每一条都留在输出里（以前只剩计数 applied=1、auto 被换成空的残余）
+        self.assertEqual([(a["item"], a["from"], a["to"], a["kind"]) for a in rep["applied"]],
+                         [(1, "reconcile_due", "reconcile_due（QueueDispatcher）", "id")])
+        self.assertEqual([(a["from"], a["to"]) for a in rep["auto"]], [("reconcile_due", "reconcile_due（QueueDispatcher）")])
         res = json.loads((ec.campaign_dir("t1") / "results" / f"{bid}.json").read_text())
         self.assertIn("reconcile_due（QueueDispatcher）", [e["name"] for e in res["items"][0]["entities"]])
         with self.assertRaises(SystemExit) as cm:                  # 结果改了：旧 dry-run 失效，先重新预览

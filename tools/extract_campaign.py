@@ -231,8 +231,10 @@ SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}�
 4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」（超长 fact 由 lint 逐条列出，不用自己写脚本查）。
    命名同步（自检通过后、质量表之前）：$PY -m tools.extract_campaign namesync --id {cid} --batch <批次> --apply --graph
    它按锚点键（文件=仓库+相对路径、纯标识符、工作树目录名）把同物异名统一成图里或更早批次的写法，不用你判断；
-   review 里的 core / pr / head 只是提示，自己判断要不要改；graph_hints 说图里已有同名短节点的，优先用那个短名。
-   退出码 0 干净；2 还有没改掉的（看 auto 与 skipped，手动改后再跑一次）。改过名要重新 lint。
+   review 里的 core / pr / head / xrepo 只是提示，自己判断要不要改；graph_hints 说图里已有同名短节点的，优先用那个短名，
+   标 xrepo 的（图里同名节点连着别的仓库）按 suggest 加仓库前缀；server 列的是服务端会自己并过去的，不用改，
+   但「并过去」不对（不同的东西）时按规则 14 改名。--apply 后 applied 列出实际改了哪些名字。
+   退出码 0 干净；2 还有没改掉的（看 residual 与 skipped，手动改后再跑一次）。改过名要重新 lint。
 5. 预览：$PY -m tools.extract_campaign submit --id {cid} --batch <批次> --dry-run
    逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
    标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
@@ -792,8 +794,8 @@ def graph_lookup(url: str, token: str | None, get=None):
     from urllib.parse import quote
     get = get or ax._http
 
-    def look(ident: str) -> dict:
-        code, j = get("GET", f"{url}/api/node_neighbors?name={quote(ident)}&limit=1", None, token)
+    def look(ident: str, limit: int = 1) -> dict:
+        code, j = get("GET", f"{url}/api/node_neighbors?name={quote(ident)}&limit={int(limit)}", None, token)
         if code != 200:
             raise RuntimeError(f"http {code}")
         return j
@@ -804,7 +806,8 @@ def cmd_namesync(cid: str, bid: str, *, apply: bool = False, lookup=None,
                  layout: ns.Layout | None = None) -> tuple[dict, int]:
     """命名同步一批：报告 auto / review / 分裂；apply 时把 auto 写回结果文件（质量表之前做）。
     lookup 给了就对「标识符 + 短后缀」名问图里有没有同名短节点（--graph）。
-    返回 (报告, 退出码)：0 干净；2 还有没改掉的 auto，或按当前 dry-run 会分裂。"""
+    apply 后 auto 仍是改之前的计划，applied 列实际写回的每一条（item / from / to / kind / source），residual 列改完仍没统一的。
+    返回 (报告, 退出码)：0 干净；2 还有没改掉的 auto（apply 后看 residual），或按当前 dry-run 会分裂。"""
     d = campaign_dir(cid)
     c = load(d)
     b = find_batch(c, bid)
@@ -815,7 +818,7 @@ def cmd_namesync(cid: str, bid: str, *, apply: bool = False, lookup=None,
     rep, mine = ns.batch_report(d.parent, cid, bid, layout, new if state == "ok" else None)
     rep["dryrun"] = state
     if lookup is not None:
-        rep["graph_hints"] = ns.graph_hints(mine, lookup)
+        rep["graph_hints"] = ns.graph_hints(mine, lookup, layout)
     if apply and rep["auto"]:
         p = d / "results" / f"{bid}.json"
         data = ns.load_json(p)
@@ -826,10 +829,13 @@ def cmd_namesync(cid: str, bid: str, *, apply: bool = False, lookup=None,
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
         tmp.replace(p)
         after, _ = ns.batch_report(d.parent, cid, bid, layout)
-        rep.update(applied=rep["renames"], skipped=skipped, auto=after["auto"], renames=after["renames"],
+        # auto 保留改之前算出的计划，applied 是实际写回的每一条，residual 是改完再查仍没统一的（正常为空）。
+        # 以前把 auto 换成残余、只留一个计数，复查时看不出改了什么（022 批 graphiti_core 被改了名却看不出来）。
+        rep.update(applied=ns.applied_rows(rep["auto"], skipped), skipped=skipped, residual=after["auto"],
                    splits=[], dryrun="stale" if state != "no_dryrun" else state,
                    redo="结果已改：重新 lint，再做质量表与 dry-run（旧的都已失效）")
-    code = EXIT_SPLIT if rep["auto"] or rep["splits"] else 0
+    left = rep["residual"] if "residual" in rep else rep["auto"]
+    code = EXIT_SPLIT if left or rep["splits"] else 0
     return rep, code
 
 
@@ -850,7 +856,7 @@ def cmd_namesync_replay(cid: str, *, layout: ns.Layout | None = None) -> dict:
     return {"campaign": cid, "batches": len(rows), "submitted": len(submitted),
             "submitted_with_splits": [r["batch"] for r in submitted if r["splits"]],
             "splits": sum(r["splits"] for r in submitted), "auto": sum(r["auto"] for r in submitted),
-            "review": sum(r["review"] for r in submitted), "rows": rows}
+            "review": sum(r["review"] for r in submitted), "server": sum(r["server"] for r in submitted), "rows": rows}
 
 
 def cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | None, post=None, gate=None,
