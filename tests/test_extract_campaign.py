@@ -6,6 +6,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 import contextlib
+import io
 import json
 import os
 import tempfile
@@ -108,7 +109,8 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual((o["batch"], o["run_id"], o["chain"], len(b["items"])),
                          ("DeepSeek-Flash-001", "t1-DeepSeek-Flash", "c0", 25))
         self.assertTrue(b["lookahead"] and b["lookahead"][0]["id"] > b["items"][-1]["id"])
-        self.assertIn("submit --id t1 --batch DeepSeek-Flash-001 --dry-run", " ".join(o["next"]))
+        self.assertIn("prepare --id t1 --batch DeepSeek-Flash-001", o["next"][0])        # 写完结果先 prepare，再 submit
+        self.assertIn("submit --id t1 --batch DeepSeek-Flash-001", " ".join(o["next"]))
         with self.assertRaises(SystemExit):
             self.claim("没登记的模型")
 
@@ -566,6 +568,54 @@ class CampaignTest(unittest.TestCase):
         m = ec.merge_rows("x", [a, b])
         self.assertEqual((m["items"], m["ok"], m["headline_verbatim_pct"], m["credits_per_obs"]), (40, 40, 62.5, 1.0))
 
+    def test_report_structure_columns_and_cumulative_reuse(self):
+        def two_nodes(i, x, y):
+            return {"id": i, "entities": [{"name": x, "type": "Concept", "summary": "s"}, {"name": y, "type": "Tool"}],
+                    "edges": [{"source": x, "name": "relates_to", "target": y, "fact": TITLES[i]},
+                              {"source": x, "name": "relates_to", "target": y, "fact": f"Observation title number {i}"},
+                              {"source": x, "name": "relates_to", "target": y, "fact": "x relates to y"}]}
+        o1 = self.claim("DeepSeek-Flash")
+        ids1 = [x["id"] for x in json.loads(_Path(o1["batch_file"]).read_text())["items"]]
+        _Path(o1["results_file"]).write_text(json.dumps({"items": [two_nodes(i, f"甲{i}", f"乙{i}") for i in ids1]}))
+        first = ec.cmd_report("t1")["batches"][0]
+        self.assertEqual((first["two_entity_pct"], first["pairs_per_obs"], first["rest_relates_to_pct"],
+                          first["reuse_pct"]), (100.0, 1.0, 100.0, 0.0))
+        # 第二批第 k 条提到第一批第 k 条的「甲」（批内各不相同，复用只能来自前一批）：第二批行 25/50；
+        # 第一批行按截至该批算，不被后来的批改写；模型合计按截至最后一批的参照池，第一批的「甲」也算复用，(25 + 25) / 100
+        o2 = self.claim("DeepSeek-Flash")
+        ids2 = [x["id"] for x in json.loads(_Path(o2["batch_file"]).read_text())["items"]]
+        _Path(o2["results_file"]).write_text(json.dumps({"items": [two_nodes(i, f"甲{j}", f"丙{i}")
+                                                                   for i, j in zip(ids2, ids1)]}))
+        rep = ec.cmd_report("t1")
+        self.assertEqual([r["reuse_pct"] for r in rep["batches"]], [0.0, 50.0])
+        self.assertEqual((rep["models"][0]["reuse_pct"], rep["by_chain"][0]["reuse_pct"]), (50.0, 50.0))
+        self.assertEqual((rep["models"][0]["two_entity_pct"], rep["models"][0]["pairs_per_obs"]), (100.0, 1.0))
+        self.assertNotIn("_keysets", rep["batches"][0])
+        head = ec.render(rep["models"]).splitlines()[0]
+        for col in ("恰2实体%", "端点对/条", "其余relates_to%", "跨观测复用%"):
+            self.assertIn(col, head)
+
+    def test_thin_structure_is_a_warning_that_never_fails_lint(self):
+        o = self.claim("DeepSeek-Flash")
+        bf = _Path(o["batch_file"])
+        batch = json.loads(bf.read_text())
+        first = batch["items"][0]["id"]
+        batch["items"][0]["episode_body"] += "\n改了 `tools/extract_campaign.py`，提交 3d6f574。"
+        bf.write_text(json.dumps(batch, ensure_ascii=False))
+        _Path(o["results_file"]).write_text(json.dumps({"items": [good_item(x["id"]) for x in batch["items"]]},
+                                                       ensure_ascii=False))
+        self.assertEqual(ec.cmd_lint("t1", o["batch"]), [])                     # 通过 / 失败判定不变
+        warns = ec.lint_structure_warnings("t1", o["batch"])
+        self.assertEqual(len(warns), 1)
+        self.assertTrue(warns[0].startswith(f"{o['batch']} {first}: 结构过薄"))
+        self.assertIn("tools/extract_campaign.py、3d6f574", warns[0])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = ec.main(["lint", "--id", "t1", "--batch", o["batch"]])
+        self.assertEqual(rc, 0)
+        self.assertIn("自检通过", buf.getvalue())
+        self.assertIn("提醒（1 条，不阻断）", buf.getvalue())
+
 
 
 class NoSelfObservationTest(unittest.TestCase):
@@ -930,9 +980,10 @@ class NameSyncSubmitTest(unittest.TestCase):
 
     def test_brief_and_claim_name_the_new_steps(self):
         text = ec.brief(ec.load(ec.campaign_dir("t1")), "DeepSeek-Flash")
-        for needle in ("namesync --id t1 --batch <批次> --apply --graph", "2 命名分裂", "75 读不到 NAS 温度", "76 闸门等待超时"):
+        for needle in ("prepare --id t1 --batch <批次>", "namesync --id t1 --batch <批次> --apply --graph", "2 命名分裂",
+                       "75 读不到 NAS 温度", "76 闸门等待超时"):
             self.assertIn(needle, text)
-        self.assertTrue(any(" namesync " in c for c in self.claim("DeepSeek-Flash")["next"]))
+        self.assertTrue(any(" prepare --id t1 " in c for c in self.claim("DeepSeek-Flash")["next"]))
 
 
 if __name__ == "__main__":

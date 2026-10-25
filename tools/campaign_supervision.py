@@ -19,6 +19,10 @@ from tools import agent_extract as ax, extract_campaign as ec, claim_registry, n
 from utils import process_receipts as receipts
 
 
+def normal_recovery(kind):
+    return kind in (None, 'none', 'diagnostic_unavailable', 'migration_drained')
+
+
 def completed(c: dict, d: Path, model: str, slot: int | None = None) -> int:
     batches = {b["id"]: b for b in c["batches"] if b["model"] == model
                and (slot is None or ec.batch_slot(c, b) == slot)}
@@ -163,7 +167,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     update(phase="coordinator_required", exit_code=2, reason="adopted_worker_terminal_unverified")
                     return {"model": model, "state": "blocked", "reason": "adopted_worker_terminal_unverified"}
                 adopt_exit = None
-                if (outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")
+                if (not normal_recovery(outcome.get("recovery_kind"))
                         and not (cleared and outcome.get("recovery_kind") == "nas_refused")):
                     update(phase="coordinator_required", exit_code=2, reason=outcome["recovery_kind"])
                     return {"model": model, "state": "blocked", "reason": outcome["recovery_kind"]}
@@ -211,7 +215,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 session = outcome.get("session") or session
                 bind_slot_session(d, model, slot, session)
                 if (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
-                        or (outcome.get("recovery_kind") not in (None, "none", "diagnostic_unavailable")
+                        or (not normal_recovery(outcome.get("recovery_kind"))
                             and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")
                     return {"model": model, "state": "blocked", "reason": "native_worker_blocked"}
@@ -224,7 +228,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             if count >= c["quota"]:
                 update(phase="quota_complete", success=count)
                 return {"model": model, "state": "complete", "success": count}
-            if (c.get('dispatch') or {}).get('state') == 'draining':
+            from tools.campaign_dispatch import pause_reason
+            if (c.get('dispatch') or {}).get('state') == 'draining' or (pause_reason(c, model, slot) and not own_pending):
                 update(phase='claims_drained', success=count)
                 return {'model': model, 'state': 'drained', 'success': count}
             if slot is not None and ec.claimed_items(c, model) >= c["quota"] and not own_pending:

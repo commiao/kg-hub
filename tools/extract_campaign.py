@@ -27,10 +27,14 @@
   launch  --tool codex|cursor|qodercli [--model ...]   打印「每个模型一个会话」的启动命令（退路 / 并行开会话）
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边、其余 fact 超 200 字符；
-          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交
+          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交；另出「结构过薄」提醒（不阻断）
   namesync --batch <批次 id> [--apply] [--graph]   命名同步（tools/campaign_namesync.py 的锚点键规则）：
           同键异名的自动改成规范名（--apply 改写结果文件，质量表之前做）；退出码 0 干净 / 2 还有要改的或会分裂
   namesync-replay                    回放本战役各批会被抓到的同键异名与分裂（只读，统计用）
+  prepare --batch <批次 id> [--sheet 路径] [--no-graph] [--fresh-dryrun]   写完结果后推荐只跑这一条：
+          lint → 命名同步（只写回确定性的）→ 质量表模板 + 引文候选 → 表填完则 quality-check → 至多一次整批 dry-run
+          （经 NAS 闸门；输入摘要没变且标记仍有效就复用上次预览）→ dry-run 后 lint / 分裂；只列要人判断的与下一步
+          （tools/campaign_prepare.py）。退出码 0 可以 submit；1 要人处理；2 命名分裂；75/76 闸门
   submit  --batch <批次 id> [--dry-run] [--allow-split 原因]   先 dry-run 看误并候选，再正式入库（模型、run_id、执行器从战役取）；
           两者都先过 NAS 重操作闸门（tools/nas_gate.py：全机锁、间隔、测温），正式提交前另查 dry-run 判出的命名分裂
   release --batch <批次 id> --reason <原因>   回收：没提交的整批、已提交的只回收没入库的条目，放回队列并还给配额，
@@ -39,7 +43,7 @@
   cost    --batch <批次 id> [--credits N] [--tokens N] [--seconds N]   记子代理这一批的消耗（每条成本只含子代理）
           --overhead [--credits ...] [--note]                         记编排者自己的开销（单独合计，不摊进模型）
   status                             各模型配额进度与每批状态
-  report  [--json 路径]               复盘表：每批一行 + 每个模型 × 约定版本合计
+  report  [--json 路径]               复盘表：每批一行 + 每个模型 × 约定版本合计（含恰2实体%、端点对/条等结构列）
 """
 from __future__ import annotations
 
@@ -58,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools import agent_extract as ax  # noqa: E402
 from tools import campaign_namesync as ns  # noqa: E402
 from tools import claim_registry  # noqa: E402
+from utils import extraction_structure as xs  # noqa: E402
 
 TOOL = "extract_campaign"
 CHAIN_NONE = "c0"
@@ -293,27 +298,28 @@ SUBAGENT_BRIEF = """你是 kg-hub 抽取对比战役的执行者，战役 {cid}�
    "edges": [{{"source","name","target","fact"}}]}}]}}。没有知识的观测给 "entities": []。
    **起草时就按一句一事实写短句**：第 3 条边起每条 fact 只写一件事、不超过 200 字符，装不下就拆成几条边，
    不要先写长句再回头删改或截断；新建实体的 summary 写够 30 字。
-4. 自检：$PY -m tools.extract_campaign lint --id {cid} --batch <批次>，改到「自检通过」（超长 fact、写反方向的有向边由 lint 逐条列出，不用自己写脚本查）。
-   命名同步（自检通过后、质量表之前）：$PY -m tools.extract_campaign namesync --id {cid} --batch <批次> --apply --graph
-   它按锚点键（文件=仓库+相对路径、纯标识符、工作树目录名）把同物异名统一成图里或更早批次的写法，不用你判断；
-   review 里的 core / pr / head / xrepo 只是提示，自己判断要不要改；graph_hints 说图里已有同名短节点的，优先用那个短名，
-   标 xrepo 的（图里同名节点连着别的仓库）按 suggest 加仓库前缀；server 列的是服务端会自己并过去的，不用改，
-   但「并过去」不对（不同的东西）时按规则 14 改名。--apply 后 applied 列出实际改了哪些名字。
-   退出码 0 干净；2 还有没改掉的（看 residual 与 skipped，手动改后再跑一次）。改过名要重新 lint。
-5. 预览：$PY -m tools.extract_campaign submit --id {cid} --batch <批次> --dry-run
-   逐条看 reuse_mismatch（抽出名 → 会并到的旧名）：并错的（不同的东西、更泛的旧名）按规则 14 改名，再自检、再预览；
-   标「（同批新建）」的是本批前面条目会新建的实体，判法相同。
-   再看 reused（每个复用一行：抽出名（类型）→ 被复用节点名（类型）「它的 summary 开头」）：同名也要看 summary 是不是同一个
-   仓库 / 同一件事（不同仓库的同名文件要带仓库前缀改名）；reuse_cross_type 列的是复用到不同类型节点的，逐条确认。
-   dry-run 之后再 lint 一次：这时才查新建实体的 summary（少于 30 字的补全；复用的实体不查），改过就再预览。
-6. 入库：$PY -m tools.extract_campaign submit --id {cid} --batch <批次>（逐条写图，可能超过 2 分钟，给足超时）。
-   dry-run 与入库都先过 NAS 闸门：排队等锁、留间隔、测温，可能要等几分钟到几十分钟，命令放后台跑、给足超时，不要中途杀掉重来。
-   退出码：0 成功；1 自检 / 质量表 / 没 dry-run 等原有拒绝；2 命名分裂（dry-run 会新建的名字在图里已有同键节点：
-   跑 namesync --apply、重新 lint、重做质量表和 dry-run 再提交）；3 dry-run 太旧判不了分裂（重新 dry-run）；
+4. 准备提交（结果文件合并好之后只跑这一条）：$PY -m tools.extract_campaign prepare --id {cid} --batch <批次>
+   它依次做 lint → 命名同步（只写回锚点键确定的同物异名）→ 生成质量表并预填引文候选 → 质量表填完则 quality-check →
+   整批 dry-run（每次至多一次；输入没变就复用上次预览，不再排闸门）→ dry-run 后再 lint、查命名分裂，输出一份精简报告：
+   stage（停在哪一步）、next（下一步做什么）、lint、namesync.applied（实际改了哪些名字）、namesync.review（要你判断的提示，不自动改）、
+   quality_sheet（表的路径与待确认项数）、merge_candidates（reuse_mismatch / reuse_cross_type / reused：抽出名（类型）→ 复用目标名（类型））。
+   照 next 做，改完再跑 prepare，直到 stage=ready。不用另写脚本比对改名前后、读 dry-run 输出，也不用手跑 lint / quality-sheet /
+   quality-check / submit --dry-run——这些 prepare 都做了、报告里都有；查图留给报告点名的疑点（graph_hints、review、merge_candidates）。
+   （工具版本没有 prepare 时退回单步：lint → namesync --id {cid} --batch <批次> --apply --graph → quality-sheet → quality-check → submit --dry-run。）
+5. 审质量表（路径在报告 quality_sheet.path）：填 reviewer；逐条读全文，下 verdict 与四个核对标志、空项写判空理由。
+   预填的引文带 candidate 键，只是候选：逐条核对，对就删掉 candidate，不对就改 quote（及 source / source_id）；空着的自己从原文找。
+   不批量删 candidate、不批量把标志改 true。命名：review 里的 core / pr / head / xrepo 自己判断要不要改；graph_hints 说图里已有同名短节点的优先用短名。
+   误并：reuse_mismatch 里并错的（不同的东西、更泛的旧名）按规则 14 改名，标「（同批新建）」的判法相同；reused 里同名也要看 summary
+   是不是同一个仓库 / 同一件事（不同仓库的同名文件带仓库前缀改名）；reuse_cross_type 逐条确认。
+   改了结果就重跑 prepare：质量表按内容重新生成，没改的条目沿用你确认过的引文作候选（仍要逐条确认）。
+6. 入库：stage=ready 后 $PY -m tools.extract_campaign submit --id {cid} --batch <批次>（沿用 prepare 那次预览，不要再 dry-run；逐条写图，给足超时）。
+   prepare 里的 dry-run 与 submit 都先过 NAS 闸门：排队等锁、留间隔、测温，可能要等几分钟到几十分钟，命令放后台跑、给足超时，不要中途杀掉重来。
+   退出码：0 成功（prepare：可以 submit）；1 要处理（prepare 看 next；submit 是自检 / 质量表 / 没 dry-run 等原有拒绝）；2 命名分裂（dry-run 会新建的名字在图里已有同键节点：
+   改成图里的写法后重跑 prepare 再提交）；3 dry-run 太旧判不了分裂（重跑 prepare --fresh-dryrun）；
    75 读不到 NAS 温度、76 闸门等待超时（都是没提交，停下汇报，不要绕过闸门）。
 7. 汇报（只输出这个 JSON）：
    {{"batch": "<批次>", "model": "{model}", "submitted": {{"ok": 0, "empty": 0, "error": 0}},
-    "dryrun_mismatch_seen": 0, "renamed_after_dryrun": 0,
+    "dryrun_mismatch_seen": 0, "renamed_after_dryrun": 0, "prepare_runs": 0,
     "credits": null, "tokens": null, "seconds": null,
     "lessons": ["最多 4 条：规则哪里不好用、哪类观测难抽、你做了什么取舍"]}}
    credits / tokens / seconds 只填你自己这一批的消耗（看得到就填，看不到写 null，不要估）。
@@ -344,9 +350,9 @@ def brief(c: dict, model: str, slot: int | None = None) -> str:
     text += (f"\n本战役冻结运行设置：effort={settings['effort']}，proxy_mode={settings['proxy_mode']}。"
              "原生会话使用 campaign launch 生成的 runtime exec 命令，确保正式调用与探测使用相同子进程环境和推理强度。"
              "宿主手工子代理定义仅提供模型与任务文本，不能证明宿主已应用这些设置；需工具侧证据，未验证不能声称就绪。\n")
-    return text + ("\n正式提交前：先 quality-sheet --id " + c["id"] + " --batch <批次> --out <审核表>，"
-                   "逐条读全文填证据、完整译文/事实/归属及判空理由，再 quality-check --id " + c["id"] +
-                   " --batch <批次> --review <审核表>。通过后才能dry-run和submit；改结果/正文/lookahead/规则都须重新审。"
+    return text + ("\n正式提交前：prepare --id " + c["id"] + " --batch <批次> 生成质量表（预填的引文只是候选），"
+                   "逐条读全文填证据、完整译文/事实/归属及判空理由，再跑 prepare（它做 quality-check 与整批 dry-run）。"
+                   "quality-check 通过后才能dry-run和submit；改结果/正文/lookahead/规则都须重新审。"
                    "审核不能自动填true或编造quote。提交成功不等于语义全对；成本不可见填unknown，不估。\n"
                    "新战役编排者先用 runtime probe --executor <原生CLI> --model <模型> --out <新凭据> 做真实无数据探测；"
                    "runtime inspect、binary、capabilities 或公共包hash不代表真实模型可用。Cursor/DSH手工通道无可验证探测时标未验证，不能冒绿。\n"
@@ -685,10 +691,13 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
     with locked(d):
         c = load(d)
         rules_text(d, c)
-        if (c.get('dispatch') or {}).get('state') == 'draining':
-            return {'done': False, 'paused': True, 'batch': None, 'model': model,
-                    'action': 'finish_current_batch_then_exit', 'message': '领取已冻结；完成当前批次后退出，不轮询或另开执行线。'}
+        from tools.campaign_dispatch import pause_reason, drain_spent_window
         slot = worker_slot(c, model, slot)
+        paused = pause_reason(c, model, slot)
+        if paused and paused != 'observation_budget_reached':
+            return {'done': False, 'paused': True, 'batch': None, 'model': model,
+                    'action': 'finish_current_batch_then_exit', 'reason': paused,
+                    'message': '领取已冻结；完成当前批次后退出，不轮询或另开执行线。'}
         if slot is not None:
             # An idempotent claim is also the only supported slot recovery path.
             pending = [b for b in c["batches"] if b["model"] == model and batch_slot(c, b) == slot
@@ -701,6 +710,9 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
                         "model": model, "run_id": c["models"][model]["run_id"], "chain": b["chain"],
                         "items": len(b["ids"]), "batch_file": str(d / "batches" / (b["id"] + ".json")),
                         "results_file": str(d / "results" / (b["id"] + ".json"))}
+        if paused:
+            return {'done': False, 'paused': True, 'batch': None, 'model': model,
+                    'reason': paused, 'action': 'finish_current_batch_then_exit'}
         with claim_registry.opened() as reg:
             if tracking["tracked"]:
                 c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "claim", "model": model,
@@ -747,15 +759,13 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
                                  **({"slot": slot} if slot is not None else {}),
                                  "status": "claimed", "claimed_at": _now(), "cost": {}})
             reg.reserve([i["id"] for i in picked], owner, info=bid)
+            drain_spent_window(c)
             save(d, c)
     run_id = c["models"][model]["run_id"]
     return {"done": False, "batch": bid, "model": model, "slot": slot, "run_id": run_id, "chain": c["chain"],
             "items": len(picked), "batch_file": str(bpath), "results_file": str(rpath),
-            "next": [f"{cli_command()} lint --id {cid} --batch {bid}",
-                     f"{cli_command()} namesync --id {cid} --batch {bid} --apply --graph",
-                     f"{cli_command()} quality-sheet --id {cid} --batch {bid} --out <审核表>",
-                     f"{cli_command()} quality-check --id {cid} --batch {bid} --review <审核表>",
-                     f"{cli_command()} submit --id {cid} --batch {bid} --dry-run",
+            "next": [f"{cli_command()} prepare --id {cid} --batch {bid}",
+                     "照 prepare 报告的 next 处理（审质量表、改名），再跑 prepare，直到 stage=ready",
                      f"{cli_command()} submit --id {cid} --batch {bid}",
                      f"{cli_command()} cost --id {cid} --batch {bid} --credits <N> --tokens <N> --seconds <N>"]}
 
@@ -805,6 +815,15 @@ def cmd_lint(cid: str, bid: str) -> list[str]:
     res = _results(d, bid)
     by_id = {int(it["id"]): it for it in res.get("items", [])}
     return lint_items(rows, by_id, new_names=dryrun_new_names(d, bid))
+
+
+def lint_structure_warnings(cid: str, bid: str) -> list[str]:
+    """结构过薄提醒（utils/extraction_structure.thin_structure_warnings）：只提醒，不算自检问题、不挡提交。"""
+    d = campaign_dir(cid)
+    batch, rows = _batch_rows(d, bid)
+    res = _results(d, bid)
+    by_id = {int(it["id"]): it for it in res.get("items", [])}
+    return xs.thin_structure_warnings(rows, by_id, {int(i["id"]): i.get("episode_body") or "" for i in batch["items"]})
 
 
 def lint_summary_pending(cid: str, bid: str) -> list[int]:
@@ -1080,9 +1099,8 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
             raise SystemExit(f"{bid} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}），先 --dry-run")
         split_guard(d, c, b, batch, results, allow_split=allow_split, layout=layout)
     model, run_id = b["model"], c["models"][b["model"]]["run_id"]
-    progress(phase="waiting_nas", may_have_written=False,
-             input_sha256=ax.quality.digest({"batch": batch, "results": results, "prompt": prompt,
-                                             "review": review, "identity": batch_identity(c, b)}),
+    input_sha256 = preview_input_digest(batch, results, prompt, review, batch_identity(c, b))
+    progress(phase="waiting_nas", may_have_written=False, input_sha256=input_sha256,
              source_keys=[{k: item[k] for k in ("source_description", "source_obs_id")} for item in batch["items"]])
     with (gate or no_gate)("dryrun" if dry_run else "submit"):
         progress(phase="submitting", may_have_written=not dry_run)
@@ -1114,7 +1132,41 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
         # 全部复用（含同名）逐条列出被复用节点的名字、类型、summary 开头：跨仓库同名、跨类型的误并在这里一眼可见
         out["reused"] = [ax.reuse_line(x, r["id"]) for r in recs for x in r.get("resolution") or [] if x.get("reused")]
         out["reuse_cross_type"] = [f"{r['id']}: {m}" for r in recs for m in r.get("reuse_cross_type") or []]
+        if not out["errors"] and set(counts) <= {"dry_run", "empty"}:
+            save_preview(d, bid, input_sha256, out)
+    else:
+        prev = load_preview(d, bid)
+        out["preview"] = {"reused": bool(prev) and prev.get("input_sha256") == input_sha256,
+                          "at": (prev or {}).get("at")}
     return out
+
+
+# ---------- 整批预览缓存（campaign prepare 复用） ----------
+# 摘要与提交回执的 input_sha256 同一口径：批次（含 lookahead）、结果、冻结规则、质量表、身份。
+# 缓存只省「输入没变时再排一次 NAS 闸门」：用它的一方（prepare）另要求 dry-run 标记仍覆盖当前每条结果
+# （dryrun_state == ok，与正式提交前的 dryrun_missing / split_guard 同一绑定），所以不放宽 v5 门禁。
+
+def preview_input_digest(batch: dict, results: dict, prompt: str, review, identity: dict) -> str:
+    return ax.quality.digest({"batch": batch, "results": results, "prompt": prompt,
+                              "review": review, "identity": identity})
+
+
+def preview_path(d: Path, bid: str) -> Path:
+    return d / "previews" / f"{bid}.json"
+
+
+def load_preview(d: Path, bid: str) -> dict | None:
+    data = ns.load_json(preview_path(d, bid))
+    return data if isinstance(data, dict) and isinstance(data.get("out"), dict) else None
+
+
+def save_preview(d: Path, bid: str, input_sha256: str, out: dict) -> None:
+    p = preview_path(d, bid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps({"batch": bid, "input_sha256": input_sha256, "at": _now(), "out": out},
+                              ensure_ascii=False, indent=1))
+    tmp.replace(p)
 
 
 def failed_ids(d: Path, bid: str) -> list[int]:
@@ -1299,7 +1351,10 @@ def batch_row(d: Path, b: dict) -> dict:
     rp = d / "results" / f"{b['id']}.json"
     res = {int(it["id"]): it for it in json.loads(rp.read_text()).get("items", [])} if rp.exists() else {}
     r = {"label": f"{b['id']}（{b['chain']}）", "model": b["model"], "chain": b["chain"], "status": b["status"],
-         **aggregate([item_metrics(res.get(i), t, ENTITY_TYPES, EDGE_TYPES) for i, t, _ in rows])}
+         **aggregate([item_metrics(res.get(i), t, ENTITY_TYPES, EDGE_TYPES) for i, t, _ in rows]),
+         **xs.structure_aggregate([xs.structure_metrics(res.get(i)) for i, _, _ in rows])}
+    # 跨观测复用率要和本模型别的批一起算，cmd_report 里补（apply_reuse）；这里只留每条非空观测的实体名集合
+    r["_keysets"] = [k for k in (xs.entity_keys(res.get(i)) for i, _, _ in rows) if k]
     final = final_statuses(d, b["id"], {x[0] for x in rows}) if b["status"] == "submitted" else {}
     # 预览误并候选（dry-run，执行者据此改名）与入库时实际发生的不同名复用分两列
     r.update(ok=sum(v == "ok" for v in final.values()),
@@ -1352,6 +1407,7 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     for k in ("ent_per_obs", "edge_per_obs", "offschema_edge_pct", "dangling_edge_pct", "headline_verbatim_pct",
               "second_other_lang_pct", "rest_fact_en_pct", "rest_fact_len", "rest_fact_len_ok_pct"):
         out[k] = round(sum((r.get(k) or 0) * r["_n"] for r in rows) / n, 2)
+    out.update(xs.merge_structure(rows))
     tri = [r["_triage"] for r in rows if r.get("_triage")]
     if tri:
         tsum = {k: sum(t[k] for t in tri) for k in TRIAGE_COUNTS}
@@ -1375,6 +1431,8 @@ REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error"
                ("dry_mismatch", "预览误并候选"),
                ("mismatch", "入库不同名复用"),
                ("ent_per_obs", "实体/条"), ("edge_per_obs", "边/条"), ("zero_edge", "零边"),
+               ("two_entity_pct", "恰2实体%"), ("pairs_per_obs", "端点对/条"), ("rest_relates_to_pct", "其余relates_to%"),
+               ("reuse_pct", "跨观测复用%"),
                ("offschema_edge_pct", "边名越界%"), ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"),
                ("dirty_name", "脏命名"), ("headline_verbatim_pct", "照抄标题%"), ("second_other_lang_pct", "译文边%"),
                ("rest_fact_en_pct", "其余英文%"), ("rest_fact_len", "其余均长"), ("rest_fact_len_ok_pct", "其余长度合规%"), ("random_reviewed", "随机抽查"),
@@ -1396,6 +1454,7 @@ def cmd_report(cid: str) -> dict:
     c = load(d)
     per = [batch_row(d, b) for b in c["batches"]
            if b["status"] != "released" and (d / "batches" / f"{b['id']}.json").exists()]
+    pools = apply_reuse(per)
     groups = {}
     for r in per:
         groups.setdefault((r["model"], r["chain"]), []).append(r)
@@ -1404,6 +1463,10 @@ def cmd_report(cid: str) -> dict:
     for r in per:
         by_model.setdefault(r["model"], []).append(r)
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
+    for ((m, _), rs), out in zip(sorted(groups.items()), totals):
+        out["reuse_pct"] = group_reuse(rs, pools[m])
+    for (m, rs), out in zip(sorted(by_model.items()), models):
+        out["reuse_pct"] = group_reuse(rs, pools[m])
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
     from kg_hub_eval.business.utils.evaluation_receipts import artifact, overhead_coverage
     evidence = [artifact(p) for p in [d / "campaign.json", d / "log.jsonl", d / "prompt.md",
@@ -1414,6 +1477,21 @@ def cmd_report(cid: str) -> dict:
             "evidence": evidence, "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "overhead": overhead_total(c), "triage": triage_summary(d, c), "models": models, "by_chain": totals,
             "batches": clean}
+
+
+def apply_reuse(per: list[dict]) -> dict[str, dict[str, int]]:
+    """跨观测复用率：每个模型一个参照池（名字 → 出现在本模型几条观测），按领批顺序累加。
+    每批行的参照池截至该批（含）——后领的批不会改写前面的行，所以早期批天然偏低；
+    返回各模型截至最后一批的参照池，合计行（按模型、按模型 × 约定版本）都用它算。不跨模型合并。"""
+    pools: dict[str, dict[str, int]] = {}
+    for r in per:
+        pool = xs.count_obs(r["_keysets"], pools.setdefault(r["model"], {}))
+        r["reuse_pct"] = xs.reuse_pct(*xs.reuse_counts(r["_keysets"], pool))
+    return pools
+
+
+def group_reuse(rows: list[dict], pool: dict[str, int]) -> float | None:
+    return xs.reuse_pct(*xs.reuse_counts([k for r in rows for k in r["_keysets"]], pool))
 
 
 def campaign_full(c: dict) -> bool:
@@ -1523,6 +1601,12 @@ def _main(argv=None) -> int:
     drain = sub.add_parser('drain', help='freeze new claims, allow current batch to finish, never kill a worker')
     drain.add_argument('--id', required=True)
     drain.add_argument('--reason', required=True)
+    resume = sub.add_parser('resume', help='resume idle dispatch; optionally bound new batches per model to original slot 1')
+    resume.add_argument('--id', required=True)
+    resume.add_argument('--reason', required=True)
+    limit = resume.add_mutually_exclusive_group(required=True)
+    limit.add_argument('--batches-per-model', type=positive_int)
+    limit.add_argument('--all-remaining', action='store_true')
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -1550,7 +1634,7 @@ def _main(argv=None) -> int:
     flight.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "review",
                  "cost", "status", "report", "mark-empty", "quality-sheet", "quality-check", "namesync",
-                 "namesync-replay", "operation-status", "reconcile-operation"):
+                 "namesync-replay", "operation-status", "reconcile-operation", "prepare"):
         s = sub.add_parser(name)
         s.add_argument("--id", required=True)
         if name == "start":
@@ -1579,7 +1663,8 @@ def _main(argv=None) -> int:
         if name == "agents":
             s.add_argument("--format", choices=("qodercli", "md"), default="qodercli")
             s.add_argument("--dir", help="md 格式写到这个目录（每个模型一个文件）；不给就打印")
-        if name in ("lint", "submit", "release", "review", "quality-sheet", "quality-check", "namesync", "operation-status", "reconcile-operation"):
+        if name in ("lint", "submit", "release", "review", "quality-sheet", "quality-check", "namesync", "operation-status",
+                    "reconcile-operation", "prepare"):
             s.add_argument("--batch", required=True)
         if name == "reconcile-operation":
             s.add_argument("--legacy-exit", type=Path, help="original unique legacy invocation exit receipt")
@@ -1591,6 +1676,10 @@ def _main(argv=None) -> int:
                            help="另对「标识符 + 短后缀」名问图里有没有同名短节点（只读，至多 20 次）")
         if name == "quality-sheet":
             s.add_argument("--out", required=True)
+        if name == "prepare":
+            s.add_argument("--sheet", help="质量表工作副本路径；缺省 <战役目录>/reviews/<批次>.sheet.json")
+            s.add_argument("--no-graph", action="store_true", help="命名同步不问图（缺省问，只读、至多 20 次）")
+            s.add_argument("--fresh-dryrun", action="store_true", help="不复用上次预览，重新整批 dry-run")
         if name == "quality-check":
             s.add_argument("--review", required=True)
         if name == "review":
@@ -1614,9 +1703,13 @@ def _main(argv=None) -> int:
             s.add_argument("--seconds", type=float)
         if name == "report":
             s.add_argument("--json")
-        if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation"):
+        if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation", "prepare"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
+    if a.cmd == 'resume':
+        from tools.campaign_dispatch import resume
+        print(json.dumps(resume(a.id, reason=a.reason, batches_per_model=a.batches_per_model), ensure_ascii=False, indent=2))
+        return 0
     if a.cmd == 'drain':
         from tools.campaign_migration import drain
         print(json.dumps(drain(a.id, a.reason), ensure_ascii=False, indent=2))
@@ -1634,7 +1727,8 @@ def _main(argv=None) -> int:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     if os.environ.get("KG_HUB_CAMPAIGN_SLOT") is not None and a.cmd in (
-            "lint", "submit", "release", "review", "cost", "quality-sheet", "quality-check", "namesync") and getattr(a, "batch", None):
+            "lint", "submit", "release", "review", "cost", "quality-sheet", "quality-check", "namesync",
+            "prepare") and getattr(a, "batch", None):
         cfg = load(campaign_dir(a.id))
         assert_worker_batch(cfg, find_batch(cfg, a.batch))
     if a.cmd == "supervise":
@@ -1718,6 +1812,9 @@ def _main(argv=None) -> int:
     elif a.cmd == "lint":
         probs = cmd_lint(a.id, a.batch)
         print("\n".join(probs) if probs else "自检通过")
+        warns = lint_structure_warnings(a.id, a.batch)
+        if warns:   # 只提醒：不计入问题数、不改退出码，submit 前的自检也不看它
+            print(f"\n提醒（{len(warns)} 条，不阻断）：\n" + "\n".join(warns))
         pending = lint_summary_pending(a.id, a.batch)
         if pending:
             print(f"注意：{len(pending)} 条还没 dry-run，新建实体 summary（规则 24，至少 30 字）要 dry-run 之后才查；"
@@ -1740,6 +1837,14 @@ def _main(argv=None) -> int:
                 triage_notify.notify_if_full(a.id)
             except Exception as exc:  # noqa: BLE001
                 print(f"[triage-notify] skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
+    elif a.cmd == "prepare":
+        from tools import campaign_prepare, nas_gate
+        token = ax.api_token()
+        out, code = campaign_prepare.cmd_prepare(
+            a.id, a.batch, url=a.url, token=token, gate=nas_gate.hold, sheet=a.sheet, fresh=a.fresh_dryrun,
+            lookup=None if a.no_graph else graph_lookup(a.url, token))
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return code
     elif a.cmd == "namesync-replay":
         out = cmd_namesync_replay(a.id)
     elif a.cmd == "namesync":
