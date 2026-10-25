@@ -79,7 +79,7 @@ class SubmissionLeaseTests(unittest.TestCase):
             check=lambda rows, *a: {row["source_obs_id"]: None for row in rows})
         self.assertTrue(absent["confirmed_not_written"])
         self.assertEqual(r.status(directory)["state"], "reconciled_not_written")
-        with r.attempt(directory, kind="submit"):
+        with r.attempt(directory, kind="submit", identity={"campaign":"t1","batch":bid}):
             pass
         self.assertEqual(ec.cmd_operation_status("t1", bid)["operation"]["state"], "completed")
 

@@ -121,6 +121,8 @@ def attempt(directory: Path, *, kind: str, identity: dict | None = None, allow_a
         except BlockingIOError as exc:
             raise Busy("original operation is live; read its receipt and wait") from exc
         previous = read(directory / "latest.json")
+        if previous.get("identity") and previous["identity"] != (identity or {}):
+            raise Uncertain("receipt identity differs from the original owner")
         if (previous.get("state") in {"invalid", "unreadable"}
                 or previous.get("state") == "running" and not allow_abandoned
                 or previous.get("requires_reconciliation")):

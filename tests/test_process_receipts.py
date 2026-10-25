@@ -83,6 +83,15 @@ class ReceiptTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {'OPENAI_API_KEY':bad}), self.assertRaises(ValueError):
                 extract_runtime.execute([sys.executable,'-c','raise AssertionError()'],proxy_mode='none')
 
+    def test_different_owner_cannot_replace_a_completed_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with r.attempt(root,kind='supervisor',identity={'model':'first'}): pass
+            original = (root/'latest.json').read_bytes()
+            with self.assertRaises(r.Uncertain):
+                with r.attempt(root,kind='supervisor',identity={'model':'other'}): pass
+            self.assertEqual((root/'latest.json').read_bytes(),original)
+
 
 if __name__ == "__main__":
     unittest.main()

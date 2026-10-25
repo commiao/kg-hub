@@ -32,6 +32,7 @@ def execute(argv, *, proxy_mode="auto", receipt_dir: Path | None = None) -> int:
     if receipt_dir is not None:
         from utils import process_receipts as receipts
         with receipts.attempt(receipt_dir, kind="native_cli") as update:
+            update(argv_sha256=runtime._digest(list(argv)), proxy_mode=proxy_mode)
             code = execute_child(argv, env, update)
             update(exit_code=code)
             return code

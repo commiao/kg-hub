@@ -206,9 +206,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             entry = Path(os.environ.get("KG_HUB_CODE", "~/.local/share/kg-hub/current")).expanduser() / "tools/extract"
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],
                     "--receipt-dir", str(native), "--", *native_args(c, model, session)]
-            out_fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            err_fd = os.open(error, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(out_fd, "wb") as out, os.fdopen(err_fd, "wb") as err:
+            with os.fdopen(os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as out, \
+                    os.fdopen(os.open(error, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as err:
                 child = spawn(args, cwd=ec.workspace_dir(), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                               start_new_session=True)
             # A just-spawned wrapper has not acquired its lease yet. Do not
