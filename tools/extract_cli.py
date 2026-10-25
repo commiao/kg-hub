@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,14 @@ sys.path.insert(0, str(CODE_ROOT))
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "campaign" and os.environ.get("LLM_EVAL_ACTIVE_BUNDLE"):
+        delegated = os.environ.get("LLM_EVAL_DELEGATED_BACKEND")
+        if not delegated:
+            from llm_eval.cli import main as common_main
+            return common_main(["campaign", "--scenario", "kg_hub.entity_extract", "--", *args[1:]])
+        release = json.loads((CODE_ROOT / "RELEASE.json").read_text())
+        if release.get("commit") != delegated:
+            raise SystemExit("delegated campaign backend identity differs")
     if args == ["--runtime"]:
         print(json.dumps({"python": sys.executable, "version": sys.version.split()[0], "code_root": str(CODE_ROOT)}))
         return 0
