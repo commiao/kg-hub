@@ -146,4 +146,3 @@ def attempt(directory: Path, *, kind: str, identity: dict | None = None, allow_a
             raise
         else:
             update(state="completed", ended_at=now(), exit_code=record.get("exit_code", 0))
-
