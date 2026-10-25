@@ -69,6 +69,7 @@ def legacy_proof(exit_path: Path, events_path: Path, session: str, cid: str, bid
     if ended.tzinfo is None or ended.timestamp() > time.time() + 30:
         raise ValueError('legacy native exit timestamp must include timezone')
     native_session, last_terminal, last_event, pending, latest = None, None, None, set(), None
+    writers = []
     with events_path.open() as stream:
         for line in stream:
             event = json.loads(line)
@@ -90,12 +91,18 @@ def legacy_proof(exit_path: Path, events_path: Path, session: str, cid: str, bid
             if event.get('type') == 'item.started':
                 pending.add(item['id'])
             elif event.get('type') == 'item.completed':
+                if item['id'] not in pending:
+                    raise ValueError('legacy command completion has no matching start')
                 pending.discard(item['id'])
                 latest = {**scope, 'command_id': item['id'], 'exit_code': item.get('exit_code')}
+                if scope['kind'] == 'submit':
+                    writers.append(item['id'])
     if native_session != session or last_terminal != 'turn.completed' or last_event != 'turn.completed' or pending:
         raise ValueError('legacy session terminal or command completion unverified')
     if not latest or latest['exit_code'] != 76 or not latest['log']:
         raise ValueError('legacy proof must show the last exact command ended at the NAS gate')
+    if writers and (len(writers) != 1 or latest['kind'] != 'submit' or writers[0] != latest['command_id']):
+        raise ValueError('earlier legacy write request terminal cannot be inferred from a later gate timeout')
     console = Path(latest['log'])
     if not console.is_absolute() or console.stat().st_mtime > ended.timestamp() + 1:
         raise ValueError('legacy console is not frozen before native exit')
