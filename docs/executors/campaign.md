@@ -209,6 +209,45 @@ xrepo 不自动加前缀：正文路径可能是暂存或部署副本（回放�
 | 75 | NAS 闸门：连续 5 轮读不到温度，没提交 | 停下汇报（02:00 前后属正常，过后重跑） |
 | 76 | NAS 闸门：排队、间隔、降温合计等了 1 小时还没放行，没提交 | 停下汇报，不要绕过闸门 |
 
+## 提交前准备合成一条：`campaign prepare`
+
+2026-10-24 opus2000 战役实测，每批成本 ≈ 27.7 万 token + 1.3 千 token × 工具调用数（r=0.72）；工具调用从 c1 的 48 次涨到
+c10 的 113 次以上，多出来的几乎都是流程步骤：分别跑 lint、namesync check/apply、写脚本比对改名前后、quality-sheet → 手填 →
+quality-check、整批 dry-run（常常 2 次）、再写脚本读 dry-run 输出。`prepare` 把这些串成一条命令，只把要人判断的列出来：
+
+```bash
+"$CLI" campaign prepare --id <战役> --batch <批次> [--sheet <质量表路径>] [--no-graph] [--fresh-dryrun]
+```
+
+| 顺序 | 做什么 | 停下的条件 |
+|---|---|---|
+| 1 | `lint`（离线） | 有问题 → `stage=lint` |
+| 2 | 命名同步（与 `namesync --apply --graph` 同一套）：只写回 `auto`（锚点键确定的同物异名）；`review` / `server` 只列出；改过名再 lint | 有改不掉的 → `stage=namesync` |
+| 3 | 质量表（v5）：缺省写到 `<战役目录>/reviews/<批次>.sheet.json`，为每条边与 summary 预填**引文候选**；表已存在且内容没变就不覆盖 | 没填完（缺审阅人、有行没下结论、候选没确认、引文空着）或有判 error 的行 → `stage=quality_sheet` |
+| 4 | 表填完 → `quality-check`（通过后照旧存一份到 `reviews/<批次>.json` 供提交） | 不通过 → `stage=quality_check`，列 errors |
+| 5 | 整批 dry-run，**每次 prepare 至多一次**，经 NAS 闸门；输入摘要没变且 dry-run 标记仍覆盖当前每条结果时直接复用上次预览 | 闸门拒绝（75/76）或有条目报错 → `stage=dryrun` |
+| 6 | dry-run 之后再 lint（新建实体 summary）、按 `new_entities` 查命名分裂，列误并候选 | summary 过短 → `post_lint`；会分裂 → `splits`（退出码 2） |
+
+报告（JSON）字段：`stage`、`ready`、`next`（下一步做什么）、`lint`、`namesync`（`applied` 实际改名、`review` 要判断的提示、`residual`、`graph_hints`）、
+`quality_sheet`（路径、`status` 里的待确认项数、`candidates` 预填计数）、`quality_check`、`dryrun`（`cached`、`by_status`、`errors`）、
+`merge_candidates`（`reuse_mismatch` / `reuse_cross_type` / `reused`：抽出名（类型）→ 复用目标名（类型）「summary 开头」）、`post_lint`、`splits`。
+退出码：0 可以 `submit`；1 要人处理（看 `next`）；2 命名分裂；75 / 76 闸门没放行；73 / 74 同 `submit` 的回执状态。
+
+**引文候选**（`utils/quality_candidates.py`）：确定性的句子匹配，不调模型。出处按本条正文 → lookahead → 同批其他条目找字词重合最多的原句
+（照抄标题与标题译文两条边取标题行；`belongs_to` 只在本条正文里找、且句子要含目标名）。写进表之前用与 `quality-check` 同一套取证再核一遍，
+保证是冻结输入里真实存在的子串；核不过就不填。候选带 `candidate` 键（`true` 是匹配所得，`previous_review` 是结果改过后从上一版表沿用的、
+审阅者当时填的引文）。**候选不是通过**：verdict、四个核对标志、判空理由一律不预填；审阅者逐条核对，对就删掉 `candidate`，不对就改 quote。
+`candidate` 键不影响 `quality-check` 的任何判定，`prepare` 自己见到还有没确认的候选就不往 quality-check / dry-run 走。
+
+**预览复用**：每次整批 dry-run 成功（没有报错）后，`submit --dry-run` 把输出存到 `<战役目录>/previews/<批次>.json`，键是
+（批次含 lookahead、结果、冻结规则、质量表、身份）的摘要——与提交回执的 `input_sha256` 同一口径。`prepare` 只在摘要一致**且**
+dry-run 标记仍覆盖当前每条结果（`dryrun_state == ok`，与正式提交前查的同一绑定）时复用；任何一项变了就重新 dry-run。
+正式 `submit` 的门禁不变（每条都要按当前内容预览过、另查命名分裂），输出里 `preview.reused` 说明是否沿用了这次预览。
+预览不随图的变化失效（与原有 dry-run 标记一样）；隔了很久或别的批次刚入库很多，用 `--fresh-dryrun` 重跑。
+
+推荐流程：**写完结果 → `prepare` → 处理报告（改 lint / 名字、审质量表、看误并候选）→ 再 `prepare` 直到 `stage=ready` → `submit`**。
+单步命令（`lint`、`namesync`、`quality-sheet`、`quality-check`、`submit --dry-run`）行为不变，仍可单独用。
+
 ## 每模型并发组数、每组条数与总配额
 
 三个参数相互独立：`--parallel` 是每模型并发组数（缺省1），`--batch` 是每组条数，
@@ -390,11 +429,9 @@ Codex `supervise` 默认相邻槽位错开300秒；`--stagger-seconds 0` 可同�
    "$CLI" campaign start --id <战役> --models <模型...> --executor <工具> --quota <配额> --batch <每组> --parallel <每模型并发> --model-preflight <每模型新探测回执...>
 2. 每一轮：按每模型并发槽派子代理，**子代理必须用那个模型**，多路任务说明用 `"$CLI" campaign brief --id <战役> --model <模型> --slot <槽位>` 的输出
    （或直接用 `agents` 生成的子代理定义，见下文「各工具怎么派」）。
-   每批正式提交前先生成并完成逐条质量证据：
-   "$CLI" campaign quality-sheet --id <战役> --batch <批次> --out <质量表>
-   质量表身份自动绑定manifest中的真实模型、执行工具和run_id；审阅完整原文与lookahead，填写真实证据后：
-   "$CLI" campaign quality-check --id <战役> --batch <批次> --review <质量表>
-   质量表之前子代理已跑过 `namesync --apply --graph`；dry-run 与正式 submit 都经 NAS 闸门排队，正式 submit 另查命名分裂（退出码 2 退回子代理按报告改名重做）。
+   子代理写完结果后跑 `"$CLI" campaign prepare --id <战役> --batch <批次>`：它做 lint、命名同步（只写回确定性的）、生成质量表并预填引文候选；
+   质量表身份自动绑定manifest中的真实模型、执行工具和run_id；审阅完整原文与lookahead、逐条确认候选并填写真实证据后再跑 prepare，
+   它做 quality-check 与至多一次整批 dry-run（经 NAS 闸门，输入没变就复用预览），报告误并候选与下一步；正式 submit 另查命名分裂（退出码 2 退回子代理按报告改名重做）。
    并行 4 路时错开约 5 分钟派出，让先落盘的分片名字被后面的批次查到。
    然后dry-run判读、正式submit；结果或身份改变须重审、整批重预览，前项变更也影响后项pending实体上下文。子代理并行跑；全部回来后：
    "$CLI" campaign report --id <战役>
@@ -428,10 +465,10 @@ Codex `supervise` 默认相邻槽位错开300秒；`--stagger-seconds 0` 可同�
 "$CLI" campaign agents --id <战役> --format md --dir <目录> # 写成带 frontmatter 的定义文件（含 model 字段）
 ```
 
-子代理的流程：读 `rules` → `claim` 领一批 → 每 10 条一组读全文抽取（起草时就按一句一事实写短句）→ `lint` 自检 →
-`namesync --apply --graph` 命名同步（改过名再 lint）→ `quality-sheet` 生成待审表 → 逐条提供原文证据并核对归属/完整句/译文/覆盖及判空 → `quality-check` →
-`submit --dry-run` 看复用候选 → 再 `lint` 一次（查新建实体 summary）→ `submit` 入库（自动查命名分裂；两次提交都经 NAS 闸门，
-退出码见上文「`submit` / `namesync` 的退出码」）。
+子代理的流程：读 `rules` → `claim` 领一批 → 每 10 条一组读全文抽取（起草时就按一句一事实写短句）→ 合并成结果文件 →
+`prepare`（lint、命名同步、质量表 + 引文候选，见上文「提交前准备合成一条」）→ 按报告的 `next` 处理：审质量表（逐条核对候选引文、
+归属/完整句/译文/覆盖及判空）、改名 → 再 `prepare`（quality-check + 整批 dry-run，看误并候选）直到 `stage=ready` → `submit` 入库
+（沿用 prepare 的预览；自动查命名分裂；dry-run 与提交都经 NAS 闸门，退出码见上文「`submit` / `namesync` 的退出码」与 prepare 一节）。
 被权限、hook 或分类器拦下时立即停下汇报，不换写法绕过。
 若修改结果或身份，重新生成并审阅质量表、重新核验和整批预览。汇报包括实际终态、未修问题与成本覆盖。红线同 [_common.md](_common.md)。
 

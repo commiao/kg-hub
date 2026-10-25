@@ -154,7 +154,12 @@ CLAUDE.md），不入库；跑完自动自检并出合表。三种执行器统�
      其他宿主按 `agents` 生成的每模型×槽位定义派发，`brief` / `claim` 都带 `--slot`。
      `campaign status` 的 `parallel` / `configured_workers` 是配置，`active_workers` / `worker_slots` 是实际回执与持锁状态；分别汇报，不能拿配置数冒充运行数。
      抽取和本地校验可并行，NAS预览和提交继续共用原闸门；命名同步、质量核验与温控规则不变。
-4. **命名同步**（lint 通过后、质量表之前）：`"$CLI" campaign namesync --id <战役> --batch <批次> --apply --graph`。
+4. **推荐流程：写完结果 → `"$CLI" campaign prepare --id <战役> --batch <批次>` → 处理报告 → 确认质量表 → 再 prepare 到 `stage=ready` → `submit`。**
+   prepare 一条命令依次做 lint → 命名同步（只写回确定性的）→ 质量表模板 + 引文候选（标 `candidate`，不预填结论与核对标志）→
+   表填完则 quality-check → 至多一次整批 dry-run（经 NAS 闸门；输入摘要没变且预览标记仍有效就复用）→ dry-run 后 lint 与命名分裂，
+   只输出要人判断的项与 `next`；退出码 0 可以 submit、1 要处理、2 分裂、75/76 闸门。详见 `docs/executors/campaign.md`「提交前准备合成一条」。
+   下面各步的单独命令行为不变，prepare 不可用时照旧单步执行。
+   **命名同步**（lint 通过后、质量表之前）：`"$CLI" campaign namesync --id <战役> --batch <批次> --apply --graph`。
    按锚点键（文件 = 仓库 + 相对路径、纯标识符、工作树目录名）把同物异名统一成图里挂得最多的干净节点名 > 更早的待提交批次 > 本批首次写法；
    core / pr / head 三类只报告，子代理自己判断。退出码 0 干净、2 还有没改掉的；改过名要重新 lint。编排者用 `namesync-replay --id <战役>` 回放统计。
    **每批提交前先过语义门**：`quality-sheet --id <战役> --batch <批次> --out <质量表>` 生成待评表，身份自动取 manifest（真实模型/工具/run_id）。
