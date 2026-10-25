@@ -43,8 +43,11 @@ def drain(cid: str, reason: str) -> dict:
         c = ec.load(d)
         ec.rules_text(d, c)
         if (c.get('dispatch') or {}).get('state') != 'draining':
+            window = (c.get('dispatch') or {}).get('window')
             c['dispatch'] = {'state': 'draining', 'id': uuid.uuid4().hex,
                              'requested_at': ec._now(), 'reason': reason}
+            if window:
+                c['dispatch']['window'] = window
             ec.save(d, c)
         return {'campaign': cid, 'dispatch': c['dispatch'], 'action': 'finish_current_batch_then_exit'}
 
@@ -113,7 +116,7 @@ def _prepare(c, d, parallel, proof):
         if (state['lease_held'] is not False or state['state'] != 'completed'
                 or state.get('exit_code') != 0 or not state.get('ended_at')
                 or outcome.get('session') != sid or outcome.get('terminal') != 'turn.completed'
-                or outcome.get('recovery_kind') not in (None, 'none', 'diagnostic_unavailable', 'migration_drained')):
+                or not supervision.normal_recovery(outcome.get('recovery_kind'))):
             raise ValueError(f'{model}: original native worker is live or its clean terminal is unverified')
         if outcome.get('hard_stop'):
             from tools.campaign_recovery import stops_reconciled

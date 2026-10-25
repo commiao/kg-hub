@@ -46,6 +46,8 @@ class MigrationTests(unittest.TestCase):
             events = root / 'coordinator-recovery.events.jsonl'
             sid = 'original-' + model
             events.write_text(json.dumps({'type': 'thread.started', 'thread_id': sid}) + '\n' +
+                              json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
+                                  'text': json.dumps({'recovery_kind': 'migration_drained'})}}) + '\n' +
                               json.dumps({'type': 'turn.completed'}) + '\n')
             r.write(root / 'worker.json', {'session': sid, 'events': str(events)})
             with r.attempt(root, kind='supervisor', identity={'campaign': self.c['id'], 'model': model}) as update:
