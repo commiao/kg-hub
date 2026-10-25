@@ -608,6 +608,7 @@ def claude_mem_trends(snapshots: list[dict], now: datetime) -> list[dict]:
                                     or now.timestamp()-telemetry.get("sampled_at",0)>1200),
                        "error":telemetry.get("error"),
                        "current":telemetry.get("current") or [], "rows":rows,
+                       "latest":rows[-1] if rows else None,
                        "rate_rows":rate_rows, "unchanged_hours":unchanged_hours})
     return result
 
@@ -676,7 +677,6 @@ def scope_series(data: dict, start: datetime, end: datetime) -> None:
     first_at = rows[0]["at"] if rows else None
     queues.update(first_at=first_at, bucket_seconds=bucket,
                   rows=thin_rows(_in_window(rows, start, end), bucket,
-                                 rates=("live_rate", "backlog_rate"),
                                  bursts=("live_burst", "backlog_burst")))
     first = _parse_ts(first_at) if first_at else None
     history = [r for r in _in_window(data.get("backlog_remaining_history") or [], start, end)
@@ -1492,7 +1492,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <section id=queue-trends>
 <h2>claude-mem · 压缩队列</h2>
 <div class=cards id=cmcards></div>
-<div class=note>队列剩余趋势：所选时间范围，按小时保留采样，缺测处断开。北京时间；光标或方向键可查看数值。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。数量持平不能说明 worker 是否在正常处理。</div>
+<div class=note>队列剩余与净速度使用同一所选时间范围，按小时保留采样。净速度 = 相邻有效采样的队列减少量 ÷ 实际间隔，折算为条/小时；正值表示积压减少，负值表示积压增长，0 表示持平，并非新增观测数或 LLM 处理吞吐。缺测、worker 重启处断开，历史日志不能推算速度。待核验表示暂停自动处理、等待核实的任务；无账本或缺测显示未知，历史不回填。剩余使用 worker 自报口径，可能包含待核验，两条曲线不可相加。北京时间；光标或方向键可查看数值。</div>
 <div class=trend-grid id=cmtrends></div>
 <h3 style="font-size:14px;margin:1rem 0 .3rem">claude-mem · 新增观测</h3>
 <div class=cards id=cmcreatedcards></div>
@@ -1501,7 +1501,7 @@ th{font-size:12px;color:GrayText;font-weight:500}
 <h2>kg-hub · 入图积压消化</h2>
 <div class=cards id=bcards></div>
 <div class=cards id=kgqueuecards></div>
-<div class=note>剩余趋势与净速度使用同一所选时间范围；净速度单位为条/小时。每 2 分钟自动采样，无需打开看板。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测或重启处断开，新指标从首次采样开始。单个采样间隔内源库增减 ≥200 条记为同步补灌（橙色虚线），不计入速度；极端值贴边显示，光标仍读出原值。北京时间，光标或方向键可查看数值。</div>
+<div class=note>剩余趋势与净速度使用同一所选时间范围；每 2 分钟自动采样，无需打开看板。净速度主线和当前卡片使用近 1 小时队列净减少量 ÷ 有效覆盖时长，折算为条/小时；不足 1 小时按实际覆盖计算，悬停可看覆盖分钟数及相邻采样短时速度。正值表示队列净减少，负值表示净增加，0 表示持平；待核验以独立曲线显示，不算入图成功；剩余下降而待核验上升，表示转入核验，并非成功消化。缺测、重启或同步补灌后重新累计有效覆盖。单个采样间隔内源库增减 ≥200 条记为同步补灌（橙色虚线），不计入速度；极端值贴边显示，光标仍读出原值。北京时间，光标或方向键可查看数值。</div>
 <div class=trend-grid id=backlogtrends></div>
 <div class=lg>所选范围入图 Episode（图内实数；北京时间，短范围按小时、超过2天按自然日分桶）：<i style="background:#1D9E75"></i>积压线<i style="background:#5B8FF9"></i>live 线<i style="background:#D97706"></i>会话自抽取<i style="background:#0E7490"></i>网关单次<i style="background:#B79CED"></i>其他源</div>
 <div id=daily></div>
@@ -1552,8 +1552,10 @@ $('cmcards').innerHTML=compressionHosts.length?compressionHosts.flatMap(h=>
    const at=w&&Number.isFinite(w.at)?new Date(w.at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'未知';
    const depth=w&&Number.isFinite(w.depth)?w.depth+' 条':'暂无数据';
    const held=w&&Number.isFinite(w.held)?w.held+' 条':'未知';
+   const last=h.latest;
+   const rate=!h.stale&&w&&!w.error&&last?last[key+'_rate']:null;
    const warning=h.stale?'数据过期':h.error||w?.error?'采样异常':'';
-   return '<div class=card><b>'+esc(h.host)+' · '+label+'（当前）</b><div>队列剩余：'+depth+'</div><div>待核验：'+held+'</div><small>'+esc(w?.held_error||'')+'</small><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
+   return '<div class=card><b>'+esc(h.host)+' · '+label+'（当前）</b><div>队列剩余：'+depth+'</div><div>净速度：'+fmt(rate)+' 条/小时</div><div>待核验：'+held+'</div><small>'+esc(w?.held_error||'')+'</small><small>采样：'+esc(at)+' 北京时间'+(warning?' · '+warning:'')+'</small></div>';
  })).join(''):'<div class=note>暂无 claude-mem 采样数据</div>';
 $('gen').textContent='快照 '+D.generated_at_beijing+' · 每 2 分钟自动刷新 · 数据接口 /dashboard/flow.json';
 if(D.source_errors.length){$('errs').innerHTML='<div class=warn>部分数据源不可读：'+D.source_errors.map(esc).join('；')+'</div>'}
@@ -1625,7 +1627,7 @@ const processingData=[
 const backlogData=[];
 const kgQueues=D.refinery_queue_trends||{rows:[],latest:null,stale:true};
 const kgLast=kgQueues.latest;
-$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列（当前）'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_rate']:null)+' 条/小时</div><small>待核验 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
+$('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 队列（当前）'+(kgQueues.stale?' · 等待新鲜采样':'')+'</b><div>剩余 '+fmt(kgLast&&kgLast[k])+' 条 · 净速度 '+fmt(!kgQueues.stale&&kgLast?kgLast[k+'_trend_rate']:null)+' 条/小时（近1小时平均）</div><small>有效覆盖 '+fmt(kgLast?Math.round(kgLast[k+'_rate_coverage_s']/60):null)+' 分钟 · 待核验 '+fmt(kgLast&&kgLast[k+'_held'])+' 条'+(kgLast?' · '+esc(kgLast.label):'')+'</small></div>').join('');
 ['live','backlog'].forEach(k=>{
  let rows=kgQueues.rows||[];
  if(k==='backlog'){
@@ -1636,9 +1638,11 @@ $('kgqueuecards').innerHTML=['live','backlog'].map(k=>'<div class=card><b>'+k+' 
  const color=k==='live'?'#378ADD':'#8250C4';
  backlogData.push({title:k+' · 队列剩余趋势',unit:' 条',gapMinutes:10,bucketSeconds:kgQueues.bucket_seconds,continuity:true,rows:filterRows(rows),
    burst:k+'_burst',series:[['剩余',k,color],['待核验',k+'_held','#E07A5F']]});
- backlogData.push({title:k+' · 净消化速度',unit:' 条/小时',gapMinutes:10,bucketSeconds:kgQueues.bucket_seconds,continuity:true,zeroBaseline:true,robust:true,
+ backlogData.push({title:k+' · 净消化速度（近1小时平均）',unit:' 条/小时',gapMinutes:10,bucketSeconds:kgQueues.bucket_seconds,continuity:true,zeroBaseline:true,robust:true,
    rows:filterRows(kgQueues.rows),burst:k+'_burst',
-   series:[['净消化速度',k+'_rate',color]]});
+   series:[['平均净速度',k+'_trend_rate',color]],
+   extra:r=>['<span>有效覆盖 '+fmt(Math.round(r[k+'_rate_coverage_s']/60))+' 分钟</span>',
+     '<span>短时净速度（相邻采样折算） '+fmt(r[k+'_rate'])+' 条/小时</span>']});
 });
 backlogData.push(...processingData);
 const cmOffset=backlogData.length;
@@ -1646,6 +1650,8 @@ compressionHosts.forEach(h=>{
  [['current','新 worker','#D97706']].forEach(([key,name,color])=>{
    backlogData.push({title:esc(h.host)+' · '+name+' · 队列剩余趋势',unit:' 条',gapMinutes:90,rows:filterRows(h.rows),
      series:[['剩余',key,color],['待核验',key+'_held','#E07A5F']]});
+   backlogData.push({title:esc(h.host)+' · '+name+' · 净消化速度',unit:' 条/小时',gapMinutes:90,zeroBaseline:true,robust:true,
+     rows:filterRows(h.rows),series:[['净消化速度',key+'_rate',color]]});
  });
 });
 const cmCreatedIndex=backlogData.length;

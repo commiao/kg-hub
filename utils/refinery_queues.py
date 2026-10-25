@@ -1,11 +1,13 @@
 """Real queue snapshots, independent of dispatch limits and dashboard visits."""
 from contextlib import closing
+from collections import deque
 from pathlib import Path
 import sqlite3
 
 INTERVAL = 120
 RETENTION = 30 * 86400
 MAX_GAP = 600
+RATE_WINDOW = 3600
 # Normal Mac→NAS syncs add a few dozen rows every 15 minutes. A jump this large
 # in one 2-minute interval is a delayed sync landing at once (2026-10-08: +4405
 # rows after 4.7 days without sync), not a digestion rate worth plotting.
@@ -72,18 +74,39 @@ def read(history: Path, now: float) -> list[dict]:
             "SELECT * FROM samples WHERE at >= ? AND at <= ? ORDER BY at",
             (now - RETENTION, now + 60))]
     previous = None
+    windows = {kind: deque() for kind in ("live", "backlog")}
     for row in rows:
         for kind in ("live", "backlog"):
             row[kind + "_rate"] = row[kind + "_burst"] = None
+            row[kind + "_trend_rate"] = None
+            row[kind + "_rate_coverage_s"] = 0
+            window = windows[kind]
             if (previous and row["process"] == previous["process"]
                     and row["boundary"] == previous["boundary"]
                     and 0 < row["at"] - previous["at"] <= MAX_GAP):
                 total, before = row.get(kind + "_total"), previous.get(kind + "_total")
                 if total is not None and before is not None and abs(total - before) >= BURST_ROWS:
                     row[kind + "_burst"] = total - before
+                    window.clear()
                     continue
+                elapsed = row["at"] - previous["at"]
+                delta = previous[kind] - row[kind]
                 row[kind + "_rate"] = round(
-                    (previous[kind] - row[kind]) * 3600 / (row["at"] - previous["at"]), 1)
+                    delta * 3600 / elapsed, 1)
+                # A 2-minute completion burst is not sustained hourly throughput.
+                # Integrate the actual queue deltas over the trailing hour, with
+                # elapsed-time weights and no bridging of restarts/gaps/refills.
+                window.append((previous["at"], row["at"], delta))
+                cutoff = row["at"] - RATE_WINDOW
+                while window and window[0][1] <= cutoff:
+                    window.popleft()
+                covered = row["at"] - max(cutoff, window[0][0])
+                net = sum(change * (end - max(start, cutoff)) / (end - start)
+                          for start, end, change in window)
+                row[kind + "_trend_rate"] = round(net * 3600 / covered, 1)
+                row[kind + "_rate_coverage_s"] = round(covered, 1)
+            else:
+                window.clear()
         previous = row
     return rows
 
