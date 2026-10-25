@@ -88,6 +88,64 @@ class QueueTests(unittest.TestCase):
         self.wm["boundary_id"] = 60
         self.sample(self.now + 1020, "b")
         self.assertTrue(all(r["live_rate"] is None for r in Q.read(self.history, self.now + 1020)))
+        self.assertTrue(all(r["live_trend_rate"] is None
+                            for r in Q.read(self.history, self.now + 1020)))
+
+    def write_levels(self, levels):
+        """Replay persisted samples without performing model or graph calls."""
+        self.sample()
+        with closing(sqlite3.connect(self.history)) as db, db:
+            db.execute("DELETE FROM samples")
+            db.executemany("INSERT INTO samples VALUES (?, 'a', 10, ?, 0, 0, 0, 2000, 0)",
+                           [(self.now + offset, depth) for offset, depth in levels])
+
+    def test_hourly_trend_matches_queue_drop_despite_completion_spikes(self):
+        # Fifty completions every ten minutes: the old chart oscillates between
+        # 0 and 1500/h although the queue falls by just 300 over the hour.
+        levels = [(i * 120, 1000 - i // 5 * 50) for i in range(31)]
+        self.write_levels(levels)
+        rows = Q.read(self.history, self.now + 3600)
+        self.assertEqual({r["live_rate"] for r in rows[1:]}, {0, 1500})
+        self.assertEqual(rows[-1]["live_trend_rate"], 300)
+        self.assertEqual(rows[-1]["live_rate_coverage_s"], 3600)
+        self.assertEqual(rows[0]["live"] - rows[-1]["live"],
+                         rows[-1]["live_trend_rate"])
+        self.assertEqual(rows[-1]["backlog_trend_rate"], 0)
+
+    def test_partial_window_is_weighted_by_elapsed_time_and_can_be_negative(self):
+        self.write_levels([(0, 1000), (120, 990), (300, 930), (600, 900)])
+        last = Q.read(self.history, self.now + 600)[-1]
+        self.assertEqual(last["live_trend_rate"], 600)
+        self.assertEqual(last["live_rate_coverage_s"], 600)
+        self.write_levels([(0, 1000), (120, 1010), (300, 1070), (600, 1100)])
+        self.assertEqual(Q.read(self.history, self.now + 600)[-1]["live_trend_rate"], -600)
+
+    def test_rolling_window_expires_old_changes_and_clips_partial_interval(self):
+        self.write_levels([(i * 600, 1000 - i * 60) for i in range(7)] + [(3720, 628)])
+        last = Q.read(self.history, self.now + 3720)[-1]
+        self.assertEqual((last["live_trend_rate"], last["live_rate_coverage_s"]), (360, 3600))
+        self.write_levels([(0, 1000), (120, 950)] + [(i * 120, 950) for i in range(2, 33)])
+        last = Q.read(self.history, self.now + 3840)[-1]
+        self.assertEqual((last["live_trend_rate"], last["live_rate_coverage_s"]), (0, 3600))
+
+    def test_trend_restarts_coverage_after_each_discontinuity(self):
+        for reset in ("process", "boundary", "gap", "burst"):
+            with self.subTest(reset=reset):
+                self.write_levels([(0, 1000), (120, 950), (240, 900), (360, 890)])
+                with closing(sqlite3.connect(self.history)) as db, db:
+                    if reset == "process":
+                        db.execute("UPDATE samples SET process='b' WHERE at>=?", (self.now + 240,))
+                    elif reset == "boundary":
+                        db.execute("UPDATE samples SET boundary=11 WHERE at>=?", (self.now + 240,))
+                    elif reset == "gap":
+                        db.execute("UPDATE samples SET at=at+600 WHERE at>=?", (self.now + 240,))
+                    else:
+                        db.execute("UPDATE samples SET live_total=2300 WHERE at>=?", (self.now + 240,))
+                rows = Q.read(self.history, self.now + 960)
+                self.assertIsNone(rows[2]["live_trend_rate"])
+                self.assertEqual(rows[2]["live_rate_coverage_s"], 0)
+                self.assertEqual(rows[3]["live_trend_rate"], 300)
+                self.assertEqual(rows[3]["live_rate_coverage_s"], 120)
 
     def test_unreadable_source_is_not_a_zero_sample(self):
         self.sample()

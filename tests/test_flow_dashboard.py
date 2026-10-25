@@ -530,7 +530,9 @@ def queue_rows(days: int, step: int = 120) -> list[dict]:
                      "boundary": 13295, "live": 9000 - i % 50, "backlog": 4,
                      "live_held": 2800, "backlog_held": 927, "live_total": 30000,
                      "backlog_total": 13280, "live_rate": float(i % 7), "live_burst": None,
-                     "backlog_rate": 0.0, "backlog_burst": None})
+                     "backlog_rate": 0.0, "backlog_burst": None,
+                     "live_trend_rate": 300.0, "backlog_trend_rate": 0.0,
+                     "live_rate_coverage_s": 3600, "backlog_rate_coverage_s": 3600})
     return rows
 
 
@@ -565,12 +567,13 @@ class ScopeSeriesTests(unittest.TestCase):
         self.assertEqual(q["bucket_seconds"], 3600)
         self.assertLessEqual(len(q["rows"]), F.MAX_CHART_POINTS + 1)
         last = q["rows"][-1]
-        # The bucket keeps its last level, averages rates, and sums refills.
+        # Keep the last level and its already-windowed rate together, and sum
+        # refills. Averaging again would move the rate away from its queue sample.
         bucket = [r for r in rows
                   if int(F._parse_ts(r["at"]).timestamp()) // 3600 == int(F._parse_ts(last["at"]).timestamp()) // 3600]
         self.assertEqual(last["live"], bucket[-1]["live"])
-        self.assertEqual(last["live_rate"],
-                         round(sum(r["live_rate"] for r in bucket) / len(bucket), 1))
+        self.assertEqual(last["live_rate"], bucket[-1]["live_rate"])
+        self.assertEqual(last["live_trend_rate"], bucket[-1]["live_trend_rate"])
         self.assertEqual(sum(r["live_burst"] or 0 for r in q["rows"]), 550)
         self.assertLess(len(json.dumps(data, ensure_ascii=False).encode()), 400_000)
 
@@ -623,6 +626,71 @@ if(live.includes('<circle'))throw Error('hour-apart samples broken into dots');
 """
         result = subprocess.run(["node", "-e", harness + script + check], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class QueueRateChartTests(unittest.TestCase):
+    def test_cards_charts_and_hover_use_the_same_rate_without_losing_raw_samples(self):
+        import shutil, subprocess
+        if not shutil.which("node"):
+            self.skipTest("node is needed for dashboard JavaScript")
+        w = F.time_range("day", NOW)
+        levels = []
+        for minutes, rate in ((60, None), (30, -20), (2, 0)):
+            at = NOW - timedelta(minutes=minutes)
+            levels.append(dict(at=at.isoformat(), label=F._beijing_time(at),
+                               current=100, current_rate=rate, current_held=2))
+        # Current cards must stay current when a historical range is selected.
+        latest = dict(levels[-1], current_rate=-40)
+        host = dict(host="mac-office", rows=levels, latest=latest, stale=False,
+                    current=[dict(worker="current", at=NOW.timestamp(), depth=100, held=2)])
+        kg = dict(at=(NOW - timedelta(minutes=2)).isoformat(), label="最新",
+                  process="a", boundary=10, live=700, live_held=2,
+                  live_rate=1500, live_trend_rate=300, live_rate_coverage_s=3600,
+                  backlog=0, backlog_held=0, backlog_rate=0,
+                  backlog_trend_rate=0, backlog_rate_coverage_s=3600)
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                data = build()
+                data.update(time_range=w, range_options=F.RANGE_LABELS,
+                            period=F.selected_period({}, w, NOW, [], [], None),
+                            claude_mem_trends=[dict(host, stale=stale)],
+                            refinery_queue_trends=dict(rows=[kg], latest=kg, stale=stale),
+                            claude_mem_created=dict(rows=[dict(at=kg["at"], label="今天", count=0,
+                                                              kg_ingested=5, kg_backlog=0, kg_live=5)],
+                                                    total=0, kg_total=5, granularity="hour"))
+                script = F._HTML.split("<script>")[1].split("</script>")[0].replace("__DATA__", json.dumps(data))
+                harness = """const elements={};
+const element=()=>({innerHTML:'',textContent:'',dataset:{},classList:{toggle(){}},append(){},addEventListener(){}});
+const document={getElementById:id=>elements[id]??=(element()),createElement:element,querySelectorAll:()=>[]};
+const window={};
+"""
+                check = """
+const kgRate=backlogData.find(s=>s.title.startsWith('live · 净消化速度'));
+if(kgRate.series[0][1]!=='live_trend_rate')throw Error('chart uses short interval instead of hourly mean');
+if(!kgRate.extra(kgRate.rows[0]).join('').includes('1500'))throw Error('raw rate lost from hover');
+if(!kgRate.extra(kgRate.rows[0]).join('').includes('60 分钟'))throw Error('coverage lost');
+const cmRate=backlogData.find(s=>s.title==='mac-office · 新 worker · 净消化速度');
+if(!cmRate||cmRate.series[0][1]!=='current_rate')throw Error('worker rate chart missing');
+if(cmRate.rows.map(r=>r.current_rate).join()!==',-20,0')throw Error('negative/zero/missing rates changed');
+if(!elements.cmtrends.innerHTML.includes('净消化速度')||!elements.cmtrends.innerHTML.includes('<polyline'))throw Error('worker chart not rendered');
+if(backlogData[cmCreatedIndex].series[0][1]!=='count'||!elements.cmcreated.innerHTML.includes('新增 vs'))throw Error('added chart breaks creation chart index');
+if(D.refinery_queue_trends.stale){
+ if(elements.kgqueuecards.innerHTML.includes('300 条/小时'))throw Error('stale kg rate shown as current');
+ if(elements.cmcards.innerHTML.includes('-40 条/小时'))throw Error('stale worker rate shown as current');
+}else{
+ if(!elements.kgqueuecards.innerHTML.includes('300 条/小时'))throw Error('card and trend disagree');
+ if(!elements.cmcards.innerHTML.includes('-40 条/小时'))throw Error('worker current card depends on selected history');
+}
+const readout=element(),line={setAttribute(){},style:{}};
+const svg={dataset:{backlogChart:String(backlogData.indexOf(cmRate))},
+ parentElement:{querySelector:()=>readout},querySelector:()=>line};
+showBacklogPoint(svg,1);
+if(!readout.innerHTML.includes('-20 条/小时'))throw Error('worker hover does not show negative speed');
+showBacklogPoint(svg,0);
+if(!readout.innerHTML.includes('无样本'))throw Error('missing sample displayed as zero');
+"""
+                result = subprocess.run(["node", "-e", harness + script + check], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class WiringTests(unittest.TestCase):
