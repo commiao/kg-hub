@@ -21,7 +21,7 @@ from utils import process_receipts as receipts
 
 def completed(c: dict, d: Path, model: str, slot: int | None = None) -> int:
     batches = {b["id"]: b for b in c["batches"] if b["model"] == model
-               and (slot is None or b.get("slot") == slot)}
+               and (slot is None or ec.batch_slot(c, b) == slot)}
     latest = {}
     log = d / "log.jsonl"
     if log.exists():
@@ -137,7 +137,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
         bind_slot_session(d, model, slot, session)
         baseline = completed(c, d, model, slot)
         if (baseline < c["quota"] and not saved and adopt_exit is None
-                and any(b["model"] == model and (slot is None or b.get("slot") == slot) for b in c["batches"])):
+                and any(b["model"] == model and (slot is None or ec.batch_slot(c, b) == slot) for b in c["batches"])):
             raise ValueError("existing model history requires its unique exit/event receipts; do not duplicate an unmanaged worker")
         stalled = 0
         child = None
@@ -169,7 +169,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     return {"model": model, "state": "blocked", "reason": outcome["recovery_kind"]}
             waiting = False
             own_pending = [b for b in c["batches"] if b["model"] == model
-                           and (slot is None or b.get("slot") == slot)
+                           and (slot is None or ec.batch_slot(c, b) == slot)
                            and b["status"] not in ("submitted", "released")]
             for batch in own_pending:
                 op = ec.cmd_operation_status(cid, batch["id"])
@@ -224,6 +224,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             if count >= c["quota"]:
                 update(phase="quota_complete", success=count)
                 return {"model": model, "state": "complete", "success": count}
+            if (c.get('dispatch') or {}).get('state') == 'draining':
+                update(phase='claims_drained', success=count)
+                return {'model': model, 'state': 'drained', 'success': count}
             if slot is not None and ec.claimed_items(c, model) >= c["quota"] and not own_pending:
                 update(phase="slot_drained", success=count)
                 return {"model": model, "slot": slot, "state": "drained", "success": count}
@@ -241,10 +244,13 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             entry = Path(os.environ.get("KG_HUB_CODE", "~/.local/share/kg-hub/current")).expanduser() / "tools/extract"
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],
                     "--receipt-dir", str(native), "--", *native_args(c, model, session, slot)]
-            env = {}
+            env = {'env': {**os.environ}}
+            dependencies = ec.dependency_pythonpath()
+            if dependencies:
+                env['env']['PYTHONPATH'] = dependencies
             if slot is not None:
-                env["env"] = {**os.environ, "KG_HUB_CAMPAIGN_ID": cid,
-                              "KG_HUB_CAMPAIGN_MODEL": model, "KG_HUB_CAMPAIGN_SLOT": str(slot)}
+                env['env'].update(KG_HUB_CAMPAIGN_ID=cid, KG_HUB_CAMPAIGN_MODEL=model,
+                                  KG_HUB_CAMPAIGN_SLOT=str(slot))
             with os.fdopen(os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as out, \
                     os.fdopen(os.open(error, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as err:
                 child = spawn(args, cwd=ec.workspace_dir(), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
@@ -280,7 +286,9 @@ def run_pool(cid: str, model: str, *, poll: float = 15, max_stalled: int = 3,
     root = ec.supervisor_dir(d, model)
     if (root / "worker.json").exists() or any(
             b["model"] == model and b.get("slot") not in range(1, n + 1) for b in c["batches"]):
-        raise ValueError("existing unslotted history requires explicit migration; cannot duplicate the original worker")
+        from tools.campaign_migration import valid_migration
+        if not valid_migration(c, d):
+            raise ValueError("existing unslotted history requires explicit migration; cannot duplicate the original worker")
     stop = threading.Event()
 
     def work(slot):

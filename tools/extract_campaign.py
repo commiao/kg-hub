@@ -170,8 +170,23 @@ def supervisor_dir(d: Path, model: str, slot: int | None = None) -> Path:
 def assert_worker_batch(c: dict, b: dict) -> None:
     if os.environ.get("KG_HUB_CAMPAIGN_SLOT") is not None:
         slot = worker_slot(c, b["model"])
-        if b.get("slot") != slot:
+        if batch_slot(c, b) != slot:
             raise SystemExit("batch belongs to a different worker slot")
+
+
+def batch_slot(c: dict, b: dict):
+    from tools.campaign_migration import logical_slot
+    return logical_slot(c, b)
+
+
+def dependency_pythonpath() -> str:
+    """Keep the actually loaded common runtime available to native subprocesses."""
+    from utils import process_receipts
+    paths = os.environ.get('PYTHONPATH', '').split(os.pathsep) if os.environ.get('PYTHONPATH') else []
+    if process_receipts.__name__.startswith('llm_eval.'):
+        source = str(Path(process_receipts.__file__).resolve().parent.parent)
+        paths = [source, *[p for p in paths if p != source]]
+    return os.pathsep.join(paths)
 
 
 def prompt_sha(text: str) -> str:
@@ -315,6 +330,7 @@ def brief(c: dict, model: str, slot: int | None = None) -> str:
         raise SystemExit(f"战役 {c['id']} 没有模型 {model}；有：{', '.join(c['models'])}")
     text = SUBAGENT_BRIEF.format(cid=c["id"], model=model)
     text = text.replace("$PY -m tools.extract_campaign", cli_command())
+    text += "\n领取返回 paused=true 时，本批核验、提交、复查及成本记录完成后退出；不轮询领取、不继续新批。\n"
     slot = worker_slot(c, model, slot)
     if slot is not None:
         text = text.replace(f"claim --id {c['id']} --model {model}",
@@ -508,6 +524,9 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None,
     slot = worker_slot(cfg, model, slot) if cfg is not None and "models" in cfg else slot
     public_entry = quote(runtime_cli) if runtime_cli is not None else cli_command().removesuffix(" campaign")
     native_prefix = f"{public_entry} runtime exec --proxy-mode {quote(settings['proxy_mode'])} -- "
+    dependencies = dependency_pythonpath()
+    dependency_prefix = f"/usr/bin/env PYTHONPATH={quote(dependencies)} " if dependencies else ''
+    native_prefix = dependency_prefix + native_prefix
     # 子代理还要写全设备在途登记（tools/claim_registry.py）；在状态目录里面就不用另加
     reg_dir = claim_registry.claims_dir()
     from tools import nas_gate
@@ -519,13 +538,13 @@ def launch_command(tool: str, cid: str, model: str, *, repo: Path | None = None,
     adds = " ".join(f"--add-dir {quote(directory)}" for directory in writable)
     # The public shell entry chooses the current HOME runtime. Quote each shell argument.
     slot_arg = f" --slot {slot}" if slot is not None else ""
-    brief_cmd = f'"$({cli_command()} brief --id {quote(cid)} --model {quote(model)}{slot_arg})"'
+    brief_cmd = f'"$({dependency_prefix}{cli_command()} brief --id {quote(cid)} --model {quote(model)}{slot_arg})"'
     if slot is not None:
         # Scope ownership to this command; never mutate the coordinator environment.
-        ownership = (f"env KG_HUB_CAMPAIGN_ID={quote(cid)} KG_HUB_CAMPAIGN_MODEL={quote(model)} "
+        ownership = (f"/usr/bin/env KG_HUB_CAMPAIGN_ID={quote(cid)} KG_HUB_CAMPAIGN_MODEL={quote(model)} "
                      f"KG_HUB_CAMPAIGN_SLOT={slot} ")
         receipt_dir = supervisor_dir(Path(st) / "campaigns" / cid, model, slot) / "native"
-        native_prefix = (ownership + f"{public_entry} runtime exec --proxy-mode {quote(settings['proxy_mode'])} "
+        native_prefix = (dependency_prefix + ownership + f"{public_entry} runtime exec --proxy-mode {quote(settings['proxy_mode'])} "
                          f"--receipt-dir {quote(receipt_dir)} -- ")
     else:
         ownership = ""
@@ -666,10 +685,13 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
     with locked(d):
         c = load(d)
         rules_text(d, c)
+        if (c.get('dispatch') or {}).get('state') == 'draining':
+            return {'done': False, 'paused': True, 'batch': None, 'model': model,
+                    'action': 'finish_current_batch_then_exit', 'message': '领取已冻结；完成当前批次后退出，不轮询或另开执行线。'}
         slot = worker_slot(c, model, slot)
         if slot is not None:
             # An idempotent claim is also the only supported slot recovery path.
-            pending = [b for b in c["batches"] if b["model"] == model and b.get("slot") == slot
+            pending = [b for b in c["batches"] if b["model"] == model and batch_slot(c, b) == slot
                        and b["status"] not in ("submitted", "released")]
             if len(pending) > 1:
                 raise SystemExit("multiple unfinished batches for one slot; coordinator reconciliation required")
@@ -1456,11 +1478,12 @@ def cmd_status(cid: str) -> dict:
         "supervisor": process_status(supervisor_dir(d, m, slot)),
         "native": process_status(supervisor_dir(d, m, slot) / "native"),
         "batches": [b["id"] for b in c["batches"] if b["model"] == m
-                    and (slot is None or b.get("slot") == slot)
+                    and (slot is None or batch_slot(c, b) == slot)
                     and b["status"] not in ("submitted", "released")]}
         for slot in (range(1, n + 1) if n > 1 else [None])} for m in c["models"]}
     return {"campaign": cid, "executor": c["executor"], "chain": c["chain"], "chain_mode": c.get("chain_mode", "latest"),
             "parallel": n, "configured_workers": n * len(c["models"]), "worker_slots": slots,
+            "dispatch": c.get('dispatch', {'state': 'running'}), "migration": c.get('migration'),
             "active_workers": sum(s["native"]["lease_held"] is True for workers in slots.values() for s in workers.values()),
             "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "host_task_state": "unverified_by_repository",
@@ -1497,6 +1520,18 @@ def _main(argv=None) -> int:
         return number
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    drain = sub.add_parser('drain', help='freeze new claims, allow current batch to finish, never kill a worker')
+    drain.add_argument('--id', required=True)
+    drain.add_argument('--reason', required=True)
+    migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
+    migrate.add_argument('--id', required=True)
+    mode = migrate.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--preview', action='store_true')
+    mode.add_argument('--apply', type=Path, metavar='PREVIEW_JSON')
+    mode.add_argument('--rollback', action='store_true')
+    migrate.add_argument('--parallel', type=positive_int)
+    migrate.add_argument('--proof', type=Path, help='original session, event log and runtime receipt for every model')
+    migrate.add_argument('--out', type=Path)
     supervisor = sub.add_parser("supervise", help="durable single-owner Codex worker loop; resume the same native session")
     supervisor.add_argument("--id", required=True)
     supervisor.add_argument("--model", required=True)
@@ -1582,6 +1617,22 @@ def _main(argv=None) -> int:
         if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
+    if a.cmd == 'drain':
+        from tools.campaign_migration import drain
+        print(json.dumps(drain(a.id, a.reason), ensure_ascii=False, indent=2))
+        return 0
+    if a.cmd == 'migrate':
+        from tools import campaign_migration as migration
+        if a.preview:
+            if a.parallel is None or a.proof is None or a.out is None:
+                ap.error('migrate --preview requires --parallel, --proof and --out')
+            out = migration.preview(a.id, a.parallel, json.loads(a.proof.read_text()), a.out)
+        elif a.apply:
+            out = migration.apply(a.id, a.apply)
+        else:
+            out = migration.rollback(a.id)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     if os.environ.get("KG_HUB_CAMPAIGN_SLOT") is not None and a.cmd in (
             "lint", "submit", "release", "review", "cost", "quality-sheet", "quality-check", "namesync") and getattr(a, "batch", None):
         cfg = load(campaign_dir(a.id))
