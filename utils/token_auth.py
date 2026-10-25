@@ -60,6 +60,8 @@ SCOPE_ALLOWLIST: dict[str, frozenset[tuple[str, str]]] = {
         ("GET", "/api/extraction/capabilities"),
         ("POST", "/api/extraction/repair/preview"),  # no mutation; same episode-read scope
         ("GET", "/api/extraction/repair"),
+        ("POST", "/api/graph/governance/preview"),  # no mutation; node-scoped graph read
+        ("GET", "/api/graph/governance"),
     }),
 }
 

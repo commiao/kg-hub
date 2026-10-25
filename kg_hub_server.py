@@ -105,6 +105,7 @@ from utils.extracted_ingest import (  # noqa: E402
 )
 from utils.extraction_quality import requires_quality, validate_payload_quality  # noqa: E402
 from utils import extraction_repair  # noqa: E402
+from utils import graph_governance  # noqa: E402
 from utils.gateway_post_normalize import post_ingest_normalize  # noqa: E402
 from utils.single_pass_extract import (  # noqa: E402
     EXTRACTION_MODE as SINGLE_PASS_EXTRACTION_MODE, INGEST_MODE_SINGLE_PASS,
@@ -2173,11 +2174,16 @@ async def extraction_capabilities(request: Request) -> JSONResponse:
     from utils import extraction_quality
     revision = hashlib.sha256(Path(__file__).read_bytes()
         + Path(extraction_quality.__file__).read_bytes()
-        + Path(extraction_repair.__file__).read_bytes()).hexdigest()
+        + Path(extraction_repair.__file__).read_bytes()
+        + Path(graph_governance.__file__).read_bytes()).hexdigest()
     return JSONResponse({"quality_versions": [extraction_quality.QUALITY_VERSION],
         "prompt_versions": ["agent-v5"], "repair": True, "revision": revision,
         "repair_paths": {"preview": "/api/extraction/repair/preview",
-                         "apply": "/api/extraction/repair", "status": "/api/extraction/repair"}})
+                         "apply": "/api/extraction/repair", "status": "/api/extraction/repair"},
+        "graph_governance": {"version": graph_governance.VERSION,
+                             "operations": list(graph_governance.OPERATIONS),
+                             "paths": {"preview": "/api/graph/governance/preview",
+                                       "apply": "/api/graph/governance", "status": "/api/graph/governance"}}})
 
 
 async def extraction_repair_preview(request: Request) -> JSONResponse:
@@ -2237,6 +2243,73 @@ async def extraction_repair_apply(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "code": "repair_apply_failed",
                              "repair_id": parsed["repair_id"],
                              "message": "retry the exact request with the same repair_id"}, status_code=503)
+    finally:
+        _extraction_finished()
+
+
+def _governance_error(exc) -> JSONResponse:
+    body = {"status": "error", "code": exc.code, "message": str(exc)}
+    if exc.detail is not None:
+        body["detail"] = exc.detail
+    return JSONResponse(body, status_code=exc.status)
+
+
+async def graph_governance_preview(request: Request) -> JSONResponse:
+    """Read-only node merge/rename/retype/split plan bound to a snapshot digest."""
+    try:
+        raw = await request.json()
+        g = await get_graphiti()
+        return JSONResponse(await graph_governance.preview(g, raw, GROUP_ID))
+    except graph_governance.GovernanceError as exc:
+        return _governance_error(exc)
+    except (ValueError, TypeError):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    except Exception:
+        logger.exception("[graph_governance:preview_failed]")
+        return JSONResponse({"status": "error", "code": "governance_preview_failed"}, status_code=503)
+
+
+async def graph_governance_status(request: Request) -> JSONResponse:
+    gid = request.query_params.get("governance_id", "")
+    if not extraction_repair._ID.fullmatch(gid):
+        return JSONResponse({"status": "error", "code": "bad_governance_id"}, status_code=400)
+    try:
+        result = await graph_governance.audit(get_status_driver(), gid)
+        if result is None:
+            return JSONResponse({"status": "error", "code": "governance_not_found"}, status_code=404)
+        return JSONResponse({"status": "ok", "governance": result})
+    except Exception:
+        logger.exception("[graph_governance:status_failed]")
+        return JSONResponse({"status": "error", "code": "governance_status_failed"}, status_code=503)
+
+
+async def graph_governance_apply(request: Request) -> JSONResponse:
+    """Admin-only, writer-locked, replayable node governance bound to a reviewed snapshot."""
+    if drain_seconds_left() > 0:
+        return JSONResponse({"status": "error", "code": "draining"}, status_code=503)
+    try:
+        raw = await request.json()
+        parsed = graph_governance.parse_request(raw)
+    except graph_governance.GovernanceError as exc:
+        return _governance_error(exc)
+    except (ValueError, TypeError):
+        return JSONResponse({"status": "error", "code": "bad_request"}, status_code=400)
+    _extraction_started()
+    try:
+        g = await get_graphiti()
+        async with _ingest_execution_lock(owner="graph-governance", timeout_seconds=INGEST_LOCK_TIMEOUT_SEC):
+            result = await graph_governance.apply(g, raw, GROUP_ID)
+        return JSONResponse(result)
+    except graph_governance.GovernanceError as exc:
+        return _governance_error(exc)
+    except WriterLockBusy:
+        return JSONResponse({"status": "error", "code": "writer_lock_busy"}, status_code=503)
+    except Exception:
+        logger.exception("[graph_governance:apply_failed] id=%s", parsed["governance_id"])
+        return JSONResponse({"status": "error", "code": "governance_apply_failed",
+                             "governance_id": parsed["governance_id"],
+                             "message": "check status, then retry the exact request with the same governance_id"},
+                            status_code=503)
     finally:
         _extraction_finished()
 
@@ -6521,6 +6594,9 @@ app = Starlette(
         Route("/api/extraction/repair/preview", extraction_repair_preview, methods=["POST"]),
         Route("/api/extraction/repair", extraction_repair_status, methods=["GET"]),
         Route("/api/extraction/repair", extraction_repair_apply, methods=["POST"]),
+        Route("/api/graph/governance/preview", graph_governance_preview, methods=["POST"]),
+        Route("/api/graph/governance", graph_governance_status, methods=["GET"]),
+        Route("/api/graph/governance", graph_governance_apply, methods=["POST"]),
         Route("/api/ingest_extracted", ingest_extracted, methods=["POST"]),
         Route("/api/ingest_extracted/check", ingest_extracted_check, methods=["POST"]),
         Route("/api/ingest/check_names", ingest_check_names, methods=["POST"]),

@@ -1,6 +1,6 @@
 """Stable released entry point; the excluded working directory never selects code.
 
-Usage: ~/.local/share/kg-hub/current/tools/extract campaign|agent|bench|repair ...
+Usage: ~/.local/share/kg-hub/current/tools/extract campaign|agent|bench|repair|nodes ...
 The shell entry chooses the runtime; this module also supports explicit Python callers.
 """
 from __future__ import annotations
@@ -29,10 +29,10 @@ def main(argv=None):
         print(json.dumps({"python": sys.executable, "version": sys.version.split()[0], "code_root": str(CODE_ROOT)}))
         return 0
     routes = {"campaign": "tools.extract_campaign", "agent": "tools.agent_extract", "bench": "tools.extract_bench",
-              "repair": "tools.extraction_repair", "runtime": "tools.extract_runtime",
+              "repair": "tools.extraction_repair", "nodes": "tools.graph_governance", "runtime": "tools.extract_runtime",
               "regression": "tools.extract_regression", "eval": "tools.extract_evaluation"}
     if not args or args[0] not in routes:
-        raise SystemExit("usage: extract_cli.py campaign|agent|bench|repair|runtime|regression|eval <command> ...")
+        raise SystemExit("usage: extract_cli.py campaign|agent|bench|repair|nodes|runtime|regression|eval <command> ...")
     return importlib.import_module(routes[args.pop(0)]).main(args)
 
 

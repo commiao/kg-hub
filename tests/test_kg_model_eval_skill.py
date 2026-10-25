@@ -16,6 +16,7 @@ from tools import extract_bench as xb
 from tools import extract_campaign as ec
 from tools import agent_extract as ax
 from tools import extraction_repair as er
+from tools import graph_governance as gg
 from tools import extract_runtime as rt
 from tools import extract_regression as regression
 from tools import extract_evaluation as evaluation
@@ -109,13 +110,13 @@ class SkillDocTest(unittest.TestCase):
 
     def test_every_mentioned_subcommand_exists(self):
         have = {"bench": subcommands(xb.main), "campaign": subcommands(ec.main),
-                "agent": flat_commands(ax.main), "repair": flat_commands(er.main),
+                "agent": flat_commands(ax.main), "repair": flat_commands(er.main), "nodes": flat_commands(gg.main),
                 "runtime": subcommands(rt.main), "regression": subcommands(regression.main),
                 "eval": subcommands(evaluation.main)}
         self.assertIn("register", have["bench"])
         reference = (SKILL / "references" / "quality.md").read_text()
         workflow = (SKILL / "references" / "evaluation-workflow.md").read_text()
-        mentioned = set(re.findall(r'\$CLI"\s+(bench|campaign|agent|repair|runtime|regression|eval)\s+([a-z-]+)',
+        mentioned = set(re.findall(r'\$CLI"\s+(bench|campaign|agent|repair|nodes|runtime|regression|eval)\s+([a-z-]+)',
                                    self.text + "\n" + reference + "\n" + workflow + "\n" + "\n".join(
                                        p.read_text() for p in (SKILL.parent.parent / "docs" / "executors").glob("*.md"))))
         self.assertTrue(mentioned)
