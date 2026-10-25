@@ -12,7 +12,8 @@ ROOT=Path(__file__).resolve().parents[1]
 TARGET=ROOT/'adapters/evaluation/src/kg_hub_eval/business'
 ASSETS=TARGET.parent/'assets'
 ASSETS.mkdir(exist_ok=True)
-files=['schema.py','utils/extracted_ingest.py','utils/embedding_profile.py','utils/single_pass_extract.py']
+files=['schema.py','utils/extracted_ingest.py','utils/embedding_profile.py','utils/single_pass_extract.py',
+       'utils/extraction_structure.py']
 for name in files:
     source=(ROOT/name).read_text()
     if name=='utils/single_pass_extract.py':

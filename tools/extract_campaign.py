@@ -27,7 +27,7 @@
   launch  --tool codex|cursor|qodercli [--model ...]   打印「每个模型一个会话」的启动命令（退路 / 并行开会话）
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边、其余 fact 超 200 字符；
-          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交
+          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交；另出「结构过薄」提醒（不阻断）
   namesync --batch <批次 id> [--apply] [--graph]   命名同步（tools/campaign_namesync.py 的锚点键规则）：
           同键异名的自动改成规范名（--apply 改写结果文件，质量表之前做）；退出码 0 干净 / 2 还有要改的或会分裂
   namesync-replay                    回放本战役各批会被抓到的同键异名与分裂（只读，统计用）
@@ -39,7 +39,7 @@
   cost    --batch <批次 id> [--credits N] [--tokens N] [--seconds N]   记子代理这一批的消耗（每条成本只含子代理）
           --overhead [--credits ...] [--note]                         记编排者自己的开销（单独合计，不摊进模型）
   status                             各模型配额进度与每批状态
-  report  [--json 路径]               复盘表：每批一行 + 每个模型 × 约定版本合计
+  report  [--json 路径]               复盘表：每批一行 + 每个模型 × 约定版本合计（含恰2实体%、端点对/条等结构列）
 """
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools import agent_extract as ax  # noqa: E402
 from tools import campaign_namesync as ns  # noqa: E402
 from tools import claim_registry  # noqa: E402
+from utils import extraction_structure as xs  # noqa: E402
 
 TOOL = "extract_campaign"
 CHAIN_NONE = "c0"
@@ -807,6 +808,15 @@ def cmd_lint(cid: str, bid: str) -> list[str]:
     return lint_items(rows, by_id, new_names=dryrun_new_names(d, bid))
 
 
+def lint_structure_warnings(cid: str, bid: str) -> list[str]:
+    """结构过薄提醒（utils/extraction_structure.thin_structure_warnings）：只提醒，不算自检问题、不挡提交。"""
+    d = campaign_dir(cid)
+    batch, rows = _batch_rows(d, bid)
+    res = _results(d, bid)
+    by_id = {int(it["id"]): it for it in res.get("items", [])}
+    return xs.thin_structure_warnings(rows, by_id, {int(i["id"]): i.get("episode_body") or "" for i in batch["items"]})
+
+
 def lint_summary_pending(cid: str, bid: str) -> list[int]:
     """有实体、但还没 dry-run 过（所以新建实体 summary 还没查）的条目。"""
     d = campaign_dir(cid)
@@ -1299,7 +1309,10 @@ def batch_row(d: Path, b: dict) -> dict:
     rp = d / "results" / f"{b['id']}.json"
     res = {int(it["id"]): it for it in json.loads(rp.read_text()).get("items", [])} if rp.exists() else {}
     r = {"label": f"{b['id']}（{b['chain']}）", "model": b["model"], "chain": b["chain"], "status": b["status"],
-         **aggregate([item_metrics(res.get(i), t, ENTITY_TYPES, EDGE_TYPES) for i, t, _ in rows])}
+         **aggregate([item_metrics(res.get(i), t, ENTITY_TYPES, EDGE_TYPES) for i, t, _ in rows]),
+         **xs.structure_aggregate([xs.structure_metrics(res.get(i)) for i, _, _ in rows])}
+    # 跨观测复用率要和本模型别的批一起算，cmd_report 里补（apply_reuse）；这里只留每条非空观测的实体名集合
+    r["_keysets"] = [k for k in (xs.entity_keys(res.get(i)) for i, _, _ in rows) if k]
     final = final_statuses(d, b["id"], {x[0] for x in rows}) if b["status"] == "submitted" else {}
     # 预览误并候选（dry-run，执行者据此改名）与入库时实际发生的不同名复用分两列
     r.update(ok=sum(v == "ok" for v in final.values()),
@@ -1352,6 +1365,7 @@ def merge_rows(label: str, rows: list[dict]) -> dict:
     for k in ("ent_per_obs", "edge_per_obs", "offschema_edge_pct", "dangling_edge_pct", "headline_verbatim_pct",
               "second_other_lang_pct", "rest_fact_en_pct", "rest_fact_len", "rest_fact_len_ok_pct"):
         out[k] = round(sum((r.get(k) or 0) * r["_n"] for r in rows) / n, 2)
+    out.update(xs.merge_structure(rows))
     tri = [r["_triage"] for r in rows if r.get("_triage")]
     if tri:
         tsum = {k: sum(t[k] for t in tri) for k in TRIAGE_COUNTS}
@@ -1375,6 +1389,8 @@ REPORT_COLS = [("items", "条数"), ("ok", "入库"), ("empty", "空"), ("error"
                ("dry_mismatch", "预览误并候选"),
                ("mismatch", "入库不同名复用"),
                ("ent_per_obs", "实体/条"), ("edge_per_obs", "边/条"), ("zero_edge", "零边"),
+               ("two_entity_pct", "恰2实体%"), ("pairs_per_obs", "端点对/条"), ("rest_relates_to_pct", "其余relates_to%"),
+               ("reuse_pct", "跨观测复用%"),
                ("offschema_edge_pct", "边名越界%"), ("dangling_edge_pct", "悬空边%"), ("unknown_type", "未知类型"),
                ("dirty_name", "脏命名"), ("headline_verbatim_pct", "照抄标题%"), ("second_other_lang_pct", "译文边%"),
                ("rest_fact_en_pct", "其余英文%"), ("rest_fact_len", "其余均长"), ("rest_fact_len_ok_pct", "其余长度合规%"), ("random_reviewed", "随机抽查"),
@@ -1396,6 +1412,7 @@ def cmd_report(cid: str) -> dict:
     c = load(d)
     per = [batch_row(d, b) for b in c["batches"]
            if b["status"] != "released" and (d / "batches" / f"{b['id']}.json").exists()]
+    pools = apply_reuse(per)
     groups = {}
     for r in per:
         groups.setdefault((r["model"], r["chain"]), []).append(r)
@@ -1404,6 +1421,10 @@ def cmd_report(cid: str) -> dict:
     for r in per:
         by_model.setdefault(r["model"], []).append(r)
     models = [merge_rows(f"{m}（合计 {len(rs)} 批）", rs) for m, rs in sorted(by_model.items())]
+    for ((m, _), rs), out in zip(sorted(groups.items()), totals):
+        out["reuse_pct"] = group_reuse(rs, pools[m])
+    for (m, rs), out in zip(sorted(by_model.items()), models):
+        out["reuse_pct"] = group_reuse(rs, pools[m])
     clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in per]
     from kg_hub_eval.business.utils.evaluation_receipts import artifact, overhead_coverage
     evidence = [artifact(p) for p in [d / "campaign.json", d / "log.jsonl", d / "prompt.md",
@@ -1414,6 +1435,21 @@ def cmd_report(cid: str) -> dict:
             "evidence": evidence, "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "overhead": overhead_total(c), "triage": triage_summary(d, c), "models": models, "by_chain": totals,
             "batches": clean}
+
+
+def apply_reuse(per: list[dict]) -> dict[str, dict[str, int]]:
+    """跨观测复用率：每个模型一个参照池（名字 → 出现在本模型几条观测），按领批顺序累加。
+    每批行的参照池截至该批（含）——后领的批不会改写前面的行，所以早期批天然偏低；
+    返回各模型截至最后一批的参照池，合计行（按模型、按模型 × 约定版本）都用它算。不跨模型合并。"""
+    pools: dict[str, dict[str, int]] = {}
+    for r in per:
+        pool = xs.count_obs(r["_keysets"], pools.setdefault(r["model"], {}))
+        r["reuse_pct"] = xs.reuse_pct(*xs.reuse_counts(r["_keysets"], pool))
+    return pools
+
+
+def group_reuse(rows: list[dict], pool: dict[str, int]) -> float | None:
+    return xs.reuse_pct(*xs.reuse_counts([k for r in rows for k in r["_keysets"]], pool))
 
 
 def campaign_full(c: dict) -> bool:
@@ -1718,6 +1754,9 @@ def _main(argv=None) -> int:
     elif a.cmd == "lint":
         probs = cmd_lint(a.id, a.batch)
         print("\n".join(probs) if probs else "自检通过")
+        warns = lint_structure_warnings(a.id, a.batch)
+        if warns:   # 只提醒：不计入问题数、不改退出码，submit 前的自检也不看它
+            print(f"\n提醒（{len(warns)} 条，不阻断）：\n" + "\n".join(warns))
         pending = lint_summary_pending(a.id, a.batch)
         if pending:
             print(f"注意：{len(pending)} 条还没 dry-run，新建实体 summary（规则 24，至少 30 字）要 dry-run 之后才查；"

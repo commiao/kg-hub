@@ -13,7 +13,7 @@ opus / sonnet / haiku 5.5 在 chain-v8（≈ agent-v4）下的结果（docs/thre
           预算「背景事实」（实验里其余观测的 fact）向量。一次性，换样本时才重做。
   parts   --bench <目录>              列出各批次文件与执行器要跑的命令。
   lint    --bench <目录> --results <文件>...   写完结果后的自检（悬空边、schema 外类型/边名、缺 edges 键、
-          第一条边是否照抄标题、第二条边是否另一语言）。
+          第一条边是否照抄标题、第二条边是否另一语言）；另出「结构过薄」提醒（不阻断）。
   register --bench <目录> --results <结果目录> --model <模型> --executor <工具>   把会话里手工抽取的结果登记成运行目录
   revoke  --model <模型> --reason <原因>   显式撤销准入（admit 不带 --sheet 只预览、不写记录）
   score   --bench <目录> --results <文件或目录>... --label <名字> [--model --executor --tokens --wall-s --json]
@@ -384,6 +384,17 @@ def lint(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
     if ids is not None:
         rows = [r for r in rows if r[0] in set(ids)]
     return lint_items([(r[0], r[1], r[2]) for r in rows], results)
+
+
+def lint_structure_warnings(p: Path, m: dict, results: dict[int, dict], ids=None) -> list[str]:
+    """结构过薄提醒，与战役 lint 同一份（utils/extraction_structure）；只提醒，不计入问题数、不进准入判定。"""
+    from kg_hub_eval.business.utils.extraction_structure import thin_structure_warnings
+    bodies = {}
+    for part in m["parts"]:
+        for it in json.loads((p / f"batch-{part['part']}.json").read_text())["items"]:
+            bodies[int(it["id"])] = it.get("episode_body") or ""
+    rows = [(r[0], r[1], r[2]) for r in _bench_items(p, m)[0] if ids is None or r[0] in set(ids)]
+    return thin_structure_warnings(rows, results, bodies)
 
 
 SUMMARY_MIN = 30   # 规则 24：summary 至少 30 字
@@ -1176,6 +1187,11 @@ def main(argv=None) -> int:
             print(f"[{r['label']}] " + (f"{len(probs)} 处问题" if probs else "自检通过"))
             for x in probs[:40]:
                 print("  " + x)
+            warns = lint_structure_warnings(p, m, r["results"], ids=r["ids"])
+            if warns:   # 只提醒：不加进 bad，不改退出码
+                print(f"  提醒（{len(warns)} 条，不阻断）：")
+                for x in warns[:40]:
+                    print("    " + x)
         if a.cmd == "lint":
             return 1 if bad else 0
     if runs:
