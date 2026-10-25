@@ -923,6 +923,8 @@ def cmd_reconcile_operation(cid: str, bid: str, *, url: str, token: str | None, 
         from tools import campaign_recovery as recovery
         from utils.extraction_quality import digest
         supervised = receipts.read(d / "supervisors" / slug(b["model"]) / "latest.json")
+        if supervised.get("identity") and supervised["identity"] != {"campaign": cid, "model": b["model"]}:
+            raise ValueError("legacy supervisor owner identity mismatch")
         if supervised.get("session") and supervised["session"] != session:
             raise ValueError("legacy native session differs from supervisor identity")
         proof = recovery.legacy_proof(legacy_exit, legacy_events, session, cid, bid)

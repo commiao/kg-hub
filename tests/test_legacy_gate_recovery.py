@@ -100,7 +100,7 @@ class LegacyGateRecoveryTest(unittest.TestCase):
         self.assertEqual((directory / 'latest.json').read_bytes(), original)
 
     def test_wrong_session_inflight_wrong_scope_and_non_gate_fail_before_service_query(self):
-        for bad in ['session', 'pending', 'scope', 'non_gate', 'console', 'compound', 'pair', 'supervisor']:
+        for bad in ['session', 'pending', 'scope', 'non_gate', 'console', 'compound', 'pair', 'supervisor', 'owner']:
             with self.subTest(bad=bad):
                 bid = self.prepare(); kw = {}
                 if bad == 'session': kw['session'] = 'different-session'
@@ -115,7 +115,8 @@ class LegacyGateRecoveryTest(unittest.TestCase):
                     for row in self.rows:
                         if 'item' in row and row['item'].get('type') == 'command_execution': row['item']['command'] += '; echo done'
                 elif bad == 'pair': kw['legacy_events'] = self.exit
-                else: receipts.write(self.d / 'supervisors/DeepSeek-Flash/latest.json', {'session': 'other'})
+                elif bad == 'supervisor': receipts.write(self.d / 'supervisors/DeepSeek-Flash/latest.json', {'session': 'other'})
+                else: receipts.write(self.d / 'supervisors/DeepSeek-Flash/latest.json', {'identity': {'campaign': 'other', 'model': 'DeepSeek-Flash'}})
                 self.write_events()
                 check = mock.Mock(side_effect=AssertionError('invalid proof must not query service'))
                 with self.assertRaises((ValueError, KeyError)): self.reconcile(bid, check, **kw)
