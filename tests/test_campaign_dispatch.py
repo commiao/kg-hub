@@ -1,6 +1,7 @@
 """Observation-window bounds with real locks; no models or graph writes."""
 import json
 import os
+from pathlib import Path
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -127,6 +128,31 @@ class DispatchTests(unittest.TestCase):
         result = dispatch.resume(self.c['id'], reason='user-authorized observation passed')
         self.assertNotIn('window', result['dispatch'])
         self.assertEqual(self.claim('n', 4)['slot'], 4)
+
+    def test_missing_worker_session_requires_existing_matching_slot_binding(self):
+        self.activate()
+        root = ec.supervisor_dir(self.d, 'm', 1)
+        worker = receipts.read(root / 'worker.json')
+        worker['session'] = None
+        receipts.write(root / 'worker.json', worker)
+        original = ec.load(self.d)
+        for binding in [None, 'different-session']:
+            c = ec.load(self.d)
+            c['slot_sessions']['m']['1'] = binding
+            ec.save(self.d, c)
+            with self.assertRaisesRegex(ValueError, 'terminal'):
+                dispatch.resume(self.c['id'], reason='unverified binding must refuse')
+        ec.save(self.d, original)
+        c = ec.load(self.d)
+        c['slot_sessions']['n']['2'] = original['slot_sessions']['m']['1']
+        ec.save(self.d, c)
+        with self.assertRaisesRegex(ValueError, 'terminal'):
+            dispatch.resume(self.c['id'], reason='duplicate slot ownership must refuse')
+        ec.save(self.d, original)
+        event_path = Path(worker['events'])
+        event_path.write_text(event_path.read_text().replace('original-m', 'different-event-session'))
+        with self.assertRaisesRegex(ValueError, 'terminal'):
+            dispatch.resume(self.c['id'], reason='event identity must match durable slot')
 
     def nas_refusal(self):
         from pathlib import Path

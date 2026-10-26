@@ -80,10 +80,19 @@ def resume(cid, *, reason, batches_per_model=None):
                         raise ValueError('worker proof outside its model supervisor directory')
                     terminal = receipts.read(native / 'latest.json')
                     outcome = events(event_path)
+                    # A new slot's first turn records its session binding when
+                    # its native events end, before another spawn rewrites the
+                    # initial worker.json. Require that existing binding rather
+                    # than inventing an identity from the event alone.
+                    bound_session = (c.get('slot_sessions', {}).get(model, {}).get(str(slot))
+                                     if slot is not None else None)
+                    session = worker.get('session') or bound_session
                     cleared = bool(outcome.get('hard_stop')) and stops_reconciled(
                         c, d, model, event_path, outcome, operation_records=operations)
-                    if (not worker.get('session') or outcome.get('session') != worker['session']
-                            or slot is not None and c.get('slot_sessions', {}).get(model, {}).get(str(slot)) != worker['session']
+                    if (not session or outcome.get('session') != session
+                            or slot is not None and bound_session != session
+                            or slot is not None and sum(session == sid for bindings in
+                                c.get('slot_sessions', {}).values() for sid in bindings.values()) != 1
                             or terminal.get('state') != 'completed' or terminal.get('exit_code') != 0
                             or not terminal.get('ended_at')
                             or outcome.get('terminal') != 'turn.completed'
