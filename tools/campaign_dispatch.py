@@ -54,6 +54,7 @@ def resume(cid, *, reason, batches_per_model=None):
             raise ValueError('dispatch must be draining before explicit resumption')
         from tools.campaign_migration import valid_migration
         from tools.campaign_supervision import events, normal_recovery
+        from tools.campaign_recovery import stops_reconciled
         if c.get('migration') and not valid_migration(c, d):
             raise ValueError('migration receipt integrity differs')
         lock_dirs = {p.parent.resolve() for parent in (d / 'supervisors', d / 'operations')
@@ -62,6 +63,7 @@ def resume(cid, *, reason, batches_per_model=None):
         with contextlib.ExitStack() as stack:
             for directory in sorted(lock_dirs):
                 stack.enter_context(receipts.idle(directory))
+            operations = {b['id']: receipts.read(d / 'operations' / b['id'] / 'latest.json') for b in c['batches']}
             for model in c['models']:
                 slots = range(1, ec.parallelism(c) + 1) if ec.parallelism(c) > 1 else [None]
                 for slot in slots:
@@ -78,15 +80,19 @@ def resume(cid, *, reason, batches_per_model=None):
                         raise ValueError('worker proof outside its model supervisor directory')
                     terminal = receipts.read(native / 'latest.json')
                     outcome = events(event_path)
+                    cleared = bool(outcome.get('hard_stop')) and stops_reconciled(
+                        c, d, model, event_path, outcome, operation_records=operations)
                     if (not worker.get('session') or outcome.get('session') != worker['session']
                             or slot is not None and c.get('slot_sessions', {}).get(model, {}).get(str(slot)) != worker['session']
                             or terminal.get('state') != 'completed' or terminal.get('exit_code') != 0
                             or not terminal.get('ended_at')
                             or outcome.get('terminal') != 'turn.completed'
-                            or outcome.get('hard_stop') or not normal_recovery(outcome.get('recovery_kind'))):
+                            or outcome.get('hard_stop') and not cleared
+                            or not normal_recovery(outcome.get('recovery_kind'))
+                            and not (cleared and outcome.get('recovery_kind') == 'nas_refused')):
                         raise ValueError('worker clean terminal or recovery outcome unverified')
             for batch in c['batches']:
-                op = receipts.read(d / 'operations' / batch['id'] / 'latest.json')
+                op = operations[batch['id']]
                 if batch['status'] not in ('submitted', 'released') and (
                         op.get('may_have_written') or op.get('exit_code', 0) != 0
                         and op.get('state') != 'reconciled_not_written'):

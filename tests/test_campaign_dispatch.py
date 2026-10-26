@@ -128,6 +128,72 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn('window', result['dispatch'])
         self.assertEqual(self.claim('n', 4)['slot'], 4)
 
+    def nas_refusal(self):
+        from pathlib import Path
+        batch = self.pending()
+        source = self.d / 'batches/m-002.json'
+        frozen = json.loads(source.read_text())
+        frozen['items'][0].update(source_description='synthetic observation', source_obs_id='source-3')
+        source.write_text(json.dumps(frozen))
+        self.activate()
+        c = ec.load(self.d)
+        keys = [{k: it[k] for k in ('source_description', 'source_obs_id')} for it in frozen['items']]
+        directory = self.d / 'operations/m-002'
+        with self.assertRaises(SystemExit):
+            with receipts.attempt(directory, kind='dryrun', identity={
+                    'campaign': c['id'], 'batch': batch['id'], **ec.batch_identity(c, batch)}) as update:
+                update(phase='waiting_nas', source_keys=keys, may_have_written=False)
+                raise SystemExit(76)
+        event_path = Path(self.proof['workers']['m']['events'])
+        entry = Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract'
+        with event_path.open('a') as stream:
+            for event in [
+                    {'type': 'item.completed', 'item': {'type': 'command_execution', 'id': 'gate1',
+                        'command': f'{entry} campaign submit --id {c["id"]} --batch m-002 --dry-run', 'exit_code': 76}},
+                    {'type': 'item.completed', 'item': {'type': 'agent_message',
+                        'text': json.dumps({'recovery_kind': 'nas_refused'})}}, {'type': 'turn.completed'}]:
+                stream.write(json.dumps(event) + '\n')
+        return directory, event_path
+
+    def test_readback_reconciled_nas_stop_resumes_without_erasing_original76(self):
+        directory, events = self.nas_refusal()
+        before = events.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'terminal'):
+            dispatch.resume(self.c['id'], reason='not reconciled')
+        proof = ec.cmd_reconcile_operation(self.c['id'], 'm-002', url='http://invalid', token=None,
+            check=lambda rows, *a: {row['source_obs_id']: None for row in rows})
+        self.assertTrue(proof['confirmed_not_written'])
+        result = dispatch.resume(self.c['id'], reason='user authorized; sources absent and NAS now available')
+        self.assertEqual(result['dispatch']['state'], 'running')
+        self.assertEqual(events.read_bytes(), before)
+        self.assertEqual(receipts.read(directory / 'latest.json')['exit_code'], 76)
+        self.assertEqual(ec.load(self.d)['quota'], 2000)
+
+    def test_nas_readback_must_be_complete_absent_same_attempt_kind_and_source(self):
+        directory, _ = self.nas_refusal()
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            ec.cmd_reconcile_operation(self.c['id'], 'm-002', url='http://invalid', token=None, check=lambda *a: {})
+        proof = ec.cmd_reconcile_operation(self.c['id'], 'm-002', url='http://invalid', token=None,
+            check=lambda rows, *a: {row['source_obs_id']: 'ok' for row in rows})
+        self.assertFalse(proof['confirmed_not_written'])
+        with self.assertRaisesRegex(ValueError, 'terminal'):
+            dispatch.resume(self.c['id'], reason='existing source must not replay')
+        ec.cmd_reconcile_operation(self.c['id'], 'm-002', url='http://invalid', token=None,
+            check=lambda rows, *a: {row['source_obs_id']: None for row in rows})
+        original = receipts.read(directory / 'latest.json')
+        for mutation in ['attempt', 'kind', 'source']:
+            record = json.loads(json.dumps(original))
+            if mutation == 'attempt': record['reconciliation']['attempt'] = 'another-operation'
+            if mutation == 'kind': record['kind'] = 'submit'
+            if mutation == 'source': record['source_keys'][0]['source_obs_id'] = 'changed-source'
+            receipts.write(directory / 'latest.json', record)
+            with self.assertRaisesRegex(ValueError, 'terminal'):
+                dispatch.resume(self.c['id'], reason='mismatched proof must not authorize replay')
+        receipts.write(directory / 'latest.json', original)
+        with receipts.attempt(directory, kind='dryrun', identity=original['identity']):
+            with self.assertRaises(receipts.Busy):
+                dispatch.resume(self.c['id'], reason='live original cannot be resumed')
+
 
 if __name__ == '__main__':
     unittest.main()

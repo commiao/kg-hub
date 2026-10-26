@@ -145,7 +145,8 @@ def adopt(directory: Path, identity: dict, batch_sha: str, source_keys: list, ev
         return proof
 
 
-def stops_reconciled(c: dict, d: Path, model: str, events_path: Path, outcome: dict) -> bool:
+def stops_reconciled(c: dict, d: Path, model: str, events_path: Path, outcome: dict,
+                     *, operation_records: dict | None = None) -> bool:
     """Clear only the exact recorded gate refusals that a coordinator reconciled."""
     from utils.extraction_quality import digest
     from tools.extract_campaign import batch_identity
@@ -157,16 +158,22 @@ def stops_reconciled(c: dict, d: Path, model: str, events_path: Path, outcome: d
         batch = next((b for b in c['batches'] if scope and b['id'] == scope['batch'] and b['model'] == model), None)
         if not batch or scope['campaign'] != c['id']:
             return False
-        record = receipts.status(d / 'operations' / batch['id'])
+        # Dispatch resumption already holds these exclusive leases. Re-probing
+        # them would mistake our own lock for a live submit; use its locked read.
+        record = (operation_records.get(batch['id'], {}) if operation_records is not None
+                  else receipts.status(d / 'operations' / batch['id']))
         if (record['state'] != 'reconciled_not_written' or record.get('kind') != scope['kind']
                 or record.get('identity') != {'campaign': c['id'], 'batch': batch['id'], **batch_identity(c, batch)}
                 or record.get('may_have_written') is not False
                 or record.get('reconciliation', {}).get('confirmed_not_written') is not True
                 or record.get('reconciliation', {}).get('attempt') != record.get('attempt')):
             return False
+        frozen = json.loads((d / 'batches' / (batch['id'] + '.json')).read_text())
+        if record.get('source_keys') != [{k: item[k] for k in ('source_description', 'source_obs_id')}
+                                         for item in frozen['items']]:
+            return False
         evidence = record.get('legacy_evidence')
         if evidence:
-            frozen = json.loads((d / 'batches' / (batch['id'] + '.json')).read_text())
             if (not evidence_unchanged(evidence)
                     or evidence.get('events_sha256') != file_sha(events_path)
                     or evidence.get('command_id') != stop.get('id')
