@@ -355,6 +355,15 @@ def reconcile_worker(cid, model, slot, *, reason, model_preflight=None):
               and outcome.get('recovery_kind') == 'uncertain_submit'
               and all(valid_partial(c, d, b, receipts.status(d / 'operations' / b['id'])) for b in pending)):
             kind = 'partial_upload_reconciled'
+        elif (terminal.get('exit_code') == 0 and outcome.get('terminal') == 'turn.completed'
+              and outcome.get('recovery_kind') == 'nas_refused'
+              and all((record := receipts.status(d / 'operations' / b['id'])).get('kind') in ('dryrun', 'submit')
+                      and record.get('exit_code') in (75, 76)
+                      and record.get('state') == 'reconciled_not_written'
+                      and record.get('may_have_written') is False
+                      and record.get('reconciliation', {}).get('confirmed_not_written') is True
+                      for b in pending)):
+            kind = 'nas_refusal_reconciled'
         else:
             raise ValueError('native failure is not an explicitly supported continuation')
         proof = {'version': 'native-continuation-v1', 'at': ec._now(), 'reason': reason,
@@ -391,6 +400,19 @@ def worker_reconciled(c, d, model, slot, *, locked=False):
         if proof['kind'] == 'capacity_recovered':
             settings = ec.runtime_settings(c)
             return ec.model_readiness([model], c['executor'], [proof['model_preflight']], **settings) == proof['readiness']
+        if proof['kind'] == 'nas_refusal_reconciled':
+            pending = [b for b in c['batches'] if b['model'] == model
+                       and ec.batch_slot(c, b) == slot and b['status'] not in ('submitted', 'released')]
+            if set(proof['operations']) != {b['id'] for b in pending}:
+                return False
+            for b in pending:
+                record = receipts.read(d / 'operations' / b['id'] / 'latest.json')
+                if (record.get('kind') not in ('dryrun', 'submit') or record.get('exit_code') not in (75, 76)
+                        or record.get('state') != 'reconciled_not_written'
+                        or record.get('may_have_written') is not False
+                        or record.get('reconciliation', {}).get('confirmed_not_written') is not True):
+                    return False
+            return bool(pending)
         return proof['kind'] == 'partial_upload_reconciled' and bool(proof['operations'])
     except (OSError, KeyError, ValueError, TypeError):
         return False
