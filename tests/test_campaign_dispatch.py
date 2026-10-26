@@ -154,6 +154,29 @@ class DispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'terminal'):
             dispatch.resume(self.c['id'], reason='event identity must match durable slot')
 
+    def test_public_resume_accepts_exact_capacity_terminal_but_not_other_native_failure(self):
+        self.activate()
+        root = ec.supervisor_dir(self.d, 'm', 1)
+        worker = receipts.read(root / 'worker.json')
+        event = Path(worker['events'])
+        original = event.read_bytes()
+        native = Path(self.proof['workers']['m']['runtime_receipt_dir']) / 'latest.json'
+        terminal = receipts.read(native)
+        receipts.write(native, {**terminal, 'exit_code': 1})
+        for message in ['authentication failed', supervision.CAPACITY_MESSAGE]:
+            rows = [{'type': 'thread.started', 'thread_id': worker['session']},
+                    {'type': 'error', 'message': message},
+                    {'type': 'turn.failed', 'error': {'message': message}}]
+            event.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            if message != supervision.CAPACITY_MESSAGE:
+                with self.assertRaisesRegex(ValueError, 'terminal'):
+                    dispatch.resume(self.c['id'], reason='do not retry other failures')
+            else:
+                before = event.read_bytes()
+                self.assertEqual(dispatch.resume(self.c['id'], reason='user authorized safe capacity recovery')['dispatch']['state'], 'running')
+                self.assertEqual(event.read_bytes(), before)
+                self.assertEqual(receipts.read(native)['exit_code'], 1)
+
     def nas_refusal(self):
         from pathlib import Path
         batch = self.pending()

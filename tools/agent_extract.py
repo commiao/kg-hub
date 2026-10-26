@@ -45,6 +45,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -233,7 +234,13 @@ def fetch_remote_rows(after_id: int, limit: int) -> list[dict]:
     return fetch_remote_pending(after_id, limit)["rows"]
 
 
-def _http(method: str, url: str, body: dict | None, token: str | None, timeout: int = 120):
+def _http(method: str, url: str, body: dict | None, token: str | None, timeout: float | None = None):
+    if timeout is None:
+        # Pre-extracted writes share the service's writer lock and embedding
+        # work. The generic120s timeout used to abandon valid service requests.
+        from utils.ingest_budget import ingest_ceiling_sec
+        timeout = (ingest_ceiling_sec() + 30 if method == 'POST' and
+                   urllib.parse.urlsplit(url).path == '/api/ingest_extracted' else 120)
     data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json",
@@ -1085,9 +1092,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     from tools import nas_gate
     try:
-        with nas_gate.hold("dryrun" if a.dry_run else "submit"):
+        with nas_gate.hold("dryrun" if a.dry_run else "submit") as gate_info:
             recs = submit_results(batch, results, model=a.model, session=a.session, url=a.url,
                                   token=token, log_path=log_path, dry_run=a.dry_run,
+                                  post=nas_gate.track_responses(_http, gate_info),
                                   names_path=sd / f"names-{a.model}.tsv",
                                   executor=a.executor, run_id=a.run_id, prompt_version=version,
                                   quality_review=review, prompt_text=prompt)

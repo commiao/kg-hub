@@ -101,6 +101,20 @@ class SubmissionLeaseTests(unittest.TestCase):
                 ec.cmd_submit("t1", bid, dry_run=False, url="http://fake", token=None)
             self.assertEqual(post.call_count, 1)
 
+    def test_campaign_gate_observes_only_completed_http_calls(self):
+        bid = self.prepare()
+        response_progress = mock.Mock()
+        @contextlib.contextmanager
+        def gate(kind):
+            yield {'response_progress': response_progress}
+        def submit(*args, **kwargs):
+            self.assertEqual(kwargs['post']('POST', 'http://fake', {}, None), (200, {}))
+            return []
+        with mock.patch.object(ax, 'submit_results', side_effect=submit):
+            ec.cmd_submit('t1', bid, dry_run=True, url='http://fake', token=None,
+                          gate=gate, post=lambda *args: (200, {}))
+        response_progress.assert_called_once_with()
+
 
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
@@ -294,6 +308,81 @@ class SupervisorTests(unittest.TestCase):
         out = self.run_supervisor(poll=0.01,spawn=self.native(calls))
         self.assertEqual(out['reason'],'native_terminal_unverified')
         self.assertFalse(calls)
+
+    def capacity_spawn(self, calls, *, always=False, extra_error=None, unsafe_submit=False):
+        normal = self.native([])
+        def spawn(args, **kw):
+            calls.append(args)
+            if len(calls) > 1 and not always:
+                self.formal(1); self.formal(2)
+                return normal(args, **kw)
+            directory = Path(args[args.index('--receipt-dir') + 1])
+            with r.attempt(directory, kind='native_cli') as update:
+                update(exit_code=1)
+                rows = [{'type': 'thread.started', 'thread_id': 'same-session'},
+                        {'type': 'error', 'message': s.CAPACITY_MESSAGE},
+                        {'type': 'turn.failed', 'error': {'message': s.CAPACITY_MESSAGE}}]
+                if extra_error:
+                    rows.insert(-1, {'type': 'error', 'message': extra_error})
+                if unsafe_submit:
+                    with r.attempt(self.d / 'operations/b', kind='submit') as progress:
+                        progress(may_have_written=True, requires_reconciliation=True)
+                for row in rows:
+                    kw['stdout'].write((json.dumps(row) + '\n').encode())
+                kw['stdout'].flush()
+            return mock.Mock(poll=lambda: 0)
+        return spawn
+
+    def test_exact_capacity_refusal_waits_then_resumes_same_session_without_extra_claim(self):
+        calls, sleeps = [], []
+        before = ec.load(self.d)['batches']
+        with mock.patch.object(s, 'CAPACITY_WAIT_SECONDS', .02):
+            out = self.run_supervisor(poll=.01, sleep=sleeps.append, spawn=self.capacity_spawn(calls))
+        self.assertEqual(out['state'], 'complete')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][calls[1].index('resume') + 1], 'same-session')
+        self.assertEqual(ec.load(self.d)['batches'], before)
+        self.assertTrue(sleeps)
+        states = list((self.d / 'supervisors/m/native').glob('*.json'))
+        self.assertTrue(any(r.read(p).get('exit_code') == 1 for p in states))
+
+    def test_persistent_capacity_is_bounded_and_does_not_invent_formal_progress(self):
+        calls = []
+        with mock.patch.object(s, 'CAPACITY_WAIT_SECONDS', .01):
+            out = self.run_supervisor(poll=.01, sleep=lambda _: None,
+                                      spawn=self.capacity_spawn(calls, always=True))
+        self.assertEqual(out['reason'], 'model_capacity_exhausted')
+        self.assertEqual(len(calls), 1 + s.MAX_CAPACITY_RETRIES)
+        self.assertEqual(s.completed(self.c, self.d, 'm'), 0)
+
+    def test_capacity_does_not_clear_unknown_write(self):
+        calls = []
+        out = self.run_supervisor(poll=.01, sleep=lambda _: None,
+                                  spawn=self.capacity_spawn(calls, unsafe_submit=True))
+        self.assertEqual(out['state'], 'blocked')
+        self.assertEqual(len(calls), 1)
+
+    def test_capacity_does_not_override_unrelated_provider_error(self):
+        calls = []
+        out = self.run_supervisor(poll=.01, sleep=lambda _: None,
+                                  spawn=self.capacity_spawn(calls, extra_error='authentication failed'))
+        self.assertEqual(out['state'], 'blocked')
+        self.assertEqual(len(calls), 1)
+
+    def test_capacity_never_overrides_recorded_approval_denial(self):
+        p = self.root / 'denied.events'
+        rows = [{'type': 'error', 'message': s.CAPACITY_MESSAGE},
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 1,
+                 'aggregated_output': 'This action was rejected due to unacceptable risk.'}},
+                {'type': 'turn.failed', 'error': {'message': s.CAPACITY_MESSAGE}}]
+        p.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        self.assertFalse(s.capacity_terminal(s.events(p), {'state': 'completed', 'exit_code': 1, 'ended_at': 'now'}))
+
+    def test_capacity_text_in_agent_reply_is_not_a_native_refusal(self):
+        p = self.root / 'quoted.events'
+        p.write_text(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
+            'text': s.CAPACITY_MESSAGE}}) + '\n' + json.dumps({'type': 'turn.failed'}) + '\n')
+        self.assertFalse(s.events(p).get('capacity_refused'))
 
 
 if __name__ == "__main__":

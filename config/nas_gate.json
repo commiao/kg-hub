@@ -10,5 +10,6 @@
   "recheck_s": 120,
   "max_misses": 5,
   "max_wait_s": 3600,
+  "_wait_budget": "FIFO等待只在前方HTTP响应或队列前移时刷新3600秒无进展预算；到队首后的锁/间隔/测温仍共用3600秒，温度与间隔不变。",
   "lock_dir": "~/.kg-hub/campaign-tools"
 }

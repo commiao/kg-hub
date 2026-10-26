@@ -504,3 +504,13 @@ NAS75/76 后须先确认当前NAS可用并取得恢复授权，再对原批运�
 - **冒烟**（新模型进场前，不入库）：`tools/extract_bench.py` 在冻结样本上离线评分，见 [qoder.md](qoder.md) 的「对比模式」。
 - **运行器**（`extract_bench run --executor qodercli|codex|claude`）：把 qoder、codex 或 Claude Code 命令行当纯模型通道、无人值守地比模型本身；不入库，用于冒烟与准入。
 - **战役**（本文）：多模型生产画像，入库，每批复盘、改链路；模型能不能用、谁更好看 bench 准入记录。
+
+## NAS queue and recoverable infrastructure waits
+
+NAS-heavy operations reserve process-leased FIFO tickets before acquiring the existing machine-wide lock. Only the oldest live ticket may contend for that lock. Abandoned tickets are removed only after their file lease is provably released; PIDs, age or stale timestamps never authorize evicting a live owner. All clients must load the same released gate to guarantee FIFO fairness; legacy clients remain mutually exclusive but cannot participate in ordering.
+
+`max_wait_s` remains3600. At the queue head it bounds lock acquisition, the original60/180-second gaps and three-sample temperature admission at90C. Behind other tickets it bounds lack of progress: only completed HTTP responses from the head or a forward queue transition refresh that budget. Polling and timer heartbeats do not. Eight productive batches may therefore queue longer than an hour without being falsely labeled a NAS failure, while a stalled owner still refuses with76. Temperature read failures still refuse with75. Thermal admission is never weakened.
+
+Pre-extracted HTTP writes and previews use the existing `utils.ingest_budget.ingest_ceiling_sec()` plus30seconds transport margin, instead of the generic120seconds. Other requests retain120seconds. A timeout still means unknown remote state and does not authorize retry, source-key changes or promoted success. This prevents premature client abandonment; it cannot retrospectively prove the outcome of an older timed-out request.
+
+Only the exact native `Selected model is at capacity. Please try a different model.` refusal, a clean native exit1 and `turn.failed` with the same original session qualify for capacity recovery. Supervision waits300seconds and resumes the same session up to three times, without new claims or model probes. Unknown writes, approval denials, NAS refusals and other provider errors still stop. Capacity refusals do not spend the no-formal-progress budget; persistent capacity exhaustion remains an explicit infrastructure blocker. The retry counter is persisted with the worker.
