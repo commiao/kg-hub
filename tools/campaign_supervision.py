@@ -233,6 +233,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             if saved.get("events"):
                 outcome = events(Path(saved["events"]))
                 from tools.campaign_recovery import stops_reconciled
+                from tools.campaign_continuation import worker_reconciled
+                continuation = slot is not None and worker_reconciled(c, d, model, slot)
                 cleared = bool(outcome.get("hard_stop")) and stops_reconciled(c, d, model, Path(saved["events"]), outcome)
                 if outcome.get("hard_stop") and not cleared:
                     update(phase="coordinator_required", exit_code=2, reason="nas_gate_refused", business_exit_code=outcome["hard_stop"])
@@ -244,7 +246,13 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 session = outcome.get("session") or session
                 bind_slot_session(d, model, slot, session)
                 capacity = capacity_terminal(outcome, state)
-                if capacity:
+                if capacity and continuation:
+                    # A coordinator may clear an exhausted capacity refusal only
+                    # after a fresh same-model probe and exact terminal binding.
+                    capacity_retries = 0
+                    saved['capacity_retries'] = 0
+                    receipts.write(root / 'worker.json', saved)
+                elif capacity:
                     if not capacity_safe or capacity_retries >= MAX_CAPACITY_RETRIES:
                         reason = 'capacity_submit_unverified' if not capacity_safe else 'model_capacity_exhausted'
                         update(phase='coordinator_required', exit_code=2, reason=reason,
@@ -263,7 +271,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                         step = min(poll, remaining)
                         sleep(step)
                         remaining -= step
-                elif (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
+                elif not continuation and (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
                         or (not normal_recovery(outcome.get("recovery_kind"))
                             and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")

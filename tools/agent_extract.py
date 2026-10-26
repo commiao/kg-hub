@@ -382,7 +382,7 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
                    dry_run: bool = False, names_path: Path | None = None,
                    executor: str | None = None, run_id: str | None = None,
                    prompt_version: str | None = None, quality_review: dict | None = None,
-                   prompt_text: str | None = None) -> list[dict]:
+                   prompt_text: str | None = None, acknowledged: list[dict] | None = None) -> list[dict]:
     """dry_run：只让服务端做消解不写图，返回每个实体会并到谁；不记 log。
     prompt_version：随 episode 入图的规则版本；对比战役传开局快照的版本（+ 补充约定版本），不随仓库变。
     names_path：追加本会话已用过的实体名（第 2 轮复盘：靠记忆维护避坑名单不可靠）。
@@ -405,6 +405,16 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
         item = by_id.get(oid)
         if item is None:
             out.append({"id": oid, "status": "unknown_id"})
+            continue
+        if acknowledged and not dry_run and len(out) < len(acknowledged):
+            previous = acknowledged[len(out)]
+            expected = extraction_payload_digest(item, res, prompt_version, prompt_text,
+                batch=batch, results=results, identity=quality.extraction_identity(model, executor, run_id))
+            if (previous.get('id') != oid or previous.get('status') != 'ok' or previous.get('http') != 200
+                    or previous.get('model') != model or previous.get('executor') != executor
+                    or previous.get('run_id') != run_id or previous.get('payload_digest') != expected):
+                raise ValueError('acknowledged prefix differs from the reviewed request')
+            out.append(previous)  # no HTTP request and no second formal log row
             continue
         if not res.get("entities"):
             # 空观测：预览时只在本地记；正式提交时也发一条「空」记录（服务端只记 IngestedKey status=empty、不写图），
