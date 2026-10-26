@@ -53,7 +53,7 @@ def resume(cid, *, reason, batches_per_model=None):
         if (c.get('dispatch') or {}).get('state') != 'draining':
             raise ValueError('dispatch must be draining before explicit resumption')
         from tools.campaign_migration import valid_migration
-        from tools.campaign_supervision import events, normal_recovery
+        from tools.campaign_supervision import events, normal_recovery, capacity_terminal
         from tools.campaign_recovery import stops_reconciled
         if c.get('migration') and not valid_migration(c, d):
             raise ValueError('migration receipt integrity differs')
@@ -80,6 +80,7 @@ def resume(cid, *, reason, batches_per_model=None):
                         raise ValueError('worker proof outside its model supervisor directory')
                     terminal = receipts.read(native / 'latest.json')
                     outcome = events(event_path)
+                    capacity = capacity_terminal(outcome, terminal)
                     # A new slot's first turn records its session binding when
                     # its native events end, before another spawn rewrites the
                     # initial worker.json. Require that existing binding rather
@@ -93,9 +94,9 @@ def resume(cid, *, reason, batches_per_model=None):
                             or slot is not None and bound_session != session
                             or slot is not None and sum(session == sid for bindings in
                                 c.get('slot_sessions', {}).values() for sid in bindings.values()) != 1
-                            or terminal.get('state') != 'completed' or terminal.get('exit_code') != 0
+                            or terminal.get('state') != 'completed' or terminal.get('exit_code') != 0 and not capacity
                             or not terminal.get('ended_at')
-                            or outcome.get('terminal') != 'turn.completed'
+                            or outcome.get('terminal') != 'turn.completed' and not capacity
                             or outcome.get('hard_stop') and not cleared
                             or not normal_recovery(outcome.get('recovery_kind'))
                             and not (cleared and outcome.get('recovery_kind') == 'nas_refused')):

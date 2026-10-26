@@ -5,8 +5,8 @@
   1. 全机一把锁：同一时刻只有一个重操作在 NAS 上跑（fcntl 文件锁，同一台机器内有效）；
   2. 间隔：距上一次重操作结束至少 gap_s 秒（缺省 dry-run 60、submit 180），让温度回落；
   3. 测温：连读 samples 次（缺省 3）NAS CPU 温度取均值，≤ max_c（缺省 90°C）才放行，否则每 recheck_s 秒复测；
-     连续 max_misses 次读不到温度退出码 75（EX_TEMPFAIL，不盲目放行）；排队、等间隔、等降温合计超过 max_wait_s
-     退出码 76。每天约 02:00 家里路由器重启，期间读不到温度属正常。
+     连续 max_misses 次读不到温度退出码 75（EX_TEMPFAIL，不盲目放行）；FIFO 排队期间只有前方真实 HTTP
+     响应或队列前移才刷新 max_wait_s 无进展预算。到队首后等锁、间隔和降温仍共用原 max_wait_s，超时退出76。
 
 配置：config/nas_gate.json（KG_HUB_NAS_GATE_CONFIG 换整份）；KG_HUB_NAS_TEMP_SSH / KG_HUB_NAS_TEMP_SENSOR /
 KG_HUB_NAS_GATE_DIR 覆盖 SSH 目标、传感器路径、锁目录。锁目录缺省与仓库外的 ~/.kg-hub/campaign-tools/nas_gate.py
@@ -95,6 +95,20 @@ def last_end(settings: dict) -> float:
         return 0.0
 
 
+def track_responses(post, gate_info):
+    """Record real queue progress without replacing a successful HTTP result."""
+    def send(*args, **kwargs):
+        result = post(*args, **kwargs)
+        progress = (gate_info or {}).get('response_progress')
+        if progress:
+            try:
+                progress()
+            except (OSError, ValueError):
+                _log('FIFO 响应进度记录失败；保留真实 HTTP 结果，等待者仍受无进展预算限制')
+        return result
+    return send
+
+
 @contextlib.contextmanager
 def hold(kind: str, *, settings: dict | None = None, read=None, sleep=time.sleep, clock=time.time, log=_log):
     """拿到锁、等够间隔、温度达标后进入；退出时记下这次重操作的结束时间（拿锁期间才写，进不来不写）。"""
@@ -104,10 +118,30 @@ def hold(kind: str, *, settings: dict | None = None, read=None, sleep=time.sleep
     read = read or read_temp
     gap = float((s.get("gap_s") or {}).get(kind, 0))
     max_c, recheck = float(s.get("max_c", 90)), float(s.get("recheck_s", 120))
-    deadline = clock() + float(s.get("max_wait_s", 3600))
+    budget = float(s.get("max_wait_s", 3600))
     lock_dir = Path(s["lock_dir"]).expanduser()
     lock_dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_dir / "nas-heavy.lock", "a") as lk:
+    from tools.nas_queue import reserve
+    with reserve(lock_dir, kind, clock) as ticket, open(lock_dir / "nas-heavy.lock", "a") as lk:
+        # The queue may legitimately contain hours of successful work. A waiter
+        # times out only when the queue makes no progress for the same original
+        # budget; the head still has that full budget for lock/gap/temperature.
+        last_progress, signature, previous_position = clock(), None, None
+        while True:
+            position, head = ticket.position()
+            if position == 0:
+                break
+            current = (position, head)
+            if current != signature:
+                last_progress, signature = clock(), current
+            if position != previous_position:
+                log(f"FIFO 排队：前方 {position} 个 NAS 重操作")
+                previous_position = position
+            left = last_progress + budget - clock()
+            if left <= 0:
+                raise GateRefused(EXIT_TIMEOUT, f"NAS FIFO 队列超过 {budget:g} 秒无进展，未放行 {kind}")
+            sleep(min(LOCK_POLL_S, left))
+        deadline = clock() + budget
         queued = False
         while True:
             try:
@@ -123,11 +157,17 @@ def hold(kind: str, *, settings: dict | None = None, read=None, sleep=time.sleep
                 sleep(min(LOCK_POLL_S, left))
         wait = last_end(s) + gap - clock()
         if wait > 0:
+            if clock() + wait > deadline:
+                raise GateRefused(EXIT_TIMEOUT, "NAS 安全间隔超过当前等待预算，未放行")
             log(f"距上一次重操作不足 {gap:.0f} 秒，再等 {wait:.0f} 秒")
             sleep(wait)
         misses = 0
         while True:
+            if clock() >= deadline:
+                raise GateRefused(EXIT_TIMEOUT, "NAS 测温等待超过预算，未放行")
             t = avg_temp(s, read, sleep)
+            if clock() > deadline:
+                raise GateRefused(EXIT_TIMEOUT, "NAS 测温完成时已超过预算，未放行")
             if t is None:
                 misses += 1
                 log(f"读不到 NAS 温度（第 {misses} 次）")
@@ -144,7 +184,7 @@ def hold(kind: str, *, settings: dict | None = None, read=None, sleep=time.sleep
                                                 f"{'读不到' if t is None else f'{t:.1f}°C'}），未放行 {kind}")
             sleep(recheck)
         try:
-            yield {"kind": kind, "temp_c": round(t, 1)}
+            yield {"kind": kind, "temp_c": round(t, 1), "response_progress": ticket.response}
         finally:
             state_path(s).write_text(json.dumps({"last_end": clock(), "last_kind": kind}))
             log(f"{kind} 结束")

@@ -18,6 +18,18 @@ from concurrent.futures import ThreadPoolExecutor
 from tools import agent_extract as ax, extract_campaign as ec, claim_registry, nas_gate
 from utils import process_receipts as receipts
 
+CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model.'
+CAPACITY_WAIT_SECONDS = 300
+MAX_CAPACITY_RETRIES = 3
+
+
+def capacity_terminal(outcome, terminal):
+    return (terminal.get('state') == 'completed' and terminal.get('exit_code') == 1
+            and bool(terminal.get('ended_at')) and outcome.get('terminal') == 'turn.failed'
+            and outcome.get('capacity_refused') is True and not outcome.get('hard_stop')
+            and not outcome.get('approval_refused')
+            and normal_recovery(outcome.get('recovery_kind')))
+
 
 def normal_recovery(kind):
     return kind in (None, 'none', 'diagnostic_unavailable', 'migration_drained')
@@ -50,6 +62,7 @@ def events(path: Path) -> dict:
     if not path.is_file():
         return {}
     result = {}
+    native_errors = []
     with path.open("rb") as stream:
         for line in stream:
             try:
@@ -60,7 +73,15 @@ def events(path: Path) -> dict:
                 result["session"] = row.get("thread_id")
             if row.get("type") in ("turn.completed", "turn.failed", "error"):
                 result["terminal"] = row["type"]
+            if row.get('type') == 'error':
+                native_errors.append(row.get('message'))
+            elif row.get('type') == 'turn.failed':
+                error = row.get('error')
+                native_errors.append(error.get('message') if isinstance(error, dict) else None)
             item = row.get("item", {})
+            if (item.get('type') == 'command_execution' and item.get('exit_code')
+                    and 'This action was rejected due to unacceptable risk' in str(item.get('aggregated_output', ''))):
+                result['approval_refused'] = True
             if (row.get("type") == "item.completed" and item.get("type") == "command_execution"
                     and item.get("exit_code") in (75, 76)
                     and re.search(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+campaign\s+submit\b", item.get("command", ""))):
@@ -74,6 +95,8 @@ def events(path: Path) -> dict:
                     continue
                 if isinstance(report, dict) and report.get("recovery_kind"):
                     result["recovery_kind"] = report["recovery_kind"]
+    if native_errors:
+        result['capacity_refused'] = all(message == CAPACITY_MESSAGE for message in native_errors)
     return result
 
 
@@ -138,6 +161,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
         if session and saved.get("session") and session != saved["session"]:
             raise ValueError("resume session differs from managed worker identity")
         session = saved.get("session") or session
+        capacity_retries = int(saved.get('capacity_retries', 0))
         bind_slot_session(d, model, slot, session)
         baseline = completed(c, d, model, slot)
         if (baseline < c["quota"] and not saved and adopt_exit is None
@@ -172,11 +196,16 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     update(phase="coordinator_required", exit_code=2, reason=outcome["recovery_kind"])
                     return {"model": model, "state": "blocked", "reason": outcome["recovery_kind"]}
             waiting = False
+            capacity_safe = True
             own_pending = [b for b in c["batches"] if b["model"] == model
                            and (slot is None or ec.batch_slot(c, b) == slot)
                            and b["status"] not in ("submitted", "released")]
             for batch in own_pending:
                 op = ec.cmd_operation_status(cid, batch["id"])
+                operation = op['operation']
+                capacity_safe = capacity_safe and (
+                    operation.get('state') in ('not_started', 'completed', 'reconciled_not_written')
+                    and not operation.get('may_have_written') and not operation.get('requires_reconciliation'))
                 if op["action"] == "wait_for_original":
                     waiting = True
                 elif op["action"] == "legacy_terminal_unverified" and batch["status"] == "dry_run":
@@ -214,12 +243,34 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     return {"model": model, "state": "blocked", "reason": "native_session_mismatch"}
                 session = outcome.get("session") or session
                 bind_slot_session(d, model, slot, session)
-                if (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
+                capacity = capacity_terminal(outcome, state)
+                if capacity:
+                    if not capacity_safe or capacity_retries >= MAX_CAPACITY_RETRIES:
+                        reason = 'capacity_submit_unverified' if not capacity_safe else 'model_capacity_exhausted'
+                        update(phase='coordinator_required', exit_code=2, reason=reason,
+                               capacity_retries=capacity_retries)
+                        return {'model': model, 'state': 'blocked', 'reason': reason}
+                    capacity_retries += 1
+                    saved['capacity_retries'] = capacity_retries
+                    receipts.write(root / 'worker.json', saved)
+                    update(phase='waiting_model_capacity', session=session,
+                           capacity_retries=capacity_retries, wait_seconds=CAPACITY_WAIT_SECONDS)
+                    remaining = CAPACITY_WAIT_SECONDS
+                    while remaining > 0:
+                        if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
+                            update(phase='claims_drained', success=count)
+                            return {'model': model, 'state': 'drained', 'success': count}
+                        step = min(poll, remaining)
+                        sleep(step)
+                        remaining -= step
+                elif (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
                         or (not normal_recovery(outcome.get("recovery_kind"))
                             and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")
                     return {"model": model, "state": "blocked", "reason": "native_worker_blocked"}
-                stalled = stalled + 1 if own_count <= baseline else 0
+                if not capacity:
+                    capacity_retries = 0
+                    stalled = stalled + 1 if own_count <= baseline else 0
                 baseline = own_count
                 update(stalled_turns=stalled, success=count, session=session)
                 if stalled >= max_stalled:
@@ -244,7 +295,8 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 return {"model": model, "state": "blocked", "reason": "preflight_failed", "preflight": flight}
             tag = uuid.uuid4().hex
             output, error = root / (tag + ".events.jsonl"), root / (tag + ".stderr.log")
-            saved = {"session": session, "events": str(output), "stderr": str(error)}
+            saved = {"session": session, "events": str(output), "stderr": str(error),
+                     "capacity_retries": capacity_retries}
             receipts.write(root / "worker.json", saved)
             entry = Path(os.environ.get("KG_HUB_CODE", "~/.local/share/kg-hub/current")).expanduser() / "tools/extract"
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],

@@ -1102,10 +1102,12 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
     input_sha256 = preview_input_digest(batch, results, prompt, review, batch_identity(c, b))
     progress(phase="waiting_nas", may_have_written=False, input_sha256=input_sha256,
              source_keys=[{k: item[k] for k in ("source_description", "source_obs_id")} for item in batch["items"]])
-    with (gate or no_gate)("dryrun" if dry_run else "submit"):
+    with (gate or no_gate)("dryrun" if dry_run else "submit") as gate_info:
         progress(phase="submitting", may_have_written=not dry_run)
+        from tools.nas_gate import track_responses
+        tracked_post = track_responses(post or ax._http, gate_info)
         recs = ax.submit_results(batch, results, model=model, session=cid, url=url, token=token,
-                                 post=post or ax._http, log_path=None if dry_run else d / "log.jsonl",
+                                 post=tracked_post, log_path=None if dry_run else d / "log.jsonl",
                                  dry_run=dry_run, executor=c["executor"], run_id=run_id,
                                  prompt_version=version, quality_review=review, prompt_text=prompt)
     counts: dict[str, int] = {}
