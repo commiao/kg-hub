@@ -170,6 +170,35 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(original.read_bytes(), self.original_bytes)
         self.assertEqual(ec.load(self.d)['quota'], 2000)
 
+    def test_reconciled_nas_refusal_allows_resume_without_rewriting_original_event(self):
+        root, event = self.worker('m', 2, kind='nas_refused')
+        original_event = event.read_bytes()
+        latest = self.d / 'operations' / self.bid / 'latest.json'
+        record = receipts.read(latest)
+        record.update(state='reconciled_not_written', exit_code=76, may_have_written=False,
+                      reconciliation={'confirmed_not_written': True, 'evidence': 'synthetic-readonly-ledger'})
+        receipts.write(latest, record)
+        proof = continuation.reconcile_worker(self.c['id'], 'm', 2, reason='authorized after exact no-write reconciliation')
+        self.assertEqual(proof['kind'], 'nas_refusal_reconciled')
+        self.assertTrue(continuation.worker_reconciled(ec.load(self.d), self.d, 'm', 2))
+        self.assertEqual(event.read_bytes(), original_event)
+        with mock.patch.object(receipts, 'idle', side_effect=lambda _: contextlib.nullcontext()):
+            self.assertEqual(dispatch.resume(self.c['id'], reason='verified synthetic NAS refusal recovery')['dispatch']['state'], 'running')
+
+    def test_nas_refusal_requires_every_operation_proven_not_written(self):
+        self.worker('m', 2, kind='nas_refused')
+        latest = self.d / 'operations' / self.bid / 'latest.json'
+        record = receipts.read(latest)
+        record.update(state='reconciled_not_written', exit_code=76, may_have_written=False,
+                      reconciliation={'confirmed_not_written': False})
+        receipts.write(latest, record)
+        with self.assertRaises(ValueError):
+            continuation.reconcile_worker(self.c['id'], 'm', 2, reason='incomplete proof')
+        record['exit_code'] = 1
+        receipts.write(latest, record)
+        with self.assertRaises(ValueError):
+            continuation.reconcile_worker(self.c['id'], 'm', 2, reason='wrong original exit code')
+
     def test_readback_requires_all_keys_exact_uuids_and_absent_remaining(self):
         original = (self.d / 'operations' / self.bid / 'latest.json').read_bytes()
         def missing(*args):
