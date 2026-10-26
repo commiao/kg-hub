@@ -200,6 +200,19 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual((len(ids), len(set(ids)), len(calls)), (402, 402, 8))
         self.assertTrue(m.valid_migration(c, self.d))
         self.assertEqual(len({sid for _, _, sid in calls}), 8)
+        # A first native turn learns its session from thread.started. If it
+        # finishes before another spawn, worker.json still has the initial
+        # null session, while the durable slot binding is already recorded.
+        from tools import campaign_dispatch
+        for model in self.c['models']:
+            for slot in [2, 3, 4]:
+                self.assertIsNone(r.read(ec.supervisor_dir(self.d, model, slot) / 'worker.json')['session'])
+        m.drain(self.c['id'], 'user authorized continuation after clean first turns')
+        before = (self.d / 'log.jsonl').read_bytes()
+        resumed = campaign_dispatch.resume(self.c['id'], reason='same eight original sessions')
+        self.assertEqual(resumed['dispatch']['state'], 'running')
+        self.assertEqual(ec.load(self.d)['slot_sessions'], c['slot_sessions'])
+        self.assertEqual((self.d / 'log.jsonl').read_bytes(), before)
 
     def test_original_lease_and_nas_refusal_cannot_be_bypassed(self):
         self.prepare()
