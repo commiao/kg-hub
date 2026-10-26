@@ -55,6 +55,7 @@ def resume(cid, *, reason, batches_per_model=None):
         from tools.campaign_migration import valid_migration
         from tools.campaign_supervision import events, normal_recovery, capacity_terminal
         from tools.campaign_recovery import stops_reconciled
+        from tools.campaign_continuation import valid_partial, worker_reconciled
         if c.get('migration') and not valid_migration(c, d):
             raise ValueError('migration receipt integrity differs')
         lock_dirs = {p.parent.resolve() for parent in (d / 'supervisors', d / 'operations')
@@ -90,20 +91,22 @@ def resume(cid, *, reason, batches_per_model=None):
                     session = worker.get('session') or bound_session
                     cleared = bool(outcome.get('hard_stop')) and stops_reconciled(
                         c, d, model, event_path, outcome, operation_records=operations)
+                    continuation = slot is not None and worker_reconciled(c, d, model, slot, locked=True)
                     if (not session or outcome.get('session') != session
                             or slot is not None and bound_session != session
                             or slot is not None and sum(session == sid for bindings in
                                 c.get('slot_sessions', {}).values() for sid in bindings.values()) != 1
-                            or terminal.get('state') != 'completed' or terminal.get('exit_code') != 0 and not capacity
+                            or terminal.get('state') != 'completed'
                             or not terminal.get('ended_at')
-                            or outcome.get('terminal') != 'turn.completed' and not capacity
+                            or terminal.get('exit_code') != 0 and not (capacity or continuation)
+                            or outcome.get('terminal') != 'turn.completed' and not (capacity or continuation)
                             or outcome.get('hard_stop') and not cleared
                             or not normal_recovery(outcome.get('recovery_kind'))
-                            and not (cleared and outcome.get('recovery_kind') == 'nas_refused')):
+                            and not (cleared and outcome.get('recovery_kind') == 'nas_refused') and not continuation):
                         raise ValueError('worker clean terminal or recovery outcome unverified')
             for batch in c['batches']:
                 op = operations[batch['id']]
-                if batch['status'] not in ('submitted', 'released') and (
+                if batch['status'] not in ('submitted', 'released') and not valid_partial(c, d, batch, op) and (
                         op.get('may_have_written') or op.get('exit_code', 0) != 0
                         and op.get('state') != 'reconciled_not_written'):
                     raise ValueError('pending operation requires reconciliation before resume')

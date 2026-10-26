@@ -26,11 +26,14 @@ def command_scope(command: str, expected: tuple[str, str] | None = None) -> dict
     """Parse a single public command, never evaluate shell text or compound commands."""
     args = shlex.split(command)
     entry = str(Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract')
+    stable = '${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract'
     if len(args) == 3 and Path(args[0]).name in ('zsh', 'bash', 'sh') and args[1] in ('-c', '-lc'):
         # Unrelated Python here-docs need not be valid shlex word streams.
-        if not args[2].lstrip().startswith((entry, shlex.quote(entry))):
+        if not args[2].lstrip().startswith((entry, shlex.quote(entry), '"' + stable + '"')):
             return None
         args = shlex.split(args[2])
+    if args and args[0] == stable:
+        args[0] = entry  # one known stable-entry expression, never shell evaluation
     if len(args) < 3 or args[:3] != [entry, 'campaign', 'submit']:
         return None
     flags, log = {}, None

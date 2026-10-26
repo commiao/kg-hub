@@ -347,6 +347,13 @@ def brief(c: dict, model: str, slot: int | None = None) -> str:
                  "一批提交并完成随机复查、成本记录后再领取下一批。done=true 表示本槽位已无可领任务，"
                  "模型是否完成以正式提交累计数为准。\n")
     settings = runtime_settings(c)
+    for b in c.get('batches', []):
+        if (b['model'] == model and b['status'] not in ('submitted', 'released')
+                and (slot is None or batch_slot(c, b) == slot)
+                and (campaign_dir(c['id']) / 'operations' / b['id'] / 'partial-active.json').is_file()):
+            text += (f"\n批次 {b['id']} 已经公共核验部分提交：保留原批次、完整结果、质量表与来源键，"
+                     "复用既有抽取；不得切分/改写结果或重交已确认条目。公共submit会保留原HTTP200回执，"
+                     "仅发送未被接收的后缀。仍需整批有效预览和提交后原随机复查；输入需改动时先停下交协调器。\n")
     text += (f"\n本战役冻结运行设置：effort={settings['effort']}，proxy_mode={settings['proxy_mode']}。"
              "原生会话使用 campaign launch 生成的 runtime exec 命令，确保正式调用与探测使用相同子进程环境和推理强度。"
              "宿主手工子代理定义仅提供模型与任务文本，不能证明宿主已应用这些设置；需工具侧证据，未验证不能声称就绪。\n")
@@ -1009,7 +1016,9 @@ def cmd_operation_status(cid: str, bid: str) -> dict:
     c = load(campaign_dir(cid))
     b = find_batch(c, bid)
     state = status(campaign_dir(cid) / "operations" / bid)
+    from tools.campaign_continuation import valid_partial
     action = ("wait_for_original" if state["state"] == "running" else
+              "resume_remaining_only" if valid_partial(c, campaign_dir(cid), b, state) else
               "reconcile_service_before_replay" if state["state"] == "uncertain" or state.get("requires_reconciliation") else
               "review_and_preview_before_submit" if state["state"] == "reconciled_not_written" else
               "stop_nas_gate_refusal" if state.get("exit_code") in (75, 76) else
@@ -1100,6 +1109,9 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
         split_guard(d, c, b, batch, results, allow_split=allow_split, layout=layout)
     model, run_id = b["model"], c["models"][b["model"]]["run_id"]
     input_sha256 = preview_input_digest(batch, results, prompt, review, batch_identity(c, b))
+    from tools.campaign_continuation import partial_records
+    acknowledged = partial_records(c, d, b)
+    continuation = {'acknowledged': acknowledged} if acknowledged and not dry_run else {}
     progress(phase="waiting_nas", may_have_written=False, input_sha256=input_sha256,
              source_keys=[{k: item[k] for k in ("source_description", "source_obs_id")} for item in batch["items"]])
     with (gate or no_gate)("dryrun" if dry_run else "submit") as gate_info:
@@ -1109,7 +1121,7 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
         recs = ax.submit_results(batch, results, model=model, session=cid, url=url, token=token,
                                  post=tracked_post, log_path=None if dry_run else d / "log.jsonl",
                                  dry_run=dry_run, executor=c["executor"], run_id=run_id,
-                                 prompt_version=version, quality_review=review, prompt_text=prompt)
+                                 prompt_version=version, quality_review=review, prompt_text=prompt, **continuation)
     counts: dict[str, int] = {}
     for r in recs:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -1609,6 +1621,16 @@ def _main(argv=None) -> int:
     limit = resume.add_mutually_exclusive_group(required=True)
     limit.add_argument('--batches-per-model', type=positive_int)
     limit.add_argument('--all-remaining', action='store_true')
+    upload = sub.add_parser('reconcile-upload', help='verify a partial JSON-body upload failure; never replay acknowledged sources')
+    upload.add_argument('--id', required=True)
+    upload.add_argument('--batch', required=True)
+    upload.add_argument('--url', default=os.environ.get('KG_HUB_URL', ax.DEFAULT_URL))
+    worker_recovery = sub.add_parser('reconcile-worker', help='bind exact reconciled partial-submit or transient-capacity native terminal')
+    worker_recovery.add_argument('--id', required=True)
+    worker_recovery.add_argument('--model', required=True)
+    worker_recovery.add_argument('--slot', type=positive_int, required=True)
+    worker_recovery.add_argument('--reason', required=True)
+    worker_recovery.add_argument('--model-preflight', type=Path)
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -1769,6 +1791,12 @@ def _main(argv=None) -> int:
         out = cmd_reconcile_operation(a.id, a.batch, url=a.url, token=ax.api_token(),
                                       legacy_exit=a.legacy_exit, legacy_events=a.legacy_events,
                                       session=a.resume_session)
+    elif a.cmd == 'reconcile-upload':
+        from tools.campaign_continuation import reconcile_upload
+        out = reconcile_upload(a.id, a.batch, url=a.url, token=ax.api_token())
+    elif a.cmd == 'reconcile-worker':
+        from tools.campaign_continuation import reconcile_worker
+        out = reconcile_worker(a.id, a.model, a.slot, reason=a.reason, model_preflight=a.model_preflight)
     elif a.cmd == "rules":
         d = campaign_dir(a.id)
         c = load(d)
