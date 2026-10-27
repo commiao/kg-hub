@@ -229,6 +229,46 @@ class OwnershipRecoveryTests(unittest.TestCase):
             c = copy.deepcopy(original);change(c)
             self.assertFalse(recovery.valid(c, self.d, 'm', 3))
 
+    def test_real_native_quality_check_shape_allows_only_private_audit_json_redirect(self):
+        entry = str(Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract')
+        destination = self.d / 'audit' / 'same-source' / 'quality-check.json'
+        destination.parent.mkdir(parents=True)
+        destination.write_text(json.dumps({'ok': True, 'errors': []}))
+        command = shlex.join([entry, 'agent', 'quality-check', '--batch', '/synthetic/batch.json', '--file', '/synthetic/results.json'])
+        command += ' > ' + shlex.quote(str(destination))
+        self.assertEqual(recovery._public_command(command, output_root=self.d / 'audit')[:2], ['agent', 'quality-check'])
+        self.assertEqual(recovery._public_command(command.replace(' > ', '>'), output_root=self.d / 'audit')[:2],
+                         ['agent', 'quality-check'])
+        self.assertEqual(recovery._public_command(shlex.join(['/bin/sh', '-lc', command]), output_root=self.d / 'audit')[:2],
+                         ['agent', 'quality-check'])
+        cmd = shlex.join(['/bin/zsh', '-lc', command])
+        rows = [{'type': 'item.started', 'item': {'id': 'quality-check', 'type': 'command_execution', 'command': cmd}},
+                {'type': 'item.completed', 'item': {'id': 'quality-check', 'type': 'command_execution', 'command': cmd,
+                                                  'exit_code': 0, 'aggregated_output': ''}}]
+        self.rows[1:1] = rows;self.write_events()
+        self.assertEqual(len(self.preview()['evidence']['commands']), 2)
+        self.plan.unlink()
+        for invalid in [command.replace(str(destination), '/tmp/outside.json'),
+                        command.replace(str(destination), 'relative.json'),
+                        command.replace('agent quality-check', 'campaign submit'),
+                        command.replace('agent quality-check', 'repair apply'),
+                        command + ' && echo chained', command + ' 2>&1',
+                        command.replace(' > ', ' >> '), command + ';echo attached',
+                        command.replace(' > ', ';echo > '),
+                        command.replace(str(destination), str(destination.parent / '$(command).json')),
+                        command.replace(str(destination), str(destination.parent / '`command`.json')),
+                        command.replace(str(destination), str(destination.parent / '${PART}.json')),
+                        command.replace(str(destination), str(destination.parent / '$PART.json')),
+                        command.replace(' > ', '\necho > '), command.replace(' > ', '\recho > '),
+                        command.replace(' > ', ' < '),
+                        command.replace('quality-check.json', 'not-json.log')]:
+            with self.subTest(command=invalid), self.assertRaises(ValueError):
+                recovery._public_command(shlex.join(['/bin/zsh', '-lc', invalid]), output_root=self.d / 'audit')
+        self.preview();self.apply()
+        self.assertTrue(recovery.valid(ec.load(self.d), self.d, 'm', 3))
+        destination.write_text(json.dumps({'ok': False, 'errors': ['changed']}))
+        self.assertFalse(recovery.valid(ec.load(self.d), self.d, 'm', 3))
+
     def test_successful_prior_repair_requires_exact_source_request_and_verified_terminal(self):
         entry = str(Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract')
         request = self.job / 'reviewed-request.json';applied = self.job / 'apply.json';status = self.job / 'status.json'

@@ -51,7 +51,7 @@ def _adoption(c, d, model, slot, session, native, events, terminal, batches):
             completed.add(item['id'])
             if type(item.get('exit_code')) is not int:
                 raise ValueError('adopted command exit required')
-            if item['exit_code'] and (_public_command(item['command'])
+            if item['exit_code'] and (_public_command(item['command'], output_root=d / 'audit')
                     or str(item.get('aggregated_output', '')).strip() == MESSAGE or item['exit_code'] in (75, 76)):
                 raise ValueError('failed public operation cannot be resumed by rework')
     if sessions != [session] or pending:raise ValueError('one complete adopted session required')

@@ -342,6 +342,9 @@ NAS75/76 后须先确认当前NAS可用并取得恢复授权，再对原批运�
 所有源批次须已有 submitted/released 终态、全机原战役 lease 均闲置。
 原调用中的公共写入只允许已具备 apply/status verified 回执且来源/episode/请求完全匹配的同源修复。
 其他公共变更、真实审批/NAS/提供商拒绝、未知写入、活动或缺失终态均拒绝。
+原生记录里的 `agent quality-check` 可将stdout写到本战役audit目录内的绝对JSON路径；
+只接受单个尾部 `>`，并绑定成功JSON回执摘要。追加/输入/目录外/相对重定向、命令链、
+反引号、变量/命令展开或换行不接受，写入命令也不能用重定向获得此例外。
 
 ```bash
 "$CLI" campaign reconcile-ownership --id <原战役> --model <原模型> --slot <错误调用的原槽位> \

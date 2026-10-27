@@ -52,17 +52,37 @@ def _contract(c, model):
                          'runtime': ec.runtime_settings(c)}}
 
 
-def _public_command(command):
+def _public_command(command, *, output_root=None, redirected_outputs=None):
     """One literal public command; never evaluate shell expressions."""
     entry = str(Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract')
     args = shlex.split(command)
+    shell_text = command
     if len(args) == 3 and Path(args[0]).name in ('zsh', 'sh', 'bash') and args[1] in ('-lc', '-c'):
         if not args[2].lstrip().startswith((entry, shlex.quote(entry))):
             return None
-        args = shlex.split(args[2])
+        shell_text = args[2]
+        args = shlex.split(shell_text)
     if not args or args[0] != entry:
         return None
-    if any(x in args for x in (';', '&&', '||', '|', '>', '2>&1')):
+    if any(char in shell_text for char in ('$', '`', '\n', '\r')):
+        raise ValueError('shell expansion cannot authorize continuation')
+    lexer = shlex.shlex(shell_text, posix=True, punctuation_chars=';&|<>')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    args = list(lexer)
+    if '>' in args:
+        # Native quality checks commonly persist their JSON to a private audit
+        # file. Accept only this single, bounded read/check output redirection;
+        # no write operation, command chain or arbitrary destination qualifies.
+        if (args[1:3] != ['agent', 'quality-check'] or args.count('>') != 1
+                or args[-2] != '>' or output_root is None
+                or not Path(args[-1]).is_absolute() or Path(args[-1]).suffix != '.json'
+                or not Path(args[-1]).resolve().is_relative_to(Path(output_root).resolve())):
+            raise ValueError('only a private audit JSON quality-check output may be redirected')
+        if redirected_outputs is not None:
+            redirected_outputs.append(Path(args[-1]).resolve())
+        args = args[:-2]
+    if any(x and all(ch in ';&|<>' for ch in x) for x in args):
         raise ValueError('compound public command cannot authorize continuation')
     return args[1:]
 
@@ -131,6 +151,7 @@ def _evidence(c, d, model, slot, event_path, exit_path, stop_path):
             or previous.get('hard_stop') or previous.get('approval_refused')):
         raise ValueError('previous own-slot terminal must be clean')
     started, pending, commands, failures, repair_applies, repair_statuses = [], {}, [], [], [], {}
+    redirected_checks = []
     for line in event_path.read_text().splitlines():
         row = json.loads(line)
         if row.get('type') == 'thread.started':
@@ -153,7 +174,12 @@ def _evidence(c, d, model, slot, event_path, exit_path, stop_path):
             if (item['exit_code'] and 'This action was rejected due to unacceptable risk' in output
                     or item['exit_code'] in (75, 76)):
                 raise ValueError('approval/NAS refusal remains a hard stop')
-            parsed = _public_command(command)
+            redirected = []
+            parsed = _public_command(command, output_root=d / 'audit', redirected_outputs=redirected)
+            for output_path in redirected:
+                if _read(output_path).get('ok') is not True:
+                    raise ValueError('redirected quality-check must retain its successful JSON receipt')
+                redirected_checks.append(_ref(output_path))
             commands.append({'id': cid, 'command': command, 'exit_code': item['exit_code'],
                              'output_sha256': digest(output)})
             if item['exit_code']:
@@ -221,7 +247,8 @@ def _evidence(c, d, model, slot, event_path, exit_path, stop_path):
             'native': _ref(root / 'native/latest.json'), 'worker': _ref(root / 'worker.json'),
             'previous_events': _ref(old_events), 'events': _ref(event_path), 'exit': _ref(exit_path),
             'process': _ref(process_path), 'stop': _ref(stop_path), 'batch': _ref(batch_path),
-            'formal_source_terminals_sha256': digest(latest), 'commands': commands, 'verified_prior_repairs': repair_applies}
+            'formal_source_terminals_sha256': digest(latest), 'commands': commands,
+            'redirected_quality_checks': redirected_checks, 'verified_prior_repairs': repair_applies}
 
 
 def preview(cid, model, slot, *, events, terminal, stop, reason, out):
@@ -330,6 +357,8 @@ def valid(c, d, model, slot):
         for repair in e['verified_prior_repairs']:
             if not all(_unchanged(repair[key]) for key in ('request', 'apply', 'status')):
                 return False
+        if not all(_unchanged(ref) for ref in e.get('redirected_quality_checks', [])):
+            return False
         if not _unchanged(proof['approved_preview']) or not _unchanged(proof['copied_events']):
             return False
         approved = _read(proof['approved_preview']['path'])
