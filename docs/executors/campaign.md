@@ -578,6 +578,8 @@ campaign及standalone agent均禁止新领取/提交，不能覆盖原批次结�
 
 ## NAS queue and recoverable infrastructure waits
 
+已完成返工因成本备注保护被拒绝时，只能按[成本拒绝交接协议](rework-completion.md)审阅冻结证据并显式登记；该入口不开放成本权限、不重试被拒操作、不自动验收质量或恢复领取。
+
 NAS-heavy operations reserve process-leased FIFO tickets before acquiring the existing machine-wide lock. Only the oldest live ticket may contend for that lock. Abandoned tickets are removed only after their file lease is provably released; PIDs, age or stale timestamps never authorize evicting a live owner. All clients must load the same released gate to guarantee FIFO fairness; legacy clients remain mutually exclusive but cannot participate in ordering.
 
 `max_wait_s` remains3600. At the queue head it bounds lock acquisition, the original60/180-second gaps and three-sample temperature admission at90C. Behind other tickets it bounds lack of progress: only completed HTTP responses from the head or a forward queue transition refresh that budget. Polling and timer heartbeats do not. Eight productive batches may therefore queue longer than an hour without being falsely labeled a NAS failure, while a stalled owner still refuses with76. Temperature read failures still refuse with75. Thermal admission is never weakened.
