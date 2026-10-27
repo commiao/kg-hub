@@ -26,7 +26,6 @@ def main(argv=None, *, http=None) -> int:
     ap.add_argument("--url", default=ax.DEFAULT_URL)
     args = ap.parse_args(argv)
     post = http or ax._http
-    token = ax.api_token()
     if args.command == "status":
         if not args.repair_id or not _ID.fullmatch(args.repair_id):
             ap.error("status requires a valid --repair-id")
@@ -38,13 +37,15 @@ def main(argv=None, *, http=None) -> int:
         selector(payload)
         if args.command == "apply":
             payload = parse_request(payload)
+            from tools.extract_campaign import assert_worker_repair_source
+            assert_worker_repair_source(payload)
         elif not payload.get("expected_snapshot_sha256"):
             # Obtain the initial source snapshot before binding a repair plan.
             # Do not send a partially filled request as if it were approved.
             payload = {k: payload[k] for k in ("source_description", "source_obs_id")}
         method = "POST"
         path = "/api/extraction/repair" + ("/preview" if args.command == "preview" else "")
-    code, body = post(method, args.url.rstrip("/") + path, payload, token)
+    code, body = post(method, args.url.rstrip("/") + path, payload, ax.api_token())
     output = {"http": code, **body}
     if args.out:
         target = Path(args.out)

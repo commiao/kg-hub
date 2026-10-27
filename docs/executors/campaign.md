@@ -326,11 +326,66 @@ NAS75/76 后须先确认当前NAS可用并取得恢复授权，再对原批运�
 它仅接受上述已核清的部分上传，或精确的原模型容量拒绝；容量拒绝另须 `--model-preflight <新探针回执>`，
 核对相同模型、effort、proxy 和新鲜真实 canary，并要求原在途操作已完整对账。
 回执绑定原槽位、session、native、事件及操作哈希；原退出码不改，真实审批/权限拒绝不可这样恢复。
+下面的独立所有权恢复协议仅接受已终止、未写入的跨槽 `campaign review` 误用，不接受其他权限拒绝。
 两项通过后使用 `resume --all-remaining` 和原 `supervise`。这些命令不做模型补评/补测，不重抽旧结果。
 只有完整源键回读确认未写入、对账仍绑定原操作attempt/身份/输入时，`resume` 才认可已解决的那次拒绝；
 保留原76和原生事件，不改写历史。未对账、已有写入、活动或未知终态仍拒绝恢复。
 
 ## 领批：凑满一批再交
+
+### 协调器显式纠正跨槽评审的执行范围
+
+`reconcile-ownership` 不执行被拒绝的评审、不移交批次、不把非零退出改成成功。
+它仅适用于：已提交来源的协助会话错误调用另一槽位批次的 `campaign review --kind targeted`，
+命令唯一失败为 exit1 与原样 `batch belongs to a different worker slot`，所有命令均有完整终态；
+协调器已在无在途命令时中断该调用，原 native exit1、PID/session/时间及中断凭据匹配。
+所有源批次须已有 submitted/released 终态、全机原战役 lease 均闲置。
+原调用中的公共写入只允许已具备 apply/status verified 回执且来源/episode/请求完全匹配的同源修复。
+其他公共变更、真实审批/NAS/提供商拒绝、未知写入、活动或缺失终态均拒绝。
+
+```bash
+"$CLI" campaign reconcile-ownership --id <原战役> --model <原模型> --slot <错误调用的原槽位> \
+  --preview --events <原调用stdout.jsonl> --exit-receipt <同目录exit-status.json> \
+  --stop-receipt <协调器原中断回执> --reason <原范围纠正原因> --out <新私有预览.json>
+# 协调器读预览中的每条完整命令及原输出、核实已完成修复，不存在隐藏/未知写入；
+# 确认原批次仍归原owner，原跨槽评审不重放。预览含私有材料，不提交到公开仓库。
+"$CLI" campaign reconcile-ownership --id <原战役> --apply <新私有预览.json> \
+  --confirm-plan-sha <实际预览sha256字段> --reviewer <实际协调器> --reason <明确授权与核验结论>
+```
+
+apply 在锁内重新核对全部输入及冻结配置，保存不可变预览/原失败事件摘要、原worker快照和批准凭据，
+将实际失败事件的原样副本登记到该模型目录。原 native exit1 和拒绝文件始终不改。
+新凭据仅允许原 session 在自己的槽位继续，原批次的逐条返工仍由正确owner完成。
+它不解除 `assert_worker_batch`，不自动派发模型、不恢复新领取；质量返工未闭环时继续 draining。
+完成必要返工后按原 `resume --all-remaining`/`supervise` 流程恢复原剩余配额。
+批准后任何证据、原来源正式日志、配额/批量/并发/session配置或 native attempt 改变都会使凭据失效；
+新原生调用开始后不再复用旧批准。此协议不增加模型、测试或新来源预算。
+
+### 冻结新领取期间由原owner返工
+
+不能先全额resume再补质量欠账。协调器使用独立 `rework` 入口，仍由原模型、原槽位和原session
+完成自己已提交的批次，不把批次交给协助槽。普通supervise在draining时不新开模型回合。
+
+```bash
+"$CLI" campaign rework --id <原战役> --model <原模型> --slot <原owner槽位> \
+  --batches <自己已提交批次...> --assignment <已核对的私有返工说明> --reason <明确授权原因>
+# 原native调用在外部目录留回执时，须加同一调用的配对证据：
+# --adopt-events <原stdout.jsonl> --adopt-exit <同目录exit-status.json>
+```
+
+要求原native真实exit0、thread.started/session与原绑定相同、turn.completed、没有真实审批/NAS拒绝
+或失败公共操作；只读诊断失败不自动推导为写入失败。若原owner正常终止时只报告另一槽的
+business_permission_denied，还须关联上面已显式批准的那个peer所有权恢复凭据，且自己的原生
+事件中没有失败公共调用。自己的真实拒绝不能借另一个槽的凭据清除。
+
+入口持有原supervisor租约，核服务preflight并用原native参数/自动审批/工作区sandbox启动一次原session。
+不增加canary、评测、来源或配额。说明正文先冻结在私有job目录，证据和实际提示绑定同一份字节。
+子进程限定 `KG_HUB_REWORK_BATCHES`：只能对名单内自己的来源做正规修复/targeted评审；
+campaign及standalone agent均禁止新领取/提交，不能覆盖原批次结果与质量表或增加random分母。
+本轮有效候选、逐源决定及质量凭据另存私有audit目录，原错误、旧表和成本未知项保留。
+语义判断和每个复用候选须逐条核实，禁止批量默认true/ok；合并只能复制已经明确保存的逐条判断。
+命令返回rework_turn_completed只证明这次原生调用正常结束，不代表该批或全战役语义验收。
+协调器核实完整返工、所有真实修复回读、固定原随机记录和费用后，才另行恢复剩余配额。
 
 `claim`（以及 `agent_extract next`）从游标往后逐段扫（每段 `max(还差条数×4, 40)` 条，最多 8 段，
 `tools/agent_extract.FILL_MAX_ROUNDS`），跳过质量闸拒掉的、已入库的、别人正领着的，凑满一批再交。

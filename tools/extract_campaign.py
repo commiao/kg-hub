@@ -177,6 +177,37 @@ def assert_worker_batch(c: dict, b: dict) -> None:
         slot = worker_slot(c, b["model"])
         if batch_slot(c, b) != slot:
             raise SystemExit("batch belongs to a different worker slot")
+        scope = os.environ.get('KG_HUB_REWORK_BATCHES')
+        if scope is not None and b['id'] not in json.loads(scope):
+            raise SystemExit('batch outside explicitly approved quality rework scope')
+
+
+def assert_worker_repair_source(payload: dict) -> None:
+    """A bound worker may repair only an exact submitted source of its own slot.
+
+    Coordinators retain the public reviewed repair workflow. Source previews and
+    status are read-only; reject a misdispatch before any repair write is sent.
+    """
+    if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is None:
+        return
+    cid, model = os.environ.get('KG_HUB_CAMPAIGN_ID'), os.environ.get('KG_HUB_CAMPAIGN_MODEL')
+    if not cid or not model:
+        raise SystemExit('worker campaign/model binding required for source repair')
+    d = campaign_dir(cid)
+    with locked(d):
+        c = load(d)
+        slot = worker_slot(c, model)
+        matches = []
+        for b in c['batches']:
+            if b['model'] != model or b['status'] == 'released':
+                continue
+            source_batch = json.loads((d / 'batches' / (b['id'] + '.json')).read_text())
+            for item in source_batch['items']:
+                if all(item.get(key) == payload.get(key) for key in ('source_description', 'source_obs_id')):
+                    matches.append(b)
+        if len(matches) != 1 or matches[0]['status'] != 'submitted' or batch_slot(c, matches[0]) != slot:
+            raise SystemExit('source repair belongs to a different worker slot or is not an exact submitted source')
+        assert_worker_batch(c, matches[0])
 
 
 def batch_slot(c: dict, b: dict):
@@ -1631,6 +1662,29 @@ def _main(argv=None) -> int:
     worker_recovery.add_argument('--slot', type=positive_int, required=True)
     worker_recovery.add_argument('--reason', required=True)
     worker_recovery.add_argument('--model-preflight', type=Path)
+    ownership = sub.add_parser('reconcile-ownership', help='preview/approve exact interrupted cross-slot review refusal; never replay it')
+    ownership.add_argument('--id', required=True)
+    ownership.add_argument('--reason', required=True)
+    ownership_mode = ownership.add_mutually_exclusive_group(required=True)
+    ownership_mode.add_argument('--preview', action='store_true')
+    ownership_mode.add_argument('--apply', type=Path)
+    ownership.add_argument('--model')
+    ownership.add_argument('--slot', type=positive_int)
+    ownership.add_argument('--events', type=Path)
+    ownership.add_argument('--exit-receipt', type=Path)
+    ownership.add_argument('--stop-receipt', type=Path)
+    ownership.add_argument('--out', type=Path)
+    ownership.add_argument('--confirm-plan-sha')
+    ownership.add_argument('--reviewer')
+    rework = sub.add_parser('rework', help='one original owner quality-rework turn; keep new claims draining')
+    rework.add_argument('--id', required=True)
+    rework.add_argument('--model', required=True)
+    rework.add_argument('--slot', type=positive_int, required=True)
+    rework.add_argument('--batches', nargs='+', required=True)
+    rework.add_argument('--assignment', type=Path, required=True)
+    rework.add_argument('--reason', required=True)
+    rework.add_argument('--adopt-events', type=Path)
+    rework.add_argument('--adopt-exit', type=Path)
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -1730,6 +1784,12 @@ def _main(argv=None) -> int:
         if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation", "prepare"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
+    if os.environ.get('KG_HUB_REWORK_BATCHES') is not None:
+        if a.cmd in ('claim', 'submit', 'release', 'mark-empty', 'prepare', 'namesync', 'chain',
+                     'quality-sheet', 'quality-check', 'cost'):
+            raise SystemExit('quality rework cannot claim, resubmit or overwrite original batch artifacts; use separate agent files')
+        if a.cmd == 'review' and a.kind != 'targeted':
+            raise SystemExit('quality rework may only append targeted reviews, preserving the original random denominator')
     if a.cmd == 'resume':
         from tools.campaign_dispatch import resume
         print(json.dumps(resume(a.id, reason=a.reason, batches_per_model=a.batches_per_model), ensure_ascii=False, indent=2))
@@ -1797,6 +1857,24 @@ def _main(argv=None) -> int:
     elif a.cmd == 'reconcile-worker':
         from tools.campaign_continuation import reconcile_worker
         out = reconcile_worker(a.id, a.model, a.slot, reason=a.reason, model_preflight=a.model_preflight)
+    elif a.cmd == 'reconcile-ownership':
+        from tools import campaign_ownership_recovery as ownership_recovery
+        if a.preview:
+            if not all((a.model, a.slot, a.events, a.exit_receipt, a.stop_receipt, a.out)):
+                ap.error('ownership preview requires model/slot/events/exit-receipt/stop-receipt/out')
+            out = ownership_recovery.preview(a.id, a.model, a.slot, events=a.events,
+                terminal=a.exit_receipt, stop=a.stop_receipt, reason=a.reason, out=a.out)
+        else:
+            if not a.confirm_plan_sha or not a.reviewer:
+                ap.error('ownership apply requires confirm-plan-sha and reviewer')
+            out = ownership_recovery.apply(a.id, plan_file=a.apply, confirm=a.confirm_plan_sha,
+                reviewer=a.reviewer, reason=a.reason)
+    elif a.cmd == 'rework':
+        from tools.campaign_rework import run as rework_run
+        out = rework_run(a.id, a.model, a.slot, batches=a.batches, assignment=a.assignment,
+                        reason=a.reason, adopt_events=a.adopt_events, adopt_exit=a.adopt_exit)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out['state'] == 'rework_turn_completed' else 2
     elif a.cmd == "rules":
         d = campaign_dir(a.id)
         c = load(d)

@@ -380,6 +380,9 @@ def reconcile_worker(cid, model, slot, *, reason, model_preflight=None):
 
 
 def worker_reconciled(c, d, model, slot, *, locked=False):
+    from tools.campaign_ownership_recovery import valid as ownership_valid
+    if ownership_valid(c, d, model, slot):
+        return True
     try:
         root, worker, native, event, session, terminal, outcome = _worker(c, d, model, slot, locked=locked)
         reference = receipts.read(root / 'continuation-active.json')
