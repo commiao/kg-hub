@@ -105,9 +105,11 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 path = Path(worker.get('events', '/missing')).resolve()
                 if not path.is_relative_to(root.resolve()):raise ValueError('own-slot event ownership required')
                 outcome = supervision.events(path)
+                from tools.campaign_rework_completion import valid as completion_valid
                 if (outcome.get('session') != session or outcome.get('terminal') != 'turn.completed'
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
-                        or not supervision.normal_recovery(outcome.get('recovery_kind'))):
+                        or not supervision.normal_recovery(outcome.get('recovery_kind'))
+                        and not completion_valid(c, d, model, slot, locked=True)):
                     raise ValueError('original clean rework events required')
                 adopted = None
             for bid in selected:
@@ -124,11 +126,14 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             assignment = Path(assignment).resolve(strict=True)
             text = assignment.read_text()
             (job / 'assignment.md').write_text(text)
-            args = supervision.native_args(c, model, session, slot)
+            args = supervision.native_args(c, model, session, slot, quality_rework=True)
             args[-1] = (args[-1] + '\n当前是协调器明确批准的已提交批次质量返工，不是配额恢复。'
                 'dispatch必须保持draining，禁止claim/submit/release/修改原结果历史，禁止处理名单外来源。'
                 '只对以下原本属于本槽的已提交批次逐来源审核及公共修复；保存原错/原质量表，'
-                '另写有效候选、逐条语义决定和质量凭据。全部终态经协调器验收前不能宣布完成。'
+                '另写有效候选、逐条语义决定和质量凭据。成本仅写独立rework-cost.json，未知值保留null；'
+                '禁止campaign cost（包括仅修改note）或overhead，不覆盖原批成本。'
+                '本次返工以本段为准，不执行普通生产brief中的领批、提交或记成本命令。'
+                '全部终态经协调器验收前不能宣布完成。'
                 '\n冻结批次名单：' + json.dumps(selected) + '\n具体返工材料与要求：\n' + text)
             entry = Path(os.environ.get('KG_HUB_CODE', '~/.local/share/kg-hub/current')).expanduser() / 'tools/extract'
             args = [str(entry), 'runtime', 'exec', '--proxy-mode', ec.runtime_settings(c)['proxy_mode'],

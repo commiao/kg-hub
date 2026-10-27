@@ -1676,6 +1676,18 @@ def _main(argv=None) -> int:
     ownership.add_argument('--out', type=Path)
     ownership.add_argument('--confirm-plan-sha')
     ownership.add_argument('--reviewer')
+    completion = sub.add_parser('reconcile-rework-completion', help='review a completed original rework cost-note refusal; never retry cost or accept quality')
+    completion.add_argument('--id', required=True)
+    completion.add_argument('--reason', required=True)
+    completion_mode = completion.add_mutually_exclusive_group(required=True)
+    completion_mode.add_argument('--preview', action='store_true')
+    completion_mode.add_argument('--apply', type=Path)
+    completion.add_argument('--model')
+    completion.add_argument('--slot', type=positive_int)
+    completion.add_argument('--evidence', type=Path)
+    completion.add_argument('--out', type=Path)
+    completion.add_argument('--confirm-plan-sha')
+    completion.add_argument('--reviewer')
     rework = sub.add_parser('rework', help='one original owner quality-rework turn; keep new claims draining')
     rework.add_argument('--id', required=True)
     rework.add_argument('--model', required=True)
@@ -1857,6 +1869,17 @@ def _main(argv=None) -> int:
     elif a.cmd == 'reconcile-worker':
         from tools.campaign_continuation import reconcile_worker
         out = reconcile_worker(a.id, a.model, a.slot, reason=a.reason, model_preflight=a.model_preflight)
+    elif a.cmd == 'reconcile-rework-completion':
+        from tools import campaign_rework_completion as completion
+        if a.preview:
+            if not (a.model and a.slot and a.evidence and a.out):
+                ap.error('completion preview requires --model --slot --evidence --out')
+            out = completion.preview(a.id, a.model, a.slot, evidence_file=a.evidence, reason=a.reason, out=a.out)
+        else:
+            if not (a.confirm_plan_sha and a.reviewer):
+                ap.error('completion apply requires --confirm-plan-sha --reviewer')
+            out = completion.apply(a.id, plan_file=a.apply, confirm=a.confirm_plan_sha, reviewer=a.reviewer, reason=a.reason)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
     elif a.cmd == 'reconcile-ownership':
         from tools import campaign_ownership_recovery as ownership_recovery
         if a.preview:
