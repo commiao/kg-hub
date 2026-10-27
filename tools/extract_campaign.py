@@ -19,6 +19,11 @@
   start   --models <模型 id>... --executor <工具> [--quota 200] [--batch 50] [--parallel 1] [--after-id N] [--skip-admission 原因]
           每个模型要有 bench 准入记录（verdict=pass、规则正文版本一致），否则拒绝开局
   chain   --file <补充约定.md>        登记新的补充约定版本（之后领的批次生效；只写本轮新增，前面的版本照样生效）
+  structure-gate --enable|--disable --by <谁> --reason <原因> [--from-chain cN] [--max-two-entity-pct 30]
+          [--min-pairs-per-obs 2.5] [--max-relates-to-pct N] [--max-exempt-pct 20]
+          结构门槛（tools/campaign_structure_gate.py）：整批恰 2 实体占比 / 平均端点对 / 可选 relates_to 超阈值时
+          lint、prepare、正式 submit 拒绝；只管 chain ≥ from_chain 的批次，启用、改阈值、关闭都记进 structure_gate_log。
+          start 缺省开启（--no-structure-gate 原因 关闭）；开局前的战役要显式启用
   rules                              打印抽取规则：开局冻结的规则正文 + c1…当前版依次的补充约定（子代理第一步读它）
   brief   --model <模型 id>           打印填好的子代理说明（粘给子代理，或由 agents 写进子代理定义）
   agents  [--format qodercli|md] [--dir 目录]   按战役里的模型与并发槽生成子代理定义，带指定模型：
@@ -27,7 +32,8 @@
   launch  --tool codex|cursor|qodercli [--model ...]   打印「每个模型一个会话」的启动命令（退路 / 并行开会话）
   claim   --model <模型 id>           领下一批（加锁、按配额），打印批次文件、结果文件路径与后续命令
   lint    --batch <批次 id>           自检结果文件（悬空边、schema、缺 edges、照抄标题、译文边、其余 fact 超 200 字符；
-          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交；另出「结构过薄」提醒（不阻断）
+          dry-run 之后另查新建实体 summary 不足 30 字），不过不许提交；另出「结构过薄」提醒（不阻断）；
+          战役启用了结构门槛时另查整批结构，没过退出码 1
   namesync --batch <批次 id> [--apply] [--graph]   命名同步（tools/campaign_namesync.py 的锚点键规则）：
           同键异名的自动改成规范名（--apply 改写结果文件，质量表之前做）；退出码 0 干净 / 2 还有要改的或会分裂
   namesync-replay                    回放本战役各批会被抓到的同键异名与分裂（只读，统计用）
@@ -61,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import agent_extract as ax  # noqa: E402
 from tools import campaign_namesync as ns  # noqa: E402
+from tools import campaign_structure_gate as sg  # noqa: E402
 from tools import claim_registry  # noqa: E402
 from utils import extraction_structure as xs  # noqa: E402
 
@@ -377,6 +384,15 @@ def brief(c: dict, model: str, slot: int | None = None) -> str:
                  "只处理 claim 返回给本槽位的批次；先复用本槽位未完成批次，不接管其他槽位。"
                  "一批提交并完成随机复查、成本记录后再领取下一批。done=true 表示本槽位已无可领任务，"
                  "模型是否完成以正式提交累计数为准。\n")
+    g = c.get("structure_gate") or {}
+    if g.get("enabled"):
+        lim = [f"恰 2 实体占比超过 {g['max_two_entity_pct']:g}%" if g.get("max_two_entity_pct") is not None else "",
+               f"平均不同端点对低于 {g['min_pairs_per_obs']:g}" if g.get("min_pairs_per_obs") is not None else "",
+               f"第 3 条边起 relates_to 超过 {g['max_relates_to_pct']:g}%" if g.get("max_relates_to_pct") is not None else ""]
+        text += (f"\n本战役开了结构门槛（{g['from_chain']} 起领的批次）：整批非空结果" + "、或".join(x for x in lim if x)
+                 + " 时 prepare / submit 拒绝并逐条列出。原文确实只支持两个对象的条目，在质量表该行写本条特有的 "
+                 f"{sg.NOTE_FIELD}（点名实体、说明证据限制）可移出分母；同一句模板不算，例外至多 {g['max_exempt_pct']:g}%。"
+                 "不要为凑数编实体、拆同一对象或编关系。\n")
     settings = runtime_settings(c)
     for b in c.get('batches', []):
         if (b['model'] == model and b['status'] not in ('submitted', 'released')
@@ -668,10 +684,16 @@ def model_readiness(models, executor, receipts, *, effort="medium", proxy_mode="
 
 def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
               skip_admission: str | None = None, lookup=None, allow_tracking: str | None = None,
-              model_preflight=None, effort="medium", proxy_mode="auto", parallel: int = 1) -> dict:
+              model_preflight=None, effort="medium", proxy_mode="auto", parallel: int = 1,
+              structure_gate: dict | None = None, no_structure_gate: str | None = None) -> dict:
+    """structure_gate 给阈值就从 c0 起开启结构门槛；no_structure_gate 写原因表示明确不开（都记进 structure_gate_log）。
+    命令行 start 缺省开启；函数缺省两者都不给，行为与门槛出现前相同。"""
     d = campaign_dir(cid)
     if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
         raise SystemExit(f"战役 {cid} 已存在")
+    if structure_gate is not None and no_structure_gate:
+        raise SystemExit("结构门槛不能同时开启又关闭")
+    gate_cfg = sg.validate_config(structure_gate) if structure_gate is not None else None
     tracking = tracking_guard(allow_tracking)
     gate = admission_gate(models, ax.PROMPT_VERSION, prompt_sha(ax.PROMPT_PATH.read_text()), lookup)
     bad = {m: g["why"] for m, g in gate.items() if not g["ok"]}
@@ -696,6 +718,13 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
         if tracking["tracked"]:
             c.setdefault("tracking_exceptions", []).append({"at": _now(), "cmd": "start", "reason": allow_tracking,
                                                            "dirs": tracking["dirs"]})
+        if gate_cfg is not None:
+            c["structure_gate"] = {"enabled": True, "version": sg.GATE_VERSION, "from_chain": CHAIN_NONE, **gate_cfg}
+            c["structure_gate_log"] = [gate_log_entry("enable", by=actor(), via="start", reason="新战役缺省开启",
+                                                      gate=c["structure_gate"])]
+        elif no_structure_gate:
+            c["structure_gate_log"] = [gate_log_entry("declined", by=actor(), via="start", reason=no_structure_gate,
+                                                      gate=None)]
         for sub in ("batches", "results"):
             (d / sub).mkdir(exist_ok=True)
         (d / "prompt.md").write_text(ax.PROMPT_PATH.read_text())   # 冻结规则正文，战役内不随仓库变
@@ -716,6 +745,56 @@ def cmd_chain(cid: str, file: str) -> dict:
         c["chain"] = ver
         save(d, c)
     return {"chain": ver, "file": str(dst)}
+
+
+# ---------- 结构门槛的启用与审计（tools/campaign_structure_gate.py） ----------
+
+def actor() -> str:
+    import getpass
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def gate_log_entry(action: str, *, by: str, via: str, reason: str, gate: dict | None) -> dict:
+    return {"at": _now(), "action": action, "by": by, "os_user": actor(), "via": via, "reason": reason,
+            "gate": dict(gate) if gate else None}
+
+
+def cmd_structure_gate(cid: str, *, enable: bool, by: str, reason: str, from_chain: str | None = None,
+                       thresholds: dict | None = None) -> dict:
+    """启用 / 改阈值 / 关闭结构门槛。只走这条公共命令改 campaign.json，每次都在 structure_gate_log 追加一条（谁、何时、阈值、原因）。
+    执行者（子代理 / 返工会话）不能改自己的门槛。from_chain 缺省为当前 chain；可以写下一版（登记 c(N+1) 起生效），
+    写早于当前的版本会把还没提交的旧 chain 批次也纳入，返回里列出受影响的批次。"""
+    if os.environ.get("KG_HUB_CAMPAIGN_SLOT") is not None or os.environ.get("KG_HUB_REWORK_BATCHES") is not None:
+        raise SystemExit("执行者不能改结构门槛：由编排者在执行会话之外改")
+    if not by.strip() or not reason.strip():
+        raise SystemExit("--by 与 --reason 都要写（记进 structure_gate_log）")
+    d = campaign_dir(cid)
+    with locked(d):
+        c = load(d)
+        old = c.get("structure_gate") or {}
+        if enable:
+            start = from_chain or (old.get("from_chain") if old.get("enabled") else None) or c["chain"]
+            if sg.chain_no(start) > sg.chain_no(c["chain"]) + 1:
+                raise SystemExit(f"from_chain {start} 太远：当前 {c['chain']}，最多写下一版")
+            base = {k: old[k] for k in sg.THRESHOLDS if k in old} if old.get("enabled") else {}
+            cfg = sg.validate_config({**base, **{k: v for k, v in (thresholds or {}).items() if v is not None},
+                                      **{k: None for k, v in (thresholds or {}).items() if v == "off"}})
+            gate = {"enabled": True, "version": sg.GATE_VERSION, "from_chain": start, **cfg}
+            action = "update" if old.get("enabled") else "enable"
+        else:
+            if not old.get("enabled"):
+                raise SystemExit(f"战役 {cid} 没开结构门槛")
+            gate, action = {**old, "enabled": False}, "disable"
+        c["structure_gate"] = gate
+        c.setdefault("structure_gate_log", []).append(gate_log_entry(action, by=by.strip(), via="structure-gate",
+                                                                     reason=reason.strip(), gate=gate))
+        save(d, c)
+    affected = [b["id"] for b in c["batches"] if b["status"] not in ("submitted", "released")
+                and sg.config_for(c, b) is not None]
+    return {"campaign": cid, "action": action, "structure_gate": gate, "open_batches_gated": affected}
 
 
 def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, check=None,
@@ -862,6 +941,21 @@ def lint_structure_warnings(cid: str, bid: str) -> list[str]:
     res = _results(d, bid)
     by_id = {int(it["id"]): it for it in res.get("items", [])}
     return xs.thin_structure_warnings(rows, by_id, {int(i["id"]): i.get("episode_body") or "" for i in batch["items"]})
+
+
+def structure_gate_check(cid: str, bid: str, review: dict | None = None, *, c: dict | None = None) -> dict | None:
+    """这一批的结构门槛评估（tools/campaign_structure_gate.evaluate）；没启用或批次 chain 早于 from_chain 时 None。
+    review 是质量表（structure_note 例外从这里读）；正式提交用 quality-check 通过后存的那份。"""
+    d = campaign_dir(cid)
+    c = c or load(d)
+    cfg = sg.config_for(c, find_batch(c, bid))
+    if cfg is None:
+        return None
+    return sg.evaluate(cfg, _results(d, bid), review)
+
+
+def approved_review(d: Path, bid: str) -> dict | None:
+    return ns.load_json(ax.quality_file(d, bid))
 
 
 def lint_summary_pending(cid: str, bid: str) -> list[int]:
@@ -1126,7 +1220,7 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
     batch, results = json.loads((d / "batches" / f"{bid}.json").read_text()), _results(d, bid)
     prompt = batch_rules_text(d, c, b)
     version = episode_prompt_version(c, b["chain"])
-    review = None
+    review, structure = None, None
     if ax.quality.requires_quality(version):
         try:
             review = json.loads(ax.quality_file(d, bid).read_text())
@@ -1137,6 +1231,10 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
                                     identity=batch_identity(c, b))
         if missing:
             raise SystemExit(f"{bid} 有 {len(missing)} 条还没 dry-run 过（id {missing[:10]}），先 --dry-run")
+        # 结构门槛在分裂判据之前：被拒的批次不留 --allow-split 的放行记录
+        structure = structure_gate_check(cid, bid, review, c=c)
+        if structure is not None and not structure["ok"]:
+            raise SystemExit("\n".join(sg.refusal_lines(bid, structure)))
         split_guard(d, c, b, batch, results, allow_split=allow_split, layout=layout)
     model, run_id = b["model"], c["models"][b["model"]]["run_id"]
     input_sha256 = preview_input_digest(batch, results, prompt, review, batch_identity(c, b))
@@ -1167,6 +1265,9 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
                      dry_run_mismatch=len(mismatch))
         else:
             b.update(status="submitted", submitted_at=_now(), counts=counts, mismatch=len(mismatch))
+            if structure is not None:   # 提交时的门槛结论留在批次上，复盘可查
+                b["structure_gate"] = {k: structure[k] for k in ("version", "config", "metrics", "counted", "nonempty")} \
+                    | {"exempt": [x["id"] for x in structure["exempt"]]}
         save(d, c)
     # 入库（或别处已入库）的注销全设备在途登记；没入库的留在本战役名下，等 release 后重领。
     # dry-run 的终态是 dry_run，不在 DONE_STATUSES 里，这里不会注销任何东西
@@ -1607,6 +1708,7 @@ def cmd_status(cid: str) -> dict:
     return {"campaign": cid, "executor": c["executor"], "chain": c["chain"], "chain_mode": c.get("chain_mode", "latest"),
             "parallel": n, "configured_workers": n * len(c["models"]), "worker_slots": slots,
             "dispatch": c.get('dispatch', {'state': 'running'}), "migration": c.get('migration'),
+            "structure_gate": c.get("structure_gate"), "structure_gate_log": (c.get("structure_gate_log") or [])[-5:],
             "active_workers": sum(s["native"]["lease_held"] is True for workers in slots.values() for s in workers.values()),
             "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "host_task_state": "unverified_by_repository",
@@ -1722,7 +1824,7 @@ def _main(argv=None) -> int:
     ws.add_argument("--repo", help="Git checkout used to create workspace; released code is not a Git checkout")
     flight = sub.add_parser("preflight", help="read-only loaded-code, dependency, tracking and server capability checks")
     flight.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
-    for name in ("start", "chain", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "review",
+    for name in ("start", "chain", "structure-gate", "rules", "brief", "agents", "launch", "claim", "lint", "submit", "release", "review",
                  "cost", "status", "report", "mark-empty", "quality-sheet", "quality-check", "namesync",
                  "namesync-replay", "operation-status", "reconcile-operation", "prepare"):
         s = sub.add_parser(name)
@@ -1742,8 +1844,21 @@ def _main(argv=None) -> int:
         if name in ("start", "claim"):
             s.add_argument("--allow-tracking", metavar="原因",
                            help="会话会被 claude-mem 记录也照样跑（不推荐；原因记进战役）")
+        if name == "start":
+            s.add_argument("--no-structure-gate", metavar="原因",
+                           help="新战役缺省开启结构门槛（阈值见 tools/campaign_structure_gate.DEFAULTS）；不开要写原因")
         if name == "chain":
             s.add_argument("--file", required=True)
+        if name == "structure-gate":
+            g = s.add_mutually_exclusive_group(required=True)
+            g.add_argument("--enable", action="store_true", help="开启或改阈值（已开时只改给出的项）")
+            g.add_argument("--disable", action="store_true")
+            s.add_argument("--by", required=True, help="谁拍板（记进 structure_gate_log）")
+            s.add_argument("--reason", required=True)
+            s.add_argument("--from-chain", help="从哪一版 chain 领的批次起适用；缺省当前版，可写下一版")
+            for k in sg.THRESHOLDS:
+                s.add_argument("--" + k.replace("_", "-"), type=lambda v: v if v == "off" else float(v),
+                               help=f"缺省 {sg.DEFAULTS[k]}；写 off 表示不查这一项")
         if name in ("claim", "brief"):
             s.add_argument("--model", required=True)
             s.add_argument("--slot", type=positive_int, help="parallel campaign worker slot")
@@ -1797,7 +1912,7 @@ def _main(argv=None) -> int:
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
     if os.environ.get('KG_HUB_REWORK_BATCHES') is not None:
-        if a.cmd in ('claim', 'submit', 'release', 'mark-empty', 'prepare', 'namesync', 'chain',
+        if a.cmd in ('claim', 'submit', 'release', 'mark-empty', 'prepare', 'namesync', 'chain', 'structure-gate',
                      'quality-sheet', 'quality-check', 'cost'):
             raise SystemExit('quality rework cannot claim, resubmit or overwrite original batch artifacts; use separate agent files')
         if a.cmd == 'review' and a.kind != 'targeted':
@@ -1854,9 +1969,14 @@ def _main(argv=None) -> int:
             raise SystemExit(json.dumps(flight, ensure_ascii=False))
         out = cmd_start(a.id, a.models, executor=a.executor, quota=a.quota, batch=a.batch, after_id=a.after_id,
                         skip_admission=a.skip_admission, allow_tracking=a.allow_tracking,
-                        model_preflight=a.model_preflight, effort=a.effort, proxy_mode=a.proxy_mode, parallel=a.parallel)
+                        model_preflight=a.model_preflight, effort=a.effort, proxy_mode=a.proxy_mode, parallel=a.parallel,
+                        structure_gate=None if a.no_structure_gate else dict(sg.DEFAULTS),
+                        no_structure_gate=a.no_structure_gate)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
+    elif a.cmd == "structure-gate":
+        out = cmd_structure_gate(a.id, enable=a.enable, by=a.by, reason=a.reason, from_chain=a.from_chain,
+                                 thresholds={k: getattr(a, k) for k in sg.THRESHOLDS})
     elif a.cmd == "operation-status":
         out = cmd_operation_status(a.id, a.batch)
     elif a.cmd == "reconcile-operation":
@@ -1946,11 +2066,22 @@ def _main(argv=None) -> int:
         warns = lint_structure_warnings(a.id, a.batch)
         if warns:   # 只提醒：不计入问题数、不改退出码，submit 前的自检也不看它
             print(f"\n提醒（{len(warns)} 条，不阻断）：\n" + "\n".join(warns))
+        from tools.campaign_prepare import sheet_path
+        d = campaign_dir(a.id)
+        sheet = sheet_path(d, a.batch)   # 例外看审阅中的质量表；没有就看已通过的那份
+        structure = structure_gate_check(a.id, a.batch, ns.load_json(sheet) if sheet.exists() else approved_review(d, a.batch))
+        if structure is not None:   # 战役启用了结构门槛：没过就不许提交，退出码 1
+            if structure["ok"]:
+                print(f"\n结构门槛通过：{structure['metrics']}（例外 {len(structure['exempt'])} 条）")
+            else:
+                print("\n" + "\n".join(sg.refusal_lines(a.batch, structure)))
+            for w in structure["warnings"]:
+                print(w)
         pending = lint_summary_pending(a.id, a.batch)
         if pending:
             print(f"注意：{len(pending)} 条还没 dry-run，新建实体 summary（规则 24，至少 30 字）要 dry-run 之后才查；"
                   "dry-run 后再 lint 一次", file=sys.stderr)
-        return 1 if probs else 0
+        return 1 if probs or (structure is not None and not structure["ok"]) else 0
     elif a.cmd == "submit":
         from tools import nas_gate
         try:

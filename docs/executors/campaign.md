@@ -78,6 +78,7 @@
 | 有向边写反方向 | 两端类型恰好是 `schema.EDGE_TYPE_MAP` 约定的反方向：`fixed_by` Fix→Issue（应 Issue→Fix）、`documented_in` KnowledgeDoc→Concept、`derived_from` Issue→Lesson、`belongs_to` Project→File / Project→Session；逐条列出边序号与两端实体（含类型），对调 source / target。只是类型不在约定里（如 `fixed_by` Issue→Tool）不报。准入判定不计这一项（与规则 21/22 同属执行者自检） | 一直查 |
 | 新建实体 summary 过短 | 少于 **30 字**（`strip` 后的字符数，规则 24）；只查 dry-run 返回的 `new_entities` 里的实体——并到图里旧实体的、并到同批前面条目新建实体的（`dry_run_pending`）都不查 | dry-run 之后 |
 | 结构过薄（**提醒，不阻断**） | 正文点名 ≥2 个不同的具体对象，而结果只有 ≤1 个端点对或 ≤2 个实体；列出 obs id 与识别到的对象样例。不计入问题数、不改退出码，`submit` 前的自检也不看它；bench `lint` 同样只提醒、不进准入判定。识别口径见下文「复盘表的结构指标」 | 一直查 |
+| 结构门槛（**整批，阻断**） | 战役启用了结构门槛时：整批恰2实体% / 端点对/条 / 可选 relates_to 超阈值，退出码 1，逐条列出偏薄条目。见下文「结构门槛」 | 战役启用、批次 chain ≥ `from_chain` |
 
 新建与否离线分不出来（哪些名字会并到旧实体要服务端消解才知道），所以 summary 这一项取**最近一次 dry-run** 的结果：
 每次 dry-run 把各条的 `new_entities` 记进批次的 dry-run 标记文件（`dryrun-<批次>.json`），同一条再预览就覆盖。
@@ -116,6 +117,44 @@ v5 质量门与上面的硬错误只查对错与格式，不查**结构**。2026
 「结构过薄」提醒对具体对象只认三种（保守，宁可漏报）：带斜杠且以字母开头的扩展名结尾的路径，或常见代码 / 配置扩展名的裸文件名
 （`Node.js` 这类框架名排除）；7–40 位小写十六进制、同时含数字和 a–f 字母的提交 SHA（UUID 分段、纯数字不算）；
 反引号里 2–80 个非空白字符的标识符。反引号里的路径与裸写同一路径、路径与它末尾的文件名只算一个。
+
+## 结构门槛：整批结构过薄时拒绝提交（按战役启用）
+
+提醒挡不住退化：同一场 8000 条战役登记结构约定 c13 后一度改善，扩到每模型 4 组并发后 gpt-6-sol 回潮
+（066 批恰 2 实体 40%、071 批 56%、075 批 100% / 端点对 1.12），提醒照出、批次照样入库。所以结构指标可以升级为提交门槛
+（`tools/campaign_structure_gate.py`）：**整批**非空条目的恰2实体% 超上限、或端点对/条低于下限、或（配置了的话）其余relates_to% 超上限，
+`lint`（退出码 1）、`prepare`（停在 `stage=structure_gate`，不排 dry-run）、正式 `submit`（退出码 1，不进 NAS 闸门）都拒绝，并逐条列出偏薄的条目。
+`submit --dry-run` 不拦（不写图）。门槛只**增加**拒绝条件：lint、v5 质量表、dry-run 绑定、命名分裂等原有判定一条不改。
+
+| 阈值 | 缺省 | 说明 |
+|---|---|---|
+| `max_two_entity_pct` | 30 | 恰2实体% 超过就拒（等于放行），与 c13 批次观察目标同线 |
+| `min_pairs_per_obs` | 2.5 | 端点对/条低于就拒；c13 观察目标是 3，门槛放宽到 2.5，只拦明显退回两节点模板的批次 |
+| `max_relates_to_pct` | 不查 | 区分度有限（Claude 战役中位数也约 80%），缺省只在超过 90% 时提醒；要拦就显式配置 |
+| `max_exempt_pct` | 20 | `structure_note` 例外最多占非空条目的这个比例（至少允许 1 条），超了整批拒 |
+
+**启用只走公共命令，不手改 `campaign.json`**：
+
+```bash
+"$CLI" campaign structure-gate --id <战役> --enable --by <谁拍板> --reason <原因> [--from-chain cN] \
+    [--max-two-entity-pct 30] [--min-pairs-per-obs 2.5] [--max-relates-to-pct N|off] [--max-exempt-pct 20]
+"$CLI" campaign structure-gate --id <战役> --disable --by <谁> --reason <原因>
+```
+
+- 门槛只管 **chain ≥ `from_chain`** 的批次。`from_chain` 缺省是当前 chain，可以写下一版（先启用、再 `chain` 登记，新版起生效）；
+  写早于当前的版本会把还没提交的旧 chain 批次也纳入，返回的 `open_batches_gated` 列出受影响的批次。没启用的战役行为不变。
+- 已开时再 `--enable` 是改阈值：只改给出的项，`off` 表示不查这一项。每次启用、改阈值、关闭都在 `structure_gate_log` 追加一条
+  （`at`、`action`、`by`、`os_user`、`via`、`reason`、当时的完整配置）；`status` 显示当前配置与最近 5 条记录。
+- 执行者（带 `KG_HUB_CAMPAIGN_SLOT` 或 `KG_HUB_REWORK_BATCHES` 的会话）不能改门槛。
+- **新战役**：`campaign start` 缺省按上表阈值从 c0 开启（记一条 `via=start` 的日志）；不要就写 `--no-structure-gate <原因>`（记 `declined`）。
+- 正式提交通过门槛时，批次上记 `structure_gate`（版本、阈值、三项指标、计入 / 非空条数、例外 id），复盘可查。
+- 在跑战役启用前先看 `migrate` 预览：预览绑定 `campaign.json` 摘要，启用后要重新预览。
+
+**例外（c13 规则 3）**：原文确实只讲一个对象、或证据只支持两个实体的条目，审阅者在质量表该行写 `structure_note`（不是通用的 `note`——
+c14 起每行都有 `note`），说明本条的证据限制，这条就移出分母、在报告里单独列出。`structure_note` 要：点名本条至少一个实体名；
+去掉本条实体名与数字后仍有 ≥10 字的说明；同批两条以上去掉实体名与数字后相同的视为模板句，**全部不算**（呼应 c14 禁止整批统一置为通过）。
+只有确实偏薄（恰 2 实体或端点对低于下限）的条目上的 `structure_note` 才看。`lint` 与 `prepare` 的预览读审阅中的质量表，
+`prepare` 的判定与正式 `submit` 读 `quality-check` 通过后存的那份。不要为凑数编实体、拆同一对象或编关系。
 
 ## dry-run 的复用回显
 
@@ -203,7 +242,7 @@ xrepo 不自动加前缀：正文路径可能是暂存或部署副本（回放�
 | 退出码 | 含义 | 子代理怎么办 |
 |---|---|---|
 | 0 | 成功（namesync：没有要改的、按当前 dry-run 也不会分裂） | 继续下一步 |
-| 1 | 原有拒绝：lint 没过、没 dry-run 或预览后改过结果、缺质量表、批次已提交 / 已回收 | 按提示修 |
+| 1 | 原有拒绝：lint 没过、没 dry-run 或预览后改过结果、缺质量表、批次已提交 / 已回收；战役启用了结构门槛时整批结构过薄 | 按提示修 |
 | 2 | 命名：namesync 还有没改掉的 auto，或 submit 判出会分裂 | `namesync --apply`（自环等改不掉的手动改）→ lint → 质量表 → dry-run → 再提交 |
 | 3 | dry-run 标记太旧（旧版本预览没记 `new_entities`），判不了分裂 | 重新 `submit --dry-run` |
 | 75 | NAS 闸门：连续 5 轮读不到温度，没提交 | 停下汇报（02:00 前后属正常，过后重跑） |
@@ -225,12 +264,14 @@ quality-check、整批 dry-run（常常 2 次）、再写脚本读 dry-run 输�
 | 2 | 命名同步（与 `namesync --apply --graph` 同一套）：只写回 `auto`（锚点键确定的同物异名）；`review` / `server` 只列出；改过名再 lint | 有改不掉的 → `stage=namesync` |
 | 3 | 质量表（v5）：缺省写到 `<战役目录>/reviews/<批次>.sheet.json`，为每条边与 summary 预填**引文候选**；表已存在且内容没变就不覆盖 | 没填完（缺审阅人、有行没下结论、候选没确认、引文空着）或有判 error 的行 → `stage=quality_sheet` |
 | 4 | 表填完 → `quality-check`（通过后照旧存一份到 `reviews/<批次>.json` 供提交） | 不通过 → `stage=quality_check`，列 errors |
+| 4½ | 战役启用了结构门槛：按通过的那份质量表判整批结构（第 1–2 步之后报告里已有按审阅中质量表的预览 `structure_gate.preview`） | 没过 → `stage=structure_gate`，`structure_gate.thin` 逐条列出 |
 | 5 | 整批 dry-run，**每次 prepare 至多一次**，经 NAS 闸门；输入摘要没变且 dry-run 标记仍覆盖当前每条结果时直接复用上次预览 | 闸门拒绝（75/76）或有条目报错 → `stage=dryrun` |
 | 6 | dry-run 之后再 lint（新建实体 summary）、按 `new_entities` 查命名分裂，列误并候选 | summary 过短 → `post_lint`；会分裂 → `splits`（退出码 2） |
 
 报告（JSON）字段：`stage`、`ready`、`next`（下一步做什么）、`lint`、`namesync`（`applied` 实际改名、`review` 要判断的提示、`residual`、`graph_hints`）、
 `quality_sheet`（路径、`status` 里的待确认项数、`candidates` 预填计数）、`quality_check`、`dryrun`（`cached`、`by_status`、`errors`）、
-`merge_candidates`（`reuse_mismatch` / `reuse_cross_type` / `reused`：抽出名（类型）→ 复用目标名（类型）「summary 开头」）、`post_lint`、`splits`。
+`merge_candidates`（`reuse_mismatch` / `reuse_cross_type` / `reused`：抽出名（类型）→ 复用目标名（类型）「summary 开头」）、`post_lint`、`splits`、
+`structure_gate`（启用时：`ok`、三项指标、`violations`、`thin`、`exempt`、`invalid_exempt`）。
 退出码：0 可以 `submit`；1 要人处理（看 `next`）；2 命名分裂；75 / 76 闸门没放行；73 / 74 同 `submit` 的回执状态。
 
 **引文候选**（`utils/quality_candidates.py`）：确定性的句子匹配，不调模型。出处按本条正文 → lookahead → 同批其他条目找字词重合最多的原句
