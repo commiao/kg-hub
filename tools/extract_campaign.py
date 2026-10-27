@@ -1879,7 +1879,6 @@ def _main(argv=None) -> int:
             if not (a.confirm_plan_sha and a.reviewer):
                 ap.error('completion apply requires --confirm-plan-sha --reviewer')
             out = completion.apply(a.id, plan_file=a.apply, confirm=a.confirm_plan_sha, reviewer=a.reviewer, reason=a.reason)
-        print(json.dumps(out, ensure_ascii=False, indent=2))
     elif a.cmd == 'reconcile-ownership':
         from tools import campaign_ownership_recovery as ownership_recovery
         if a.preview:

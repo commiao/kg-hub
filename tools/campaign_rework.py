@@ -95,20 +95,28 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             native = receipts.read(root / 'native/latest.json')
             worker = receipts.read(root / 'worker.json')
             session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
+            # The ownership protocol already bound this exact failed native,
+            # copied refusal transcript, original SID and unchanged ownership.
+            # It authorizes only subsequent own-slot work, never the denied
+            # cross-slot review. A new native attempt consumes that proof.
+            owner_continuation = native.get('exit_code') == 1 and ownership_valid(c, d, model, slot)
             if (not session or worker.get('session') != session or native.get('state') != 'completed'
-                    or not native.get('ended_at') or native.get('exit_code') != 0
+                    or not native.get('ended_at') or native.get('exit_code') != 0 and not owner_continuation
                     or sum(session == sid for ss in c['slot_sessions'].values() for sid in ss.values()) != 1):
                 raise ValueError('original clean idle native/session required; rework does not waive a failed exit')
             if adopt_events:
+                if owner_continuation:
+                    raise ValueError('ownership continuation cannot adopt a different invocation')
                 adopted = _adoption(c, d, model, slot, session, native, adopt_events, adopt_exit, selected)
             else:
                 path = Path(worker.get('events', '/missing')).resolve()
                 if not path.is_relative_to(root.resolve()):raise ValueError('own-slot event ownership required')
                 outcome = supervision.events(path)
                 from tools.campaign_rework_completion import valid as completion_valid
-                if (outcome.get('session') != session or outcome.get('terminal') != 'turn.completed'
+                expected_terminal = None if owner_continuation else 'turn.completed'
+                if (outcome.get('session') != session or outcome.get('terminal') != expected_terminal
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
-                        or not supervision.normal_recovery(outcome.get('recovery_kind'))
+                        or not owner_continuation and not supervision.normal_recovery(outcome.get('recovery_kind'))
                         and not completion_valid(c, d, model, slot, locked=True)):
                     raise ValueError('original clean rework events required')
                 adopted = None
@@ -122,6 +130,9 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             job.mkdir(parents=True)
             (job / 'previous-worker.json').write_bytes((root / 'worker.json').read_bytes())
             (job / 'previous-native.json').write_bytes((root / 'native/latest.json').read_bytes())
+            if owner_continuation:
+                receipts.write(job / 'ownership-continuation.json',
+                               _ref(root / 'ownership-continuation-active.json'))
             if adopted:receipts.write(job / 'adoption.json', adopted)
             assignment = Path(assignment).resolve(strict=True)
             text = assignment.read_text()
