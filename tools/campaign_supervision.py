@@ -139,6 +139,14 @@ def native_args(c: dict, model: str, session: str | None, slot: int | None = Non
                "最终JSON的recovery_kind分别写approval_rejected/nas_refused/infrastructure_failed/"
                "business_permission_denied/uncertain_submit。正常完成或只因诊断不可用写none/diagnostic_unavailable。"
                "继续原配额；仍须逐条质量审核、整批预览、正式入库及随机复查，不新增冒烟或准入调用。")
+    prompt += ("\n本会话只拥有冻结绑定的原模型/槽位，不能接手其他槽位的批次或已提交来源返工。"
+               "收到跨槽任务先保存scope_mismatch并交协调器，不尝试campaign review或repair apply，"
+               "不清除或改写KG_HUB_CAMPAIGN_*环境绑定来绕过拒绝。"
+               "逐条读完整正文和lookahead，针对当前一条明确写出四项语义判断及具体理由/引文；"
+               "禁止approve()默认全true、循环将pending改ok或以关键词/引文命中替代判断。"
+               "整批预览的每个复用候选也须分别判读，禁止模板或脚本批量确认候选。"
+               "可原样合并已逐条明确保存的决定，合并阶段不能生成新的通过。"
+               "发现批量默认批准即停止新领取并如实报告quality_process_violation，不把格式检查当语义正确。")
     return args + [prompt]
 
 

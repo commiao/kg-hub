@@ -930,6 +930,8 @@ def main(argv: list[str] | None = None) -> int:
         a.retro_args = list(a.retro_args) + list(extra)
     elif extra:
         ap.error(f"unrecognized arguments: {' '.join(extra)}")
+    if os.environ.get('KG_HUB_REWORK_BATCHES') is not None and a.cmd in ('next', 'submit', 'mark-empty'):
+        raise SystemExit('quality rework cannot claim or submit sources through the standalone agent entry')
     token = api_token()
     sd = state_dir()
     state_path, log_path = sd / "state.json", sd / "log.jsonl"
