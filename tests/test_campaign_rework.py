@@ -176,4 +176,100 @@ class ReworkTests(unittest.TestCase):
         run.assert_called_once()
 
 
+class OriginalOwnerContinuationReworkTests(unittest.TestCase):
+    """An already approved failed owner may rework only its own submitted batch."""
+    setUpBase, tearDown = ownership.OwnershipRecoveryTests.setUpBase, ownership.OwnershipRecoveryTests.tearDown
+    claim, finish = ownership.OwnershipRecoveryTests.claim, ownership.OwnershipRecoveryTests.finish
+    write_events = ownership.OwnershipRecoveryTests.write_events
+    preview, apply = ownership.OwnershipRecoveryTests.preview, ownership.OwnershipRecoveryTests.apply
+
+    def setUp(self):
+        ownership.OwnershipRecoveryTests.setUp(self)
+        c = ec.load(self.d)
+        drained = dict(c['dispatch'])
+        c['dispatch']['state'] = 'running';ec.save(self.d, c)
+        own = self.claim('m', 3)
+        self.own_bid = own['batch']
+        self.finish(self.own_bid)
+        c = ec.load(self.d);c['dispatch'] = drained;ec.save(self.d, c)
+        self.c = c
+        # Match the actual managed supervisor identity in this synthetic fixture.
+        original = receipts.read(self.root3 / 'latest.json')
+        original['identity'] = {'campaign': c['id'], 'model': 'm', 'slot': 3}
+        receipts.write(self.root3 / 'latest.json', original)
+        self.assignment = self.root / 'own-submitted-rework.md'
+        self.assignment.write_text('Review the selected original own-slot submitted sources only; no new quota.')
+        self.spawned = []
+
+    def spawn(self, args, **kwargs):
+        self.assertEqual(args[args.index('resume') + 1], self.session)
+        self.assertEqual(kwargs['env']['KG_HUB_CAMPAIGN_SLOT'], '3')
+        self.assertEqual(json.loads(kwargs['env']['KG_HUB_REWORK_BATCHES']), [self.own_bid])
+        self.spawned.append(args)
+        with receipts.attempt(self.root3 / 'native', kind='native_cli') as update:
+            for row in [{'type': 'thread.started', 'thread_id': self.session}, {'type': 'turn.completed'}]:
+                kwargs['stdout'].write((json.dumps(row) + '\n').encode())
+            kwargs['stdout'].flush();update(exit_code=0)
+        return mock.Mock(wait=lambda: 0)
+
+    def run_own_rework(self, **kwargs):
+        return rework.run(self.c['id'], 'm', 3, batches=[self.own_bid], assignment=self.assignment,
+                          reason='explicit same owner submitted-source rework', spawn=self.spawn,
+                          preflight=lambda *a: {'ok': True}, **kwargs)
+
+    def test_registered_owner_refusal_allows_original_session_own_batch_and_preserves_failure(self):
+        self.preview();self.apply()
+        c = ec.load(self.d)
+        # The approved protocol remains valid under the exact caller idle locks.
+        from tools.campaign_ownership_recovery import valid
+        with receipts.idle(self.root3), receipts.idle(self.root3 / 'native'):
+            self.assertTrue(valid(c, self.d, 'm', 3))
+        before = {p: p.read_bytes() for p in [self.event, self.terminal, self.root3 / 'native/latest.json',
+                                             self.root3 / 'worker.json']}
+        outcome = self.run_own_rework()
+        self.assertEqual(outcome['state'], 'rework_turn_completed')
+        self.assertEqual(outcome['new_source_quota'], 0)
+        self.assertEqual(ec.load(self.d)['dispatch']['state'], 'draining')
+        self.assertEqual(len(self.spawned), 1)
+        job = Path(outcome['evidence_dir'])
+        self.assertEqual((job / 'previous-native.json').read_bytes(), before[self.root3 / 'native/latest.json'])
+        self.assertEqual((job / 'previous-worker.json').read_bytes(), before[self.root3 / 'worker.json'])
+        self.assertEqual(receipts.read(job / 'previous-native.json')['exit_code'], 1)
+        self.assertTrue((job / 'ownership-continuation.json').is_file())
+        self.assertEqual(self.event.read_bytes(), before[self.event])
+        self.assertEqual(self.terminal.read_bytes(), before[self.terminal])
+        self.assertEqual(ec.batch_slot(ec.load(self.d), ec.find_batch(ec.load(self.d), self.bid)), 2)
+        self.assertFalse(valid(ec.load(self.d), self.d, 'm', 3))
+
+    def test_failed_owner_without_registered_proof_cannot_start_rework(self):
+        with self.assertRaisesRegex(ValueError, 'clean idle'):
+            self.run_own_rework()
+        self.assertEqual(self.spawned, [])
+
+    def test_changed_native_or_ownership_proof_cannot_start_rework(self):
+        self.preview();self.apply()
+        active = receipts.read(self.root3 / 'ownership-continuation-active.json')
+        for path in [self.root3 / 'native/latest.json', Path(active['path'])]:
+            original = path.read_bytes()
+            if path == self.root3 / 'native/latest.json':
+                value = json.loads(original);value['attempt'] = 'different-native-attempt'
+                receipts.write(path, value)
+            else:
+                path.write_bytes(original + b' ')
+            with self.subTest(path=path.name):
+                with self.assertRaisesRegex(ValueError, 'clean idle'):
+                    self.run_own_rework()
+            path.write_bytes(original)
+        self.assertEqual(self.spawned, [])
+
+    def test_ownership_proof_never_transfers_peer_batch_or_adopts_another_invocation(self):
+        self.preview();self.apply()
+        with self.assertRaisesRegex(ValueError, 'owned'):
+            rework.run(self.c['id'], 'm', 3, batches=[self.bid], assignment=self.assignment,
+                       reason='must reject peer batch', spawn=self.spawn)
+        with self.assertRaisesRegex(ValueError, 'cannot adopt'):
+            self.run_own_rework(adopt_events=self.event, adopt_exit=self.terminal)
+        self.assertEqual(self.spawned, [])
+
+
 if __name__ == '__main__':unittest.main()

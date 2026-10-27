@@ -1,5 +1,7 @@
 """Synthetic original receipts and real local leases; no model/network/graph."""
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -338,6 +340,31 @@ print(json.dumps(out,ensure_ascii=False))
             self.assertEqual(ec._main(['reconcile-rework-completion', '--id', self.c['id'], '--apply', str(self.plan),
                 '--confirm-plan-sha', plan['sha256'], '--reviewer', 'coordinator', '--reason', 'reviewed exact plan']), 0)
         self.assertTrue(completion.valid(ec.load(self.d), self.d, 'm', 1))
+
+    def test_public_preview_stdout_is_one_parseable_json_document(self):
+        expected = {'kind': completion.KIND, 'sha256': 'synthetic-plan-sha', 'scope': '原会话交接'}
+        output = io.StringIO()
+        with mock.patch.object(completion, 'preview', return_value=expected) as operation, contextlib.redirect_stdout(output):
+            code = ec._main(['reconcile-rework-completion', '--id', 'synthetic-campaign', '--preview',
+                '--model', 'synthetic-model', '--slot', '1', '--evidence', '/private/tmp/synthetic-evidence.json',
+                '--out', '/private/tmp/synthetic-plan.json', '--reason', 'explicit reviewed scope'])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), expected)
+        operation.assert_called_once_with('synthetic-campaign', 'synthetic-model', 1,
+            evidence_file=Path('/private/tmp/synthetic-evidence.json'), reason='explicit reviewed scope',
+            out=Path('/private/tmp/synthetic-plan.json'))
+
+    def test_public_apply_stdout_is_one_parseable_json_document(self):
+        expected = {'kind': completion.KIND, 'original_public_exit_code': 2, 'rejected_cost_retried': False}
+        output = io.StringIO()
+        with mock.patch.object(completion, 'apply', return_value=expected) as operation, contextlib.redirect_stdout(output):
+            code = ec._main(['reconcile-rework-completion', '--id', 'synthetic-campaign', '--apply',
+                '/private/tmp/synthetic-plan.json', '--confirm-plan-sha', 'synthetic-plan-sha',
+                '--reviewer', 'synthetic-coordinator', '--reason', 'explicit reviewed scope'])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), expected)
+        operation.assert_called_once_with('synthetic-campaign', plan_file=Path('/private/tmp/synthetic-plan.json'),
+            confirm='synthetic-plan-sha', reviewer='synthetic-coordinator', reason='explicit reviewed scope')
 
     def test_no_commands_after_terminal_and_no_unfinished_or_additional_refusal(self):
         self.event.write_text(self.transcript([]) + ''.join(json.dumps(x) + '\n' for x in self.rows))
