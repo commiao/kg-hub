@@ -9,6 +9,8 @@ quality-check、整批 dry-run（常常 2 次），每步都要子代理自己�
      改过名就再 lint 一次
   3. 质量表（v5）：生成模板并预填引文候选（utils/quality_candidates.py，标 candidate，不碰 verdict 与核对标志）；
      表已存在且内容没变就不覆盖；审阅者填完（有审阅人、每行有结论、候选都确认过）才跑 quality-check
+  3½. 结构门槛（战役启用时，tools/campaign_structure_gate.py）：lint 之后先在报告里给预览（不阻断，例外看审阅中的质量表）；
+     quality-check 通过后按通过的那份质量表判定，没过就停在 structure_gate，不排 dry-run
   4. 整批 dry-run：每次至多一次，经 NAS 闸门（命令行传 tools.nas_gate.hold）；输入摘要没变、且 dry-run 标记
      仍覆盖当前每条结果时直接复用上次的预览，不再排闸门
   5. dry-run 之后：再 lint（新建实体 summary）、按 new_entities 判命名分裂、列误并候选
@@ -23,6 +25,7 @@ from pathlib import Path
 
 from tools import agent_extract as ax
 from tools import campaign_namesync as ns
+from tools import campaign_structure_gate as sg
 from tools import extract_campaign as ec
 from utils import extraction_quality as quality
 from utils import quality_candidates as qc
@@ -94,6 +97,14 @@ def prepare_sheet(d: Path, c: dict, b: dict, path: Path) -> dict:
     return out
 
 
+def _compact_gate(ev: dict, *, preview: bool = False) -> dict:
+    out = {k: ev[k] for k in ("ok", "metrics", "violations", "warnings", "nonempty", "counted", "config")}
+    out.update(thin=ev["thin"][:50], exempt=[x["id"] for x in ev["exempt"]], invalid_exempt=ev["invalid_exempt"])
+    if preview:
+        out["preview"] = "按审阅中的质量表预估；quality-check 通过后按通过的那份判定"
+    return out
+
+
 def cmd_prepare(cid: str, bid: str, *, url: str, token: str | None, post=None, gate=None, lookup=None,
                 layout=None, sheet: str | None = None, fresh: bool = False) -> tuple[dict, int]:
     """返回 (报告, 退出码)。gate / post / lookup / layout 同 submit、namesync（测试注入假的；命令行给真的）。"""
@@ -132,6 +143,9 @@ def cmd_prepare(cid: str, bid: str, *, url: str, token: str | None, post=None, g
 
     # 3. 质量表（v5 起必须）
     path = Path(sheet).expanduser() if sheet else sheet_path(d, bid)
+    early = ec.structure_gate_check(cid, bid, ns.load_json(path) if path.exists() else None, c=c)
+    if early is not None:    # 预览：早点知道要不要补结构，不用等质量表填完
+        rep["structure_gate"] = _compact_gate(early, preview=True)
     if quality.requires_quality(version):
         sh = prepare_sheet(d, c, b, path)
         rep["quality_sheet"] = sh
@@ -154,6 +168,15 @@ def cmd_prepare(cid: str, bid: str, *, url: str, token: str | None, post=None, g
         rep["quality_check"] = {"ok": check["ok"], "errors": check["errors"][:30], "error_count": len(check["errors"])}
         if not check["ok"]:
             return stop("quality_check", EXIT_ACTION, f"按 quality_check.errors 改质量表 {path}（或结果文件），再重跑 {again}")
+
+    # 3½. 结构门槛：按通过 quality-check 的那份质量表判（与正式 submit 同一份），没过不排 dry-run
+    gate_ev = ec.structure_gate_check(cid, bid, ec.approved_review(d, bid) if quality.requires_quality(version) else None,
+                                      c=c)
+    if gate_ev is not None:
+        rep["structure_gate"] = _compact_gate(gate_ev)
+        if not gate_ev["ok"]:
+            return stop("structure_gate", EXIT_ACTION, *sg.refusal_lines(bid, gate_ev)[-1:],
+                        f"逐条看 structure_gate.thin；改了结果要重审质量表，再重跑 {again}")
 
     # 4. 整批 dry-run：输入没变、标记仍覆盖当前结果就复用
     batch, _ = ec._batch_rows(d, bid)
