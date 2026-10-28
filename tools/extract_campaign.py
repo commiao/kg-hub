@@ -1847,6 +1847,16 @@ def _main(argv=None) -> int:
     maintenance.add_argument('--slot', type=positive_int, required=True)
     maintenance.add_argument('--evidence', type=Path, required=True)
     maintenance.add_argument('--out', type=Path, required=True)
+    released = sub.add_parser('reconcile-released-quality', help='explicitly discard an unsubmitted released batch; never accept old quality or retry it')
+    released.add_argument('--id', required=True)
+    released_mode = released.add_mutually_exclusive_group(required=True)
+    released_mode.add_argument('--preview', action='store_true')
+    released_mode.add_argument('--apply', type=Path)
+    released.add_argument('--model')
+    released.add_argument('--slot', type=positive_int)
+    released.add_argument('--batch')
+    released.add_argument('--quarantine', type=Path)
+    released.add_argument('--out', type=Path)
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -2083,6 +2093,14 @@ def _main(argv=None) -> int:
                 ap.error('ownership apply requires confirm-plan-sha and reviewer')
             out = ownership_recovery.apply(a.id, plan_file=a.apply, confirm=a.confirm_plan_sha,
                 reviewer=a.reviewer, reason=a.reason)
+    elif a.cmd == 'reconcile-released-quality':
+        from tools import campaign_released_quality as released_quality
+        if a.preview:
+            if not all((a.model,a.slot,a.batch,a.quarantine,a.out)):
+                ap.error('released quality preview requires model/slot/batch/quarantine/out')
+            out = released_quality.preview(a.id,a.model,a.slot,a.batch,quarantine=a.quarantine,out=a.out)
+        else:
+            out = released_quality.apply(a.id,review=a.apply)
     elif a.cmd == 'rework-maintenance-sheet':
         from tools.campaign_rework_maintenance import sheet
         out = sheet(a.id,a.model,a.slot,evidence=a.evidence,out=a.out)
