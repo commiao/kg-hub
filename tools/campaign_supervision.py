@@ -172,6 +172,12 @@ def native_args(c: dict, model: str, session: str | None, slot: int | None = Non
                    "--id <战役> --batch <本批> --file <单来源JSON> --reviewer <同质量表reviewer>。"
                    "必须逐条明确判断后登记，不允许循环生成通过；最终质量表只能原样合并登记行。"
                    "全批quality-check和dry-run/submit均核对登记，不允许直接改表绕过；结果变化需重审受影响来源。")
+        prompt += ("\n提交后随机复查发现错误时，生产campaign decision仅适用于未提交批次，不能重写原登记。"
+                   "另建单来源repair的quality_context（原batch仅缩为该来源，保留原lookahead和规则）及完整quality_review，"
+                   "用campaign repair-decision --id <战役> --batch <已提交原批次> --file <完整repair请求> "
+                   "--reviewer <修复质量表reviewer>登记，再按公共repair preview/apply/status处理，保留原随机错误。"
+                   "原标题只报告来源的历史标题；正文证据不足不等于后被推翻。原标题与完整翻译逐字保留，"
+                   "证据范围限制另写有引文的独立事实及摘要，不伪造推翻证据，也不把标题断言当已验证结论。")
     return args + [prompt]
 
 

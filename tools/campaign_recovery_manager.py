@@ -186,6 +186,37 @@ def isolated_slot_failure(result):
     return result.get('reason') in ('model_capacity_exhausted', 'no_formal_progress')
 
 
+def conditions(c, d, model, slot, registration, progress):
+    """Eligibility excludes native attempt IDs and peers' formal counters.
+
+    A new failed invocation is not a changed prerequisite. Persisted blocked
+    results survive observer restarts and policy disable/enable cycles.
+    """
+    pending = [b for b in c['batches'] if b['model']==model and ec.batch_slot(c,b)==slot
+               and b['status'] not in ('submitted','released')]
+    files=[]
+    for b in pending:
+        for p in [d/'results'/(b['id']+'.json'), ax.quality_file(d,b['id'])]:
+            if p.exists():files.append(ref(p))
+        files.extend(ref(p) for p in sorted((d/'source-decisions'/b['id']).glob('*/latest.json')))
+    return digest({'session':c.get('slot_sessions',{}).get(model,{}).get(str(slot)),
+        'own_formal':supervision.completed(c,d,model,slot),
+        'pending':[{k:b.get(k) for k in ('id','model','slot','ids','chain','status','decision_protocol')} for b in pending],
+        'inputs':files,
+        'registration':registration.get('id'),'progress':progress,
+        'manager_code':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+
+
+def unchanged_block(d, row):
+    for path in (d/'recovery/events').glob('*/result.json'):
+        result=receipts.read(path)
+        if (result.get('state')=='blocked' and result.get('model')==row['model']
+                and result.get('slot')==row['slot']
+                and result.get('conditions_sha256')==row['conditions_sha256']):
+            return {'event':path.parent.name,'reason':result.get('reason')}
+    return None
+
+
 def snapshot(cid):
     d = ec.campaign_dir(cid); c = ec.load(d); policy = config(d)
     if policy.get('enabled') is not True:
@@ -241,10 +272,24 @@ def snapshot(cid):
                 if op.get('lease_held'):
                     action = 'wait_original'; break
                 if b['status'] not in ('submitted', 'released'):
-                    if op.get('may_have_written') or op.get('state') == 'uncertain' or op.get('requires_reconciliation'):
-                        action = 'unknown_write_reconciliation_required'; scope = 'campaign'; break
+                    from tools.campaign_continuation import valid_partial
+                    partial=valid_partial(c,d,b,op)
+                    if not partial and (op.get('may_have_written') or op.get('state') == 'uncertain' or op.get('requires_reconciliation')):
+                        action = 'unknown_write_reconciliation_required'; scope = 'campaign'
+                        batch=receipts.read(d/'batches'/(b['id']+'.json'))
+                        keys=[{k:i.get(k) for k in ('source_description','source_obs_id')} for i in batch.get('items',[])]
+                        if (op.get('identity')=={'campaign':cid,'batch':b['id'],**ec.batch_identity(c,b)}
+                                and op.get('source_keys')==keys and keys):scope='slot'
+                        break
                     if op.get('exit_code') in (75, 76):
                         action = 'nas_reconciliation_required'; scope = 'campaign'; break
+            pending=[b for b in own if b['status'] not in ('submitted','released')]
+            if action=='engineering_reconciliation_required' and len(pending)==1 and outcome.get('recovery_kind')=='infrastructure_failed':
+                op=receipts.status(d/'operations'/pending[0]['id']);statuses=op.get('by_status',{})
+                if (op.get('kind')=='dryrun' and op.get('state')=='completed' and op.get('exit_code')==0
+                        and op.get('may_have_written') is False and statuses.get('http_502')
+                        and not set(statuses)-{'dry_run','empty','http_502'}):
+                    action='reconcile_preview';scope='slot'
             if supervision.completed(c, d, model) >= c['quota'] and action == 'supervise':
                 action = 'quota_complete'
             row = {'model': model, 'slot': slot, 'session': session, 'action': action,
@@ -252,6 +297,11 @@ def snapshot(cid):
                    'worker': worker, 'outcome': outcome, 'progress': progress,
                    'registration': registration, 'dispatch_id': (c.get('dispatch') or {}).get('id')}
             row['published_continuation_valid'] = continuation
+            row['conditions_sha256'] = conditions(c,d,model,slot,registration,progress)
+            if action in ('supervise','rework','reconcile_preview'):
+                blocked=unchanged_block(d,row)
+                if blocked:
+                    row.update(action='unchanged_blocked',scope='slot',blocked=blocked)
             row['event_id'] = digest(row)
             rows.append(row)
     return {'version': VERSION, 'campaign': cid, 'observed_at': receipts.now(), 'dispatch': c.get('dispatch'),
@@ -294,7 +344,7 @@ def step(cid, event_id):
             epoch = (current.get('registration') or {}).get('id') or current['dispatch_id']
             same = [r for r in history if r.get('model') == current['model'] and r.get('slot') == current['slot']
                     and r.get('progress_epoch') == epoch]
-            before = current.get('progress') or {'formal': snapshot(cid)['formal'][current['model']]}
+            before = current.get('progress') or {'formal': supervision.completed(ec.load(d),d,current['model'],current['slot'])}
             token = {k: v for k, v in before.items() if k in ('reviewed', 'repairs_verified', 'formal')}
             stalled = sum(r.get('progress_token') == token and r.get('action') == current['action'] for r in same)
             if stalled >= config(d)['max_stalled']:
@@ -308,6 +358,10 @@ def step(cid, event_id):
                                      assignment=reg['assignment']['path'], reason=reg['reason'])
                     elif current['action'] == 'supervise':
                         result = supervision.run(cid, current['model'], slot=current['slot'])
+                    elif current['action']=='reconcile_preview':
+                        from tools.campaign_local_recovery import reconcile
+                        result={'state':'reconciled',**reconcile(cid,current['model'],current['slot'],
+                            reason='bounded source-scoped read-only preview recovery',url=ax.DEFAULT_URL,token=ax.api_token())}
                     else:
                         result = {'state': 'blocked', 'reason': 'recovery_action_no_longer_executable'}
                 except (Exception, SystemExit) as exc:
@@ -316,7 +370,8 @@ def step(cid, event_id):
                     result = {'state': 'blocked', 'reason': 'public_recovery_refused',
                               'error_type': type(exc).__name__, 'message': str(exc)}
             result = {**result, 'model': current['model'], 'slot': current['slot'],
-                      'action': current['action'], 'progress_token': token, 'progress_epoch': epoch}
+                      'action': current['action'], 'progress_token': token, 'progress_epoch': epoch,
+                      'conditions_sha256':current['conditions_sha256']}
         receipts.write(path / 'result.json', result)
         update(phase='action_completed', exit_code=0 if result.get('state') != 'blocked' else 2)
         return result
@@ -340,7 +395,7 @@ def tick(cid, *, spawn=None):
         plan = snapshot(cid)
         shared = {'approval_required', 'nas_reconciliation_required', 'registered_rework_required',
                   'unknown_write_reconciliation_required', 'engineering_reconciliation_required'}
-        incidents = [r for r in plan['slots'] if r['action'] in shared]
+        incidents = [r for r in plan['slots'] if r['action'] in shared and r['scope']=='campaign']
         for row in incidents:
             path = d / 'recovery/incidents' / (row['event_id'] + '.json')
             if not path.exists(): receipts.write(path, row)
@@ -377,7 +432,7 @@ def tick(cid, *, spawn=None):
                     _retire_accepted(d, plan, request)
                     plan = {**snapshot(cid), 'resume': outcome}
         for row in plan['slots']:
-            if row['action'] not in ('rework', 'supervise'): continue
+            if row['action'] not in ('rework', 'supervise','reconcile_preview'): continue
             directory = d / 'recovery/events' / row['event_id']
             if (directory / 'result.json').exists() or receipts.status(directory).get('lease_held'):
                 continue

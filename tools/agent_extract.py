@@ -410,7 +410,8 @@ def submit_results(batch: dict, results: dict, *, model: str, session: str | Non
             previous = acknowledged[len(out)]
             expected = extraction_payload_digest(item, res, prompt_version, prompt_text,
                 batch=batch, results=results, identity=quality.extraction_identity(model, executor, run_id))
-            if (previous.get('id') != oid or previous.get('status') != 'ok' or previous.get('http') != 200
+            settled = previous.get('receipt_kind') == 'source-settlement-v1' and previous.get('http') is None
+            if (previous.get('id') != oid or previous.get('status') != 'ok' or (previous.get('http') != 200 and not settled)
                     or previous.get('model') != model or previous.get('executor') != executor
                     or previous.get('run_id') != run_id or previous.get('payload_digest') != expected):
                 raise ValueError('acknowledged prefix differs from the reviewed request')
@@ -602,7 +603,9 @@ def record_dryrun(sd: Path, batch_id: str, recs: list[dict], now: str | None = N
         if rec.get("status") == "dry_run" and rec.get("http") == 200 and "resolution" in rec:
             resolution[str(rec["id"])] = rec["resolution"]
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen),
+    latest={'ids':[int(r['id']) for r in recs],
+            'complete':all(r.get('status')=='empty' or (r.get('status')=='dry_run' and r.get('http')==200) for r in recs)}
+    p.write_text(json.dumps({"batch_id": batch_id, "ids": sorted(seen), "latest_attempt":latest,
                              "payload_digests": digests, "new_entities": new_names, "resolution": resolution,
                              "ts": now or datetime.now(tz=timezone.utc).isoformat()}, ensure_ascii=False))
     return p

@@ -88,3 +88,33 @@ def errors(d, b, review):
                 or value.get('decision') != by_id[oid]):
             problems.append(f'obs {oid}: source_decision_changed_or_unregistered')
     return problems
+
+
+def record_repair(cid,bid,request,*,reviewer):
+    """Separate append-only repair receipt; never edits production decisions."""
+    from utils.extraction_repair import parse_request
+    request=parse_request(request)
+    d=ec.campaign_dir(cid)
+    with ec.locked(d):
+        c=ec.load(d);b=ec.find_batch(c,bid);ec.assert_worker_batch(c,b)
+        if b['status']!='submitted' or not reviewer.strip():
+            raise ValueError('submitted own batch and explicit repair reviewer required')
+        batch,_=ec._batch_rows(d,bid)
+        matches=[i for i in batch['items'] if all(i[k]==request[k] for k in ('source_description','source_obs_id'))]
+        payload=request.get('replacement')
+        if len(matches)!=1 or not payload:
+            raise ValueError('one original source and reviewed replacement required')
+        item=matches[0];context=payload.get('quality_context',{});review=payload.get('quality_review',{})
+        frozen={**batch,'items':[item]}
+        if (context.get('batch')!=frozen or context.get('prompt_text')!=ec.batch_rules_text(d,c,b)
+                or context.get('prompt_version')!=ec.episode_prompt_version(c,b['chain'])
+                or review.get('identity')!=ec.batch_identity(c,b) or review.get('reviewer')!=reviewer
+                or payload.get('extractor_session')!=cid or ax.quality.validate_payload_quality(payload)):
+            raise ValueError('repair requires unchanged original source/lookahead/rules/identity and complete source review')
+        value={'version':'source-repair-decision-v1','campaign':cid,'batch':bid,'source_id':item['id'],
+               'request_sha256':digest(request),'request':request,'reviewer':reviewer,
+               'production_batch_sha256':digest(batch),'rules_sha256':digest(ec.batch_rules_text(d,c,b))}
+        path=d/'repair-decisions'/bid/(digest(value)+'.json')
+        if not path.exists():receipts.write(path,value)
+    return {'path':str(path),'sha256':digest(value),'request_sha256':value['request_sha256'],
+            'production_decisions_unchanged':True,'semantic_truth_certified':False}

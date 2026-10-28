@@ -196,6 +196,29 @@ class RecoveryManagerTests(unittest.TestCase):
         self.assertEqual(first, ec.load(self.d)['dispatch'])
         self.assertTrue(list((self.d / 'recovery/incidents').glob('*.json')))
 
+    def test_failed_prerequisite_does_not_reset_on_new_native_or_other_slot_progress(self):
+        self.prepare();calls=[]
+        manager.tick(self.c['id'],spawn=lambda args,**kw:(calls.append(args) or mock.Mock(pid=1)))
+        with mock.patch.object(supervision,'run',return_value={'state':'blocked','reason':'no_formal_progress'}) as run:
+            manager.step(self.c['id'],calls[0][-1]);run.assert_called_once()
+        self.write_turn()  # New invocation ID is not progress or a fix.
+        other=self.claim('m',2)['batch'];self.finish(other)
+        self.assertEqual(self.row()['action'],'unchanged_blocked')
+        manager.disable(self.c['id'],reason='observer restart')
+        manager.enable(self.c['id'],reason='same unchanged inputs')
+        calls.clear();manager.tick(self.c['id'],spawn=lambda args,**kw:(calls.append(args) or mock.Mock(pid=1)))
+        self.assertEqual(calls,[])
+        self.assertEqual(ec.load(self.d)['dispatch']['state'],'running')
+
+    def test_changed_source_candidate_can_be_reobserved_after_stall(self):
+        self.prepare();calls=[]
+        manager.tick(self.c['id'],spawn=lambda args,**kw:(calls.append(args) or mock.Mock(pid=1)))
+        with mock.patch.object(supervision,'run',return_value={'state':'blocked','reason':'no_formal_progress'}):
+            manager.step(self.c['id'],calls[0][-1])
+        self.assertEqual(self.row()['action'],'unchanged_blocked')
+        path=self.d/'results'/(self.bid+'.json');path.write_text('{"items":[],"revised":true}')
+        self.assertEqual(self.row()['action'],'supervise')
+
     def test_two_observers_cannot_execute_same_owner_event_concurrently(self):
         self.prepare(); calls = []
         manager.tick(self.c['id'], spawn=lambda args, **kw: (calls.append(args) or mock.Mock(pid=1)))

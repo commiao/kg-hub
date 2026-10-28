@@ -279,6 +279,9 @@ def reconcile_upload(cid, bid, *, url, token, post=None, snapshot=None):
 
 
 def partial_records(c, d, b):
+    if (d / 'operations' / b['id'] / 'settlement-active.json').exists():
+        from tools.campaign_settlement import records_for
+        return records_for(c, d, b)
     reference = receipts.read(d / 'operations' / b['id'] / 'partial-active.json')
     if not reference:
         return []
@@ -303,6 +306,9 @@ def partial_records(c, d, b):
 
 
 def valid_partial(c, d, b, operation):
+    if operation.get('settlement_continuation'):
+        from tools.campaign_settlement import valid
+        return valid(c, d, b, operation)
     if operation.get('state') != 'reconciled_partial' or operation.get('requires_reconciliation'):
         return False
     try:
@@ -348,9 +354,15 @@ def reconcile_worker(cid, model, slot, *, reason, model_preflight=None):
                         errors.append((row.get('error') or {}).get('message'))
             if errors != ['Selected model is at capacity. Please try a different model.'] * 2:
                 raise ValueError('only the exact transient capacity refusal can be reconciled')
-            settings = ec.runtime_settings(c)
-            readiness = ec.model_readiness([model], c['executor'], [model_preflight], **settings)
-            kind = 'capacity_recovered'
+            if all(receipts.read(d / 'operations' / b['id'] / 'latest.json').get('settlement_continuation')
+                   and valid_partial(c,d,b,receipts.status(d/'operations'/b['id'])) for b in pending):
+                # The exact interrupted operation is settled. Ordinary bounded
+                # capacity backoff resumes the owner; no extra model probe.
+                kind = 'capacity_settled'
+            else:
+                settings = ec.runtime_settings(c)
+                readiness = ec.model_readiness([model], c['executor'], [model_preflight], **settings)
+                kind = 'capacity_recovered'
         elif (terminal.get('exit_code') == 0 and outcome.get('terminal') == 'turn.completed'
               and outcome.get('recovery_kind') == 'uncertain_submit'
               and all(valid_partial(c, d, b, receipts.status(d / 'operations' / b['id'])) for b in pending)):
@@ -380,6 +392,9 @@ def reconcile_worker(cid, model, slot, *, reason, model_preflight=None):
 
 
 def worker_reconciled(c, d, model, slot, *, locked=False, operation_locked=False):
+    from tools.campaign_local_recovery import valid as local_valid
+    if local_valid(c,d,model,slot,locked=locked):
+        return True
     from tools.campaign_released_quality import valid as released_quality_valid
     if released_quality_valid(c,d,model,slot,locked=locked,operation_locked=operation_locked):
         return True
@@ -409,6 +424,11 @@ def worker_reconciled(c, d, model, slot, *, locked=False, operation_locked=False
         if proof['kind'] == 'capacity_recovered':
             settings = ec.runtime_settings(c)
             return ec.model_readiness([model], c['executor'], [proof['model_preflight']], **settings) == proof['readiness']
+        if proof['kind'] == 'capacity_settled':
+            pending = [b for b in c['batches'] if b['model']==model and ec.batch_slot(c,b)==slot
+                       and b['status'] not in ('submitted','released')]
+            return (bool(pending) and set(proof['operations'])=={b['id'] for b in pending}
+                    and all(valid_partial(c,d,b,receipts.read(d/'operations'/b['id']/'latest.json')) for b in pending))
         if proof['kind'] == 'nas_refusal_reconciled':
             pending = [b for b in c['batches'] if b['model'] == model
                        and ec.batch_slot(c, b) == slot and b['status'] not in ('submitted', 'released')]
