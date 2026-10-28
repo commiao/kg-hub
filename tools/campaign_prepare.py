@@ -201,6 +201,9 @@ def cmd_prepare(cid: str, bid: str, *, url: str, token: str | None, post=None, g
     rep["merge_candidates"] = {"reuse_mismatch": dry.get("reuse_mismatch", []),
                                "reuse_cross_type": dry.get("reuse_cross_type", []),
                                "reused": dry.get("reused", [])}
+    incomplete={k:v for k,v in dry['by_status'].items() if k not in ('dry_run','empty') and v}
+    if incomplete:
+        return stop('dryrun',EXIT_ACTION,f'整批预览未完成（{incomplete}），不能正式提交；保留回执并按恢复协议处理')
     if dry["errors"]:
         return stop("dryrun", EXIT_ACTION, f"dry-run 有 {len(dry['errors'])} 条报错（看 dryrun.errors），修好后重跑 {again}")
 

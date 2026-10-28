@@ -138,6 +138,19 @@ class PrepareTest(unittest.TestCase):
                          "new_entities": [{"name": n} for n in (f"worker_{i}", f"reconcile_queue_{i}")]}
         return 200, {"status": "empty_recorded"} if body.get("empty") else {"status": "ok", "episode_uuid": "u"}
 
+    def test_http502_without_error_code_cannot_report_ready(self):
+        self.prepare();self.review_sheet()
+        original=self.post
+        def failed(method,url,body,token):
+            if body.get('dry_run') and body['source_obs_id']==f'h{self.ids[0]}':
+                return 502,{'detail':'temporary gateway failure'}
+            return original(method,url,body,token)
+        result=cp.cmd_prepare('p1',self.bid,url='http://x',token='t',post=failed,gate=self.gate,layout=self.layout)
+        report,code=result
+        self.assertEqual(report['stage'],'dryrun');self.assertFalse(report['ready'])
+        self.assertEqual(report['dryrun']['by_status']['http_502'],1)
+        self.assertNotEqual(code,0)
+
     def prepare(self, **kw):
         return cp.cmd_prepare("p1", self.bid, url="http://x", token="t", post=self.post, gate=self.gate,
                               layout=self.layout, **kw)

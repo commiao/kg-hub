@@ -1019,6 +1019,26 @@ def no_gate(kind: str):
     yield {"kind": kind, "gate": None}
 
 
+def whole_preview_complete(d,c,b):
+    marker=ns.load_json(ax.dryrun_marker_path(d,b['id'])) or {}
+    attempt=marker.get('latest_attempt')
+    if attempt is not None:
+        return attempt.get('complete') is True and set(attempt.get('ids',[]))==set(b['ids'])
+    # Preserve an actual successful pre-upgrade preview, never infer success
+    # from the union of old per-source markers. The latest invocation wins.
+    from utils import process_receipts as receipts
+    rows=[receipts.read(p) for p in (d/'operations'/b['id']).glob('*.json') if p.name!='latest.json']
+    rows=[r for r in rows if r.get('kind')=='dryrun']
+    if not rows:return False
+    latest=max(rows,key=lambda r:r.get('started_at',''))
+    batch,_=_batch_rows(d,b['id']);prompt=batch_rules_text(d,c,b)
+    sha=preview_input_digest(batch,_results(d,b['id']),prompt,ns.load_json(ax.quality_file(d,b['id'])),batch_identity(c,b))
+    statuses=latest.get('by_status',{})
+    return (latest.get('state')=='completed' and latest.get('exit_code')==0
+            and latest.get('may_have_written') is False and latest.get('input_sha256')==sha
+            and not set(statuses)-{'dry_run','empty'} and sum(statuses.values())==len(b['ids']))
+
+
 def dryrun_state(d: Path, c: dict, b: dict) -> tuple[str, dict[str, set[str]]]:
     """最近一次 dry-run 的 new_entities 能不能用来判分裂：
     ok（每条带实体的结果都按当前内容预览过、且记了 new_entities）/ no_dryrun / stale（结果或规则改过、或旧版本标记）。"""
@@ -1026,6 +1046,9 @@ def dryrun_state(d: Path, c: dict, b: dict) -> tuple[str, dict[str, set[str]]]:
     marker = ns.load_json(ax.dryrun_marker_path(d, bid))
     if marker is None or not (d / "results" / f"{bid}.json").exists():
         return "no_dryrun", {}
+    if b.get('decision_protocol'):
+        if not whole_preview_complete(d,c,b):
+            return 'incomplete', {}
     batch, results = json.loads((d / "batches" / f"{bid}.json").read_text()), _results(d, bid)
     missing = ax.dryrun_missing(d, bid, results, batch=batch, prompt_text=batch_rules_text(d, c, b),
                                 prompt_version=episode_prompt_version(c, b["chain"]), identity=batch_identity(c, b))
@@ -1240,6 +1263,9 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
         if problems:
             raise SystemExit('\n'.join(problems))
     if not dry_run:
+        if b.get('decision_protocol'):
+            if not whole_preview_complete(d,c,b):
+                raise SystemExit('latest whole-batch preview incomplete; HTTP errors cannot be merged into a ready receipt')
         missing = ax.dryrun_missing(d, bid, results, batch=batch, prompt_text=prompt, prompt_version=version,
                                     identity=batch_identity(c, b))
         if missing:
@@ -1799,6 +1825,24 @@ def _main(argv=None) -> int:
     upload.add_argument('--id', required=True)
     upload.add_argument('--batch', required=True)
     upload.add_argument('--url', default=os.environ.get('KG_HUB_URL', ax.DEFAULT_URL))
+    settlement = sub.add_parser('reconcile-settled', help='adopt exact terminal accepted sources after interrupted capacity; never replay them')
+    settlement.add_argument('--id', required=True)
+    settlement.add_argument('--batch', required=True)
+    settlement.add_argument('--url', default=os.environ.get('KG_HUB_URL', ax.DEFAULT_URL))
+    local = sub.add_parser('reconcile-local', help='review exact closed-decision rejection or incomplete read-only preview; no write replay')
+    local.add_argument('--id', required=True)
+    local.add_argument('--model', required=True)
+    local.add_argument('--slot', type=positive_int, required=True)
+    local.add_argument('--reason', required=True)
+    local.add_argument('--batch')
+    local.add_argument('--repair-file', type=Path)
+    local.add_argument('--reviewer')
+    local.add_argument('--url', default=os.environ.get('KG_HUB_URL', ax.DEFAULT_URL))
+    repair_decision=sub.add_parser('repair-decision', help='register one complete reviewed source repair without editing production decisions')
+    repair_decision.add_argument('--id',required=True)
+    repair_decision.add_argument('--batch',required=True)
+    repair_decision.add_argument('--file',type=Path,required=True)
+    repair_decision.add_argument('--reviewer',required=True)
     worker_recovery = sub.add_parser('reconcile-worker', help='bind exact reconciled partial-submit or transient-capacity native terminal')
     worker_recovery.add_argument('--id', required=True)
     worker_recovery.add_argument('--model', required=True)
@@ -2068,6 +2112,18 @@ def _main(argv=None) -> int:
     elif a.cmd == 'reconcile-upload':
         from tools.campaign_continuation import reconcile_upload
         out = reconcile_upload(a.id, a.batch, url=a.url, token=ax.api_token())
+    elif a.cmd == 'reconcile-settled':
+        from tools.campaign_settlement import reconcile
+        out = reconcile(a.id, a.batch, url=a.url, token=ax.api_token())
+    elif a.cmd == 'reconcile-local':
+        from tools.campaign_local_recovery import reconcile
+        if bool(a.repair_file)!=bool(a.batch) or bool(a.repair_file)!=bool(a.reviewer):
+            ap.error('repair disposition requires --batch --repair-file --reviewer together')
+        out=reconcile(a.id,a.model,a.slot,reason=a.reason,url=a.url,token=ax.api_token(),bid=a.batch,
+            repair=json.loads(a.repair_file.read_text()) if a.repair_file else None,reviewer=a.reviewer)
+    elif a.cmd == 'repair-decision':
+        from tools.campaign_decisions import record_repair
+        out=record_repair(a.id,a.batch,json.loads(a.file.read_text()),reviewer=a.reviewer)
     elif a.cmd == 'reconcile-worker':
         from tools.campaign_continuation import reconcile_worker
         out = reconcile_worker(a.id, a.model, a.slot, reason=a.reason, model_preflight=a.model_preflight)
