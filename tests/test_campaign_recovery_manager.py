@@ -270,7 +270,8 @@ class RecoveryManagerTests(unittest.TestCase):
         c = ec.load(self.d); c['quota'] = 50; ec.save(self.d, c)
         manager.enable(self.c['id'], reason='Synthetic quota contract')
         env = dict(os.environ)
-        env['PYTHONPATH'] = str(Path(__file__).resolve().parent.parent) + os.pathsep + str(Path(__file__).parent)
+        env['PYTHONPATH'] = (str(Path(__file__).resolve().parent.parent) + os.pathsep +
+                             str(Path(__file__).parent) + os.pathsep + env.get('PYTHONPATH', ''))
         env['SYNTHETIC_WORKSPACE'] = str(self.workspace)
         command = [sys.executable, str(Path(__file__).resolve()), '--synthetic-observer', self.c['id']]
         crashed = subprocess.run(command + ['crash'], env=env, capture_output=True, text=True, timeout=10)
