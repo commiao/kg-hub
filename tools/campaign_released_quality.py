@@ -50,6 +50,32 @@ def _preparation(command,cid,bid):
             raise ValueError('only discarded own-batch preparation or failed read diagnostic qualifies')
     for body in bodies:
         tree=ast.parse(body)
+        paths={};assignments=[n for n in ast.walk(tree) if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name)]
+        def path(n):
+            if isinstance(n,ast.Name):return paths.get(n.id)
+            if isinstance(n,ast.Constant) and isinstance(n.value,str):return Path(n.value)
+            if isinstance(n,ast.Call) and ast.unparse(n.func)=='pathlib.Path' and len(n.args)==1:
+                value=path(n.args[0]);return value.resolve() if value is not None else None
+            if isinstance(n,ast.Call) and ast.unparse(n.func)=='str' and len(n.args)==1:return path(n.args[0])
+            if isinstance(n,ast.BinOp) and isinstance(n.op,(ast.Div,ast.Add)):
+                left=path(n.left)
+                if left is not None and isinstance(n.right,ast.Constant) and isinstance(n.right.value,str):
+                    return (left/n.right.value).resolve() if isinstance(n.op,ast.Div) else Path(str(left)+n.right.value).resolve()
+            if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr=='with_suffix' and len(n.args)==1 and isinstance(n.args[0],ast.Constant):
+                left=path(n.func.value)
+                if left is not None:return left.with_suffix(n.args[0].value).resolve()
+        for _ in range(len(assignments)+1):
+            for n in assignments:
+                value=path(n.value)
+                if value is not None:paths[n.targets[0].id]=value
+        def bounded(p,writing=False):
+            if p is None:return False
+            p=p.resolve();d=ec.campaign_dir(cid).resolve()
+            if any(x.startswith('.env') for x in p.parts):return False
+            if p.is_relative_to(Path('/private/tmp')) and p.suffix in ('.json','.py'):return True
+            if not writing and p in (d/'campaign.json',d/'log.jsonl'):return True
+            dirs=(d/'results',d/'reviews') if writing else (d/'results',d/'reviews',d/'batches')
+            return any(p.parent==directory for directory in dirs) and (p.name==bid+'.json' or p.name.startswith(bid+'.'))
         for n in ast.walk(tree):
             if isinstance(n,ast.Import) and any(a.name not in {'json','pathlib','shutil'} or a.asname for a in n.names):raise ValueError('failed preparation cannot call external processes/network')
             if isinstance(n,(ast.ImportFrom,ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Lambda)):
@@ -60,6 +86,10 @@ def _preparation(command,cid,bid):
                 pure={'json.loads','json.dumps','pathlib.Path','shutil.copy2','next','print','len','sum','zip','RuntimeError'}
                 local={'read_text','write_text','with_suffix','append','pop','update','index'}
                 if name not in pure and not (isinstance(n.func,ast.Attribute) and n.func.attr in local):raise ValueError('failed preparation contains an executable operation')
+                if isinstance(n.func,ast.Attribute) and n.func.attr in ('read_text','write_text'):
+                    if not bounded(path(n.func.value),n.func.attr=='write_text'):raise ValueError('failed preparation accesses outside its released batch')
+                if name=='shutil.copy2':
+                    if len(n.args)!=2 or not bounded(path(n.args[0])) or not bounded(path(n.args[1]),True):raise ValueError('only released local artifacts may be copied')
     return helpers
 
 
@@ -72,6 +102,8 @@ def facts(c,d,model,slot,bid,quarantine,*,locked=False,operation_locked=False):
             or b['model']!=model or ec.batch_slot(c,b)!=slot or b['status']!='released' or set(b.get('released_ids',[]))!=ids):
         raise ValueError('only exact native0 own released unsubmitted quality stop qualifies')
     if c.get('source_decisions',{}).get('version')!='source-decisions-v1':raise ValueError('future per-source decision enforcement must already be enabled')
+    if any(x['model']==model and ec.batch_slot(c,x)==slot and x['status'] not in ('submitted','released') for x in c['batches']):
+        raise ValueError('another unresolved original batch must not be bypassed')
     if any(v in ('ok','empty') for v in ec.final_statuses(d,bid,ids).values()):raise ValueError('submitted source quality debt requires rework, not quarantine')
     op=({'lease_held':False} if operation_locked else receipts.status(d/'operations'/bid))
     if op.get('lease_held') is not False:raise ValueError('original operation still live')

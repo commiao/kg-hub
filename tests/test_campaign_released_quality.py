@@ -110,7 +110,8 @@ class ReleasedTests(unittest.TestCase):
 
     def test_failed_graph_write_other_batch_and_dynamic_process_cannot_be_discarded(self):
         for command in [self.command.replace('prepare','submit'),self.command.replace(self.bid,'another-batch'),
-                        'python3 - <<\'PY\'\nimport subprocess\nsubprocess.run(["true"])\nPY']:
+                        'python3 - <<\'PY\'\nimport subprocess\nsubprocess.run(["true"])\nPY',
+                        'python3 - <<\'PY\'\nimport pathlib\npathlib.Path("/etc/config").write_text("bad")\nPY']:
             with self.subTest(command=command),self.assertRaises(ValueError):released._preparation(command,self.c['id'],self.bid)
 
     def test_preview_cannot_replace_old_quality_or_quarantine_evidence(self):
