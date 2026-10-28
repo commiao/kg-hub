@@ -111,6 +111,8 @@ class Graph:
                     if m["node"] == p["u"] and ("eps" not in p or m["ep"] in p["eps"])]
         if tag == "gov:episodes":
             return [deepcopy(self.episodes[u]) for u in p["eps"] if u in self.episodes]
+        if tag == "gov:summary-episodes":
+            return [{"props": deepcopy(self.episodes[u])} for u in p["eps"] if u in self.episodes]
         if tag == "gov:pending":
             return [{"governance_id": g} for g, a in sorted(self.audits.items())
                     if a["state"] == "pending" and set(a["node_uuids"]) & set(p["ids"])]
@@ -193,6 +195,16 @@ class Graph:
             before = len(self.mentions)
             self.mentions = [m for m in self.mentions if not (m["ep"] == p["ep"] and m["node"] == p["old"])]
             return [{"dropped": before - len(self.mentions)}]
+        if tag == "gov:node-summary":
+            self.guard(q, "WHERE n.name=$name AND coalesce(n.group_id,$g)=$g")
+            self.guard(q, "coalesce(n.summary,'') IN $accepted")
+            x = self.entity(p["uid"])
+            if (not x or x["props"].get("name") != p["name"]
+                    or x["props"].get("group_id", p["g"]) != p["g"]
+                    or (x["props"].get("summary") or '') not in p["accepted"]):
+                return []
+            x["props"].update(summary=p["summary"], governance_ids=p["governance_ids"])
+            return [{"uuid": p["uid"]}]
         if tag == "gov:node-update":
             x = self.entity(p["uid"])
             if not x:
