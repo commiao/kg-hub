@@ -1840,6 +1840,13 @@ def _main(argv=None) -> int:
     rework.add_argument('--reason', required=True)
     rework.add_argument('--adopt-events', type=Path)
     rework.add_argument('--adopt-exit', type=Path)
+    rework.add_argument('--maintenance-review', type=Path, help='explicit reviewed original read-only maintenance stop; no failed writes')
+    maintenance = sub.add_parser('rework-maintenance-sheet', help='freeze every failed command and private checkpoint for coordinator review')
+    maintenance.add_argument('--id', required=True)
+    maintenance.add_argument('--model', required=True)
+    maintenance.add_argument('--slot', type=positive_int, required=True)
+    maintenance.add_argument('--evidence', type=Path, required=True)
+    maintenance.add_argument('--out', type=Path, required=True)
     migrate = sub.add_parser('migrate', help='preview/apply a receipt-bound single-worker to slot-pool migration')
     migrate.add_argument('--id', required=True)
     mode = migrate.add_mutually_exclusive_group(required=True)
@@ -2076,10 +2083,14 @@ def _main(argv=None) -> int:
                 ap.error('ownership apply requires confirm-plan-sha and reviewer')
             out = ownership_recovery.apply(a.id, plan_file=a.apply, confirm=a.confirm_plan_sha,
                 reviewer=a.reviewer, reason=a.reason)
+    elif a.cmd == 'rework-maintenance-sheet':
+        from tools.campaign_rework_maintenance import sheet
+        out = sheet(a.id,a.model,a.slot,evidence=a.evidence,out=a.out)
     elif a.cmd == 'rework':
         from tools.campaign_rework import run as rework_run
         out = rework_run(a.id, a.model, a.slot, batches=a.batches, assignment=a.assignment,
-                        reason=a.reason, adopt_events=a.adopt_events, adopt_exit=a.adopt_exit)
+                        reason=a.reason, adopt_events=a.adopt_events, adopt_exit=a.adopt_exit,
+                        maintenance_review=a.maintenance_review)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0 if out['state'] == 'rework_turn_completed' else 2
     elif a.cmd == "rules":
