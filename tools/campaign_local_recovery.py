@@ -33,7 +33,7 @@ def commands(event):
 
 
 def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=None,preflight=None,
-              prior_backend=None,prior_bundle=None,probe=None):
+              prior_backend=None,prior_bundle=None,probe=None,capability_receipt=None,require_capability=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip():
         raise ValueError('explicit coordinator disposition required')
     ec.tracking_guard();d=ec.campaign_dir(cid);c=ec.load(d)
@@ -49,7 +49,39 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             if op.get('lease_held') or op.get('requires_reconciliation') or op.get('state')=='uncertain':
                 raise ValueError('local continuation never settles an unknown operation')
             if op.get('exit_code') in (75,76):raise ValueError('NAS refusal requires separate reconciliation')
-        if prior_backend is not None:
+        if capability_receipt is not None:
+            b=ec.find_batch(c,bid)
+            pending=[v for v in own if v['status'] not in ('submitted','released')]
+            if (require_capability!='evidence_scope_v1' or pending!=[b]
+                    or outcome.get('recovery_kind')!='infrastructure_failed'
+                    or receipts.status(d/'operations'/bid).get('state')!='not_started'
+                    or any(json.loads(line).get('batch')==bid for line in (d/'log.jsonl').read_text().splitlines())):
+                raise ValueError('one unstarted original batch with a missing title capability required')
+            old_path=Path(capability_receipt).resolve(strict=True)
+            if not old_path.is_relative_to((d/'audit').resolve()):
+                raise ValueError('retained campaign audit capability receipt required')
+            old=json.loads(old_path.read_text());matches=[]
+            entry=str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+            for row in rows:
+                if row['exit_code'] in (75,76) or any(s in row.get('aggregated_output','') for s in (
+                        'This action was rejected due to unacceptable risk','PermissionError:',
+                        'batch belongs to a different worker slot','delegated campaign backend identity differs',
+                        'llm-eval: bundle core differs')):
+                    raise ValueError('permission, NAS or delegation refusal needs its own reconciliation')
+                try:
+                    output=json.loads(row.get('aggregated_output',''))
+                except ValueError:continue
+                args=shlex.split(_shell(row['command']).splitlines()[0])
+                if args and args[0]=='${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract':args[0]=entry
+                if (row['exit_code']==0 and output==old and args[:3]==[entry,'agent','preflight']
+                        and (len(args)==3 or len(args)==5 and args[3]=='>' and Path(args[4]).is_absolute())):
+                    matches.append(row['id'])
+            if (len(matches)!=1 or old.get('ok') is not True or not old.get('server',{}).get('revision')
+                    or require_capability in old.get('server',{}).get('title_qualifiers',[])):
+                raise ValueError('exact original successful public preflight missing the capability required')
+            inputs[str(old_path)]=cc.file_sha(old_path)
+            kind='capability_restored'
+        elif prior_backend is not None:
             b=ec.find_batch(c,bid)
             core_failure=prior_bundle is not None
             expected_kind='infrastructure_failed' if core_failure else 'business_permission_denied'
@@ -134,6 +166,8 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
         # Service-only readiness, no paid model admission/probe.
         flight=(preflight or ax.runtime_preflight)(url,token)
         if flight.get('ok') is not True:raise ValueError('service readiness required')
+        if capability_receipt is not None and require_capability not in flight.get('server',{}).get('title_qualifiers',[]):
+            raise ValueError('published server still lacks the required title capability')
         value={'version':'local-owner-continuation-v1','campaign':cid,'model':model,'slot':slot,
             'session':session,'kind':kind,'batch':b['id'],'reason':reason,'service_readiness':flight,
             'worker_sha256':cc.file_sha(root/'worker.json'),'native_sha256':cc.file_sha(native/'latest.json'),
@@ -155,7 +189,7 @@ def valid(c,d,model,slot,*,locked=False):
         proof=cc._read(path);b=ec.find_batch(c,proof['batch'])
         if (proof.get('version')!='local-owner-continuation-v1' or proof.get('campaign')!=c['id']
                 or proof.get('model')!=model or proof.get('slot')!=slot or proof.get('session')!=session
-                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered')
+                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered','capability_restored')
                 or cc.file_sha(root/'worker.json')!=proof['worker_sha256']
                 or cc.file_sha(native/'latest.json')!=proof['native_sha256']
                 or str(event)!=proof['events'] or cc.file_sha(event)!=proof['events_sha256']

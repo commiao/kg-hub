@@ -144,5 +144,53 @@ class LocalRecoveryTests(unittest.TestCase):
                 probe=probe,preflight=lambda *a:{'ok':True},reason='known overlay isolation restored',url='invalid',token=None)
             self.assertEqual(out['kind'],'delegation_epoch_recovered');self.assertTrue(local.valid(ec.load(self.d),self.d,'m',2))
 
+    def capability_stop(self):
+        import shutil
+        root,event=self.worker('m',2,kind='infrastructure_failed')
+        shutil.rmtree(self.d/'operations'/self.bid);(self.d/'log.jsonl').write_text('')
+        c=ec.load(self.d);ec.find_batch(c,self.bid)['status']='claimed';ec.save(self.d,c)
+        old={'ok':True,'server':{'revision':'old-provider','quality_versions':['extraction-quality-v1']}}
+        path=self.d/'audit/original-preflight.json';path.parent.mkdir(exist_ok=True);receipts.write(path,old)
+        cmd=f'''/bin/zsh -lc '"${{KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}}/tools/extract" agent preflight > /private/tmp/original-preflight.json
+python3 -c "print(1)"' '''
+        rows=[{'type':'thread.started','thread_id':'original-m-2'},
+            {'type':'item.started','item':{'id':'flight','type':'command_execution','command':cmd}},
+            {'type':'item.completed','item':{'id':'flight','type':'command_execution','command':cmd,'exit_code':0,'aggregated_output':json.dumps(old)}},
+            {'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'recovery_kind':'infrastructure_failed'})}},
+            {'type':'turn.completed'}]
+        event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        return path,event,rows
+
+    def test_capability_restore_binds_real_old_receipt_and_new_provider_without_replaying_work(self):
+        path,event,rows=self.capability_stop();before=event.read_bytes()
+        args=dict(bid=self.bid,capability_receipt=path,require_capability='evidence_scope_v1',reason='provider published',url='invalid',token=None)
+        with self.assertRaisesRegex(ValueError,'still lacks'):
+            local.reconcile(self.c['id'],'m',2,preflight=lambda *a:{'ok':True,'server':{}},**args)
+        flight={'ok':True,'server':{'title_qualifiers':['evidence_scope_v1']}}
+        out=local.reconcile(self.c['id'],'m',2,preflight=lambda *a:flight,**args)
+        self.assertEqual(out['kind'],'capability_restored');self.assertEqual(out['graph_writes'],0)
+        self.assertTrue(local.valid(ec.load(self.d),self.d,'m',2));self.assertEqual(event.read_bytes(),before)
+        receipts.write(path,{'ok':True,'server':{'revision':'fabricated'}})
+        self.assertFalse(local.valid(ec.load(self.d),self.d,'m',2))
+        with self.assertRaisesRegex(ValueError,'exact original'):
+            local.reconcile(self.c['id'],'m',2,preflight=lambda *a:flight,**args)
+
+    def test_capability_restore_never_clears_approval_or_written_operation(self):
+        path,event,rows=self.capability_stop()
+        args=dict(bid=self.bid,capability_receipt=path,require_capability='evidence_scope_v1',reason='provider published',url='invalid',token=None,
+            preflight=lambda *a:{'ok':True,'server':{'title_qualifiers':['evidence_scope_v1']}})
+        rows[2]['item'].update(exit_code=1,aggregated_output='This action was rejected due to unacceptable risk')
+        event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        with self.assertRaisesRegex(ValueError,'approval/NAS refusal'):
+            local.reconcile(self.c['id'],'m',2,**args)
+        rows[2]['item'].update(exit_code=0,aggregated_output=path.read_text());event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        p=self.d/'operations'/self.bid/'latest.json';p.parent.mkdir(parents=True)
+        receipts.write(p,{'state':'uncertain','may_have_written':True,'requires_reconciliation':True})
+        with self.assertRaisesRegex(ValueError,'unknown operation'):
+            local.reconcile(self.c['id'],'m',2,**args)
+        p.unlink();(self.d/'log.jsonl').write_text(json.dumps({'batch':self.bid,'id':1,'status':'ok'})+'\n')
+        with self.assertRaisesRegex(ValueError,'unstarted original batch'):
+            local.reconcile(self.c['id'],'m',2,**args)
+
 
 if __name__=='__main__':unittest.main()
