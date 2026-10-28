@@ -1838,6 +1838,7 @@ def _main(argv=None) -> int:
     local.add_argument('--repair-file', type=Path)
     local.add_argument('--reviewer')
     local.add_argument('--prior-backend',help='exact known published prior backend for a read-only delegation epoch proof')
+    local.add_argument('--prior-bundle',type=Path,help='known installed prior composition for an exact read-only bundle-core rejection')
     local.add_argument('--url', default=os.environ.get('KG_HUB_URL', ax.DEFAULT_URL))
     repair_decision=sub.add_parser('repair-decision', help='register one complete reviewed source repair without editing production decisions')
     repair_decision.add_argument('--id',required=True)
@@ -2118,6 +2119,8 @@ def _main(argv=None) -> int:
         out = reconcile(a.id, a.batch, url=a.url, token=ax.api_token())
     elif a.cmd == 'reconcile-local':
         from tools.campaign_local_recovery import reconcile
+        if a.prior_bundle and not a.prior_backend:
+            ap.error('prior bundle requires its exact --prior-backend')
         if a.prior_backend:
             if not a.batch or a.repair_file or a.reviewer:
                 ap.error('delegation disposition requires --batch --prior-backend only')
@@ -2125,7 +2128,7 @@ def _main(argv=None) -> int:
             ap.error('repair disposition requires --batch --repair-file --reviewer together')
         out=reconcile(a.id,a.model,a.slot,reason=a.reason,url=a.url,token=ax.api_token(),bid=a.batch,
             repair=json.loads(a.repair_file.read_text()) if a.repair_file else None,reviewer=a.reviewer,
-            prior_backend=a.prior_backend)
+            prior_backend=a.prior_backend,prior_bundle=a.prior_bundle)
     elif a.cmd == 'repair-decision':
         from tools.campaign_decisions import record_repair
         out=record_repair(a.id,a.batch,json.loads(a.file.read_text()),reviewer=a.reviewer)

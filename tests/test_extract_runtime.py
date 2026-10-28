@@ -12,6 +12,15 @@ from tools import extract_runtime as command
 
 
 class RuntimeCLITest(unittest.TestCase):
+    def test_bundle_interpreter_isolates_inherited_pythonpath(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home=Path(temp);composition=home/'composition';interpreter=composition/'venv/bin/python';interpreter.parent.mkdir(parents=True)
+            interpreter.write_text('#!/bin/sh\ncase "$*" in *"import sys; assert"*) exit 0;; esac\nprintf "%s\\n" "$1"\n');interpreter.chmod(0o700)
+            (composition/'bundle.json').write_text('{}');active=home/'.local/share/llm-eval/active-bundle.json';active.parent.mkdir(parents=True);active.symlink_to(composition/'bundle.json')
+            env={k:v for k,v in os.environ.items() if k not in ('KG_HUB_PYTHON','LLM_EVAL_ACTIVE_BUNDLE')};env.update(HOME=str(home),PYTHONPATH='/previous-composition/core')
+            result=subprocess.run(['sh',str(Path(__file__).resolve().parents[1]/'tools/extract'),'--runtime'],env=env,capture_output=True,text=True,check=True)
+            self.assertEqual(result.stdout.strip(),'-I')
+
     def test_default_composition_is_exported_to_child_cli(self):
         with tempfile.TemporaryDirectory() as temp:
             home=Path(temp)

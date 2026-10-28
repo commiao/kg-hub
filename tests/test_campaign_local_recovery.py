@@ -96,7 +96,10 @@ class LocalRecoveryTests(unittest.TestCase):
                 preflight=lambda *a:{'ok':True})
 
     def test_delegation_rejection_requires_real_public_readback_and_never_replays_prepare(self):
+        import shutil
         root,event=self.worker('m',2,kind='business_permission_denied');self.settled_operation()
+        shutil.rmtree(self.d/'operations'/self.bid)
+        c=ec.load(self.d);ec.find_batch(c,self.bid)['status']='claimed';ec.save(self.d,c)
         (self.d/'log.jsonl').write_text('')
         entry=str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
         command=f"/bin/zsh -lc '{entry} campaign prepare --id {self.c['id']} --batch {self.bid}'"
@@ -117,6 +120,29 @@ class LocalRecoveryTests(unittest.TestCase):
             self.assertEqual(probe.call_args.args[0][1:3],['campaign','operation-status'])
         self.assertEqual(out['kind'],'delegation_epoch_recovered')
         self.assertTrue(cc.worker_reconciled(ec.load(self.d),self.d,'m',2))
+
+    def test_bundle_core_rejection_uses_known_old_overlay_only_for_readonly_probe(self):
+        self.worker('m',2,kind='infrastructure_failed');self.settled_operation();(self.d/'log.jsonl').write_text('')
+        home=self.root/'fake-home';entry=home/'.local/share/kg-hub/current/tools/extract';entry.parent.mkdir(parents=True)
+        entry.write_text('synthetic released entry');entry.with_name('extract_cli.py').write_text('synthetic verified loader')
+        bundle=home/'.local/share/llm-eval/compositions/old/bundle.json';bundle.parent.mkdir(parents=True)
+        receipts.write(bundle,{'delegates':{'kg_hub.entity_extract':{'commit':'b'*40}}})
+        site=bundle.parent/'venv/lib/python3.13/site-packages';site.mkdir(parents=True)
+        root=ec.supervisor_dir(self.d,'m',2);event=Path(receipts.read(root/'worker.json')['events'])
+        cmd=f"/bin/zsh -lc '{entry} campaign operation-status --id {self.c['id']} --batch {self.bid}'"
+        rows=[{'type':'thread.started','thread_id':'original-m-2'},
+            {'type':'item.started','item':{'type':'command_execution','id':'status','command':cmd}},
+            {'type':'item.completed','item':{'type':'command_execution','id':'status','command':cmd,'exit_code':2,'aggregated_output':'llm-eval: bundle core differs\n'}},
+            {'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'recovery_kind':'infrastructure_failed'})}},
+            {'type':'turn.completed'}]
+        event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        def probe(args,**kwargs):
+            self.assertEqual(args[1:3],['campaign','operation-status']);self.assertEqual(kwargs['env']['PYTHONPATH'],str(site.resolve()))
+            return mock.Mock(returncode=0,stdout=json.dumps({'batch':self.bid}))
+        with mock.patch.dict('os.environ',{'HOME':str(home)}):
+            out=local.reconcile(self.c['id'],'m',2,bid=self.bid,prior_backend='b'*40,prior_bundle=bundle,
+                probe=probe,preflight=lambda *a:{'ok':True},reason='known overlay isolation restored',url='invalid',token=None)
+            self.assertEqual(out['kind'],'delegation_epoch_recovered');self.assertTrue(local.valid(ec.load(self.d),self.d,'m',2))
 
 
 if __name__=='__main__':unittest.main()
