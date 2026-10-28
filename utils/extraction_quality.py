@@ -198,7 +198,8 @@ def _validate_review(batch: dict, results: dict, review: dict | None, prompt_tex
         first_fact = edges[0].get("fact", "") if edges else ""
         correction = first_fact[len(title):] if first_fact.startswith(title) else ""
         corrected_title = bool(re.fullmatch(r"（后被推翻：[^\n]+）", correction))
-        if len(edges) < 2 or (first_fact != title and not corrected_title):
+        scoped_title = bool(re.fullmatch(r"（证据范围：[^\n]+）", correction))
+        if len(edges) < 2 or (first_fact != title and not corrected_title and not scoped_title):
             errors.append(prefix + "verbatim_title_required")
         elif edges[1].get("fact", "").strip() in {title.strip(), first_fact.strip()}:
             # Proper names can contain CJK in English prose; a reviewer decides
@@ -213,6 +214,24 @@ def _validate_review(batch: dict, results: dict, review: dict | None, prompt_tex
             errors.append(prefix + "every_edge_requires_unique_evidence")
             continue
         evidence = {e["index"]: e for e in evidence}
+        if scoped_title:
+            # An evidence limit does not claim the original title was later
+            # disproved. Keep its exact text and bind both qualifications to
+            # a separately explicit, source-backed review decision.
+            scope = receipt.get('title_scope')
+            qualification = correction[len('（证据范围：'):-1]
+            translation = scope.get('translated_qualification') if isinstance(scope, dict) else None
+            if (not isinstance(scope, dict) or scope.get('kind') != 'evidence_limit'
+                    or scope.get('qualification') != qualification
+                    or not isinstance(scope.get('note'), str) or len(scope['note'].strip()) < 8
+                    or not _quote_ok(scope.get('quote'), evidence_text(scope, item, by_source, future))
+                    or not isinstance(translation, str) or len(translation.strip()) < 8
+                    or translation not in edges[1].get('fact', '')):
+                errors.append(prefix + 'scoped_title_requires_explicit_bilingual_evidence_limit')
+            if receipt.get('title_correction') is not None:
+                errors.append(prefix + 'evidence_limit_is_not_title_reversal')
+        elif receipt.get('title_scope') is not None:
+            errors.append(prefix + 'title_scope_requires_qualified_verbatim_title')
         if corrected_title:
             # Older receipts used the first edge's lookahead quote. Keep those
             # valid; body/same-batch corrections need their own explicit proof.

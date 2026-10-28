@@ -2182,6 +2182,7 @@ async def extraction_capabilities(request: Request) -> JSONResponse:
         + Path(graph_governance.__file__).read_bytes()).hexdigest()
     return JSONResponse({"quality_versions": [extraction_quality.QUALITY_VERSION],
         "prompt_versions": ["agent-v5"], "repair": True, "revision": revision,
+        "title_qualifiers": ["superseded", "evidence_scope_v1"],
         "repair_paths": {"preview": "/api/extraction/repair/preview",
                          "apply": "/api/extraction/repair", "status": "/api/extraction/repair"},
         "graph_governance": {"version": graph_governance.VERSION,
