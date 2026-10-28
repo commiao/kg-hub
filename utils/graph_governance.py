@@ -1,4 +1,4 @@
-"""Audited node-level graph governance: merge, rename, retype and split.
+"""Audited node-level graph governance: identity changes and summary correction.
 
 ``utils.extraction_repair`` corrects what ONE source observation wrote. Duplicate
 nodes span sources and campaigns, so this module works on node identity instead,
@@ -20,6 +20,8 @@ Invariants:
   ``merged_into``; their own properties remain in place.
 - Replays reuse the frozen plan. Every write step is guarded by uuid, endpoints
   and fact, and recognises its own completed state instead of re-resolving.
+- Summary correction reads every complete backing episode, requires source-bound
+  reviews and preserves all other node, edge, mention and source properties.
 """
 from __future__ import annotations
 
@@ -33,18 +35,19 @@ from schema import ENTITY_TYPES
 from utils.extraction_repair import encoded, digest, _ID, _SHA
 
 VERSION = "graph-governance-v1"
-OPERATIONS = ("merge", "rename", "retype", "split")
+OPERATIONS = ("merge", "rename", "retype", "split", "summary")
 TOMBSTONE = "MergedEntity"
 MAX_MERGED = 20
 MAX_PARTITIONS = 20
 MAX_EDGES = 1500
 MAX_EPISODES = 3000
+MAX_SUMMARY_EPISODES = 50
 _LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 _VECTORS = ("name_embedding", "fact_embedding")
 _READ_TAGS = frozenset({"gov:resolve", "gov:nodes", "gov:tombstones", "gov:foreign-rels", "gov:edges-out",
                         "gov:edges-in", "gov:anchor-out", "gov:anchor-in", "gov:mentions", "gov:episodes",
                         "gov:name-conflicts", "gov:pending", "gov:degree", "gov:audit-read", "gov:edge-locate",
-                        "gov:edge-full", "gov:mention-exists", "gov:node-read"})
+                        "gov:edge-full", "gov:mention-exists", "gov:node-read", "gov:summary-episodes"})
 
 
 class GovernanceError(ValueError):
@@ -106,6 +109,33 @@ def parse_scope(document: dict, *, bound: bool) -> dict:
         scope["merged"] = [_ref(x, "merged", bound=bound) for x in merged]
     else:
         scope["node"] = _ref(document.get("node"), "node", bound=bound)
+    if op == "summary":
+        allowed = {"operation", "node", "summary_to", "reviewed_episodes", "governance_id",
+                   "expected_snapshot_sha256", "reason", "reviewer", "version"}
+        if set(document) - allowed:
+            raise GovernanceError("bad_request", "summary correction cannot also change identity or type", 400)
+        scope["summary_to"] = _text(document.get("summary_to"), "summary_to", 2000)
+        reviews = document.get("reviewed_episodes", [])
+        if (not isinstance(reviews, list) or len(reviews) > MAX_SUMMARY_EPISODES or bound and not reviews):
+            raise GovernanceError("bad_request", "summary apply requires explicit backing episode reviews", 400)
+        scope["reviewed_episodes"] = []
+        for item in reviews:
+            if not isinstance(item, dict) or set(item) != {"uuid", "sha256", "note"}:
+                raise GovernanceError("bad_request", "each episode review requires uuid, sha256 and note", 400)
+            sha = item["sha256"]
+            if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                raise GovernanceError("bad_request", "episode review requires the full source snapshot SHA256", 400)
+            note = _text(item["note"], "episode review note", 2000)
+            if len(note) < 10:
+                raise GovernanceError("bad_request", "episode review needs a concrete source-specific explanation", 400)
+            scope["reviewed_episodes"].append({"uuid": _uuid(item["uuid"], "episode uuid"),
+                                               "sha256": sha, "note": note})
+        ids = [item["uuid"] for item in scope["reviewed_episodes"]]
+        if len(set(ids)) != len(ids):
+            raise GovernanceError("bad_request", "episode reviews cannot repeat a source", 400)
+        scope["reviewed_episodes"].sort(key=lambda item: item["uuid"])
+    elif "summary_to" in document or "reviewed_episodes" in document:
+        raise GovernanceError("bad_request", "summary changes require the dedicated summary operation", 400)
     if op == "split":
         parts = document.get("partitions") or []
         if not isinstance(parts, list) or len(parts) > MAX_PARTITIONS or (bound and not parts):
@@ -177,6 +207,8 @@ def _roles(scope: dict) -> tuple[list[str], list[str]]:
         return [m["uuid"] for m in scope["merged"]], [scope["canonical"]["uuid"]]
     if op == "split":
         return [scope["node"]["uuid"]], [p["target"]["uuid"] for p in scope["partitions"] if p["target"]]
+    if op == "summary":
+        return [scope["node"]["uuid"]], []
     return [], [scope["node"]["uuid"]]
 
 
@@ -303,8 +335,17 @@ async def snapshot(driver, scope: dict, group_id: str) -> dict:
                              u=uid, eps=scoped[start:start + 200])]
     if len(episode_ids) > MAX_EPISODES:
         raise GovernanceError("governance_too_large", f"more than {MAX_EPISODES} source episodes in scope", 413)
+    if scope["operation"] == "summary" and len(episode_ids) > MAX_SUMMARY_EPISODES:
+        raise GovernanceError("governance_too_large", "summary correction requires reviewing at most "
+                              f"{MAX_SUMMARY_EPISODES} complete backing episodes", 413)
     episodes, wanted = [], sorted(episode_ids)
     for start in range(0, len(wanted), 200):
+        if scope["operation"] == "summary":
+            rows = await _rows(driver,
+                "/* gov:summary-episodes */ MATCH (ep:Episodic) WHERE ep.uuid IN $eps "
+                "RETURN properties(ep) AS props", eps=wanted[start:start + 200])
+            episodes += [_strip(row["props"]) for row in rows]
+            continue
         episodes += await _rows(driver,
             "/* gov:episodes */ MATCH (ep:Episodic) WHERE ep.uuid IN $eps RETURN ep.uuid AS uuid, ep.name AS name, "
             "ep.source_description AS source_description, ep.valid_at AS valid_at, ep.group_id AS group_id, "
@@ -320,6 +361,8 @@ async def snapshot(driver, scope: dict, group_id: str) -> dict:
         "AND any(x IN coalesce(r.node_uuids,[]) WHERE x IN $ids) RETURN r.governance_id AS governance_id "
         "ORDER BY r.governance_id", ids=ids)
     found = {e["uuid"] for e in episodes}
+    if scope["operation"] == "summary" and len(found) != len(episodes):
+        raise GovernanceError("ambiguous_episode_uuid", "summary backing episode UUIDs must be unique")
     out = {"version": VERSION, "group_id": group_id, "scope": scope,
            "nodes": sorted(({"uuid": n["props"]["uuid"], "labels": sorted(n["labels"]), "props": _strip(n["props"])}
                             for n in nodes), key=lambda n: n["uuid"]),
@@ -328,7 +371,8 @@ async def snapshot(driver, scope: dict, group_id: str) -> dict:
            "edges": sorted(edges.values(), key=lambda e: e["props"]["uuid"]),
            "anchor_edges": sorted(anchor_edges.values(), key=lambda e: e["props"]["uuid"]),
            "mentions": sorted(mentions, key=lambda m: (m["episode_uuid"], m["node_uuid"], str(m["props"].get("uuid")))),
-           "episodes": sorted(({**e, "entity_edges": list(e.get("entity_edges") or [])} for e in episodes),
+           "episodes": sorted((dict(e) if scope["operation"] == "summary" else
+                               {**e, "entity_edges": list(e.get("entity_edges") or [])} for e in episodes),
                               key=lambda e: e["uuid"]),
            "missing_episodes": sorted(episode_ids - found),
            "name_conflicts": conflicts,
@@ -586,7 +630,7 @@ def build_plan(scope: dict, snap: dict) -> dict:
     refs = {}
     removed = {e["uuid"]: e for e in edge_plans if e["action"] in ("absorb", "drop_self_loop")}
     for episode in snap["episodes"]:
-        stored = episode["entity_edges"]
+        stored = episode.get("entity_edges") or []
         remove = sorted(x for x in stored if x in removed)
         add = _ordered_union([removed[x]["survivor_uuid"] for x in remove if removed[x]["action"] == "absorb"])
         add = [x for x in add if x not in stored]
@@ -634,6 +678,33 @@ def build_plan(scope: dict, snap: dict) -> dict:
         update(anchors[0], rename=scope.get("rename_to"), kind=scope.get("retype_to"))
         if not node_plans[-1]["set"].get("name") and not node_plans[-1]["labels_add"] and not node_plans[-1]["labels_remove"]:
             raise GovernanceError("nothing_to_change", "the node already has this name/type", 400)
+    elif op == "summary":
+        source = primary[0]
+        if len(snap["nodes"]) != 1:
+            raise GovernanceError("ambiguous_node_uuid", "summary correction requires one unique live node")
+        old_summary = nodes[source]["props"].get("summary")
+        if not isinstance(old_summary, str) or not old_summary.strip():
+            raise GovernanceError("summary_missing", "summary correction requires an existing stored summary", 400)
+        if old_summary == scope["summary_to"]:
+            raise GovernanceError("nothing_to_change", "the node already has this summary", 400)
+        if not snap["episodes"] or snap["missing_episodes"]:
+            raise GovernanceError("summary_sources_incomplete", "every summary backing source must exist")
+        for ep in snap["episodes"]:
+            if not isinstance(ep.get("content"), str) or not ep["content"].strip():
+                raise GovernanceError("summary_sources_incomplete", f"episode {ep['uuid']} lacks source content")
+        reviews = {item["uuid"]: item for item in scope["reviewed_episodes"]}
+        if reviews:
+            if set(reviews) != {ep["uuid"] for ep in snap["episodes"]}:
+                raise GovernanceError("summary_review_incomplete", "review every backing episode, not one selected source")
+            for ep in snap["episodes"]:
+                if reviews[ep["uuid"]]["sha256"] != digest(ep):
+                    raise GovernanceError("stale_summary_evidence", f"episode {ep['uuid']} changed after source review")
+        else:
+            warnings.append({"code": "summary_review_required", "message": "listing only: review each complete "
+                             "episode below and bind its snapshot SHA256 and a concrete note before apply"})
+        node_plans.append({"uuid": source, "action": "update", "name": names[source],
+                           "labels_remove": [], "labels_add": [], "embed_name": False,
+                           "set": {"summary": scope["summary_to"]}, "previous_summary": old_summary})
     else:
         source = primary[0]
         for target in sorted(set(partition_nodes) & set(nodes)):
@@ -654,6 +725,9 @@ def build_plan(scope: dict, snap: dict) -> dict:
 
     # affected sources
     touched_eps = {}
+    if op == "summary":
+        touched_eps = {ep["uuid"]: {"edges": sum(ep["uuid"] in (edge["props"].get("episodes") or [])
+                                                    for edge in snap["edges"])} for ep in snap["episodes"]}
     for plan_edge in edge_plans:
         for ep in plan_edge["episodes"]:
             touched_eps.setdefault(ep, {"edges": 0})["edges"] += 1
@@ -681,7 +755,12 @@ def build_plan(scope: dict, snap: dict) -> dict:
             "nodes": node_plans, "edges": edge_plans, "residual_edges": sorted(residual),
             "mentions": mention_plans, "episode_refs": [refs[k] for k in sorted(refs)],
             "sources": sources, "summary": summary, "warnings": warnings,
-            "applicable": not (op == "split" and not scope.get("partitions"))}
+            "applicable": not (op == "split" and not scope.get("partitions"))
+                          and not (op == "summary" and not scope.get("reviewed_episodes"))}
+    if op == "summary":
+        plan["summary_sources"] = [{"uuid": ep["uuid"], "sha256": digest(ep), "content": ep["content"],
+                                     "review_note": next((r["note"] for r in scope["reviewed_episodes"]
+                                                         if r["uuid"] == ep["uuid"]), None)} for ep in snap["episodes"]]
     plan["plan_sha256"] = digest(plan)
     return plan
 
@@ -877,6 +956,18 @@ async def _apply_plan(driver, request: dict, before: dict, plan: dict, mat: dict
             continue
         props = {**node["set"],
                  "governance_ids": _ordered_union(stored[node["uuid"]].get("governance_ids"), [gid])}
+        if plan["operation"] == "summary":
+            rows = await _rows(driver,
+                "/* gov:node-summary */ MATCH (n:Entity {uuid:$uid}) "
+                "WHERE n.name=$name AND coalesce(n.group_id,$g)=$g "
+                "AND coalesce(n.summary,'') IN $accepted "
+                "SET n.summary=$summary, n.governance_ids=$governance_ids RETURN n.uuid AS uuid",
+                uid=node["uuid"], name=node["name"], g=group_id,
+                accepted=[node["previous_summary"], node["set"]["summary"]],
+                summary=node["set"]["summary"], governance_ids=props["governance_ids"])
+            if len(rows) != 1:
+                raise GovernanceError("governance_conflict", "summary or node identity changed", 503)
+            continue
         query = "/* gov:node-update */ MATCH (n:Entity {uuid:$uid}) SET n += $props"
         if node["labels_remove"]:
             query += " REMOVE n" + _labels(node["labels_remove"])
@@ -921,8 +1012,39 @@ def _float32(values) -> list[float]:
     return [struct.unpack("!f", struct.pack("!f", float(v)))[0] for v in values]
 
 
+async def _verify_summary_state(driver, request: dict, before: dict, plan: dict, *, require_after: bool) -> dict:
+    """A summary edit preserves complete source, node, edge and mention state.
+
+    On a pending replay, accept only the exact old state or this plan's exact
+    completed update. Any other write requires a new human decision.
+    """
+    current = await snapshot(driver, request["scope"], before["group_id"])
+    gid = request["governance_id"]
+    for key in ("version", "group_id", "scope", "edges", "anchor_edges", "mentions", "episodes",
+                "foreign_relationships", "missing_episodes", "name_conflicts", "tombstones"):
+        if current[key] != before[key]:
+            raise GovernanceError("governance_origin_changed", f"summary correction changed or lost {key}", 503)
+    if [x for x in current["pending_governance"] if x != gid] != before["pending_governance"]:
+        raise GovernanceError("governance_conflict", "another governance owns the summary node", 503)
+    expected = {**before["nodes"][0], "props": {**before["nodes"][0]["props"],
+        "summary": request["scope"]["summary_to"],
+        "governance_ids": _ordered_union(before["nodes"][0]["props"].get("governance_ids"), [gid])}}
+    choices = [[expected]] if require_after else [before["nodes"], [expected]]
+    if current["nodes"] not in choices:
+        raise GovernanceError("governance_origin_changed", "summary or other original node properties differ", 503)
+    item = {"uuid": expected["uuid"], "action": "summary", "name": expected["props"]["name"],
+            "old_summary_sha256": digest(before["nodes"][0]["props"]["summary"]),
+            "new_summary_sha256": digest(request["scope"]["summary_to"]),
+            "preserved_edges": len(before["edges"]), "preserved_mentions": len(before["mentions"]),
+            "preserved_sources": len(before["episodes"])}
+    return {"status": "verified", "before_snapshot_sha256": before["snapshot_sha256"], "count": 1,
+            "proof_sha256": digest([item]), "items": [item], "truncated": False}
+
+
 async def verify(driver, request: dict, before: dict, plan: dict, mat: dict) -> dict:
     """Read every planned effect back before issuing a success receipt."""
+    if plan["operation"] == "summary":
+        return await _verify_summary_state(driver, request, before, plan, require_after=True)
     original = {e["props"]["uuid"]: e for e in before["edges"] + before["anchor_edges"]}
     proof = []
     for edge in plan["edges"]:
@@ -1011,6 +1133,8 @@ async def apply(g, document: dict, group_id: str) -> dict:
         if len(prepared) != 1 or prepared[0].get("request_sha256") != digest(request):
             raise GovernanceError("governance_prepare_unconfirmed", "durable plan was not confirmed", 503)
     try:
+        if plan["operation"] == "summary":
+            await _verify_summary_state(g.driver, request, before, plan, require_after=False)
         result = await _apply_plan(g.driver, request, before, plan, mat, group_id)
         result["verification"] = await verify(g.driver, request, before, plan, mat)
         result["verified"] = True

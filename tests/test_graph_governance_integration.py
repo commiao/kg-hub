@@ -256,6 +256,54 @@ class RealGovernanceTests(unittest.IsolatedAsyncioTestCase):
                                          extractor_model="unit", group_id=GROUP, episode_uuid="late",
                                          dry_run=dry_run)
 
+    async def summary_fixture(self):
+        await self.node('summary-node', 'Tool', 'worker dashboard', 'Telemetry and an unsupported review instruction.')
+        await self.node('summary-peer', 'Concept', 'worker telemetry')
+        await self.edge('summary-edge', 'summary-node', 'summary-peer', 'Dashboard shows worker telemetry.',
+                        ['summary-source'], '2026-10-01T00:00:00Z', 'displays')
+        await self.episode('summary-source', ['summary-edge'], ['summary-node', 'summary-peer'])
+        scope = {'operation': 'summary', 'node': {'uuid': 'summary-node'},
+                 'summary_to': 'Shows active worker telemetry.'}
+        first = await gov.preview(self.g, scope, GROUP)
+        self.assertFalse(first['plan']['applicable'])
+        scope['reviewed_episodes'] = [{'uuid': ep['uuid'], 'sha256': gov.digest(ep),
+                                      'note': 'Read the complete source and retained its dashboard telemetry assertion.'}
+                                     for ep in first['snapshot']['episodes']]
+        body = await gov.preview(self.g, scope, GROUP)
+        request = {**body['scope'], 'governance_id': 'summary-only', 'reason': 'Remove unsupported review instruction.',
+                   'reviewer': 'integration reviewer', 'expected_snapshot_sha256': body['snapshot']['snapshot_sha256']}
+        return request, body
+
+    async def test_summary_only_apply_preserves_actual_node_vector_edges_and_sources(self):
+        request, body = await self.summary_fixture()
+        await self.rows("CREATE (k:IngestedKey {key:'original-source-key', episode_uuid:'summary-source', "
+                        "source_obs_id:'original-obs', group_id:'kg_hub'})")
+        before_keys = await self.rows("MATCH (k:IngestedKey) RETURN properties(k) AS p")
+        before_node = (await self.rows("MATCH (n:Entity {uuid:'summary-node'}) RETURN properties(n) AS p"))[0]['p']
+        before_edges = await self.rows("MATCH (a)-[r:RELATES_TO]->(b) RETURN a.uuid AS a,b.uuid AS b,properties(r) AS p")
+        before_sources = await self.rows("MATCH (e:Episodic) RETURN properties(e) AS p")
+        before_mentions = await self.rows("MATCH (e:Episodic)-[r:MENTIONS]->(n:Entity) RETURN e.uuid AS e,n.uuid AS n,properties(r) AS p ORDER BY n")
+        result = await gov.apply(self.g, request, GROUP)
+        self.assertTrue(result['verified'])
+        after_node = (await self.rows("MATCH (n:Entity {uuid:'summary-node'}) RETURN properties(n) AS p"))[0]['p']
+        before_node.update(summary=request['summary_to'], governance_ids=['summary-only'])
+        self.assertEqual(after_node, before_node)
+        self.assertEqual(await self.rows("MATCH (a)-[r:RELATES_TO]->(b) RETURN a.uuid AS a,b.uuid AS b,properties(r) AS p"), before_edges)
+        self.assertEqual(await self.rows("MATCH (e:Episodic) RETURN properties(e) AS p"), before_sources)
+        self.assertEqual(await self.rows("MATCH (e:Episodic)-[r:MENTIONS]->(n:Entity) RETURN e.uuid AS e,n.uuid AS n,properties(r) AS p ORDER BY n"), before_mentions)
+        self.assertEqual(body['plan']['edges'], [])
+        self.assertEqual(await self.rows("MATCH (k:IngestedKey) RETURN properties(k) AS p"), before_keys)
+        self.assertTrue((await gov.apply(self.g, request, GROUP))['duplicate'])
+
+    async def test_summary_actual_write_interruption_replays_original_immutable_plan(self):
+        request, _ = await self.summary_fixture()
+        edges = await self.rows("MATCH ()-[r:RELATES_TO]->() RETURN properties(r) AS p")
+        broken = SimpleNamespace(driver=FaultDriver(self.driver, 'gov:node-summary'), embedder=Embedder())
+        with self.assertRaises(RuntimeError):await gov.apply(broken, request, GROUP)
+        self.assertEqual((await gov.audit(self.driver, 'summary-only'))['state'], 'pending')
+        self.assertTrue((await gov.apply(self.g, request, GROUP))['verified'])
+        self.assertEqual(await self.rows("MATCH ()-[r:RELATES_TO]->() RETURN properties(r) AS p"), edges)
+
     async def test_ingest_reuses_canonical_for_merged_and_renamed_names(self):
         """合并 / 改名之后，入图消解（_FIND_ALIAS / _FIND_RETIRED 在真 FalkorDB 上）认旧名，不再长回重复节点。"""
         await self.merge_fixture()

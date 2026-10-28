@@ -1,6 +1,7 @@
 """Official, model-free entry point for node-level graph governance.
 
-merge / rename / retype / split nodes across sources and campaigns. Preview is
+merge / rename / retype / split nodes, or correct a summary after reviewing all
+backing sources across campaigns. Preview is
 read-only and returns the complete plan; apply sends exactly the reviewed request
 file, including its expected snapshot digest; the CLI never refreshes it.
 """
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 from urllib.parse import urlencode
@@ -29,6 +31,14 @@ def render_markdown(body: dict) -> str:
     for node in plan.get("nodes", []):
         lines.append(f"| {node['action']} | `{node['uuid']}` | {node['name']} | {','.join(node['labels_remove'])} | "
                      f"{','.join(node['labels_add'])} | {json.dumps(node['set'], ensure_ascii=False)} |")
+    if plan.get("operation") == "summary":
+        lines += ["", "## 摘要修正与全部来源复核", "",
+                  "逐条阅读完整来源并保存具体判断；登记来源哈希不等于系统自动认定语义正确。"]
+        for node in plan.get("nodes", []):
+            lines += ["", "```json", json.dumps({"uuid": node["uuid"], "before": node.get("previous_summary"),
+                       "after": node["set"].get("summary")}, ensure_ascii=False, indent=2), "```"]
+        for source in plan.get("summary_sources", []):
+            lines += ["", "```json", json.dumps(source, ensure_ascii=False, indent=2), "```"]
     lines += ["", "## 边", "", "| 动作 | 边 uuid | 原端点 | 新端点 | 边名 | fact | 背书数 → 之后 | 并入 |",
               "|---|---|---|---|---|---|---|---|"]
     for edge in plan.get("edges", []):
@@ -66,7 +76,6 @@ def main(argv=None, *, http=None) -> int:
     ap.add_argument("--url", default=ax.DEFAULT_URL)
     args = ap.parse_args(argv)
     post = http or ax._http
-    token = ax.api_token()
     if args.command == "status":
         if not args.governance_id or not _ID.fullmatch(args.governance_id):
             ap.error("status requires a valid --governance-id")
@@ -75,12 +84,16 @@ def main(argv=None, *, http=None) -> int:
         if not args.file:
             ap.error("preview/apply require --file")
         payload = json.loads(Path(args.file).read_text())
+        if isinstance(payload, dict) and payload.get("operation") == "summary" and any(os.environ.get(k) is not None for k in
+                ("KG_HUB_CAMPAIGN_SLOT", "KG_HUB_REWORK_BATCHES")):
+            raise SystemExit("shared node summary correction requires coordinator review of every backing source")
         if args.command == "apply":
             parse_request(payload)
         else:
             parse_scope(payload, bound=False)
         method = "POST"
         path = "/api/graph/governance" + ("/preview" if args.command == "preview" else "")
+    token = ax.api_token()
     code, body = post(method, args.url.rstrip("/") + path, payload, token)
     output = {"http": code, **body}
     if args.out:
