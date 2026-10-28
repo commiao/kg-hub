@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 
 from tools import campaign_continuation as cc, extract_campaign as ec, agent_extract as ax
 from tools import campaign_supervision as supervision
@@ -31,7 +32,8 @@ def commands(event):
     return done
 
 
-def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=None,preflight=None):
+def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=None,preflight=None,
+              prior_backend=None,probe=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip():
         raise ValueError('explicit coordinator disposition required')
     ec.tracking_guard();d=ec.campaign_dir(cid);c=ec.load(d)
@@ -47,7 +49,30 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             if op.get('lease_held') or op.get('requires_reconciliation') or op.get('state')=='uncertain':
                 raise ValueError('local continuation never settles an unknown operation')
             if op.get('exit_code') in (75,76):raise ValueError('NAS refusal requires separate reconciliation')
-        if repair is not None:
+        if prior_backend is not None:
+            b=ec.find_batch(c,bid)
+            if b not in own or b['status'] in ('submitted','released') or outcome.get('recovery_kind')!='business_permission_denied':
+                raise ValueError('exact pending owner stopped at stale delegation boundary required')
+            failed=[r for r in rows if r['exit_code']]
+            if not failed or failed[-1].get('aggregated_output','').strip()!='delegated campaign backend identity differs':
+                raise ValueError('exact original delegated backend rejection required')
+            args=shlex.split(_shell(failed[-1]['command']).splitlines()[-1])
+            entry=str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+            if args[:7]!=[entry,'campaign','prepare','--id',cid,'--batch',bid] or not (
+                    len(args)==7 or len(args)==9 and args[7]=='>' and Path(args[8]).is_absolute()):
+                raise ValueError('literal original public prepare boundary required')
+            if any(json.loads(line).get('batch')==bid for line in (d/'log.jsonl').read_text().splitlines()):
+                raise ValueError('delegation recovery never settles formal writes')
+            env={**os.environ,'LLM_EVAL_DELEGATED_BACKEND':prior_backend,
+                 'LLM_EVAL_ACTIVE_BUNDLE':str(Path('~/.local/share/llm-eval/active-bundle.json').expanduser())}
+            env.pop('LLM_EVAL_BACKEND_RESELECTED',None)
+            result=(probe or subprocess.run)([entry,'campaign','operation-status','--id',cid,'--batch',bid],
+                 env=env,capture_output=True,text=True,timeout=30)
+            if result.returncode!=0 or json.loads(result.stdout).get('batch')!=bid:
+                raise ValueError('published stale-epoch re-selection readback required')
+            inputs[str(Path(entry).resolve().parent/'extract_cli.py')]=cc.file_sha(Path(entry).resolve().parent/'extract_cli.py')
+            kind='delegation_epoch_recovered'
+        elif repair is not None:
             b=ec.find_batch(c,bid)
             if b not in own or b['status']!='submitted' or outcome.get('recovery_kind')!='business_permission_denied':
                 raise ValueError('exact submitted owner stopped at production decision entry required')
@@ -115,7 +140,7 @@ def valid(c,d,model,slot,*,locked=False):
         proof=cc._read(path);b=ec.find_batch(c,proof['batch'])
         if (proof.get('version')!='local-owner-continuation-v1' or proof.get('campaign')!=c['id']
                 or proof.get('model')!=model or proof.get('slot')!=slot or proof.get('session')!=session
-                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered')
+                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered')
                 or cc.file_sha(root/'worker.json')!=proof['worker_sha256']
                 or cc.file_sha(native/'latest.json')!=proof['native_sha256']
                 or str(event)!=proof['events'] or cc.file_sha(event)!=proof['events_sha256']

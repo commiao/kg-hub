@@ -37,3 +37,17 @@ supported fact and summary. Missing evidence is not evidence of a later reversal
 
 These contracts verify attribution, evidence and execution boundaries. They do
 not establish semantic correctness or replace the coordinator's source review.
+
+A repair's optional `extractor_session` may remain null under the original repair
+protocol. The exact source, frozen model/tool/run identity and original slot
+session still bind the separate repair receipt; a foreign non-null session is
+rejected.
+
+For a completed original owner stopped by `delegated campaign backend identity
+differs`, `reconcile-local --id ID --model MODEL --slot SLOT --batch BATCH
+--prior-backend OLD_COMMIT --reason REASON` requires the exact public prepare
+rejection, no formal writes for that pending batch, and a successful read-only
+public operation-status through the known prior recursion marker. A known prior
+published marker triggers one selection of the active hash-verified adapter;
+unknown identities and repeated mismatches remain errors. Native workers do not
+inherit the caller's recursion marker. The original refusal remains recorded.

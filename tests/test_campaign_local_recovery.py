@@ -69,6 +69,18 @@ class LocalRecoveryTests(unittest.TestCase):
         self.assertTrue(cc.worker_reconciled(ec.load(self.d),self.d,'m',2));self.assertEqual(event.read_bytes(),original)
         event.write_text(event.read_text()+'{}\n');self.assertFalse(cc.worker_reconciled(ec.load(self.d),self.d,'m',2))
 
+    def test_original_optional_null_session_keeps_frozen_model_tool_run_and_owner(self):
+        request,review=self.repair();request['replacement']['extractor_session']=None
+        out=decisions.record_repair(self.c['id'],self.bid,request,reviewer=review['reviewer'])
+        value=receipts.read(Path(out['path']))
+        self.assertEqual(value['owner_session'],'original-m-2')
+        self.assertIsNone(value['request']['replacement']['extractor_session'])
+        request['replacement']['extractor_session']='foreign-campaign'
+        with self.assertRaises(ValueError):decisions.record_repair(self.c['id'],self.bid,request,reviewer=review['reviewer'])
+        request['replacement']['extractor_session']=None
+        request['replacement']['run_id']='foreign-run'
+        with self.assertRaises(ValueError):decisions.record_repair(self.c['id'],self.bid,request,reviewer=review['reviewer'])
+
     def test_readonly_preview_failure_requires_exact_input_and_healthy_service(self):
         root,event=self.worker('m',2,kind='infrastructure_failed')
         p,v=self.settled_operation();v.update(kind='dryrun',by_status={'dry_run':2,'http_502':1});receipts.write(p,v)
@@ -82,6 +94,29 @@ class LocalRecoveryTests(unittest.TestCase):
         v['may_have_written']=True;v['state']='uncertain';receipts.write(p,v)
         with self.assertRaises(ValueError):local.reconcile(self.c['id'],'m',2,reason='unsafe',url='invalid',token=None,
                 preflight=lambda *a:{'ok':True})
+
+    def test_delegation_rejection_requires_real_public_readback_and_never_replays_prepare(self):
+        root,event=self.worker('m',2,kind='business_permission_denied');self.settled_operation()
+        (self.d/'log.jsonl').write_text('')
+        entry=str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+        command=f"/bin/zsh -lc '{entry} campaign prepare --id {self.c['id']} --batch {self.bid}'"
+        rows=[{'type':'thread.started','thread_id':'original-m-2'},
+            {'type':'item.started','item':{'id':'prepare','type':'command_execution','command':command}},
+            {'type':'item.completed','item':{'id':'prepare','type':'command_execution','command':command,'exit_code':1,
+                'aggregated_output':'delegated campaign backend identity differs\n'}},
+            {'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'recovery_kind':'business_permission_denied'})}},
+            {'type':'turn.completed'}]
+        event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        with mock.patch.object(local.subprocess,'run',return_value=mock.Mock(returncode=1,stdout='')):
+            with self.assertRaisesRegex(ValueError,'readback'):
+                local.reconcile(self.c['id'],'m',2,bid=self.bid,prior_backend='b'*40,reason='blocked',url='invalid',token=None,
+                                preflight=lambda *a:{'ok':True})
+        with mock.patch.object(local.subprocess,'run',return_value=mock.Mock(returncode=0,stdout=json.dumps({'batch':self.bid}))) as probe:
+            out=local.reconcile(self.c['id'],'m',2,bid=self.bid,prior_backend='b'*40,reason='verified stable entry',url='invalid',token=None,
+                                preflight=lambda *a:{'ok':True})
+            self.assertEqual(probe.call_args.args[0][1:3],['campaign','operation-status'])
+        self.assertEqual(out['kind'],'delegation_epoch_recovered')
+        self.assertTrue(cc.worker_reconciled(ec.load(self.d),self.d,'m',2))
 
 
 if __name__=='__main__':unittest.main()
