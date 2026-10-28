@@ -86,6 +86,33 @@ class SettlementTests(unittest.TestCase):
             self.assertEqual((self.d/'log.jsonl').read_bytes(),self.original_log)
             self.assertFalse((self.d/'operations'/self.bid/'settlement-active.json').exists())
 
+    def test_capacity_again_before_suffix_write_uses_bounded_original_owner_retry(self):
+        self.settle();cc.reconcile_worker(self.c['id'],'m',2,reason='original terminal settled')
+        c=ec.load(self.d);c['dispatch']={'state':'running','id':'continue'};ec.save(self.d,c)
+        calls=[];waits=[]
+        def spawn(args,**kwargs):
+            calls.append(args);native=Path(args[args.index('--receipt-dir')+1])
+            rows=[{'type':'thread.started','thread_id':'original-m-2'}]
+            with receipts.attempt(native,kind='native_cli') as update:
+                if len(calls)==1:
+                    rows.extend([{'type':'error','message':supervision.CAPACITY_MESSAGE},
+                                 {'type':'turn.failed','error':{'message':supervision.CAPACITY_MESSAGE}}])
+                    code=1
+                else:
+                    ec.cmd_submit(self.c['id'],self.bid,dry_run=False,url='invalid',token=None,
+                                  post=self.post,gate=lambda k:contextlib.nullcontext())
+                    from tools.campaign_migration import drain
+                    drain(self.c['id'],'synthetic original suffix complete')
+                    rows.append({'type':'turn.completed'});code=0
+                for row in rows:kwargs['stdout'].write((json.dumps(row)+'\n').encode())
+                kwargs['stdout'].flush();update(exit_code=code)
+            return mock.Mock(poll=lambda:0)
+        result=supervision.run(self.c['id'],'m',slot=2,poll=15,sleep=waits.append,
+                               spawn=spawn,preflight=lambda *a:{'ok':True})
+        self.assertEqual(result['state'],'drained');self.assertEqual(len(calls),2)
+        self.assertGreaterEqual(sum(waits),300)
+        self.assertTrue(all(a[a.index('resume')+1]=='original-m-2' for a in calls))
+
     def test_real_live_operation_cannot_be_adopted(self):
         # The actual lease is authoritative, regardless of a terminal native.
         directory=self.d/'operations'/self.bid
