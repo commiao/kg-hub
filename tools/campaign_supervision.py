@@ -166,6 +166,12 @@ def native_args(c: dict, model: str, session: str | None, slot: int | None = Non
                "整批预览的每个复用候选也须分别判读，禁止模板或脚本批量确认候选。"
                "可原样合并已逐条明确保存的决定，合并阶段不能生成新的通过。"
                "发现批量默认批准即停止新领取并如实报告quality_process_violation，不把格式检查当语义正确。")
+    if c.get('source_decisions'):
+        prompt += ("\n新批次启用source-decisions-v1：每完成一条明确语义决定，将该行（含id/context_digest/"
+                   "verdict/四项布尔标志/独立note/全部引文）单独写成JSON，然后调用公共campaign decision "
+                   "--id <战役> --batch <本批> --file <单来源JSON> --reviewer <同质量表reviewer>。"
+                   "必须逐条明确判断后登记，不允许循环生成通过；最终质量表只能原样合并登记行。"
+                   "全批quality-check和dry-run/submit均核对登记，不允许直接改表绕过；结果变化需重审受影响来源。")
     return args + [prompt]
 
 
@@ -399,7 +405,9 @@ def run_pool(cid: str, model: str, *, poll: float = 15, max_stalled: int = 3,
             result = {"model": model, "slot": slot, "state": "blocked",
                       "reason": type(exc).__name__, "message": str(exc)}
         if result["state"] not in ("complete", "drained"):
-            stop.set()
+            from tools.campaign_recovery_manager import config, isolated_slot_failure
+            if not config(d).get('enabled') or not isolated_slot_failure(result):
+                stop.set()
         return {**result, "slot": slot}
 
     with receipts.attempt(root, kind="supervisor_pool", identity={"campaign": cid, "model": model},

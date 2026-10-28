@@ -874,6 +874,7 @@ def cmd_claim(cid: str, model: str, *, url: str, token: str | None, fetch=None, 
             c["cursor"] = last
             c["batches"].append({"id": bid, "model": model, "chain": c["chain"], "ids": [i["id"] for i in picked],
                                  **({"slot": slot} if slot is not None else {}),
+                                 **({'decision_protocol': c['source_decisions']['version']} if c.get('source_decisions') else {}),
                                  "status": "claimed", "claimed_at": _now(), "cost": {}})
             reg.reserve([i["id"] for i in picked], owner, info=bid)
             drain_spent_window(c)
@@ -985,6 +986,14 @@ def cmd_quality_check(cid: str, bid: str, review: str) -> dict:
     c = load(d)
     b = find_batch(c, bid)
     batch, _ = _batch_rows(d, bid)
+    from tools.campaign_decisions import errors
+    if b.get('decision_protocol'):
+        try:
+            problems = errors(d, b, json.loads(Path(review).read_text()))
+        except (OSError, ValueError):
+            problems = ['source_decisions: review unreadable']
+        if problems:
+            return {'ok': False, 'errors': problems}
     return ax.check_quality_file(batch, _results(d, bid), Path(review), batch_rules_text(d, c, b),
                                  ax.quality_file(d, bid), expected_identity=batch_identity(c, b))
 
@@ -1226,6 +1235,10 @@ def _cmd_submit(cid: str, bid: str, *, dry_run: bool, url: str, token: str | Non
             review = json.loads(ax.quality_file(d, bid).read_text())
         except (OSError, ValueError):
             raise SystemExit("quality review required: quality-sheet → review → quality-check before dry-run")
+        from tools.campaign_decisions import errors
+        problems = errors(d, b, review)
+        if problems:
+            raise SystemExit('\n'.join(problems))
     if not dry_run:
         missing = ax.dryrun_missing(d, bid, results, batch=batch, prompt_text=prompt, prompt_version=version,
                                     identity=batch_identity(c, b))
@@ -1695,7 +1708,7 @@ def cmd_status(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
     from kg_hub_eval.business.utils.evaluation_receipts import overhead_coverage
-    from utils.process_receipts import status as process_status
+    from utils.process_receipts import status as process_status, read as process_read
     from tools.campaign_supervision import completed
     n = parallelism(c)
     slots = {m: {str(slot or 1): {
@@ -1709,6 +1722,10 @@ def cmd_status(cid: str) -> dict:
             "parallel": n, "configured_workers": n * len(c["models"]), "worker_slots": slots,
             "dispatch": c.get('dispatch', {'state': 'running'}), "migration": c.get('migration'),
             "structure_gate": c.get("structure_gate"), "structure_gate_log": (c.get("structure_gate_log") or [])[-5:],
+            "source_decisions": c.get('source_decisions'),
+            "recovery_manager": {"policy": process_read(d / 'recovery/config.json'),
+                                 "observer": process_status(d / 'recovery/observer'),
+                                 "last_observed_at": process_read(d / 'recovery/latest.json').get('observed_at')},
             "active_workers": sum(s["native"]["lease_held"] is True for workers in slots.values() for s in workers.values()),
             "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "host_task_state": "unverified_by_repository",
@@ -1745,6 +1762,30 @@ def _main(argv=None) -> int:
         return number
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ('recovery-enable', 'recovery-disable', 'recovery-service', 'recovery-plan', 'recovery-watch', 'recovery-step',
+                 'recovery-register', 'recovery-approve-resume', 'decisions-enable', 'decision'):
+        parser = sub.add_parser(name)
+        parser.add_argument('--id', required=True)
+        if name in ('recovery-enable', 'recovery-disable', 'recovery-register', 'recovery-approve-resume', 'decisions-enable'):
+            parser.add_argument('--reason', required=True)
+        if name == 'recovery-enable':
+            parser.add_argument('--max-stalled', type=positive_int, default=3)
+        if name == 'recovery-watch':
+            parser.add_argument('--once', action='store_true')
+            parser.add_argument('--interval', type=float, default=45)
+        if name == 'recovery-step': parser.add_argument('--event', required=True)
+        if name == 'recovery-service': parser.add_argument('--out', type=Path, required=True)
+        if name == 'recovery-register':
+            parser.add_argument('--model', required=True)
+            parser.add_argument('--slot', type=positive_int, required=True)
+            parser.add_argument('--batches', nargs='+', required=True)
+            parser.add_argument('--assignment', type=Path, required=True)
+            parser.add_argument('--checkpoint', type=Path, required=True)
+        if name == 'recovery-approve-resume': parser.add_argument('--evidence', nargs='+', type=Path, required=True)
+        if name == 'decision':
+            parser.add_argument('--batch', required=True)
+            parser.add_argument('--file', type=Path, required=True)
+            parser.add_argument('--reviewer', required=True)
     drain = sub.add_parser('drain', help='freeze new claims, allow current batch to finish, never kill a worker')
     drain.add_argument('--id', required=True)
     drain.add_argument('--reason', required=True)
@@ -1911,6 +1952,30 @@ def _main(argv=None) -> int:
         if name in ("start", "claim", "submit", "mark-empty", "namesync", "reconcile-operation", "prepare"):
             s.add_argument("--url", default=os.environ.get("KG_HUB_URL", ax.DEFAULT_URL))
     a = ap.parse_args(argv)
+    if a.cmd.startswith('recovery-'):
+        from tools import campaign_recovery_manager as manager
+        if a.cmd == 'recovery-enable': out = manager.enable(a.id, reason=a.reason, max_stalled=a.max_stalled)
+        elif a.cmd == 'recovery-disable': out = manager.disable(a.id, reason=a.reason)
+        elif a.cmd == 'recovery-service': out = manager.service_plist(a.id, a.out)
+        elif a.cmd == 'recovery-plan': out = manager.snapshot(a.id)
+        elif a.cmd == 'recovery-watch': out = manager.watch(a.id, once=a.once, interval=a.interval)
+        elif a.cmd == 'recovery-step': out = manager.step(a.id, a.event)
+        elif a.cmd == 'recovery-register':
+            out = manager.register_rework(a.id, a.model, a.slot, batches=a.batches,
+                assignment=a.assignment, checkpoint=a.checkpoint, reason=a.reason)
+        else: out = manager.approve_resume(a.id, evidence=a.evidence, reason=a.reason)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 2 if a.cmd == 'recovery-step' and out.get('state') == 'blocked' else 0
+    if a.cmd == 'decisions-enable':
+        from tools.campaign_decisions import enable
+        print(json.dumps(enable(a.id, reason=a.reason), ensure_ascii=False, indent=2))
+        return 0
+    if a.cmd == 'decision':
+        if os.environ.get('KG_HUB_REWORK_BATCHES') is not None:
+            raise SystemExit('original production decisions cannot be overwritten during rework')
+        from tools.campaign_decisions import record
+        print(json.dumps(record(a.id, a.batch, json.loads(a.file.read_text()), reviewer=a.reviewer), ensure_ascii=False, indent=2))
+        return 0
     if os.environ.get('KG_HUB_REWORK_BATCHES') is not None:
         if a.cmd in ('claim', 'submit', 'release', 'mark-empty', 'prepare', 'namesync', 'chain', 'structure-gate',
                      'quality-sheet', 'quality-check', 'cost'):

@@ -637,3 +637,64 @@ NAS-heavy operations reserve process-leased FIFO tickets before acquiring the ex
 Pre-extracted HTTP writes and previews use the existing `utils.ingest_budget.ingest_ceiling_sec()` plus30seconds transport margin, instead of the generic120seconds. Other requests retain120seconds. A timeout still means unknown remote state and does not authorize retry, source-key changes or promoted success. This prevents premature client abandonment; it cannot retrospectively prove the outcome of an older timed-out request.
 
 Only the exact native `Selected model is at capacity. Please try a different model.` refusal, a clean native exit1 and `turn.failed` with the same original session qualify for capacity recovery. Supervision waits300seconds and resumes the same session up to three times, without new claims or model probes. Unknown writes, approval denials, NAS refusals and other provider errors still stop. Capacity refusals do not spend the no-formal-progress budget; persistent capacity exhaustion remains an explicit infrastructure blocker. The retry counter is persisted with the worker.
+
+
+## Persistent recovery and source decisions
+
+Existing parallel Codex campaigns may opt into the recovery manager with
+`campaign recovery-enable --id <campaign> --reason <coordinator-reason>`.
+It freezes the original quota, model/run identities, runtime settings and slot
+count. `recovery-plan` reads current leases and stop dispositions; it does not
+clear a refusal. `recovery-watch --once` executes eligible existing-owner actions
+and records immutable event requests and results. Use `recovery-service --out
+<private-plist>` to generate a Mac StartInterval service (45 seconds, stable
+public entry). Installation uses the fleet-ops `launchd_reload` procedure after
+normal publication review. A generated plist is not an installed or verified
+service. The service uses the discovered native CLI directory, not an assumed
+interactive-shell PATH. Verify launchd's actual job, loaded code and subsequent
+observer receipts after installation and after login/reboot.
+
+Register already authorized submitted-source rework with `recovery-register
+--model <model> --slot <slot> --batches <own-batches> --assignment <frozen-file>
+--checkpoint <campaign-audit-checkpoint> --reason <reason>`. The checkpoint must
+contain disjoint `reviewed` and `pending` integer source-ID arrays covering the
+exact registered batches, an explicit `in_flight` value, and `repairs_verified`.
+A clean incomplete turn can then continue the same original session. A released
+batch is not submitted-source rework. Unknown writes, actual approvals, NAS
+refusals and unmatched terminal states retain their original public recovery
+requirements. A clean exit, increasing review count or all IDs reviewed does
+not constitute semantic acceptance.
+
+After source-level semantic acceptance and all other known blockers close, the
+coordinator may register `recovery-approve-resume --evidence <audit-files...>
+--reason <acceptance-reason>`. This approval binds exact evidence bytes and one
+drained dispatch generation. Pending registered rework blocks the request;
+the existing public resume protocol still checks every live owner and uncertain
+operation. After a successful resume, eligible original slots are supervised.
+The manager never invents semantic acceptance or clears an incident by changing
+its report. A new drain invalidates the old generation's approval. Repeated
+observer launches share the same event lease; a completed event is not executed
+again, and a real public refusal is retained as a blocked event. Lack of rework
+progress is bounded separately from production's formal-source counter.
+
+With recovery enabled, exhausted model-capacity or no-formal-progress failures
+remain local to their slot. Approval, quality-process, unknown-write and NAS
+failures retain conservative shared-stop behavior. Other slots continuing does
+not make a blocked pool successful. `recovery-disable --reason <reason>` stops
+new manager actions and leaves live native and service operations intact. For
+rollback, drain new claims, disable/remove this observer, wait for existing
+owners and verify operation terminals before switching code. Do not resume old
+code on batches requiring a newer admission protocol.
+
+For future claims only, `decisions-enable --reason <reason>` while drained
+activates `source-decisions-v1`. Existing batches retain their frozen contract.
+Each source reviewer submits one explicit review row with `campaign decision
+--batch <batch> --file <single-row-json> --reviewer <same-reviewer-as-sheet>`.
+The row must contain its ID/current context digest, an explicit verdict, all
+four explicit boolean checks, its own nonempty note and evidence. Lists/full
+sheets/omitted checks are rejected; no defaults are supplied. Final quality
+sheets can only merge the exact recorded rows. Both quality-check and direct
+preview/submission check the ledger, so bulk editing a sheet cannot bypass it.
+Source/lookahead/rule/candidate changes require current review. All revisions
+remain addressable. These checks establish evidence and process integrity;
+they cannot detect every scripted lie or establish semantic truth.
