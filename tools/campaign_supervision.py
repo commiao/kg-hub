@@ -243,8 +243,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 op = ec.cmd_operation_status(cid, batch["id"])
                 operation = op['operation']
                 capacity_safe = capacity_safe and (
-                    operation.get('state') in ('not_started', 'completed', 'reconciled_not_written')
-                    and not operation.get('may_have_written') and not operation.get('requires_reconciliation'))
+                    (operation.get('state') in ('not_started', 'completed', 'reconciled_not_written')
+                     and not operation.get('may_have_written') and not operation.get('requires_reconciliation'))
+                    or op['action']=='resume_remaining_only')
                 if op["action"] == "wait_for_original":
                     waiting = True
                 elif op["action"] == "legacy_terminal_unverified" and batch["status"] == "dry_run":
