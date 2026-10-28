@@ -277,6 +277,24 @@ the three earlier worst queries (one had lost ranks 2 and 3) were rechecked
 against the production scan and passed. Indexed query 17–20 ms, exact scan
 about 0.4 s.
 
+**Second rebuild on production, 2026-10-28 04:35 CST (T-0381).** The ratio
+had climbed back to 1.337 six days after the first rebuild, mostly from the
+campaign rework's `/api/extraction/repair` (it `MERGE`s edges with a fresh
+`fact_embedding` and `DELETE`s the old ones). Window: a background waiter
+polled once a minute until the NAS was below 85 °C **and** the server log
+showed no write `POST` for 10 minutes (two consecutive readings), so the
+codex sessions were not interrupted. Before: 253,023 documents, `maxDocId`
+339,473 (ratio 1.342); the 8 golden queries already matched the exact scan
+8/8, so the old index was not missing edges — the rebuild was about the
+alert and about stopping the growth. `DROP` 0.2 s, `CREATE` 9.1 s,
+operational after about 4 minutes (NAS 72 °C at the start, 99 °C peak
+during the build). After: 253,023 / 253,023 (ratio 1.0), acceptance 8/8,
+indexed query 17–22 ms, exact scan about 0.58 s, `/api/search` 0.22–0.31 s
+(before 0.25–0.49 s). The watchdog cleared `vector_index_dirty` on its next
+round. Scripts for the waiter and the rebuild sequence are in that task's
+record; the sequence aborts and drops the half-built index if the NAS stays
+at 98 °C or above for three readings.
+
 ### Tombstones also come from ordinary edge updates (T-0347)
 
 Setting **any** property of an edge (not only `fact_embedding`) re-indexes
