@@ -113,10 +113,15 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 if not path.is_relative_to(root.resolve()):raise ValueError('own-slot event ownership required')
                 outcome = supervision.events(path)
                 from tools.campaign_rework_completion import valid as completion_valid
+                quality_stop = None
+                if outcome.get('recovery_kind') == 'quality_process_violation':
+                    from tools.campaign_quality_stop import validate
+                    quality_stop = validate(c, d, model, slot, session, path, selected, native)
                 expected_terminal = None if owner_continuation else 'turn.completed'
                 if (outcome.get('session') != session or outcome.get('terminal') != expected_terminal
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
                         or not owner_continuation and not supervision.normal_recovery(outcome.get('recovery_kind'))
+                        and quality_stop is None
                         and not completion_valid(c, d, model, slot, locked=True)):
                     raise ValueError('original clean rework events required')
                 adopted = None
@@ -126,6 +131,10 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             # supervision, and does not consume a new evaluation/source budget.
             flight = (preflight or ax.runtime_preflight)(os.environ.get('KG_HUB_URL', ax.DEFAULT_URL), ax.api_token())
             if not flight.get('ok'):raise ValueError('service preflight failed')
+            if not adopt_events and quality_stop is not None:
+                for ref in [quality_stop['events'], *quality_stop['local_evidence']]:
+                    if _ref(ref['path']) != ref:
+                        raise ValueError('quality stop evidence changed before native startup')
             job = root.resolve() / 'quality-reworks' / uuid.uuid4().hex
             job.mkdir(parents=True)
             (job / 'previous-worker.json').write_bytes((root / 'worker.json').read_bytes())
@@ -134,6 +143,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 receipts.write(job / 'ownership-continuation.json',
                                _ref(root / 'ownership-continuation-active.json'))
             if adopted:receipts.write(job / 'adoption.json', adopted)
+            if not adopt_events and quality_stop is not None:
+                receipts.write(job / 'quality-stop-continuation.json', quality_stop)
             assignment = Path(assignment).resolve(strict=True)
             text = assignment.read_text()
             (job / 'assignment.md').write_text(text)

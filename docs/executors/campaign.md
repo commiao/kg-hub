@@ -422,6 +422,15 @@ apply 在锁内重新核对全部输入及冻结配置，保存不可变预览/�
 business_permission_denied，还须关联上面已显式批准的那个peer所有权恢复凭据，且自己的原生
 事件中没有失败公共调用。自己的真实拒绝不能借另一个槽的凭据清除。
 
+原生产会话以 `quality_process_violation` 主动停报时，可由协调器对其自己已提交的
+批次调用同一 `rework` 入口。仅接受原 native exit0、唯一原 session、完整命令终态，
+以及零新增提交/预览的明确报告；原事件只可包含本战役状态读取、规则读取和私有审计
+文件保存，任何失败命令、网络/子进程代码、生产写入、跨范围身份、动态执行或审计目录外
+写入都拒绝。入口将原事件、原 native、原报告及本地证据摘要另存至本轮私有 job 的
+`quality-stop-continuation.json`，不会把旧报告改成正常结束，也不改变普通生产监督器的
+`normal_recovery` 判据。此许可只进入保持 draining 的逐来源返工；全部质量验收完成前
+仍不能恢复配额。它不接受用另一调用的 adoption 文件替代原自报事件。
+
 入口持有原supervisor租约，核服务preflight并用原native参数/自动审批/工作区sandbox启动一次原session。
 不增加canary、评测、来源或配额。说明正文先冻结在私有job目录，证据和实际提示绑定同一份字节。
 子进程限定 `KG_HUB_REWORK_BATCHES`：只能对名单内自己的来源做正规修复/targeted评审；

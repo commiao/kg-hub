@@ -175,6 +175,109 @@ class ReworkTests(unittest.TestCase):
                                       '--batches', self.bid, '--assignment', str(self.assignment), '--reason', 'explicit']), 2)
         run.assert_called_once()
 
+    def quality_stop_events(self, command=None, code=0, **report_changes):
+        command = command or (f'"${{KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}}/tools/extract" '
+                              f'campaign operation-status --id {self.c["id"]} --batch {self.bid}')
+        report = {'recovery_kind': 'quality_process_violation', 'model': 'm', 'batch': self.bid,
+                  'submitted': {'ok': 0, 'empty': 0, 'error': 0}, 'prepare_runs': 0,
+                  'dryrun_mismatch_seen': 0, 'renamed_after_dryrun': 0}
+        report.update(report_changes)
+        rows = [{'type': 'thread.started', 'thread_id': self.owner_session},
+                {'type': 'item.started', 'item': {'id': 'read', 'type': 'command_execution', 'command': command}},
+                {'type': 'item.completed', 'item': {'id': 'read', 'type': 'command_execution',
+                    'command': command, 'exit_code': code, 'aggregated_output': 'synthetic state read'}},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(report)}},
+                {'type': 'turn.completed'}]
+        self.owner_events.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        return rows
+
+    def test_clean_quality_violation_stays_fatal_for_production_but_enters_scoped_rework(self):
+        self.quality_stop_events()
+        before = self.owner_events.read_bytes()
+        old_native = (self.root2 / 'native/latest.json').read_bytes()
+        self.assertFalse(supervision.normal_recovery('quality_process_violation'))
+        out = self.run_rework()
+        self.assertEqual(out['state'], 'rework_turn_completed')
+        job = Path(out['evidence_dir'])
+        evidence = receipts.read(job / 'quality-stop-continuation.json')
+        self.assertFalse(evidence['production_recovery_authorized'])
+        self.assertFalse(evidence['semantic_acceptance'])
+        self.assertEqual(evidence['new_source_quota'], 0)
+        self.assertEqual(evidence['original_report']['recovery_kind'], 'quality_process_violation')
+        self.assertEqual(self.owner_events.read_bytes(), before)
+        self.assertEqual((job / 'previous-native.json').read_bytes(), old_native)
+        self.assertEqual(ec.load(self.d)['dispatch']['state'], 'draining')
+
+    def test_quality_stop_rejects_nonzero_commands_and_production_activity(self):
+        for changes in ({'code': 1}, {'model': 'other'}, {'batch': 'other-batch'},
+                        {'prepare_runs': 1}, {'submitted': {'ok': 1, 'empty': 0, 'error': 0}}):
+            with self.subTest(changes=changes):
+                self.quality_stop_events(**changes)
+                with self.assertRaises(ValueError):self.run_rework()
+        self.assertEqual(self.spawned, [])
+
+    def test_quality_stop_rejects_writes_hidden_python_and_compound_commands(self):
+        entry = str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+        commands = [f'{entry} campaign claim --id {self.c["id"]} --model m',
+                    f'{entry} campaign rules --id {self.c["id"]}; true',
+                    "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['true'])\nPY",
+                    "python3 - <<'PY'\nimport json\neval('1')\nPY",
+                    f"python3 - <<'PY'\nfrom pathlib import Path\np=Path({str(self.d / 'campaign.json')!r})\np.write_text('changed')\nPY",
+                    "python3 - <<'PY'\nimport pathlib\np=pathlib.Path('/private/tmp/unused')\np.unlink()\nPY"]
+        for command in commands:
+            with self.subTest(command=command):
+                self.quality_stop_events(command=command)
+                with self.assertRaises(ValueError):self.run_rework()
+        self.assertEqual(self.spawned, [])
+
+    def test_quality_stop_accepts_and_binds_private_audit_only_python(self):
+        audit = self.d / 'audit' / 'quality-stop'
+        audit.mkdir(parents=True)
+        source = self.root / 'historical-review.py';source.write_text('historical review only')
+        target = audit / 'report.json';target.write_text('{"kind":"quality_process_violation"}')
+        command = ("python3 - <<'PY'\nimport ast,hashlib,json,pathlib,datetime\n"
+                   f"root=pathlib.Path({str(self.d)!r})\np=pathlib.Path({str(source)!r})\n"
+                   "data=p.read_bytes(); tree=ast.parse('x=1'); calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call)]\n"
+                   "out=root/'audit/quality-stop';out.mkdir(exist_ok=True)\n"
+                   "r={'sha256':hashlib.sha256(data).hexdigest(),'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
+                   "(out/'report.json').write_text(json.dumps(r))\nPY")
+        # isoformat is not needed by the validator's read/write policy: time
+        # serialization is a local pure call explicitly accepted below.
+        self.quality_stop_events(command=command)
+        out = self.run_rework()
+        evidence = receipts.read(Path(out['evidence_dir']) / 'quality-stop-continuation.json')
+        refs = {v['path'] for v in evidence['local_evidence']}
+        self.assertIn(str(source.resolve()), refs)
+        self.assertIn(str(target.resolve()), refs)
+
+    def test_quality_stop_requires_complete_unique_original_event_lifecycle(self):
+        for mutation in ('unfinished', 'post-terminal', 'another-session', 'provider-error'):
+            rows = self.quality_stop_events()
+            if mutation == 'unfinished':rows.pop(2)
+            elif mutation == 'post-terminal':rows.append(rows[1])
+            elif mutation == 'another-session':rows[0]['thread_id'] = 'wrong'
+            else:rows.insert(1, {'type': 'error', 'message': 'provider refused'})
+            self.owner_events.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ValueError):self.run_rework()
+        self.assertEqual(self.spawned, [])
+
+    def test_quality_stop_cannot_enter_through_alternate_adoption(self):
+        adopted = self.adoption(kind='quality_process_violation')
+        with self.assertRaisesRegex(ValueError, 'exact published ownership'):
+            self.run_rework(**adopted)
+        self.assertEqual(self.spawned, [])
+
+    def test_quality_stop_rechecks_bound_evidence_after_preflight(self):
+        self.quality_stop_events()
+        def flight(*args):
+            self.owner_events.write_text(self.owner_events.read_text() + '\n')
+            return {'ok': True}
+        with self.assertRaisesRegex(ValueError, 'changed before native startup'):
+            rework.run(self.c['id'], 'm', 2, batches=[self.bid], assignment=self.assignment,
+                       reason='explicit owner rework', spawn=self.spawn, preflight=flight)
+        self.assertEqual(self.spawned, [])
+
 
 class OriginalOwnerContinuationReworkTests(unittest.TestCase):
     """An already approved failed owner may rework only its own submitted batch."""
