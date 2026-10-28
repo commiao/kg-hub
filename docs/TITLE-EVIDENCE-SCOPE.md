@@ -32,3 +32,14 @@ evidence; source semantics remain the named reviewer's responsibility.
 This changes the shared service/client quality validator. Publish and verify
 the service capability before clients begin using the extension. A client-only
 publication cannot enable it on an older service.
+
+If the original owner stopped with `infrastructure_failed` after a successful
+public `agent preflight` that lacked `evidence_scope_v1`, retain that receipt in
+the campaign audit. After the provider is published, a coordinator can use
+`campaign reconcile-local --id ID --model MODEL --slot SLOT --batch BATCH
+--capability-receipt AUDIT_JSON --require-capability evidence_scope_v1 --reason
+REASON`. This requires the same original terminal session, one unstarted pending
+batch, the original command/output matching the retained receipt, no formal
+writes or unknown operation, and a new successful provider capability readback.
+It records an immutable continuation proof, performs no graph/model writes, and
+does not approve source semantics or clear an actual permission/NAS refusal.
