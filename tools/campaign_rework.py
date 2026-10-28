@@ -73,9 +73,11 @@ def _adoption(c, d, model, slot, session, native, events, terminal, batches):
 
 
 def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, adopt_exit=None,
-        spawn=subprocess.Popen, preflight=None):
+        maintenance_review=None, spawn=subprocess.Popen, preflight=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip() or bool(adopt_events) != bool(adopt_exit):
         raise ValueError('coordinator reason and paired optional adoption evidence required')
+    if maintenance_review and adopt_events:
+        raise ValueError('maintenance continuation cannot adopt another invocation')
     ec.tracking_guard()
     d = ec.campaign_dir(cid)
     c = ec.load(d)
@@ -114,6 +116,10 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 outcome = supervision.events(path)
                 from tools.campaign_rework_completion import valid as completion_valid
                 quality_stop = None
+                maintenance = None
+                if maintenance_review:
+                    from tools import campaign_rework_maintenance as maintenance_protocol
+                    maintenance = maintenance_protocol.validate(c,d,model,slot,selected,maintenance_review)
                 if outcome.get('recovery_kind') == 'quality_process_violation':
                     from tools.campaign_quality_stop import validate
                     quality_stop = validate(c, d, model, slot, session, path, selected, native)
@@ -122,6 +128,7 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
                         or not owner_continuation and not supervision.normal_recovery(outcome.get('recovery_kind'))
                         and quality_stop is None
+                        and maintenance is None
                         and not completion_valid(c, d, model, slot, locked=True)):
                     raise ValueError('original clean rework events required')
                 adopted = None
@@ -131,6 +138,10 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             # supervision, and does not consume a new evaluation/source budget.
             flight = (preflight or ax.runtime_preflight)(os.environ.get('KG_HUB_URL', ax.DEFAULT_URL), ax.api_token())
             if not flight.get('ok'):raise ValueError('service preflight failed')
+            if maintenance_review:
+                maintenance_protocol.restored(maintenance,flight)
+                if maintenance_protocol.validate(c,d,model,slot,selected,maintenance_review)!=maintenance:
+                    raise ValueError('maintenance evidence changed during preflight')
             if not adopt_events and quality_stop is not None:
                 for ref in [quality_stop['events'], *quality_stop['local_evidence']]:
                     if _ref(ref['path']) != ref:
@@ -145,6 +156,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             if adopted:receipts.write(job / 'adoption.json', adopted)
             if not adopt_events and quality_stop is not None:
                 receipts.write(job / 'quality-stop-continuation.json', quality_stop)
+            if maintenance_review:
+                receipts.write(job / 'maintenance-continuation.json', maintenance)
             assignment = Path(assignment).resolve(strict=True)
             text = assignment.read_text()
             (job / 'assignment.md').write_text(text)
