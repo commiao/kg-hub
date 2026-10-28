@@ -207,12 +207,12 @@ def apply(cid,*,review):
     return {'state':'quarantined','batch':old['batch'],'same_session_only':True,'old_quality_accepted':False,'dispatch_resumed':False}
 
 
-def valid(c,d,model,slot,*,locked=False):
+def valid(c,d,model,slot,*,locked=False,operation_locked=False):
     try:
         root=ec.supervisor_dir(d,model,slot);ref=receipts.read(root/'released-quality-active.json');p=Path(ref['path']).resolve(strict=True)
         if not p.is_relative_to((root/'released-quality-quarantines').resolve()) or _ref(p)!=ref:return False
         proof=_read(p)
         if proof['version']!=VERSION or proof['sha256']!=digest({k:v for k,v in proof.items() if k!='sha256'}) or _ref(proof['review']['path'])!=proof['review']:return False
         old=proof['evidence']
-        return (old['campaign'],old['model'],old['slot'])==(c['id'],model,slot) and facts(c,d,model,slot,old['batch'],old['quarantine']['path'],locked=locked)==old
+        return (old['campaign'],old['model'],old['slot'])==(c['id'],model,slot) and facts(c,d,model,slot,old['batch'],old['quarantine']['path'],locked=locked,operation_locked=operation_locked)==old
     except (KeyError,ValueError,OSError,TypeError,SyntaxError,receipts.Busy):return False

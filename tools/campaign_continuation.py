@@ -379,9 +379,9 @@ def reconcile_worker(cid, model, slot, *, reason, model_preflight=None):
             'original_exit_code': terminal['exit_code'], 'original_failure_retained': True}
 
 
-def worker_reconciled(c, d, model, slot, *, locked=False):
+def worker_reconciled(c, d, model, slot, *, locked=False, operation_locked=False):
     from tools.campaign_released_quality import valid as released_quality_valid
-    if released_quality_valid(c,d,model,slot,locked=locked):
+    if released_quality_valid(c,d,model,slot,locked=locked,operation_locked=operation_locked):
         return True
     from tools.campaign_ownership_recovery import valid as ownership_valid
     from tools.campaign_rework_completion import valid as completion_valid
