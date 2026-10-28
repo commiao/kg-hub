@@ -109,9 +109,10 @@ def record_repair(cid,bid,request,*,reviewer):
         if (context.get('batch')!=frozen or context.get('prompt_text')!=ec.batch_rules_text(d,c,b)
                 or context.get('prompt_version')!=ec.episode_prompt_version(c,b['chain'])
                 or review.get('identity')!=ec.batch_identity(c,b) or review.get('reviewer')!=reviewer
-                or payload.get('extractor_session')!=cid or ax.quality.validate_payload_quality(payload)):
+                or payload.get('extractor_session') not in (None,cid) or ax.quality.validate_payload_quality(payload)):
             raise ValueError('repair requires unchanged original source/lookahead/rules/identity and complete source review')
         value={'version':'source-repair-decision-v1','campaign':cid,'batch':bid,'source_id':item['id'],
+               'owner_session':c.get('slot_sessions',{}).get(b['model'],{}).get(str(ec.batch_slot(c,b))),
                'request_sha256':digest(request),'request':request,'reviewer':reviewer,
                'production_batch_sha256':digest(batch),'rules_sha256':digest(ec.batch_rules_text(d,c,b))}
         path=d/'repair-decisions'/bid/(digest(value)+'.json')

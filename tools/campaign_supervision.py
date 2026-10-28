@@ -353,6 +353,10 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],
                     "--receipt-dir", str(native), "--", *native_args(c, model, session, slot)]
             env = {'env': {**os.environ}}
+            # The adapter's marker belongs to this invocation, not the native
+            # worker's future public commands across an atomic publication.
+            env['env'].pop('LLM_EVAL_DELEGATED_BACKEND',None)
+            env['env'].pop('LLM_EVAL_BACKEND_RESELECTED',None)
             dependencies = ec.dependency_pythonpath()
             if dependencies:
                 env['env']['PYTHONPATH'] = dependencies
