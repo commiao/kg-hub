@@ -76,6 +76,33 @@ class ReleasedTests(unittest.TestCase):
         self.assertEqual(row['action'],'supervise');self.assertEqual(row['session'],self.owner_session)
         self.assertTrue(row['published_continuation_valid'])
 
+    def test_public_resume_under_owned_operation_lock_preserves_old_evidence(self):
+        from tools.campaign_dispatch import resume
+        self.approve();released.apply(self.c['id'],review=self.review)
+        # This fixture includes an unrelated historical owner stop. Its independent
+        # recovery is outside this test; the released owner uses the real validator.
+        c=ec.load(self.d)
+        (self.root3/'worker.json').unlink()
+        paths=[self.owner_events,self.root2/'worker.json',self.root2/'native/latest.json',
+               self.d/'results'/f'{self.bid}.json',self.d/'reviews'/f'{self.bid}.sheet.json']
+        before={p:p.read_bytes() for p in paths}
+        out=resume(self.c['id'],reason='fixture coordinator accepted exact released quarantine')
+        self.assertEqual(out['dispatch']['state'],'running')
+        self.assertTrue(all(p.read_bytes()==v for p,v in before.items()))
+        self.assertEqual(ec.load(self.d)['slot_sessions']['m']['2'],self.owner_session)
+
+    def test_live_operation_owner_blocks_public_resume_and_normal_validation(self):
+        from tools.campaign_dispatch import resume
+        self.approve();released.apply(self.c['id'],review=self.review)
+        with receipts.idle(self.d/'operations'/self.bid):
+            self.assertFalse(worker_reconciled(ec.load(self.d),self.d,'m',2))
+            with receipts.idle(self.root2),receipts.idle(self.root2/'native'):
+                # Native locks alone never imply ownership of operation locks.
+                self.assertFalse(worker_reconciled(ec.load(self.d),self.d,'m',2,locked=True))
+            with self.assertRaises(receipts.Busy):
+                resume(self.c['id'],reason='fixture real active operation must block')
+        self.assertEqual(ec.load(self.d)['dispatch']['state'],'draining')
+
     def test_formal_ack_partial_release_or_missing_enforced_policy_is_not_quarantine(self):
         original=ec.load(self.d)
         for kind in ['submitted','partial','policy','formal_ack']:

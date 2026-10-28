@@ -91,7 +91,7 @@ def resume(cid, *, reason, batches_per_model=None):
                     session = worker.get('session') or bound_session
                     cleared = bool(outcome.get('hard_stop')) and stops_reconciled(
                         c, d, model, event_path, outcome, operation_records=operations)
-                    continuation = slot is not None and worker_reconciled(c, d, model, slot, locked=True)
+                    continuation = slot is not None and worker_reconciled(c, d, model, slot, locked=True, operation_locked=True)
                     if (not session or outcome.get('session') != session
                             or slot is not None and bound_session != session
                             or slot is not None and sum(session == sid for bindings in
