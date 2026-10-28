@@ -2,21 +2,28 @@
 # Stable entry: the calling HOME selects its own published dependency runtime.
 set -eu
 code_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+kg_isolated_bundle=0
 if [ -n "${KG_HUB_PYTHON:-}" ]; then
     kg_python=$KG_HUB_PYTHON
 elif [ -f "${LLM_EVAL_ACTIVE_BUNDLE:-$HOME/.local/share/llm-eval/active-bundle.json}" ]; then
     # One installed composition selects core + business adapter together.
     kg_bundle=${LLM_EVAL_ACTIVE_BUNDLE:-$HOME/.local/share/llm-eval/active-bundle.json}
     export LLM_EVAL_ACTIVE_BUNDLE="$kg_bundle"
-    kg_python=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "venv/bin/python")' "$kg_bundle")
+    kg_python=$(python3 -I -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "venv/bin/python")' "$kg_bundle")
+    kg_isolated_bundle=1
 elif [ -x "$HOME/.local/share/kg-hub/venv/bin/python" ] &&
      "$HOME/.local/share/kg-hub/venv/bin/python" -c 'import sys, httpx; from pydantic import model_validator; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
     kg_python=$HOME/.local/share/kg-hub/venv/bin/python
 else
     kg_python=python3
 fi
-if ! "$kg_python" -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+if ! "$kg_python" -I -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
     echo "kg-hub requires Python >=3.10; install the current HOME kg-hub venv or set KG_HUB_PYTHON" >&2
     exit 2
+fi
+if [ "$kg_isolated_bundle" = 1 ]; then
+    # A running native can inherit an older composition's PYTHONPATH. The
+    # selected bundle interpreter must load its own installed core/adapters.
+    exec "$kg_python" -I "$code_root/tools/extract_cli.py" "$@"
 fi
 exec "$kg_python" "$code_root/tools/extract_cli.py" "$@"

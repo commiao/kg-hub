@@ -51,3 +51,14 @@ public operation-status through the known prior recursion marker. A known prior
 published marker triggers one selection of the active hash-verified adapter;
 unknown identities and repeated mismatches remain errors. Native workers do not
 inherit the caller's recursion marker. The original refusal remains recorded.
+
+The bundle-selected public interpreter runs with `-I`: a previous native's
+PYTHONPATH cannot override the installed core/adapters of the active composition.
+Explicit standalone interpreter overrides retain their existing behavior.
+An exact read-only `llm-eval: bundle core differs` failure can use
+`reconcile-local ... --batch BATCH --prior-backend OLD_COMMIT --prior-bundle
+INSTALLED_OLD_BUNDLE --reason REASON`. It requires the original completed owner,
+no formal writes, the known installed bundle/backend binding, and a successful
+public read-only probe under that old overlay. Unknown write states and other
+bundle/permission failures remain blocked. A pending batch with no operation
+receipt is normalized identically when recording and validating its proof.

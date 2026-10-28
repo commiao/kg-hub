@@ -33,7 +33,7 @@ def commands(event):
 
 
 def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=None,preflight=None,
-              prior_backend=None,probe=None):
+              prior_backend=None,prior_bundle=None,probe=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip():
         raise ValueError('explicit coordinator disposition required')
     ec.tracking_guard();d=ec.campaign_dir(cid);c=ec.load(d)
@@ -51,14 +51,19 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             if op.get('exit_code') in (75,76):raise ValueError('NAS refusal requires separate reconciliation')
         if prior_backend is not None:
             b=ec.find_batch(c,bid)
-            if b not in own or b['status'] in ('submitted','released') or outcome.get('recovery_kind')!='business_permission_denied':
+            core_failure=prior_bundle is not None
+            expected_kind='infrastructure_failed' if core_failure else 'business_permission_denied'
+            if b not in own or b['status'] in ('submitted','released') or outcome.get('recovery_kind')!=expected_kind:
                 raise ValueError('exact pending owner stopped at stale delegation boundary required')
             failed=[r for r in rows if r['exit_code']]
-            if not failed or failed[-1].get('aggregated_output','').strip()!='delegated campaign backend identity differs':
+            expected='llm-eval: bundle core differs' if core_failure else 'delegated campaign backend identity differs'
+            if not failed or failed[-1].get('aggregated_output','').strip()!=expected:
                 raise ValueError('exact original delegated backend rejection required')
             args=shlex.split(_shell(failed[-1]['command']).splitlines()[-1])
             entry=str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
-            if args[:7]!=[entry,'campaign','prepare','--id',cid,'--batch',bid] or not (
+            if args and args[0]=='${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract':args[0]=entry
+            operation='operation-status' if core_failure else 'prepare'
+            if args[:7]!=[entry,'campaign',operation,'--id',cid,'--batch',bid] or not (
                     len(args)==7 or len(args)==9 and args[7]=='>' and Path(args[8]).is_absolute()):
                 raise ValueError('literal original public prepare boundary required')
             if any(json.loads(line).get('batch')==bid for line in (d/'log.jsonl').read_text().splitlines()):
@@ -66,11 +71,21 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             env={**os.environ,'LLM_EVAL_DELEGATED_BACKEND':prior_backend,
                  'LLM_EVAL_ACTIVE_BUNDLE':str(Path('~/.local/share/llm-eval/active-bundle.json').expanduser())}
             env.pop('LLM_EVAL_BACKEND_RESELECTED',None)
+            if core_failure:
+                old=Path(prior_bundle).resolve(strict=True)
+                if not old.is_relative_to(Path('~/.local/share/llm-eval/compositions').expanduser().resolve()):
+                    raise ValueError('known installed prior composition required')
+                metadata=json.loads(old.read_text())
+                if metadata.get('delegates',{}).get('kg_hub.entity_extract',{}).get('commit')!=prior_backend:
+                    raise ValueError('prior composition/backend binding differs')
+                env['PYTHONPATH']=str(next((old.parent/'venv/lib').glob('python*/site-packages')))
+                inputs[str(old)]=cc.file_sha(old)
             result=(probe or subprocess.run)([entry,'campaign','operation-status','--id',cid,'--batch',bid],
                  env=env,capture_output=True,text=True,timeout=30)
             if result.returncode!=0 or json.loads(result.stdout).get('batch')!=bid:
                 raise ValueError('published stale-epoch re-selection readback required')
             inputs[str(Path(entry).resolve().parent/'extract_cli.py')]=cc.file_sha(Path(entry).resolve().parent/'extract_cli.py')
+            inputs[str(Path(entry).resolve())]=cc.file_sha(Path(entry).resolve())
             kind='delegation_epoch_recovered'
         elif repair is not None:
             b=ec.find_batch(c,bid)
@@ -147,6 +162,7 @@ def valid(c,d,model,slot,*,locked=False):
                 or cc.file_sha(d/'batches'/(b['id']+'.json'))!=proof['frozen_source_sha256']
                 or digest(ec.batch_rules_text(d,c,b))!=proof['rules_sha256']):return False
         for bid,expected in proof['operations'].items():
-            if digest({**receipts.read(d/'operations'/bid/'latest.json'),'lease_held':False})!=expected:return False
+            raw=receipts.read(d/'operations'/bid/'latest.json') or {'state':'not_started'}
+            if digest({**raw,'lease_held':False})!=expected:return False
         return all(cc.file_sha(Path(p))==sha for p,sha in proof['inputs'].items())
     except (OSError,KeyError,TypeError,ValueError):return False
