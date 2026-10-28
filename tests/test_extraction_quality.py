@@ -155,6 +155,41 @@ class QualityReviewTest(unittest.TestCase):
         review["items"][0]["title_correction"] = proof
         return batch, results, review
 
+    def scope_fixture(self):
+        batch,results,_=fixture()
+        qualification='正文仅说明三次重试上限，未证明所有供应商处理阶段'
+        translated='The body specifies three retries without establishing every provider stage.'
+        results['items'][0]['edges'][0]['fact']+=f'（证据范围：{qualification}）'
+        results['items'][0]['edges'][1]['fact']+=f' (Evidence scope: {translated})'
+        review=approved(batch,results)
+        review['items'][0]['title_scope']={'kind':'evidence_limit','qualification':qualification,
+            'translated_qualification':translated,'source':'body','quote':FACT,
+            'note':'保留原标题为来源表述，仅将正文覆盖不全明确标为证据限制，未声称后来推翻。'}
+        return batch,results,review
+
+    def test_evidence_scope_is_distinct_from_reversal_and_preserves_complete_payload(self):
+        batch,results,review=self.scope_fixture()
+        self.assertEqual(q.validate_review(batch,results,review,PROMPT),[])
+        self.assertEqual(q.validate_payload_quality(payload(batch,results,review)),[])
+        self.assertNotIn('title_correction',review['items'][0])
+
+    def test_scope_requires_reviewed_exact_qualification_quote_and_translation(self):
+        for field,value in [('kind','superseded'),('qualification','different scope'),('quote','fabricated quote'),
+                            ('source','unknown'),('translated_qualification','unmatched translation'),('note','')]:
+            batch,results,review=self.scope_fixture();review['items'][0]['title_scope'][field]=value
+            with self.subTest(field=field):
+                self.assertIn('obs 1: scoped_title_requires_explicit_bilingual_evidence_limit',
+                              q.validate_review(batch,results,review,PROMPT))
+        batch,results,review=self.scope_fixture();review['items'][0]['title_correction']={'source':'body','quote':FACT}
+        self.assertIn('obs 1: evidence_limit_is_not_title_reversal',q.validate_review(batch,results,review,PROMPT))
+
+    def test_scope_never_allows_rewritten_title_or_missing_review(self):
+        batch,results,review=self.scope_fixture();review['items'][0].pop('title_scope')
+        self.assertTrue(q.validate_review(batch,results,review,PROMPT))
+        batch,results,review=self.scope_fixture();results['items'][0]['edges'][0]['fact']='rewritten title（证据范围：正文不足）'
+        review['items'][0]['context_digest']=q.context_digest(batch,PROMPT,results['items'][0],IDENTITY)
+        self.assertIn('obs 1: verbatim_title_required',q.validate_review(batch,results,review,PROMPT))
+
     def test_frozen_same_batch_correction_supports_title_facts_summaries_and_payload(self):
         batch, results, review = self.correction_fixture()
         self.assertEqual(q.validate_review(batch, results, review, PROMPT), [])

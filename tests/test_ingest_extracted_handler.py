@@ -42,6 +42,12 @@ GOOD = {"name": "claude-mem-obs-1", "episode_body": "body", "source_description"
 
 @unittest.skipUnless(HAVE, "需要 graphiti_core（容器或 venv）")
 class HandlerTest(unittest.TestCase):
+    def test_capability_explicitly_advertises_evidence_scope_extension(self):
+        response=asyncio.run(srv.extraction_capabilities(_post({})))
+        body=json.loads(response.body)
+        self.assertIn('evidence_scope_v1',body['title_qualifiers'])
+        self.assertIn('superseded',body['title_qualifiers'])
+
     def _run(self, payload, **patches):
         class FakeDriver:
             async def execute_query(self, cypher, **params):

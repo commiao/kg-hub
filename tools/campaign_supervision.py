@@ -176,8 +176,11 @@ def native_args(c: dict, model: str, session: str | None, slot: int | None = Non
                    "另建单来源repair的quality_context（原batch仅缩为该来源，保留原lookahead和规则）及完整quality_review，"
                    "用campaign repair-decision --id <战役> --batch <已提交原批次> --file <完整repair请求> "
                    "--reviewer <修复质量表reviewer>登记，再按公共repair preview/apply/status处理，保留原随机错误。"
-                   "原标题只报告来源的历史标题；正文证据不足不等于后被推翻。原标题与完整翻译逐字保留，"
-                   "证据范围限制另写有引文的独立事实及摘要，不伪造推翻证据，也不把标题断言当已验证结论。")
+                   "正文证据不足不等于后被推翻。仅当公共service preflight的server.title_qualifiers包含"
+                   "evidence_scope_v1时，可将原题逐字保留后加（证据范围：明确限定），完整翻译也带同一限定；"
+                   "该来源审核行必须另写title_scope={kind:evidence_limit,qualification:限定原文,"
+                   "translated_qualification:限定完整译文,source:body或冻结其他来源,quote:实际引文,note:具体判断理由}。"
+                   "旧服务未宣告该能力时保留阻塞，不将未知伪称推翻，也不为过校验撤掉必要限定。")
     return args + [prompt]
 
 
