@@ -34,8 +34,9 @@ def command_scope(command: str, expected: tuple[str, str] | None = None) -> dict
         args = shlex.split(args[2])
     if args and args[0] == stable:
         args[0] = entry  # one known stable-entry expression, never shell evaluation
-    if len(args) < 3 or args[:3] != [entry, 'campaign', 'submit']:
+    if len(args) < 3 or args[:2] != [entry, 'campaign'] or args[2] not in ('submit', 'prepare'):
         return None
+    command = args[2]
     flags, log = {}, None
     args = args[3:]
     if args in (['--help'], ['-h']):
@@ -47,17 +48,17 @@ def command_scope(command: str, expected: tuple[str, str] | None = None) -> dict
         flag = args.pop(0)
         if flag in ('--id', '--batch') and args and flag not in flags:
             flags[flag] = args.pop(0)
-        elif flag == '--dry-run' and flag not in flags:
+        elif flag == '--dry-run' and command == 'submit' and flag not in flags:
             flags[flag] = True
         elif flag == '>' and len(args) == 2 and args[1] == '2>&1':
             log = args[0]
             args = []
         else:
-            raise ValueError('legacy evidence requires one exact public submit command')
+            raise ValueError('legacy evidence requires one exact public submit/prepare command')
     if not flags.get('--id') or not flags.get('--batch'):
         raise ValueError('legacy command identity missing')
     return {'campaign': flags['--id'], 'batch': flags['--batch'],
-            'kind': 'dryrun' if flags.get('--dry-run') else 'submit', 'log': log}
+            'kind': 'dryrun' if command == 'prepare' or flags.get('--dry-run') else 'submit', 'log': log}
 
 
 def legacy_proof(exit_path: Path, events_path: Path, session: str, cid: str, bid: str) -> dict:
