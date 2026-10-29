@@ -84,3 +84,13 @@ no formal writes, the known installed bundle/backend binding, and a successful
 public read-only probe under that old overlay. Unknown write states and other
 bundle/permission failures remain blocked. A pending batch with no operation
 receipt is normalized identically when recording and validating its proof.
+
+A drained rework capacity retry also recognizes an exact public `repair preview`
+409 `stale_snapshot` followed by `repair status` 404 `repair_not_found` for the
+same repair ID. Both are read-only. The original request must bind a frozen
+selected source and model/tool/run, and its unchanged request and response JSON
+files must remain in the campaign audit. Shell chains and other failed commands
+are refused. All original bytes are frozen into retry evidence and revalidated
+after service preflight. This does not accept stale repair inputs: the resumed
+owner must compare fresh source state and author a newly reviewed request when
+needed. No apply, real permission refusal or unknown write is cleared.
