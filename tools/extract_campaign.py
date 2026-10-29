@@ -1890,6 +1890,7 @@ def _main(argv=None) -> int:
     rework.add_argument('--adopt-events', type=Path)
     rework.add_argument('--adopt-exit', type=Path)
     rework.add_argument('--maintenance-review', type=Path, help='explicit reviewed original read-only maintenance stop; no failed writes')
+    rework.add_argument('--retry-startup', action='store_true', help='one explicit retry of exact pre-session local initialization failure; retains original failure')
     maintenance = sub.add_parser('rework-maintenance-sheet', help='freeze every failed command and private checkpoint for coordinator review')
     maintenance.add_argument('--id', required=True)
     maintenance.add_argument('--model', required=True)
@@ -2182,7 +2183,7 @@ def _main(argv=None) -> int:
         from tools.campaign_rework import run as rework_run
         out = rework_run(a.id, a.model, a.slot, batches=a.batches, assignment=a.assignment,
                         reason=a.reason, adopt_events=a.adopt_events, adopt_exit=a.adopt_exit,
-                        maintenance_review=a.maintenance_review)
+                        maintenance_review=a.maintenance_review, retry_startup=a.retry_startup)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0 if out['state'] == 'rework_turn_completed' else 2
     elif a.cmd == "rules":

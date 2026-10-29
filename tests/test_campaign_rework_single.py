@@ -58,10 +58,10 @@ class SingleReworkTests(unittest.TestCase):
             update(exit_code=0)
         return mock.Mock(wait=lambda: 0)
 
-    def run_rework(self):
+    def run_rework(self, **kwargs):
         return rework.run(self.c['id'], 'm', 1, batches=[self.bid], assignment=self.assignment,
                           reason='original single owner repair', spawn=self.spawn,
-                          preflight=lambda *a: {'ok': True})
+                          preflight=lambda *a: {'ok': True}, **kwargs)
 
     def test_single_identity_session_scope_and_history_survive_rework(self):
         original = {p: p.read_bytes() for p in (self.d / 'campaign.json', self.d / 'log.jsonl', self.events)}
@@ -96,6 +96,74 @@ class SingleReworkTests(unittest.TestCase):
             update(exit_code=1)
         with self.assertRaisesRegex(ValueError, 'clean idle'):
             self.run_rework()
+        self.assertFalse(self.spawned)
+
+
+class StartupRetryTests(SingleReworkTests):
+    def fail_startup(self):
+        def failed(args, **kwargs):
+            with receipts.attempt(self.worker / 'native', kind='native_cli') as update:
+                kwargs['stderr'].write(b'Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)\n')
+                kwargs['stderr'].flush()
+                update(exit_code=1, child_pid=12345)
+            return mock.Mock(wait=lambda: 1)
+        with mock.patch.object(self, 'spawn', failed):
+            out = self.run_rework()
+        self.assertEqual(out['state'], 'blocked')
+        return Path(out['evidence_dir'])
+
+    def test_explicit_retry_preserves_failure_and_uses_original_clean_anchor(self):
+        job = self.fail_startup()
+        old = {p: p.read_bytes() for p in job.iterdir() if p.is_file()}
+        failure = (self.worker / 'native/latest.json').read_bytes()
+        with self.assertRaisesRegex(ValueError, 'clean idle'):
+            self.run_rework()
+        out = self.run_rework(retry_startup=True)
+        self.assertEqual(out['state'], 'rework_turn_completed')
+        new = Path(out['evidence_dir'])
+        self.assertEqual((new / 'previous-native.json').read_bytes(), failure)
+        self.assertTrue((new / 'startup-retry.json').is_file())
+        for path, data in old.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_any_native_event_or_other_stderr_refusal_is_not_a_startup_retry(self):
+        job = self.fail_startup()
+        events, stderr = job / 'events.jsonl', job / 'stderr.log'
+        original = stderr.read_bytes()
+        mutations = [(events, b'{"type":"thread.started","thread_id":"original-single-session"}\n'),
+                     (events, b'{"type":"error","message":"capacity"}\n'),
+                     (stderr, b'This action was rejected due to unacceptable risk\n' + original),
+                     (stderr, b'Error: provider denied request\n')]
+        for path, data in mutations:
+            old = path.read_bytes();path.write_bytes(data)
+            with self.subTest(data=data):
+                with self.assertRaises(ValueError):self.run_rework(retry_startup=True)
+            path.write_bytes(old)
+        self.assertFalse(self.spawned)
+
+    def test_changed_scope_assignment_or_failed_anchor_is_rejected(self):
+        job = self.fail_startup()
+        for filename, key, value in [('scope.json', 'session', 'foreign'),
+                                     ('scope.json', 'batches', ['foreign']),
+                                     ('exit-status.json', 'exit_code', 0),
+                                     ('previous-native.json', 'exit_code', 1)]:
+            path=job / filename;old=path.read_bytes();row=json.loads(old);row[key]=value;receipts.write(path,row)
+            with self.subTest(filename=filename, key=key):
+                with self.assertRaises(ValueError):self.run_rework(retry_startup=True)
+            path.write_bytes(old)
+        self.assignment.write_text('different scope')
+        with self.assertRaises(ValueError):self.run_rework(retry_startup=True)
+        self.assertFalse(self.spawned)
+
+    def test_explicit_retry_cannot_loop_or_adopt_another_invocation(self):
+        self.fail_startup()
+        with self.assertRaisesRegex(ValueError, 'cannot adopt'):
+            self.run_rework(retry_startup=True, adopt_events=self.events, adopt_exit=self.events)
+        # Another failed startup lacks a preceding clean anchor; no retry loop.
+        row=receipts.read(self.worker / 'worker.json');job=Path(row['events']).parent
+        previous=receipts.read(job / 'previous-native.json');previous['exit_code']=1
+        receipts.write(job / 'previous-native.json',previous)
+        with self.assertRaises(ValueError):self.run_rework(retry_startup=True)
         self.assertFalse(self.spawned)
 
 
