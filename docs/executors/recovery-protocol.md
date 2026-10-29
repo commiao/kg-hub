@@ -31,6 +31,28 @@ blocked condition. Source-bound uncertain operations remain isolated and cannot
 be replayed; unattributed operations and real approval/NAS refusals retain the
 shared stop boundary. Read-only preview recovery is bounded by persisted events.
 
+After a worker's exact `nodes preview` summary refusal, the coordinator may use
+`reconcile-local --id ID --model MODEL --slot SLOT --batch BATCH --summary-handoff
+AUDIT_JSON --reason REASON`. This is an identity-only handoff, not permission to
+repeat summary governance. The hash-bound `shared-summary-handoff-v1` file must
+identify the original campaign/batch/model/slot/session, events SHA, refused
+command ID and scope; include the coordinator's node UUID, complete identity
+preview, reviewer, note, `accepted:true`, and
+`disposition:identity_only_no_summary_change`. Every original review error needs
+a distinct repair ID and an explicit accepted source review; the CLI freshly
+checks the exact source/model/tool/run repair is applied and verified. All input
+references (`scope`, `identity_preview`, repair `acceptance`, extra `evidence`)
+use `{path,sha256}` inside the campaign audit. This requires a settled submitted
+batch and no pending batch on that original owner. No write or denied action is
+replayed, and the old errors and refusal remain. Summary changes, if needed,
+still require the separate all-backing-sources governance protocol. Evidence
+integrity does not certify semantic accuracy; the coordinator owns that review.
+
+An exact terminal native capacity failure may follow the CLI's known WebSocket
+reset reconnect notice. That notice alone no longer disqualifies bounded
+same-session recovery. Unrelated/authentication errors, approval/NAS refusals,
+unknown writes and non-capacity terminal failures still block it.
+
 An original title and its complete translation remain intact. If the body does
 not establish the title's claim, record the evidence limitation as a separate
 supported fact and summary. Missing evidence is not evidence of a later reversal.

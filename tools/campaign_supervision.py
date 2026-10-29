@@ -63,6 +63,7 @@ def events(path: Path) -> dict:
         return {}
     result = {}
     native_errors = []
+    terminal_error = None
     with path.open("rb") as stream:
         for line in stream:
             try:
@@ -77,7 +78,8 @@ def events(path: Path) -> dict:
                 native_errors.append(row.get('message'))
             elif row.get('type') == 'turn.failed':
                 error = row.get('error')
-                native_errors.append(error.get('message') if isinstance(error, dict) else None)
+                terminal_error = error.get('message') if isinstance(error, dict) else None
+                native_errors.append(terminal_error)
             item = row.get("item", {})
             if (item.get('type') == 'command_execution' and item.get('exit_code')
                     and 'This action was rejected due to unacceptable risk' in str(item.get('aggregated_output', ''))):
@@ -96,7 +98,14 @@ def events(path: Path) -> dict:
                 if isinstance(report, dict) and report.get("recovery_kind"):
                     result["recovery_kind"] = report["recovery_kind"]
     if native_errors:
-        result['capacity_refused'] = all(message == CAPACITY_MESSAGE for message in native_errors)
+        # The CLI emits recoverable reconnect notices as error events too.
+        # Admit only this transport notice, never arbitrary earlier errors; the
+        # actual terminal failure must still be the exact capacity response.
+        reconnect = re.compile(r'Reconnecting\.\.\. [1-5]/5 \(stream disconnected before completion: '
+                               r'WebSocket protocol error: Connection reset without closing handshake\)')
+        result['capacity_refused'] = terminal_error == CAPACITY_MESSAGE and all(
+            message == CAPACITY_MESSAGE or isinstance(message, str) and reconnect.fullmatch(message)
+            for message in native_errors)
     return result
 
 

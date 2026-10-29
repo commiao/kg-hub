@@ -33,7 +33,8 @@ def commands(event):
 
 
 def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=None,preflight=None,
-              prior_backend=None,prior_bundle=None,probe=None,capability_receipt=None,require_capability=None):
+              prior_backend=None,prior_bundle=None,probe=None,capability_receipt=None,require_capability=None,
+              summary_handoff=None,http=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip():
         raise ValueError('explicit coordinator disposition required')
     ec.tracking_guard();d=ec.campaign_dir(cid);c=ec.load(d)
@@ -49,7 +50,16 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             if op.get('lease_held') or op.get('requires_reconciliation') or op.get('state')=='uncertain':
                 raise ValueError('local continuation never settles an unknown operation')
             if op.get('exit_code') in (75,76):raise ValueError('NAS refusal requires separate reconciliation')
-        if capability_receipt is not None:
+        if summary_handoff is not None:
+            b=ec.find_batch(c,bid)
+            if (b not in own or b['status']!='submitted' or outcome.get('recovery_kind')!='business_permission_denied'
+                    or any(v['status'] not in ('submitted','released') for v in own)
+                    or any(x is not None for x in (repair,reviewer,prior_backend,prior_bundle,capability_receipt,require_capability))):
+                raise ValueError('settled submitted owner with exact summary handoff required')
+            from tools.campaign_summary_handoff import validate
+            inputs,registration=validate(c,d,b,model,slot,session,event,rows,summary_handoff,url=url,token=token,http=http)
+            kind='summary_identity_handoff_accepted'
+        elif capability_receipt is not None:
             b=ec.find_batch(c,bid)
             pending=[v for v in own if v['status'] not in ('submitted','released')]
             if (require_capability!='evidence_scope_v1' or pending!=[b]
@@ -174,6 +184,9 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
             'events':str(event),'events_sha256':cc.file_sha(event),'operations':operations,'inputs':inputs,
             'frozen_source_sha256':cc.file_sha(d/'batches'/(b['id']+'.json')),
             'rules_sha256':digest(ec.batch_rules_text(d,c,b))}
+        if summary_handoff is not None:
+            value['handoff_acceptance']=registration
+            value['batch_reviews_sha256']=digest(b.get('reviews',[]))
         path=root/('local-continuation-'+digest(value)+'.json')
         if not path.exists():cc._write(path,value)
         receipts.write(root/'local-continuation-active.json',{'path':str(path),'sha256':cc.file_sha(path)})
@@ -189,12 +202,14 @@ def valid(c,d,model,slot,*,locked=False):
         proof=cc._read(path);b=ec.find_batch(c,proof['batch'])
         if (proof.get('version')!='local-owner-continuation-v1' or proof.get('campaign')!=c['id']
                 or proof.get('model')!=model or proof.get('slot')!=slot or proof.get('session')!=session
-                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered','capability_restored')
+                or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered','capability_restored','summary_identity_handoff_accepted')
                 or cc.file_sha(root/'worker.json')!=proof['worker_sha256']
                 or cc.file_sha(native/'latest.json')!=proof['native_sha256']
                 or str(event)!=proof['events'] or cc.file_sha(event)!=proof['events_sha256']
                 or cc.file_sha(d/'batches'/(b['id']+'.json'))!=proof['frozen_source_sha256']
                 or digest(ec.batch_rules_text(d,c,b))!=proof['rules_sha256']):return False
+        if proof['kind']=='summary_identity_handoff_accepted' and (
+                b['status']!='submitted' or digest(b.get('reviews',[]))!=proof.get('batch_reviews_sha256')):return False
         for bid,expected in proof['operations'].items():
             raw=receipts.read(d/'operations'/bid/'latest.json') or {'state':'not_started'}
             if digest({**raw,'lease_held':False})!=expected:return False

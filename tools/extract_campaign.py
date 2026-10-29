@@ -1836,6 +1836,7 @@ def _main(argv=None) -> int:
     local.add_argument('--reason', required=True)
     local.add_argument('--batch')
     local.add_argument('--repair-file', type=Path)
+    local.add_argument('--summary-handoff', type=Path, help='hash-bound coordinator identity-only acceptance after an exact denied summary preview')
     local.add_argument('--reviewer')
     local.add_argument('--prior-backend',help='exact known published prior backend for a read-only delegation epoch proof')
     local.add_argument('--prior-bundle',type=Path,help='known installed prior composition for an exact read-only bundle-core rejection')
@@ -2121,6 +2122,9 @@ def _main(argv=None) -> int:
         out = reconcile(a.id, a.batch, url=a.url, token=ax.api_token())
     elif a.cmd == 'reconcile-local':
         from tools.campaign_local_recovery import reconcile
+        if a.summary_handoff:
+            if not a.batch or any((a.repair_file,a.reviewer,a.prior_backend,a.prior_bundle,a.capability_receipt,a.require_capability)):
+                ap.error('summary handoff requires --batch --summary-handoff only')
         if a.capability_receipt or a.require_capability:
             if not (a.capability_receipt and a.require_capability and a.batch) or any((a.repair_file,a.reviewer,a.prior_backend,a.prior_bundle)):
                 ap.error('capability disposition requires --batch --capability-receipt --require-capability only')
@@ -2129,12 +2133,12 @@ def _main(argv=None) -> int:
         if a.prior_backend:
             if not a.batch or a.repair_file or a.reviewer:
                 ap.error('delegation disposition requires --batch --prior-backend only')
-        elif not a.capability_receipt and (bool(a.repair_file)!=bool(a.batch) or bool(a.repair_file)!=bool(a.reviewer)):
+        elif not a.capability_receipt and not a.summary_handoff and (bool(a.repair_file)!=bool(a.batch) or bool(a.repair_file)!=bool(a.reviewer)):
             ap.error('repair disposition requires --batch --repair-file --reviewer together')
         out=reconcile(a.id,a.model,a.slot,reason=a.reason,url=a.url,token=ax.api_token(),bid=a.batch,
             repair=json.loads(a.repair_file.read_text()) if a.repair_file else None,reviewer=a.reviewer,
             prior_backend=a.prior_backend,prior_bundle=a.prior_bundle,
-            capability_receipt=a.capability_receipt,require_capability=a.require_capability)
+            capability_receipt=a.capability_receipt,require_capability=a.require_capability,summary_handoff=a.summary_handoff)
     elif a.cmd == 'repair-decision':
         from tools.campaign_decisions import record_repair
         out=record_repair(a.id,a.batch,json.loads(a.file.read_text()),reviewer=a.reviewer)

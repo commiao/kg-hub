@@ -369,6 +369,25 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(out['state'], 'blocked')
         self.assertEqual(len(calls), 1)
 
+    def test_capacity_after_real_cli_reconnect_notice_resumes_same_session(self):
+        calls=[]
+        notice='Reconnecting... 2/5 (stream disconnected before completion: WebSocket protocol error: Connection reset without closing handshake)'
+        with mock.patch.object(s,'CAPACITY_WAIT_SECONDS',.01):
+            out=self.run_supervisor(poll=.01,sleep=lambda _:None,
+                spawn=self.capacity_spawn(calls,extra_error=notice))
+        self.assertEqual(out['state'],'complete')
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[1][calls[1].index('resume')+1],'same-session')
+
+    def test_reconnect_prefix_never_hides_auth_or_noncapacity_terminal(self):
+        p=self.root/'reconnect.events'
+        for earlier,terminal in [
+            ('Reconnecting... 2/5 (authentication failed)',s.CAPACITY_MESSAGE),
+            ('Reconnecting... 2/5 (stream disconnected before completion: WebSocket protocol error: Connection reset without closing handshake)','authentication failed')]:
+            rows=[{'type':'error','message':earlier},{'type':'turn.failed','error':{'message':terminal}}]
+            p.write_text(''.join(json.dumps(x)+'\n' for x in rows))
+            self.assertFalse(s.events(p)['capacity_refused'])
+
     def test_capacity_never_overrides_recorded_approval_denial(self):
         p = self.root / 'denied.events'
         rows = [{'type': 'error', 'message': s.CAPACITY_MESSAGE},
