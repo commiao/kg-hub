@@ -123,6 +123,9 @@ class StartupRetryTests(SingleReworkTests):
         new = Path(out['evidence_dir'])
         self.assertEqual((new / 'previous-native.json').read_bytes(), failure)
         self.assertTrue((new / 'startup-retry.json').is_file())
+        from tools.campaign_ownership_recovery import _ref
+        for ref in receipts.read(new / 'startup-retry.json').values():
+            self.assertEqual(_ref(ref['path']), ref)
         for path, data in old.items():
             self.assertEqual(path.read_bytes(), data)
 
