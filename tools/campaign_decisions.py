@@ -106,7 +106,10 @@ def record_repair(cid,bid,request,*,reviewer):
             raise ValueError('one original source and reviewed replacement required')
         item=matches[0];context=payload.get('quality_context',{});review=payload.get('quality_review',{})
         frozen={**batch,'items':[item]}
-        if (context.get('batch')!=frozen or context.get('prompt_text')!=ec.batch_rules_text(d,c,b)
+        # Reuse the existing full-batch quality contract for real same-batch
+        # citations. Every source/result/review must still pass that contract;
+        # no subset, appended evidence or altered frozen body is admitted.
+        if (context.get('batch') not in (frozen,batch) or context.get('prompt_text')!=ec.batch_rules_text(d,c,b)
                 or context.get('prompt_version')!=ec.episode_prompt_version(c,b['chain'])
                 or review.get('identity')!=ec.batch_identity(c,b) or review.get('reviewer')!=reviewer
                 or payload.get('extractor_session') not in (None,cid) or ax.quality.validate_payload_quality(payload)):
@@ -114,7 +117,8 @@ def record_repair(cid,bid,request,*,reviewer):
         value={'version':'source-repair-decision-v1','campaign':cid,'batch':bid,'source_id':item['id'],
                'owner_session':c.get('slot_sessions',{}).get(b['model'],{}).get(str(ec.batch_slot(c,b))),
                'request_sha256':digest(request),'request':request,'reviewer':reviewer,
-               'production_batch_sha256':digest(batch),'rules_sha256':digest(ec.batch_rules_text(d,c,b))}
+               'production_batch_sha256':digest(batch),'rules_sha256':digest(ec.batch_rules_text(d,c,b)),
+               'evidence_scope':('original_full_frozen_batch' if context.get('batch')==batch else 'single_source')}
         path=d/'repair-decisions'/bid/(digest(value)+'.json')
         if not path.exists():receipts.write(path,value)
     return {'path':str(path),'sha256':digest(value),'request_sha256':value['request_sha256'],

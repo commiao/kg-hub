@@ -94,3 +94,13 @@ are refused. All original bytes are frozen into retry evidence and revalidated
 after service preflight. This does not accept stale repair inputs: the resumed
 owner must compare fresh source state and author a newly reviewed request when
 needed. No apply, real permission refusal or unknown write is cleared.
+
+Submitted source repair admission accepts either its original single-source
+context or the complete, unchanged original frozen batch. The latter reuses the
+already shared server quality contract for `batch_item` citations and requires
+complete results plus an explicit valid review for every original source. No
+partial/expanded context, changed body/lookahead/rules, outside quote, missing
+review or alternate identity qualifies. Registration remains for exactly one
+original source and never resubmits any supporting observation. Existing
+single-source callers remain valid. Quotes establish coverage, not semantic
+truth; the coordinator must independently judge every cited assertion.
