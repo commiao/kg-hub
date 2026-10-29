@@ -73,11 +73,13 @@ def _adoption(c, d, model, slot, session, native, events, terminal, batches):
 
 
 def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, adopt_exit=None,
-        maintenance_review=None, spawn=subprocess.Popen, preflight=None):
+        maintenance_review=None, retry_startup=False, spawn=subprocess.Popen, preflight=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip() or bool(adopt_events) != bool(adopt_exit):
         raise ValueError('coordinator reason and paired optional adoption evidence required')
     if maintenance_review and adopt_events:
         raise ValueError('maintenance continuation cannot adopt another invocation')
+    if retry_startup and (maintenance_review or adopt_events):
+        raise ValueError('startup retry cannot adopt or waive another continuation')
     ec.tracking_guard()
     d = ec.campaign_dir(cid)
     c = ec.load(d)
@@ -106,13 +108,19 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             else:
                 session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
                 bindings = [sid for ss in c.get('slot_sessions', {}).values() for sid in ss.values()]
+            startup = None
+            owner_worker, owner_native = worker, native
+            if retry_startup:
+                from tools.campaign_rework_startup import validate as startup_validate
+                owner_worker, owner_native, startup = startup_validate(
+                    c, root, model, slot, session, worker, native, selected, assignment)
             # The ownership protocol already bound this exact failed native,
             # copied refusal transcript, original SID and unchanged ownership.
             # It authorizes only subsequent own-slot work, never the denied
             # cross-slot review. A new native attempt consumes that proof.
             owner_continuation = slot is not None and native.get('exit_code') == 1 and ownership_valid(c, d, model, slot)
-            if (not session or worker.get('session') != session or native.get('state') != 'completed'
-                    or not native.get('ended_at') or native.get('exit_code') != 0 and not owner_continuation
+            if (not session or worker.get('session') != session or owner_native.get('state') != 'completed'
+                    or not owner_native.get('ended_at') or owner_native.get('exit_code') != 0 and not owner_continuation
                     or bindings.count(session) != 1):
                 raise ValueError('original clean idle native/session required; rework does not waive a failed exit')
             if adopt_events:
@@ -120,7 +128,7 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                     raise ValueError('ownership continuation cannot adopt a different invocation')
                 adopted = _adoption(c, d, model, slot, session, native, adopt_events, adopt_exit, selected)
             else:
-                path = Path(worker.get('events', '/missing')).resolve()
+                path = Path(owner_worker.get('events', '/missing')).resolve()
                 if not path.is_relative_to(root.resolve()):raise ValueError('own-slot event ownership required')
                 outcome = supervision.events(path)
                 from tools.campaign_rework_completion import valid as completion_valid
@@ -131,7 +139,7 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                     maintenance = maintenance_protocol.validate(c,d,model,slot,selected,maintenance_review)
                 if outcome.get('recovery_kind') == 'quality_process_violation':
                     from tools.campaign_quality_stop import validate
-                    quality_stop = validate(c, d, model, slot, session, path, selected, native)
+                    quality_stop = validate(c, d, model, slot, session, path, selected, owner_native)
                 expected_terminal = None if owner_continuation else 'turn.completed'
                 if (outcome.get('session') != session or outcome.get('terminal') != expected_terminal
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
@@ -147,6 +155,10 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             # supervision, and does not consume a new evaluation/source budget.
             flight = (preflight or ax.runtime_preflight)(os.environ.get('KG_HUB_URL', ax.DEFAULT_URL), ax.api_token())
             if not flight.get('ok'):raise ValueError('service preflight failed')
+            if startup:
+                for ref in startup.values():
+                    if _ref(ref['path']) != ref:
+                        raise ValueError('startup failure evidence changed before retry')
             if maintenance_review:
                 maintenance_protocol.restored(maintenance,flight)
                 if maintenance_protocol.validate(c,d,model,slot,selected,maintenance_review)!=maintenance:
@@ -159,6 +171,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             job.mkdir(parents=True)
             (job / 'previous-worker.json').write_bytes((root / 'worker.json').read_bytes())
             (job / 'previous-native.json').write_bytes((root / 'native/latest.json').read_bytes())
+            if startup:
+                receipts.write(job / 'startup-retry.json', startup)
             if owner_continuation:
                 receipts.write(job / 'ownership-continuation.json',
                                _ref(root / 'ownership-continuation-active.json'))
