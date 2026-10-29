@@ -19,8 +19,43 @@ from tools import agent_extract as ax, extract_campaign as ec, claim_registry, n
 from utils import process_receipts as receipts
 
 CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model.'
+# Defaults for a campaign without an explicit recovery_policy. A provider
+# capacity refusal is infrastructure, not a business refusal: the supervisor
+# backs off (doubling from the base wait, capped) and resumes the same session
+# without a coordinator, up to the retry budget. 2026-10-29: 3×300s froze the
+# 8000 campaign while capacity outages routinely lasted longer than 15 minutes.
 CAPACITY_WAIT_SECONDS = 300
-MAX_CAPACITY_RETRIES = 3
+CAPACITY_MAX_WAIT_SECONDS = 3600
+MAX_CAPACITY_RETRIES = 6
+RECOVERY_POLICY_VERSION = 'recovery-policy-v1'
+RECOVERY_POLICY_KEYS = ('capacity_wait_seconds', 'capacity_max_wait_seconds', 'capacity_max_retries')
+
+
+def capacity_policy(c: dict | None) -> dict:
+    """Frozen per-campaign capacity backoff; legacy campaigns keep the defaults."""
+    policy = dict((c or {}).get('recovery_policy') or {})
+    if policy and policy.get('version') != RECOVERY_POLICY_VERSION:
+        raise ValueError('unknown campaign recovery_policy version')
+    if set(policy) - {'version', *RECOVERY_POLICY_KEYS}:
+        raise ValueError('unknown campaign recovery_policy keys')
+    out = {'capacity_wait_seconds': CAPACITY_WAIT_SECONDS,
+           'capacity_max_wait_seconds': CAPACITY_MAX_WAIT_SECONDS,
+           'capacity_max_retries': MAX_CAPACITY_RETRIES}
+    for key in RECOVERY_POLICY_KEYS:
+        if key in policy:
+            value = policy[key]
+            if type(value) is not int or value < 1 or value > (50 if key == 'capacity_max_retries' else 86400):
+                raise ValueError(f'campaign recovery_policy.{key} must be a bounded positive integer')
+            out[key] = value
+    if out['capacity_max_wait_seconds'] < out['capacity_wait_seconds']:
+        raise ValueError('campaign recovery_policy capacity wait exceeds its cap')
+    return out
+
+
+def capacity_wait(policy: dict, retries: int) -> float:
+    """Wait before retry number `retries` (1-based): base × 2^(n-1), capped."""
+    base = policy['capacity_wait_seconds']
+    return min(base * (2 ** max(retries - 1, 0)), max(policy['capacity_max_wait_seconds'], base))
 
 
 def capacity_terminal(outcome, terminal):
@@ -309,17 +344,20 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     saved['capacity_retries'] = 0
                     receipts.write(root / 'worker.json', saved)
                 elif capacity:
-                    if not capacity_safe or capacity_retries >= MAX_CAPACITY_RETRIES:
+                    policy = capacity_policy(c)
+                    if not capacity_safe or capacity_retries >= policy['capacity_max_retries']:
                         reason = 'capacity_submit_unverified' if not capacity_safe else 'model_capacity_exhausted'
                         update(phase='coordinator_required', exit_code=2, reason=reason,
-                               capacity_retries=capacity_retries)
+                               capacity_retries=capacity_retries, capacity_max_retries=policy['capacity_max_retries'])
                         return {'model': model, 'state': 'blocked', 'reason': reason}
                     capacity_retries += 1
                     saved['capacity_retries'] = capacity_retries
                     receipts.write(root / 'worker.json', saved)
+                    wait = capacity_wait(policy, capacity_retries)
                     update(phase='waiting_model_capacity', session=session,
-                           capacity_retries=capacity_retries, wait_seconds=CAPACITY_WAIT_SECONDS)
-                    remaining = CAPACITY_WAIT_SECONDS
+                           capacity_retries=capacity_retries, capacity_max_retries=policy['capacity_max_retries'],
+                           wait_seconds=wait)
+                    remaining = wait
                     while remaining > 0:
                         if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
                             update(phase='claims_drained', success=count)

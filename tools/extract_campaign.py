@@ -685,12 +685,21 @@ def model_readiness(models, executor, receipts, *, effort="medium", proxy_mode="
 def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: int, after_id: int | None,
               skip_admission: str | None = None, lookup=None, allow_tracking: str | None = None,
               model_preflight=None, effort="medium", proxy_mode="auto", parallel: int = 1,
-              structure_gate: dict | None = None, no_structure_gate: str | None = None) -> dict:
+              structure_gate: dict | None = None, no_structure_gate: str | None = None,
+              recovery_policy: dict | None = None) -> dict:
     """structure_gate 给阈值就从 c0 起开启结构门槛；no_structure_gate 写原因表示明确不开（都记进 structure_gate_log）。
-    命令行 start 缺省开启；函数缺省两者都不给，行为与门槛出现前相同。"""
+    命令行 start 缺省开启；函数缺省两者都不给，行为与门槛出现前相同。
+    recovery_policy 冻结本战役的容量退避（等待秒/上限/次数）；不给则沿用 campaign_supervision 缺省。"""
     d = campaign_dir(cid)
     if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
         raise SystemExit(f"战役 {cid} 已存在")
+    if recovery_policy is not None:
+        from tools.campaign_supervision import capacity_policy, RECOVERY_POLICY_VERSION
+        frozen_policy = {"version": RECOVERY_POLICY_VERSION, **recovery_policy}
+        try:
+            capacity_policy({"recovery_policy": frozen_policy})
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     if structure_gate is not None and no_structure_gate:
         raise SystemExit("结构门槛不能同时开启又关闭")
     gate_cfg = sg.validate_config(structure_gate) if structure_gate is not None else None
@@ -725,6 +734,8 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
         elif no_structure_gate:
             c["structure_gate_log"] = [gate_log_entry("declined", by=actor(), via="start", reason=no_structure_gate,
                                                       gate=None)]
+        if recovery_policy is not None:
+            c["recovery_policy"] = frozen_policy
         for sub in ("batches", "results"):
             (d / sub).mkdir(exist_ok=True)
         (d / "prompt.md").write_text(ax.PROMPT_PATH.read_text())   # 冻结规则正文，战役内不随仓库变
@@ -1730,12 +1741,20 @@ def triage_summary(d: Path, c: dict, since: str | None = None) -> dict:
             "enabled": sorted(enabled), "full": campaign_full(c), "quota": c["quota"]}
 
 
+def _status_policy(c: dict, capacity_policy) -> dict:
+    """status 只读：策略坏了也要能看，把错误原样摆出来而不是让 status 崩。"""
+    try:
+        return capacity_policy(c)
+    except ValueError as exc:
+        return {"error": str(exc), "raw": c.get("recovery_policy")}
+
+
 def cmd_status(cid: str) -> dict:
     d = campaign_dir(cid)
     c = load(d)
     from kg_hub_eval.business.utils.evaluation_receipts import overhead_coverage
     from utils.process_receipts import status as process_status, read as process_read
-    from tools.campaign_supervision import completed
+    from tools.campaign_supervision import completed, capacity_policy
     n = parallelism(c)
     slots = {m: {str(slot or 1): {
         "supervisor": process_status(supervisor_dir(d, m, slot)),
@@ -1751,7 +1770,10 @@ def cmd_status(cid: str) -> dict:
             "source_decisions": c.get('source_decisions'),
             "recovery_manager": {"policy": process_read(d / 'recovery/config.json'),
                                  "observer": process_status(d / 'recovery/observer'),
-                                 "last_observed_at": process_read(d / 'recovery/latest.json').get('observed_at')},
+                                 "last_observed_at": process_read(d / 'recovery/latest.json').get('observed_at'),
+                                 "slots": [{k: row.get(k) for k in ("model", "slot", "action", "scope", "blocked")}
+                                           for row in process_read(d / 'recovery/latest.json').get('slots') or []]},
+            "recovery_policy": _status_policy(c, capacity_policy),
             "active_workers": sum(s["native"]["lease_held"] is True for workers in slots.values() for s in workers.values()),
             "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "host_task_state": "unverified_by_repository",
@@ -1956,6 +1978,11 @@ def _main(argv=None) -> int:
         if name == "start":
             s.add_argument("--no-structure-gate", metavar="原因",
                            help="新战役缺省开启结构门槛（阈值见 tools/campaign_structure_gate.DEFAULTS）；不开要写原因")
+            s.add_argument("--capacity-wait-seconds", type=positive_int,
+                           help="模型容量拒绝后首次退避秒数，之后逐次翻倍；缺省见 campaign_supervision.CAPACITY_WAIT_SECONDS")
+            s.add_argument("--capacity-max-wait-seconds", type=positive_int, help="容量退避单次等待上限秒数")
+            s.add_argument("--capacity-max-retries", type=positive_int,
+                           help="同一 session 连续容量拒绝最多自动续跑几次，超过才报 model_capacity_exhausted")
         if name == "chain":
             s.add_argument("--file", required=True)
         if name == "structure-gate":
@@ -2104,7 +2131,11 @@ def _main(argv=None) -> int:
                         skip_admission=a.skip_admission, allow_tracking=a.allow_tracking,
                         model_preflight=a.model_preflight, effort=a.effort, proxy_mode=a.proxy_mode, parallel=a.parallel,
                         structure_gate=None if a.no_structure_gate else dict(sg.DEFAULTS),
-                        no_structure_gate=a.no_structure_gate)
+                        no_structure_gate=a.no_structure_gate,
+                        recovery_policy={k: v for k, v in (("capacity_wait_seconds", a.capacity_wait_seconds),
+                                                           ("capacity_max_wait_seconds", a.capacity_max_wait_seconds),
+                                                           ("capacity_max_retries", a.capacity_max_retries))
+                                         if v is not None} or None)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
     elif a.cmd == "structure-gate":

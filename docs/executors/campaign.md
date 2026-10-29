@@ -658,7 +658,20 @@ NAS-heavy operations reserve process-leased FIFO tickets before acquiring the ex
 
 Pre-extracted HTTP writes and previews use the existing `utils.ingest_budget.ingest_ceiling_sec()` plus30seconds transport margin, instead of the generic120seconds. Other requests retain120seconds. A timeout still means unknown remote state and does not authorize retry, source-key changes or promoted success. This prevents premature client abandonment; it cannot retrospectively prove the outcome of an older timed-out request.
 
-Only the exact native `Selected model is at capacity. Please try a different model.` refusal, a clean native exit1 and `turn.failed` with the same original session qualify for capacity recovery. Supervision waits300seconds and resumes the same session up to three times, without new claims or model probes. Unknown writes, approval denials, NAS refusals and other provider errors still stop. Capacity refusals do not spend the no-formal-progress budget; persistent capacity exhaustion remains an explicit infrastructure blocker. The retry counter is persisted with the worker.
+Only the exact native `Selected model is at capacity. Please try a different model.` refusal, a clean native exit1 and `turn.failed` with the same original session qualify for capacity recovery. Supervision backs off and resumes the same session without new claims or model probes, up to the campaign's capacity retry budget. Unknown writes, approval denials, NAS refusals and other provider errors still stop. Capacity refusals do not spend the no-formal-progress budget; persistent capacity exhaustion remains an explicit infrastructure blocker. The retry counter is persisted with the worker.
+
+### 容量退避策略（`recovery_policy`，按战役冻结）
+
+容量拒绝是基础设施故障，不是业务拒绝：监督器自动退避续跑，不需要协调器或人工放行（原则见 [CAMPAIGN-RECOVERY-REDESIGN-PLAN.md](../CAMPAIGN-RECOVERY-REDESIGN-PLAN.md)）。
+退避参数在 `campaign start` 时冻结进 `campaign.json` 的 `recovery_policy`（`recovery-policy-v1`），没写的战役沿用 `tools/campaign_supervision.py` 的缺省：
+
+| 键 | 启动参数 | 缺省 | 含义 |
+|---|---|---|---|
+| `capacity_wait_seconds` | `--capacity-wait-seconds` | 300 | 第一次退避秒数，之后每次翻倍 |
+| `capacity_max_wait_seconds` | `--capacity-max-wait-seconds` | 3600 | 单次退避上限 |
+| `capacity_max_retries` | `--capacity-max-retries` | 6 | 同一 session 连续容量拒绝最多自动续跑次数 |
+
+缺省序列为 300/600/1200/2400/3600/3600 秒，总计约 2.9 小时后才报 `model_capacity_exhausted`（2026-10-29 之前固定 3×300 秒，容量拒绝超过 15 分钟就把整条战役封死）。每次退避前都会检查 dispatch 是否已 draining。`campaign status` 的 `recovery_policy` 显示实际生效值，`recovery_manager.slots` 显示 observer 最近一次给每个槽位的动作和 `blocked` 原因。返工的 `--retry-capacity` 读取同一策略。在途战役不受发布影响：策略只在启动时冻结。
 
 
 ## Persistent recovery and source decisions
