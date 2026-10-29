@@ -104,3 +104,23 @@ review or alternate identity qualifies. Registration remains for exactly one
 original source and never resubmits any supporting observation. Existing
 single-source callers remain valid. Quotes establish coverage, not semantic
 truth; the coordinator must independently judge every cited assertion.
+# Accepted rework returning to production
+
+An idle slot whose latest worker is a quality-rework turn needs a separate
+coordinator handoff after source-specific semantic acceptance. A clean process
+exit and dispatch resumption alone do not provide that handoff.
+
+Use `campaign recovery-handoff --id <campaign> --model <model> --slot <slot>
+--evidence <acceptance.json> --reason <coordinator decision>`. Each original
+submitted rework batch requires an audit acceptance with `batch`,
+`current_quality_rework_scope_accepted: true`, `sources`, and `source_scopes`
+mapping every original source ID to its individually reviewed audit file.
+This is an explicit coordinator attestation, not an automatic semantic verdict.
+
+The receipt binds the original session, native terminal, event bytes, submitted
+rework batches, pending production operations, dispatch and acceptance files.
+It changes only that slot's recovery prerequisite; prior stops and original
+source results remain. Live owners, unresolved writes, real refusals and partial
+acceptance are rejected. Repeating the same approval cannot reset a later
+no-progress budget. The normal production supervisor resumes the same session;
+it still requires current quality review and a full preview before submission.

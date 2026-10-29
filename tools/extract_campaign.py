@@ -1789,10 +1789,10 @@ def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ('recovery-enable', 'recovery-disable', 'recovery-service', 'recovery-plan', 'recovery-watch', 'recovery-step',
-                 'recovery-register', 'recovery-approve-resume', 'decisions-enable', 'decision'):
+                 'recovery-register', 'recovery-approve-resume', 'recovery-handoff', 'decisions-enable', 'decision'):
         parser = sub.add_parser(name)
         parser.add_argument('--id', required=True)
-        if name in ('recovery-enable', 'recovery-disable', 'recovery-register', 'recovery-approve-resume', 'decisions-enable'):
+        if name in ('recovery-enable', 'recovery-disable', 'recovery-register', 'recovery-approve-resume', 'recovery-handoff', 'decisions-enable'):
             parser.add_argument('--reason', required=True)
         if name == 'recovery-enable':
             parser.add_argument('--max-stalled', type=positive_int, default=3)
@@ -1807,7 +1807,11 @@ def _main(argv=None) -> int:
             parser.add_argument('--batches', nargs='+', required=True)
             parser.add_argument('--assignment', type=Path, required=True)
             parser.add_argument('--checkpoint', type=Path, required=True)
-        if name == 'recovery-approve-resume': parser.add_argument('--evidence', nargs='+', type=Path, required=True)
+        if name in ('recovery-approve-resume', 'recovery-handoff'):
+            parser.add_argument('--evidence', nargs='+', type=Path, required=True)
+        if name == 'recovery-handoff':
+            parser.add_argument('--model', required=True)
+            parser.add_argument('--slot', type=positive_int, required=True)
         if name == 'decision':
             parser.add_argument('--batch', required=True)
             parser.add_argument('--file', type=Path, required=True)
@@ -2031,6 +2035,9 @@ def _main(argv=None) -> int:
         elif a.cmd == 'recovery-register':
             out = manager.register_rework(a.id, a.model, a.slot, batches=a.batches,
                 assignment=a.assignment, checkpoint=a.checkpoint, reason=a.reason)
+        elif a.cmd == 'recovery-handoff':
+            from tools.campaign_rework_handoff import approve
+            out = approve(a.id, a.model, a.slot, evidence=a.evidence, reason=a.reason)
         else: out = manager.approve_resume(a.id, evidence=a.evidence, reason=a.reason)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 2 if a.cmd == 'recovery-step' and out.get('state') == 'blocked' else 0
