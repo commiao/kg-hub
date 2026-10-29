@@ -320,12 +320,21 @@ def snapshot(cid):
                     action='reconcile_preview';scope='slot'
             if supervision.completed(c, d, model) >= c['quota'] and action == 'supervise':
                 action = 'quota_complete'
+            handoff = None
+            if worker.get('mode') == 'quality_rework' and action == 'supervise':
+                from tools.campaign_rework_handoff import valid
+                handoff = valid(c, d, model, slot)
+                if not handoff:
+                    action = 'coordinator_rework_handoff_required'; scope = 'slot'
             row = {'model': model, 'slot': slot, 'session': session, 'action': action,
                    'scope': scope, 'native_attempt': native.get('attempt'),
                    'worker': worker, 'outcome': outcome, 'progress': progress,
                    'registration': registration, 'dispatch_id': (c.get('dispatch') or {}).get('id')}
             row['published_continuation_valid'] = continuation
             row['conditions_sha256'] = conditions(c,d,model,slot,registration,progress)
+            if handoff:
+                row['accepted_rework_handoff'] = handoff
+                row['conditions_sha256'] = digest({'conditions': row['conditions_sha256'], 'handoff': handoff})
             if action in ('coordinator_required', 'engineering_reconciliation_required'):
                 # The raw terminal, not just a label: stderr tail, events terminal,
                 # exit code and the spent retry budget.
