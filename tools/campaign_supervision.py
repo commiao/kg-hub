@@ -286,7 +286,11 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 outcome = events(Path(saved["events"]))
                 from tools.campaign_recovery import stops_reconciled
                 from tools.campaign_continuation import worker_reconciled
-                continuation = slot is not None and worker_reconciled(c, d, model, slot)
+                if slot is None:
+                    from tools.campaign_local_recovery import valid as local_valid
+                    continuation = local_valid(c, d, model, None)
+                else:
+                    continuation = worker_reconciled(c, d, model, slot)
                 cleared = bool(outcome.get("hard_stop")) and stops_reconciled(c, d, model, Path(saved["events"]), outcome)
                 if outcome.get("hard_stop") and not cleared:
                     update(phase="coordinator_required", exit_code=2, reason="nas_gate_refused", business_exit_code=outcome["hard_stop"])

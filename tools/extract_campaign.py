@@ -1832,7 +1832,7 @@ def _main(argv=None) -> int:
     local = sub.add_parser('reconcile-local', help='review exact closed-decision rejection or incomplete read-only preview; no write replay')
     local.add_argument('--id', required=True)
     local.add_argument('--model', required=True)
-    local.add_argument('--slot', type=positive_int, required=True)
+    local.add_argument('--slot', type=positive_int, help='omit only for an original single-worker HTTP502 preview')
     local.add_argument('--reason', required=True)
     local.add_argument('--batch')
     local.add_argument('--repair-file', type=Path)
