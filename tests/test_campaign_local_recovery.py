@@ -52,6 +52,47 @@ class LocalRecoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):decisions.record_repair(self.c['id'],self.bid,changed,reviewer=review['reviewer'])
         self.assertEqual(out,decisions.record_repair(self.c['id'],self.bid,request,reviewer=review['reviewer']))
 
+    def full_frozen_repair(self):
+        request,_=self.repair();c=ec.load(self.d);b=ec.find_batch(c,self.bid)
+        batch,_=ec._batch_rows(self.d,self.bid);results=copy.deepcopy(self.results)
+        prompt=ec.batch_rules_text(self.d,c,b)
+        review=confirm(ax.quality.review_sheet(batch,results,prompt,ec.batch_identity(c,b)),batch)
+        review['reviewer']='explicit full source reviewer'
+        review['items'][0]['summaries'][0].update(source='batch_item',source_id=batch['items'][1]['id'],
+                                                 quote=ax.quality.body_evidence(batch['items'][1]))
+        payload=request['replacement'];payload.update(quality_review=review,quality_context={
+            'batch':batch,'results':results,'prompt_text':prompt,'prompt_version':payload['prompt_version']})
+        return request,review
+
+    def test_full_frozen_context_supports_existing_server_same_batch_citation_contract(self):
+        request,review=self.full_frozen_repair()
+        before={p:p.read_bytes() for p in [self.d/'batches'/f'{self.bid}.json',ax.quality_file(self.d,self.bid),self.d/'results'/f'{self.bid}.json']}
+        # This is the exact shared validator already used by the live server.
+        self.assertEqual(ax.quality.validate_payload_quality(request['replacement']),[])
+        out=decisions.record_repair(self.c['id'],self.bid,request,reviewer=review['reviewer'])
+        value=receipts.read(Path(out['path']))
+        self.assertEqual(value['evidence_scope'],'original_full_frozen_batch')
+        self.assertEqual(value['source_id'],self.batch['items'][0]['id'])
+        self.assertEqual(value['request']['replacement'],request['replacement'])
+        self.assertTrue(all(p.read_bytes()==raw for p,raw in before.items()))
+        self.assertFalse(out['semantic_truth_certified'])
+
+    def test_full_frozen_context_rejects_changed_other_source_partial_or_missing_reviews(self):
+        request,review=self.full_frozen_repair()
+        for kind in ['other_body','subset','foreign_item','lookahead','missing_result','missing_review','foreign_citation','other_rules','other_model']:
+            bad=copy.deepcopy(request);p=bad['replacement'];ctx=p['quality_context']
+            if kind=='other_body':ctx['batch']['items'][1]['episode_body']+=' altered'
+            if kind=='subset':ctx['batch']['items']=ctx['batch']['items'][:2]
+            if kind=='foreign_item':ctx['batch']['items'].append({**ctx['batch']['items'][1],'id':9999})
+            if kind=='lookahead':ctx['batch']['lookahead']=[{'id':9999,'title':'foreign'}]
+            if kind=='missing_result':ctx['results']['items'].pop()
+            if kind=='missing_review':p['quality_review']['items'].pop()
+            if kind=='foreign_citation':p['quality_review']['items'][0]['summaries'][0]['source_id']=9999
+            if kind=='other_rules':ctx['prompt_text']+=' altered'
+            if kind=='other_model':p['extractor_model']='foreign'
+            with self.subTest(kind=kind),self.assertRaises(ValueError):
+                decisions.record_repair(self.c['id'],self.bid,bad,reviewer=review['reviewer'])
+
     def test_closed_decision_rejection_has_explicit_original_owner_continuation(self):
         request,review=self.repair();root,event=self.worker('m',2,kind='business_permission_denied')
         row=self.d/'audit/repair-row.json';row.parent.mkdir(exist_ok=True);receipts.write(row,review['items'][0])
