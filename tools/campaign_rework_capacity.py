@@ -2,11 +2,13 @@
 
 This is a process disposition, not semantic acceptance. No production claim is
 enabled. Failed tools are rejected unless they provably stopped before executing
-their Python body or are an argument-parser-only help request.
+their Python body, are an argument-parser-only help request, or are a bound
+read-only stale-preview/not-found pair.
 """
 import ast
 import json
 import re
+import shlex
 from pathlib import Path
 
 from tools import campaign_supervision as supervision, extract_campaign as ec
@@ -91,7 +93,66 @@ def prewrite_failure(script, output, scopes):
         f'  File "<stdin>", line {line}, in <module>\n'
         f'  File "<stdin>", line {line}, in <genexpr>\nKeyError: \'props\'\n')
 
-def transcript(path, session, scopes):
+def readonly_failures(path, source_keys, audit, model, executor, run_id):
+    """Bind an exact stale preview/not-found pair; never replay either call."""
+    pairs, references, accepted = {}, {}, {}
+    entry = str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+    for line in Path(path).read_text().splitlines():
+        row = json.loads(line); item = row.get('item', {})
+        if (row.get('type') != 'item.completed' or item.get('type') != 'command_execution'
+                or item.get('exit_code') != 1):
+            continue
+        try:
+            shell = _shell(item['command'])
+            if any(mark in shell for mark in ('\n', ';', '|', '&', '<', '>', '`', '$(')):
+                continue
+            args = shlex.split(shell)
+            body = json.loads(item.get('aggregated_output', ''))
+        except (ValueError, KeyError):
+            continue
+        if args and args[0] == '${KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}/tools/extract':
+            args[0] = entry
+        if len(args) != 7 or args[:2] != [entry, 'repair'] or args[5] != '--out':
+            continue
+        if not isinstance(body, dict) or body.get('status') != 'error':
+            continue
+        preview = args[2:4] == ['preview', '--file'] and (body.get('http'), body.get('code')) == (409, 'stale_snapshot')
+        status = args[2:4] == ['status', '--repair-id'] and (body.get('http'), body.get('code')) == (404, 'repair_not_found')
+        if not preview and not status:
+            continue
+        output = Path(args[6]).resolve(strict=True)
+        if not output.is_relative_to(audit.resolve()) or receipts.read(output) != body:
+            raise ValueError('retained original read-only response differs')
+        references[str(output)] = _ref(output)
+        if preview:
+            request_path = Path(args[4]).resolve(strict=True)
+            if not request_path.is_relative_to(audit.resolve()) or request_path.parent != output.parent:
+                raise ValueError('stale repair request must stay in original private audit')
+            request = receipts.read(request_path); repair_id = request.get('repair_id')
+            replacement = request.get('replacement', {})
+            if (not isinstance(repair_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}', repair_id)
+                    or repair_id in pairs
+                    or (request.get('source_description'), request.get('source_obs_id')) not in source_keys.values()
+                    or replacement.get('extractor_model') != model or replacement.get('extractor_tool') != executor
+                    or replacement.get('run_id') != run_id
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(request.get('expected_snapshot_sha256', '')))):
+                raise ValueError('exact original-source stale repair request required')
+            references[str(request_path)] = _ref(request_path)
+            pairs[repair_id] = {'preview': item['id'], 'folder': output.parent, 'status': None}
+        else:
+            pair = pairs.get(args[4])
+            if not pair or pair['status'] is not None or pair['folder'] != output.parent:
+                raise ValueError('not-found read must follow the exact same stale preview')
+            pair['status'] = item['id']
+    for pair in pairs.values():
+        if pair['status'] is None:
+            raise ValueError('stale preview requires its retained same-repair not-found response')
+        for key in (pair['preview'], pair['status']):
+            accepted[key] = 'readonly_stale_preview_and_not_found_status'
+    return accepted, references
+
+
+def transcript(path, session, scopes, readonly=None):
     pending, completed, sessions, failures = {}, set(), [], []
     terminal = False
     for line in Path(path).read_text().splitlines():
@@ -138,7 +199,7 @@ def transcript(path, session, scopes):
                     or item['exit_code'] == 0 and item.get('status') != 'completed'):
                 raise ValueError('complete tool exit required')
             if item['exit_code']:
-                failures.append({'id': key, 'disposition': local_failure(item, scopes)})
+                failures.append({'id': key, 'disposition': (readonly or {}).get(key) or local_failure(item, scopes)})
     if sessions != [session] or pending or not terminal:
         raise ValueError('one original session and no pending tools required')
     return failures
@@ -195,7 +256,9 @@ def validate(c, root, model, slot, session, worker, native, batches):
                 raise ValueError('known repair writes need matching applied and verified status receipts')
             repairs[str(applied)] = _ref(applied)
             repairs[str(status)] = _ref(status)
-    failures = transcript(path, session, scopes)
-    return {'retry': count + 1, 'local_failures': failures, 'evidence': {**repairs, **{
+    readonly, retained_reads = readonly_failures(path, source_keys, ec.campaign_dir(c['id']) / 'audit',
+                                                 model, c['executor'], c['models'][model]['run_id'])
+    failures = transcript(path, session, scopes, readonly)
+    return {'retry': count + 1, 'local_failures': failures, 'evidence': {**repairs, **retained_reads, **{
         name: _ref(job / name) for name in ('events.jsonl', 'scope.json', 'exit-status.json', 'assignment.md')
     }}}

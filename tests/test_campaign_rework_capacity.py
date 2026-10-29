@@ -122,6 +122,66 @@ class CapacityTests(SingleReworkTests):
         receipts.write(audit/f'{oid}-status.json',{'new_repair':'later'})
         for ref in proof['evidence'].values():self.assertEqual(capacity._ref(ref['path']),ref)
 
+    def readonly_pair(self):
+        from tools import extract_campaign as ec
+        audit = self.d/'audit'/'stale-read';audit.mkdir(parents=True)
+        source = receipts.read(self.d/'batches'/f'{self.bid}.json')['items'][0]
+        c = ec.load(self.d)
+        request = {'repair_id':'original-repair','source_description':source['source_description'],
+                   'source_obs_id':source['source_obs_id'],'expected_snapshot_sha256':'a'*64,
+                   'replacement':{'extractor_model':'m','extractor_tool':c['executor'],
+                                  'run_id':c['models']['m']['run_id']}}
+        receipts.write(audit/'request.json',request)
+        preview = {'http':409,'status':'error','code':'stale_snapshot','message':'source changed after preview'}
+        status = {'http':404,'status':'error','code':'repair_not_found'}
+        receipts.write(audit/'preview.json',preview);receipts.write(audit/'status.json',status)
+        entry = str(Path('~/.local/share/kg-hub/current/tools/extract').expanduser())
+        def command(args):return '/bin/zsh -lc '+shlex.quote(shlex.join([entry,'repair',*args]))
+        tools = [('preview',command(['preview','--file',str(audit/'request.json'),'--out',str(audit/'preview.json')]),1,json.dumps(preview)),
+                 ('status',command(['status','--repair-id','original-repair','--out',str(audit/'status.json')]),1,json.dumps(status))]
+        return audit, tools
+
+    def test_paired_stale_read_capacity_retry_preserves_inputs_and_rejects_mutation(self):
+        audit, tools = self.readonly_pair();job=self.fail_capacity(tools)
+        before={p:p.read_bytes() for p in [job/'events.jsonl',audit/'request.json',audit/'preview.json',audit/'status.json']}
+        # Preflight cannot replace the response/request after the guard approved it.
+        original=(audit/'status.json').read_bytes()
+        def changed(*args):
+            receipts.write(audit/'status.json',{'http':200});return {'ok':True}
+        from tools import campaign_rework
+        with mock.patch.object(supervision,'CAPACITY_WAIT_SECONDS',0),self.assertRaises(ValueError):
+            campaign_rework.run(self.c['id'],'m',1,batches=[self.bid],assignment=self.assignment,
+                reason='original retry',retry_capacity=True,spawn=self.spawn,preflight=changed)
+        (audit/'status.json').write_bytes(original)
+        result=self.retry();self.assertEqual(result['state'],'rework_turn_completed')
+        self.assertTrue(all(p.read_bytes()==v for p,v in before.items()))
+        proof=receipts.read(Path(result['evidence_dir'])/'capacity-retry.json')
+        self.assertEqual(len(proof['local_failures']),2)
+        self.assertTrue(all(x['disposition']=='readonly_stale_preview_and_not_found_status' for x in proof['local_failures']))
+        self.assertTrue(all(capacity._ref(x['path'])==x for x in proof['evidence'].values()))
+
+    def test_stale_read_does_not_waive_write_other_source_or_unpaired_failures(self):
+        audit,tools=self.readonly_pair();job=self.fail_capacity(tools)
+        event=job/'events.jsonl';original=event.read_text();request=(audit/'request.json').read_bytes()
+        for mutation in ['apply','unknown','permission','unpaired','foreign_source','changed_response']:
+            event.write_text(original);(audit/'request.json').write_bytes(request)
+            receipts.write(audit/'status.json',{'http':404,'status':'error','code':'repair_not_found'})
+            rows=[json.loads(x) for x in original.splitlines()]
+            if mutation=='foreign_source':
+                v=receipts.read(audit/'request.json');v['source_obs_id']='foreign';receipts.write(audit/'request.json',v)
+            elif mutation=='changed_response':receipts.write(audit/'status.json',{'http':200})
+            else:
+                for row in rows:
+                    item=row.get('item',{})
+                    if item.get('id')=='preview':
+                        if mutation=='apply':item['command']=item['command'].replace('repair preview','repair apply')
+                        if mutation=='unknown':item['command']+='; touch /tmp/never-execute'
+                        if mutation=='permission' and 'aggregated_output' in item:item['aggregated_output']='HTTP 403 Forbidden'
+                    if mutation=='unpaired' and item.get('id')=='status':item['command']=item['command'].replace('original-repair','other-repair')
+                event.write_text(''.join(json.dumps(x)+'\n' for x in rows))
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):self.retry()
+        self.assertFalse(self.spawned)
+
 
 class LocalFailureTests(unittest.TestCase):
     def test_syntax_error_has_no_executed_body(self):
