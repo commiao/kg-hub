@@ -83,7 +83,10 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
     c = ec.load(d)
     slot = ec.worker_slot(c, model, slot)
     root = ec.supervisor_dir(d, model, slot)
-    with receipts.attempt(root, kind='quality_rework', identity={'campaign': cid, 'model': model, 'slot': slot}) as update:
+    # Match the original supervisor's identity exactly. Single-worker campaigns
+    # never acquired a slot identity or a slot_sessions manifest binding.
+    identity = {'campaign': cid, 'model': model, **({'slot': slot} if slot is not None else {})}
+    with receipts.attempt(root, kind='quality_rework', identity=identity) as update:
         c = ec.load(d)
         if (c.get('dispatch') or {}).get('state') != 'draining':
             raise ValueError('rework requires claims to remain draining')
@@ -96,15 +99,21 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
         with receipts.idle(root / 'native'):
             native = receipts.read(root / 'native/latest.json')
             worker = receipts.read(root / 'worker.json')
-            session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
+            if slot is None:
+                session = worker.get('session')
+                bindings = [receipts.read(ec.supervisor_dir(d, name) / 'worker.json').get('session')
+                            for name in c['models']]
+            else:
+                session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
+                bindings = [sid for ss in c.get('slot_sessions', {}).values() for sid in ss.values()]
             # The ownership protocol already bound this exact failed native,
             # copied refusal transcript, original SID and unchanged ownership.
             # It authorizes only subsequent own-slot work, never the denied
             # cross-slot review. A new native attempt consumes that proof.
-            owner_continuation = native.get('exit_code') == 1 and ownership_valid(c, d, model, slot)
+            owner_continuation = slot is not None and native.get('exit_code') == 1 and ownership_valid(c, d, model, slot)
             if (not session or worker.get('session') != session or native.get('state') != 'completed'
                     or not native.get('ended_at') or native.get('exit_code') != 0 and not owner_continuation
-                    or sum(session == sid for ss in c['slot_sessions'].values() for sid in ss.values()) != 1):
+                    or bindings.count(session) != 1):
                 raise ValueError('original clean idle native/session required; rework does not waive a failed exit')
             if adopt_events:
                 if owner_continuation:
@@ -174,7 +183,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             args = [str(entry), 'runtime', 'exec', '--proxy-mode', ec.runtime_settings(c)['proxy_mode'],
                     '--receipt-dir', str(root / 'native'), '--', *args]
             env = dict(os.environ, KG_HUB_CAMPAIGN_ID=cid, KG_HUB_CAMPAIGN_MODEL=model,
-                       KG_HUB_CAMPAIGN_SLOT=str(slot), KG_HUB_REWORK_BATCHES=json.dumps(selected))
+                       KG_HUB_CAMPAIGN_SLOT=str(slot if slot is not None else 1),
+                       KG_HUB_REWORK_BATCHES=json.dumps(selected))
             dependencies = ec.dependency_pythonpath()
             if dependencies:env['PYTHONPATH'] = dependencies
             removed = []
