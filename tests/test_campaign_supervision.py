@@ -355,6 +355,32 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(calls), 1 + s.MAX_CAPACITY_RETRIES)
         self.assertEqual(s.completed(self.c, self.d, 'm'), 0)
 
+    def test_capacity_retry_budget_and_backoff_follow_frozen_campaign_policy(self):
+        c = ec.load(self.d)
+        c['recovery_policy'] = {'version': s.RECOVERY_POLICY_VERSION, 'capacity_wait_seconds': 1,
+                                'capacity_max_wait_seconds': 3, 'capacity_max_retries': 2}
+        ec.save(self.d, c)
+        calls, sleeps = [], []
+        out = self.run_supervisor(poll=10, sleep=sleeps.append, spawn=self.capacity_spawn(calls, always=True))
+        self.assertEqual(out['reason'], 'model_capacity_exhausted')
+        self.assertEqual(len(calls), 1 + 2)          # 战役策略 2 次，不是模块缺省
+        self.assertEqual([x for x in sleeps if x in (1, 2)], [1, 2])   # 1 秒、翻倍到 2 秒，再退就超预算
+        self.assertEqual(r.read(self.d / 'supervisors/m/worker.json')['capacity_retries'], 2)
+
+    def test_capacity_policy_defaults_bounds_and_doubling(self):
+        policy = s.capacity_policy({})
+        self.assertEqual(policy, {'capacity_wait_seconds': 300, 'capacity_max_wait_seconds': 3600,
+                                  'capacity_max_retries': 6})
+        self.assertEqual([s.capacity_wait(policy, n) for n in range(1, 8)],
+                         [300, 600, 1200, 2400, 3600, 3600, 3600])
+        self.assertEqual(s.capacity_wait({**policy, 'capacity_wait_seconds': 0}, 3), 0)   # 测试把等待打到 0
+        for bad in [{'version': 'other'}, {'version': s.RECOVERY_POLICY_VERSION, 'nope': 1},
+                    {'version': s.RECOVERY_POLICY_VERSION, 'capacity_max_retries': 0},
+                    {'version': s.RECOVERY_POLICY_VERSION, 'capacity_max_retries': True},
+                    {'version': s.RECOVERY_POLICY_VERSION, 'capacity_wait_seconds': 10, 'capacity_max_wait_seconds': 5}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                s.capacity_policy({'recovery_policy': bad})
+
     def test_capacity_does_not_clear_unknown_write(self):
         calls = []
         out = self.run_supervisor(poll=.01, sleep=lambda _: None,
