@@ -192,5 +192,88 @@ python3 -c "print(1)"' '''
         with self.assertRaisesRegex(ValueError,'unstarted original batch'):
             local.reconcile(self.c['id'],'m',2,**args)
 
+    def summary_handoff(self):
+        import shlex
+        from tools.campaign_summary_handoff import DENIAL
+        request,review=self.repair();root,event=self.worker('m',2,kind='business_permission_denied')
+        c=ec.load(self.d);b=ec.find_batch(c,self.bid);sid=b['ids'][0]
+        b['reviews']=[{'obs':sid,'verdict':'error','kind':'random'}];ec.save(self.d,c)
+        audit=self.d/'audit';audit.mkdir(exist_ok=True)
+        def evidence(name,value):
+            p=audit/name;receipts.write(p,value)
+            return {'path':str(p),'sha256':cc.file_sha(p)}
+        scope=evidence('denied-scope.json',{'operation':'summary','node':{'name':'script.sh'},'summary_to':'candidate'})
+        preview=evidence('identity.json',{'http':200,'scope':{'operation':'summary','node':{'uuid':'original-node'}},
+            'snapshot':{'nodes':[{'uuid':'original-node','props':{'name':'script.sh','summary':'Existing script identity'}}]}})
+        accepted=evidence('accepted-source.json',{'accepted':True,'original_random_error_retained':True})
+        shell=f'python3 - <<\'PY\'\nprint("preparation")\nPY\n"${{KG_HUB_CODE:-$HOME/.local/share/kg-hub/current}}/tools/extract" nodes preview --file {scope["path"]} --out {audit}/unused.json'
+        command='/bin/zsh -lc '+shlex.quote(shell)
+        rows=[{'type':'thread.started','thread_id':'original-m-2'},
+            {'type':'item.started','item':{'id':'denied','type':'command_execution','command':command}},
+            {'type':'item.completed','item':{'id':'denied','type':'command_execution','command':command,'exit_code':1,'aggregated_output':DENIAL+'\n'}},
+            {'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'recovery_kind':'business_permission_denied'})}},
+            {'type':'turn.completed'}]
+        event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        value={'version':'shared-summary-handoff-v1','campaign':c['id'],'batch':self.bid,'model':'m','slot':2,
+            'session':'original-m-2','events_sha256':cc.file_sha(event),'command_id':'denied','reviewer':'coordinator',
+            'note':'Read identity and source repair; no shared summary mutation approved','accepted':True,
+            'disposition':'identity_only_no_summary_change','scope':scope,'identity_preview':preview,'node_uuid':'original-node',
+            'repairs':[{'source_id':sid,'repair_id':request['repair_id'],'acceptance':accepted}]}
+        path=audit/'handoff.json';receipts.write(path,value)
+        response={'status':'ok','repair':{'state':'applied','repair_id':request['repair_id'],'request':request,'result':{'verified':True}}}
+        def http(method,url,payload,token):
+            self.assertEqual(method,'GET');self.assertIsNone(payload)
+            return 200,response
+        args=dict(bid=self.bid,summary_handoff=path,reason='coordinator identity audit complete',url='invalid',token=None,
+                  preflight=lambda *a:{'ok':True},http=http)
+        return path,value,event,rows,response,args
+
+    def test_summary_handoff_never_replays_governance_and_keeps_original_errors(self):
+        path,value,event,rows,response,args=self.summary_handoff()
+        before=event.read_bytes();original=ec.load(self.d)['batches']
+        out=local.reconcile(self.c['id'],'m',2,**args)
+        self.assertEqual(out['kind'],'summary_identity_handoff_accepted');self.assertEqual(out['graph_writes'],0)
+        self.assertTrue(local.valid(ec.load(self.d),self.d,'m',2))
+        self.assertEqual(event.read_bytes(),before);self.assertEqual(ec.load(self.d)['batches'],original)
+        from tools.campaign_dispatch import resume
+        self.assertEqual(resume(self.c['id'],reason='exact coordinator handoff accepted')['dispatch']['state'],'running')
+        p=Path(value['identity_preview']['path']);p.write_text('{}')
+        self.assertFalse(local.valid(ec.load(self.d),self.d,'m',2))
+
+    def test_summary_handoff_rejects_foreign_unverified_or_missing_source_repair(self):
+        path,value,event,rows,response,args=self.summary_handoff()
+        base=copy.deepcopy(response)
+        for change in ['unverified','foreign_source','foreign_model','missing_review']:
+            response.clear();response.update(copy.deepcopy(base));candidate=copy.deepcopy(value)
+            if change=='unverified':response['repair']['result']['verified']=False
+            if change=='foreign_source':response['repair']['request']['source_obs_id']='foreign'
+            if change=='foreign_model':response['repair']['request']['replacement']['extractor_model']='foreign'
+            if change=='missing_review':candidate['repairs']=[]
+            receipts.write(path,candidate)
+            with self.subTest(change=change),self.assertRaises(ValueError):local.reconcile(self.c['id'],'m',2,**args)
+
+    def test_summary_handoff_does_not_treat_source_text_as_a_permission_failure(self):
+        path,value,event,rows,response,args=self.summary_handoff()
+        command='cat frozen-source.json'
+        items=[{'type':'item.started','item':{'id':'source','type':'command_execution','command':command}},
+               {'type':'item.completed','item':{'id':'source','type':'command_execution','command':command,
+                   'exit_code':0,'aggregated_output':'Historical source: diagnostic returned HTTP 401 without its token'}}]
+        rows[1:1]=items;event.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        value['events_sha256']=cc.file_sha(event);receipts.write(path,value)
+        self.assertEqual(local.reconcile(self.c['id'],'m',2,**args)['graph_writes'],0)
+
+    def test_summary_handoff_rejects_other_denial_apply_and_changed_scope(self):
+        path,value,event,rows,response,args=self.summary_handoff()
+        for change in ['approval','apply','scope','foreign_session']:
+            changed=copy.deepcopy(rows);candidate=copy.deepcopy(value)
+            if change=='approval':changed[2]['item']['aggregated_output']='This action was rejected due to unacceptable risk'
+            if change=='apply':
+                for n in (1,2):changed[n]['item']['command']=changed[n]['item']['command'].replace('nodes preview','nodes apply')
+            if change=='scope':candidate['scope']=candidate['identity_preview']
+            if change=='foreign_session':candidate['session']='foreign'
+            event.write_text(''.join(json.dumps(r)+'\n' for r in changed));candidate['events_sha256']=cc.file_sha(event)
+            receipts.write(path,candidate)
+            with self.subTest(change=change),self.assertRaises(ValueError):local.reconcile(self.c['id'],'m',2,**args)
+
 
 if __name__=='__main__':unittest.main()
