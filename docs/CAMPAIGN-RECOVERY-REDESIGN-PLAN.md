@@ -1,6 +1,6 @@
 # 战役恢复机制改造方案（草案）
 
-> 起草：2026-10-29，Claude（本机 kg-hub 协调会话）。状态：**草案，未批准，未实施**。
+> 起草：2026-10-29，Claude（本机 kg-hub 协调会话）。状态：原则（A 类自动重试不需人批）已接受；P0 已合入（#302），P1 已实现待发布，P2/P3 未做。
 > 范围：`tools/extract_campaign.py` 及 `tools/campaign_*.py` 的监督/恢复层。不触碰抽取规则、质量门、图写入协议、NAS 服务。
 
 ## 1. 问题陈述
@@ -92,7 +92,7 @@ A 类的安全前提：**重试前先做一次只读对账**（现有 `reconcile
 | 阶段 | 内容 | 产出 | 风险 |
 |---|---|---|---|
 | **P0 不改代码** | 让当前 8000 条剩余 300 和 Sol-2000 按现状跑完；本阶段只把 `recovery_policy` 参数（容量重试 3→6 次）和 slot 3 空 blocker 修一下 | 1 个小 PR | 低 |
-| **P1 客观分类 + 自动退避** | 改 `campaign_supervision.py`：客观信号分类、A 类内置只读对账后同 SID 续跑、C 类有界退避；改 `classify()` 不再对未知直接封死 | 1 个 PR + 故障注入测试（容量、502、温控、WebSocket、未知） | 中：对账步骤要覆盖"部分写入"，已有测试可复用 |
+| **P1 客观分类 + 自动退避** | 改 `campaign_supervision.py`：客观信号分类、A 类内置只读对账后同 SID 续跑、C 类有界退避；改 `classify()` 不再对未知直接封死。**已实现**（2026-10-29，见 [docs/executors/campaign.md](executors/campaign.md) 「终态客观分类与自动退避」；`thermal_resume_below_c` / `blackout_windows` 两键未做，温控等价于 76 退避＋`/health` 探测） | 1 个 PR + 故障注入测试（容量、502、温控、WebSocket、未知） | 中：对账步骤要覆盖"部分写入"，已有测试可复用 |
 | **P2 launchd 守护** | supervise/watch 迁入 launchd；codex 会话去掉循环职责 | 1 个 PR + plist 模板 | 低 |
 | **P3 工具面收敛** | 冻结 reconcile-* 列表；合并重复的 continuation/rework 模块 | 删代码的 PR | 中：要保证公开 CLI 合同不变 |
 
