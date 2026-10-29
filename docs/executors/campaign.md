@@ -416,6 +416,19 @@ apply 在锁内重新核对全部输入及冻结配置，保存不可变预览/�
 错误、原成功会话锚点和未变的说明/批次；失败回执另存而不改写。出现任何原生事件、真实审批/
 provider/NAS 拒绝、未知写入或上次重试也失败时均不适用；不能用该选项反复启动或解除沙箱。
 
+已运行的返工若以精确 `Selected model is at capacity. Please try a different model.`
+及 native exit1/turn.failed 结束，协调器可在至少300秒后显式加 `--retry-capacity`。
+它仅续原session、原已提交批次，最多连续三次，始终保持draining；不调用模型探测、不增加配额。
+要求每个工具及私有文件改动都有配对终态、原提交操作已完成，已知repair写入有同ID的
+applied/verified回执。协调器仍须先通过公共repair status核对最新服务状态；本地回执不是语义验收。
+任一实际审批/NAS/其他提供商拒绝、未知工具、未结束工具或失败写入均拒绝。
+只接受三个可证明未写的本地错误：错误层级的纯help参数解析、Python正文语法错误，
+以及完整AST匹配的顺序修复包装在首次写入前因快照props形状而失败（必须仅有该断言traceback，
+不得有先前迭代输出或额外操作）。不把一般KeyError或任意Python脚本当作安全失败。
+原失败事件、scope与退出回执及已知修复回执摘要另存至新job的capacity-retry.json；
+原worker/native回执保存不可变副本。该选项不能与startup/adoption/maintenance例外组合。
+启动仍须经获准宿主环境；完整返工、专项记录和协调器质量验收完成后才可恢复生产领取。
+
 不能先全额resume再补质量欠账。协调器使用独立 `rework` 入口，仍由原模型、原槽位和原session
 完成自己已提交的批次，不把批次交给协助槽。普通supervise在draining时不新开模型回合。
 

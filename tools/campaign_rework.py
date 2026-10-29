@@ -73,13 +73,15 @@ def _adoption(c, d, model, slot, session, native, events, terminal, batches):
 
 
 def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, adopt_exit=None,
-        maintenance_review=None, retry_startup=False, spawn=subprocess.Popen, preflight=None):
+        maintenance_review=None, retry_startup=False, retry_capacity=False, spawn=subprocess.Popen, preflight=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip() or bool(adopt_events) != bool(adopt_exit):
         raise ValueError('coordinator reason and paired optional adoption evidence required')
     if maintenance_review and adopt_events:
         raise ValueError('maintenance continuation cannot adopt another invocation')
     if retry_startup and (maintenance_review or adopt_events):
         raise ValueError('startup retry cannot adopt or waive another continuation')
+    if retry_capacity and (retry_startup or maintenance_review or adopt_events):
+        raise ValueError('capacity retry cannot combine other continuations')
     ec.tracking_guard()
     d = ec.campaign_dir(cid)
     c = ec.load(d)
@@ -109,18 +111,22 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
                 bindings = [sid for ss in c.get('slot_sessions', {}).values() for sid in ss.values()]
             startup = None
+            capacity = None
             owner_worker, owner_native = worker, native
             if retry_startup:
                 from tools.campaign_rework_startup import validate as startup_validate
                 owner_worker, owner_native, startup = startup_validate(
                     c, root, model, slot, session, worker, native, selected, assignment)
+            if retry_capacity:
+                from tools.campaign_rework_capacity import validate as capacity_validate
+                capacity = capacity_validate(c, root, model, slot, session, worker, native, selected)
             # The ownership protocol already bound this exact failed native,
             # copied refusal transcript, original SID and unchanged ownership.
             # It authorizes only subsequent own-slot work, never the denied
             # cross-slot review. A new native attempt consumes that proof.
             owner_continuation = slot is not None and native.get('exit_code') == 1 and ownership_valid(c, d, model, slot)
             if (not session or worker.get('session') != session or owner_native.get('state') != 'completed'
-                    or not owner_native.get('ended_at') or owner_native.get('exit_code') != 0 and not owner_continuation
+                    or not owner_native.get('ended_at') or owner_native.get('exit_code') != 0 and not (owner_continuation or capacity)
                     or bindings.count(session) != 1):
                 raise ValueError('original clean idle native/session required; rework does not waive a failed exit')
             if adopt_events:
@@ -140,7 +146,7 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 if outcome.get('recovery_kind') == 'quality_process_violation':
                     from tools.campaign_quality_stop import validate
                     quality_stop = validate(c, d, model, slot, session, path, selected, owner_native)
-                expected_terminal = None if owner_continuation else 'turn.completed'
+                expected_terminal = None if owner_continuation else 'turn.failed' if capacity else 'turn.completed'
                 if (outcome.get('session') != session or outcome.get('terminal') != expected_terminal
                         or outcome.get('hard_stop') or outcome.get('approval_refused')
                         or not owner_continuation and not supervision.normal_recovery(outcome.get('recovery_kind'))
@@ -159,6 +165,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
                 for ref in startup.values():
                     if _ref(ref['path']) != ref:
                         raise ValueError('startup failure evidence changed before retry')
+            if capacity and capacity_validate(c, root, model, slot, session, worker, native, selected) != capacity:
+                raise ValueError('capacity evidence changed during preflight')
             if maintenance_review:
                 maintenance_protocol.restored(maintenance,flight)
                 if maintenance_protocol.validate(c,d,model,slot,selected,maintenance_review)!=maintenance:
@@ -171,6 +179,22 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             job.mkdir(parents=True)
             (job / 'previous-worker.json').write_bytes((root / 'worker.json').read_bytes())
             (job / 'previous-native.json').write_bytes((root / 'native/latest.json').read_bytes())
+            if capacity:
+                frozen = {}
+                proof_dir = job / 'capacity-evidence'
+                proof_dir.mkdir()
+                for index, (name, ref) in enumerate(capacity['evidence'].items()):
+                    if _ref(ref['path']) != ref:
+                        raise ValueError('capacity evidence changed before snapshot')
+                    target = proof_dir / (str(index) + '-' + Path(ref['path']).name)
+                    target.write_bytes(Path(ref['path']).read_bytes())
+                    copied = _ref(target)
+                    if copied['sha256'] != ref['sha256']:
+                        raise ValueError('capacity snapshot differs from reviewed evidence')
+                    frozen[name] = copied
+                receipts.write(job / 'capacity-retry.json', {**capacity, 'evidence': frozen,
+                    'failed_native': _ref(job / 'previous-native.json'),
+                    'failed_worker': _ref(job / 'previous-worker.json')})
             if startup:
                 # latest.json and worker.json will advance during this attempt;
                 # retain verifiable references to their immutable saved copies.
@@ -217,6 +241,8 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
         # Release the observed native idle lock before its runtime acquires it;
         # the held supervisor lease prevents a second managed call of this slot.
         saved = {'session': session, 'events': str(out), 'stderr': str(err), 'mode': 'quality_rework', 'batches': selected}
+        if capacity:
+            saved['capacity_retries'] = capacity['retry']
         receipts.write(root / 'worker.json', saved)
         with out.open('xb') as stdout, err.open('xb') as stderr:
             child = spawn(args, cwd=ec.workspace_dir(), stdin=subprocess.DEVNULL, stdout=stdout,
