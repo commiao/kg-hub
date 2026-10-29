@@ -86,7 +86,7 @@ def events(path: Path) -> dict:
                 result['approval_refused'] = True
             if (row.get("type") == "item.completed" and item.get("type") == "command_execution"
                     and item.get("exit_code") in (75, 76)
-                    and re.search(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+campaign\s+submit\b", item.get("command", ""))):
+                    and re.search(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+campaign\s+(?:submit|prepare)\b", item.get("command", ""))):
                 result["hard_stop"] = item["exit_code"]
                 result.setdefault("hard_stops", []).append({"id": item.get("id"),
                     "command": item.get("command", ""), "exit_code": item["exit_code"]})
