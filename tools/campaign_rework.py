@@ -172,7 +172,11 @@ def run(cid, model, slot, *, batches, assignment, reason, adopt_events=None, ado
             (job / 'previous-worker.json').write_bytes((root / 'worker.json').read_bytes())
             (job / 'previous-native.json').write_bytes((root / 'native/latest.json').read_bytes())
             if startup:
-                receipts.write(job / 'startup-retry.json', startup)
+                # latest.json and worker.json will advance during this attempt;
+                # retain verifiable references to their immutable saved copies.
+                receipts.write(job / 'startup-retry.json', {**startup,
+                    'failed_native': _ref(job / 'previous-native.json'),
+                    'failed_worker': _ref(job / 'previous-worker.json')})
             if owner_continuation:
                 receipts.write(job / 'ownership-continuation.json',
                                _ref(root / 'ownership-continuation-active.json'))
