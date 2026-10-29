@@ -137,9 +137,14 @@ class SupervisorTests(unittest.TestCase):
                   "models": {"m": {"run_id": "r"}}, "batches": [
                       {"id": "b", "chain": "c0", "model": "m", "ids": [1, 2], "status": "claimed"}]}
         ec.save(self.d, self.c)
+        self.checks = []
 
     def tearDown(self):
         self.token.stop(); self.guard.stop(); self.workspace_patch.stop(); self.env.stop(); self.temp.cleanup()
+
+    def absent_check(self, items, url, token):
+        self.checks.append([i['source_obs_id'] for i in items])
+        return {i['source_obs_id']: None for i in items}
 
     def formal(self, oid, status="ok", **fields):
         with (self.d / "log.jsonl").open("a") as out:
@@ -165,6 +170,8 @@ class SupervisorTests(unittest.TestCase):
 
     def run_supervisor(self, **kwargs):
         kwargs.setdefault('preflight',lambda *a: {'ok':True})
+        kwargs.setdefault('health', lambda *a: True)
+        kwargs.setdefault('check', getattr(self, 'absent_check', None) or (lambda items, *a: {i['source_obs_id']: None for i in items}))
         if "adopt_exit" not in kwargs:
             exit_file, log = self.root / "old-exit.json", self.root / "old-events.jsonl"
             exit_file.write_text(json.dumps({"exit_code":0,"ended_at":"2026-10-25T00:00:00Z"}))
@@ -309,11 +316,11 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(out['reason'],'native_terminal_unverified')
         self.assertFalse(calls)
 
-    def capacity_spawn(self, calls, *, always=False, extra_error=None, unsafe_submit=False):
+    def capacity_spawn(self, calls, *, always=False, extra_error=None, unsafe_submit=False, failures=1):
         normal = self.native([])
         def spawn(args, **kw):
             calls.append(args)
-            if len(calls) > 1 and not always:
+            if len(calls) > failures and not always:
                 self.formal(1); self.formal(2)
                 return normal(args, **kw)
             directory = Path(args[args.index('--receipt-dir') + 1])
@@ -389,11 +396,21 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_capacity_does_not_override_unrelated_provider_error(self):
+        # An unrelated provider error next to the capacity text is not a capacity
+        # refusal: no capacity retry is spent. It is class C (unknown): one bounded
+        # retry under the frozen policy, then the coordinator with the raw terminal.
+        c = ec.load(self.d)
+        c['recovery_policy'] = {'version': s.RECOVERY_POLICY_VERSION, 'unknown_backoff_seconds': [1]}
+        ec.save(self.d, c)
         calls = []
         out = self.run_supervisor(poll=.01, sleep=lambda _: None,
-                                  spawn=self.capacity_spawn(calls, extra_error='authentication failed'))
+                                  spawn=self.capacity_spawn(calls, always=True, extra_error='authentication failed'))
         self.assertEqual(out['state'], 'blocked')
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(out['reason'], 'native_worker_blocked')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(r.read(self.d / 'supervisors/m/worker.json')['capacity_retries'], 0)
+        self.assertIn('authentication failed', json.dumps(out['detail']['native_errors']))
+        self.assertEqual(out['detail']['events_terminal'], 'turn.failed')
 
     def test_capacity_after_real_cli_reconnect_notice_resumes_same_session(self):
         calls=[]
@@ -428,6 +445,229 @@ class SupervisorTests(unittest.TestCase):
         p.write_text(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message',
             'text': s.CAPACITY_MESSAGE}}) + '\n' + json.dumps({'type': 'turn.failed'}) + '\n')
         self.assertFalse(s.events(p).get('capacity_refused'))
+
+
+class ObjectiveClassificationTests(SupervisorTests):
+    """Fault injection for the 2026-10-29 recovery redesign (plan §3.1/3.2, acceptance §5).
+
+    Class A (infrastructure/capacity) and class C (unknown) must never produce
+    coordinator_required within budget and must never write twice; class B keeps
+    stopping exactly as before.
+    """
+    SUBMIT = '/stable/tools/extract campaign submit --id synthetic --batch b'
+
+    def setUp(self):
+        super().setUp()
+        (self.d / "batches").mkdir(exist_ok=True)
+        (self.d / "batches/b.json").write_text(json.dumps({"items": [
+            {"id": 1, "source_description": "s", "source_obs_id": "o1"},
+            {"id": 2, "source_description": "s", "source_obs_id": "o2"}]}))
+        self.submits = mock.patch.object(ax, 'submit_results', side_effect=AssertionError('graph write attempted'))
+        self.submits.start()
+
+    def tearDown(self):
+        self.submits.stop()
+        super().tearDown()
+
+    def failing(self, calls, rows, *, exit_code=1, failures=1, stderr=b'', before=None):
+        normal = self.native([])
+        def spawn(args, **kw):
+            calls.append(args)
+            if len(calls) > failures:
+                self.formal(1); self.formal(2)
+                return normal(args, **kw)
+            directory = Path(args[args.index('--receipt-dir') + 1])
+            with r.attempt(directory, kind='native_cli') as update:
+                update(exit_code=exit_code)
+                if before: before()
+                for row in [{'type': 'thread.started', 'thread_id': 'same-session'}, *rows]:
+                    kw['stdout'].write((json.dumps(row) + '\n').encode())
+                kw['stdout'].flush()
+                kw['stderr'].write(stderr); kw['stderr'].flush()
+            return mock.Mock(poll=lambda: 0)
+        return spawn
+
+    def tracking_sleep(self, sleeps, phases, clock=None):
+        """A receipt only keeps its last phase; observe intermediate phases while the supervisor sleeps."""
+        def sleep(x):
+            sleeps.append(x)
+            phases.add(r.read(self.d / 'supervisors/m/latest.json').get('phase'))
+            if clock is not None:
+                clock[0] += x
+        return sleep
+
+    def reset(self):
+        self.tearDown(); self.setUp()
+
+    def gate_timeout(self):
+        """What cmd_submit leaves behind when the NAS gate refuses with 76 before any write."""
+        try:
+            with r.attempt(self.d / 'operations/b', kind='submit', identity={'campaign': 'synthetic', 'batch': 'b'}) as update:
+                update(phase='waiting_nas', may_have_written=False,
+                       source_keys=[{'source_description': 's', 'source_obs_id': 'o1'},
+                                    {'source_description': 's', 'source_obs_id': 'o2'}])
+                raise SystemExit(76)
+        except SystemExit:
+            pass
+
+    def assert_automatic(self, out, calls, expected_calls):
+        self.assertEqual(out['state'], 'complete')
+        self.assertEqual(len(calls), expected_calls)
+        for call in calls[1:]:
+            self.assertEqual(call[call.index('resume') + 1], 'same-session')
+        self.assertEqual(r.read(self.d / 'supervisors/m/latest.json').get('phase'), 'quota_complete')
+        self.assertEqual(s.completed(ec.load(self.d), self.d, 'm'), 2)
+        worker = r.read(self.d / 'supervisors/m/worker.json')
+        self.assertEqual((worker['infra_retries'], worker['unknown_retries'], worker['infra_streak_started_at']), (0, 0, None))
+
+    def test_five_consecutive_capacity_refusals_resume_without_coordinator(self):
+        calls, sleeps, phases = [], [], set()
+        out = self.run_supervisor(poll=10, sleep=self.tracking_sleep(sleeps, phases), spawn=self.capacity_spawn(calls, failures=5))
+        self.assert_automatic(out, calls, 6)
+        self.assertGreaterEqual(sum(sleeps), 300 + 600 + 1200 + 2400 + 3600)
+        self.assertIn('waiting_model_capacity', phases)
+        self.assertNotIn('coordinator_required', phases)
+
+    def test_persistent_http502_backs_off_then_resumes_within_window(self):
+        rows = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 1,
+                 'command': '/stable/tools/extract campaign prepare --id synthetic --batch b',
+                 'aggregated_output': 'urllib.error.HTTPError: HTTP Error 502: Bad Gateway'}},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps({'recovery_kind': 'infrastructure_failed'})}},
+                {'type': 'turn.completed'}]
+        calls, sleeps, phases, now = [], [], set(), [0.0]
+        out = self.run_supervisor(poll=10, sleep=self.tracking_sleep(sleeps, phases, now), clock=lambda: now[0],
+                                  spawn=self.failing(calls, rows, exit_code=0, failures=5))
+        self.assert_automatic(out, calls, 6)
+        self.assertGreaterEqual(sum(sleeps), 300 + 600 + 1200 + 2400 + 3600)
+        self.assertLess(now[0], s.INFRA_MAX_WINDOW_SECONDS)
+        self.assertIn('waiting_infrastructure', phases)
+        self.assertNotIn('coordinator_required', phases)
+        self.assertFalse(self.checks)   # nothing failed-before-write to read back; no graph write either way
+
+    def test_infrastructure_window_is_bounded_and_blocks_with_raw_terminal(self):
+        c = ec.load(self.d)
+        c['recovery_policy'] = {'version': s.RECOVERY_POLICY_VERSION, 'infra_backoff_seconds': [100, 200],
+                                'infra_max_window_seconds': 450}
+        ec.save(self.d, c)
+        rows = [{'type': 'error', 'message': 'ReadTimeout: HTTPSConnectionPool read timed out'},
+                {'type': 'turn.failed', 'error': {'message': 'stream disconnected before completion'}}]
+        calls, sleeps, phases, now = [], [], set(), [0.0]
+        out = self.run_supervisor(poll=10, sleep=self.tracking_sleep(sleeps, phases, now), clock=lambda: now[0],
+                                  spawn=self.failing(calls, rows, failures=9, stderr=b'codex: transport failure trace'))
+        self.assertEqual((out['state'], out['reason']), ('blocked', 'infrastructure_backoff_exhausted'))
+        self.assertEqual(len(calls), 3)          # 100 + 200 spent; a third 200 would pass the 450-second window
+        self.assertIn('transport failure trace', out['detail']['stderr_tail'])
+        self.assertEqual(out['detail']['infra_signals'][0]['kind'], 'read_timeout')
+        self.assertEqual(s.completed(ec.load(self.d), self.d, 'm'), 0)
+
+    def test_nas_gate_timeout_exit76_is_reconciled_read_only_then_resumed(self):
+        rows = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 76, 'command': self.SUBMIT,
+                 'aggregated_output': 'NAS FIFO 队列超过 3600 秒无进展'}},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps({'recovery_kind': 'nas_refused'})}},
+                {'type': 'turn.completed'}]
+        calls = []
+        out = self.run_supervisor(poll=.01, sleep=lambda _: None, spawn=self.failing(calls, rows, exit_code=0, before=self.gate_timeout))
+        self.assert_automatic(out, calls, 2)
+        self.assertEqual(self.checks, [['o1', 'o2']])          # one read-only service read-back
+        op = r.status(self.d / 'operations/b')
+        self.assertEqual((op['state'], op['exit_code'], op['may_have_written']), ('reconciled_not_written', 76, False))
+
+    def test_nas_gate_timeout_with_present_source_is_not_retried(self):
+        rows = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 76, 'command': self.SUBMIT}},
+                {'type': 'turn.completed'}]
+        calls = []
+        out = self.run_supervisor(poll=.01, sleep=lambda _: None, check=lambda items, *a: {i['source_obs_id']: 'ok' for i in items},
+                                  spawn=self.failing(calls, rows, exit_code=0, before=self.gate_timeout))
+        self.assertEqual((out['state'], out['reason'], out['business_exit_code'] if 'business_exit_code' in out else 76),
+                         ('blocked', 'nas_gate_refused', 76))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out['reconciliation']['batches']['b']['state'], 'remote_unverified')
+
+    def test_websocket_reset_resumes_same_session(self):
+        notice = 'Reconnecting... 3/5 (stream disconnected before completion: WebSocket protocol error: Connection reset without closing handshake)'
+        rows = [{'type': 'error', 'message': notice},
+                {'type': 'turn.failed', 'error': {'message': 'stream disconnected before completion: WebSocket protocol error: Connection reset without closing handshake'}}]
+        calls, sleeps, phases = [], [], set()
+        out = self.run_supervisor(poll=.01, sleep=self.tracking_sleep(sleeps, phases), spawn=self.failing(calls, rows))
+        self.assert_automatic(out, calls, 2)
+        latest = r.read(self.d / 'supervisors/m/latest.json')
+        self.assertEqual((latest.get('terminal_class'), latest.get('terminal_signal')), ('clean', None))   # final turn
+        self.assertIn('waiting_infrastructure', phases)
+
+    def test_unknown_exit3_backs_off_then_resumes_and_is_bounded(self):
+        rows = [{'type': 'turn.failed', 'error': {'message': 'something nobody has seen before'}}]
+        calls, sleeps, phases = [], [], set()
+        out = self.run_supervisor(poll=10, sleep=self.tracking_sleep(sleeps, phases), spawn=self.failing(calls, rows, exit_code=3))
+        self.assert_automatic(out, calls, 2)
+        self.assertGreaterEqual(sum(sleeps), 600)
+        self.assertIn('waiting_unknown_terminal', phases)
+        # Budget: default two unknown retries, then the coordinator with the raw terminal.
+        self.reset()
+        calls = []
+        out = self.run_supervisor(poll=10, sleep=lambda _: None,
+                                  spawn=self.failing(calls, rows, exit_code=3, failures=9, stderr=b'Traceback: weird'))
+        self.assertEqual((out['state'], out['reason']), ('blocked', 'native_worker_blocked'))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual((out['detail']['exit_code'], out['detail']['events_terminal']), (3, 'turn.failed'))
+        self.assertIn('weird', out['detail']['stderr_tail'])
+        self.assertEqual(out['detail']['unknown_retries'], 2)
+
+    def test_unknown_terminal_with_unreachable_nas_waits_for_health(self):
+        rows = [{'type': 'turn.failed', 'error': {'message': 'exit without explanation'}}]
+        probes = []
+        def health(*a):
+            probes.append(1)
+            return len(probes) > 3
+        calls, sleeps, phases = [], [], set()
+        out = self.run_supervisor(poll=10, sleep=self.tracking_sleep(sleeps, phases), health=health,
+                                  spawn=self.failing(calls, rows, exit_code=2))
+        self.assert_automatic(out, calls, 2)
+        self.assertIn('waiting_nas_health', phases)
+        self.assertEqual(r.read(self.d / 'supervisors/m/latest.json').get('unknown_retries'), 0)
+        self.assertGreaterEqual(len(probes), 4)
+
+    def test_business_stops_still_block_at_once(self):
+        for kind in ('business_permission_denied', 'quality_process_violation', 'uncertain_submit', 'approval_rejected'):
+            with self.subTest(kind=kind):
+                self.reset()
+                calls = []
+                out = self.run_supervisor(poll=.01, sleep=lambda _: None, spawn=self.native(calls, [kind]))
+                self.assertEqual((out['state'], out['reason']), ('blocked', 'native_worker_blocked'))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(out['detail']['recovery_kind'], kind)
+        self.reset()
+        rows = [{'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 75, 'command': self.SUBMIT}},
+                {'type': 'turn.completed'}]
+        calls = []
+        out = self.run_supervisor(poll=.01, sleep=lambda _: None, spawn=self.failing(calls, rows, exit_code=0))
+        self.assertEqual((out['state'], out['reason'], out['business_exit_code']), ('blocked', 'nas_gate_refused', 75))
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.checks)
+
+    def test_transport_text_inside_agent_prose_is_not_an_infrastructure_signal(self):
+        p = self.root / 'prose.events'
+        rows = [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'the body mentions HTTP Error 502 and a WebSocket'}},
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 0,
+                 'command': self.SUBMIT, 'aggregated_output': 'ReadTimeout quoted in a successful command'}},
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'exit_code': 1,
+                 'command': 'cat observation.md', 'aggregated_output': 'HTTP Error 503 in an observation body'}},
+                {'type': 'turn.completed'}]
+        p.write_text(''.join(json.dumps(x) + '\n' for x in rows))
+        self.assertNotIn('infra_signals', s.events(p))
+        self.assertEqual(s.classify_terminal(s.events(p), {'state': 'completed', 'exit_code': 2, 'ended_at': 't'})['class'], 'unknown')
+
+    def test_recovery_policy_backoff_keys_are_validated(self):
+        policy = s.recovery_policy({})
+        self.assertEqual((policy['infra_backoff_seconds'], policy['infra_max_window_seconds'], policy['unknown_backoff_seconds']),
+                         ([300, 600, 1200, 2400, 3600], 21600, [600, 1800]))
+        self.assertEqual([s.backoff_wait(policy['infra_backoff_seconds'], n) for n in (1, 5, 6, 9)], [300, 3600, 3600, 3600])
+        for bad in [{'infra_backoff_seconds': []}, {'infra_backoff_seconds': [0]}, {'infra_backoff_seconds': 300},
+                    {'unknown_backoff_seconds': [1.5]}, {'infra_max_window_seconds': 10, 'infra_backoff_seconds': [300]},
+                    {'infra_max_window_seconds': 0}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                s.recovery_policy({'recovery_policy': {'version': s.RECOVERY_POLICY_VERSION, **bad}})
+        self.assertEqual(s.capacity_policy({'recovery_policy': {'version': s.RECOVERY_POLICY_VERSION, 'unknown_backoff_seconds': [5]}}),
+                         {'capacity_wait_seconds': 300, 'capacity_max_wait_seconds': 3600, 'capacity_max_retries': 6})
 
 
 if __name__ == "__main__":

@@ -673,6 +673,32 @@ Only the exact native `Selected model is at capacity. Please try a different mod
 
 缺省序列为 300/600/1200/2400/3600/3600 秒，总计约 2.9 小时后才报 `model_capacity_exhausted`（2026-10-29 之前固定 3×300 秒，容量拒绝超过 15 分钟就把整条战役封死）。每次退避前都会检查 dispatch 是否已 draining。`campaign status` 的 `recovery_policy` 显示实际生效值，`recovery_manager.slots` 显示 observer 最近一次给每个槽位的动作和 `blocked` 原因。返工的 `--retry-capacity` 读取同一策略。在途战役不受发布影响：策略只在启动时冻结。
 
+### 终态客观分类与自动退避（恢复机制改造 P1）
+
+native 退出后，监督器（`tools/campaign_supervision.py` 的 `classify_terminal`）先按**客观信号**分类，worker 在最终 JSON 自报的 `recovery_kind` 只作旁证；`campaign_recovery_manager.classify()` 用同一套判定给 observer 出动作。三类固定处置：
+
+| 类别 | 判定信号（按优先级） | 处置 |
+|---|---|---|
+| **B 业务/质量/审批** | 事件里记录的审批拒绝；`campaign submit/prepare` 退出 **75**（读不到 NAS 温度）；worker 自报 `approval_rejected` / `business_permission_denied` / `quality_process_violation` / `uncertain_submit` / `nas_refused`（无 76 退出码时） | **逐字不变**：`coordinator_required`，reason 仍是 `native_worker_blocked` / `nas_gate_refused`，等人；observer 侧仍是 `approval_required` / `nas_reconciliation_required` / `registered_rework_required` / `engineering_reconciliation_required` 并触发共享 drain |
+| **A 基础设施/容量** | 精确容量拒绝（见上节）；`campaign submit/prepare` 退出 **76**（NAS 锁/FIFO/温控等待超预算）；native `error` / `turn.failed` 消息或**我方公共工具命令**失败输出里的 HTTP 502/503/504、`ReadTimeout`/`timed out`、`Connection reset`/`ECONNRESET`/`RemoteDisconnected`/`stream disconnected`、`Reconnecting...`、`WebSocket`；NAS `/health` 不通；只剩自报 `infrastructure_failed` 时作为旁证采信 | 自动退避后**同 SID 续跑**，不产生 `coordinator_required`，不需要人批 |
+| **C 未知** | 以上都不匹配（非零退出、`turn.failed` 且无已知信号、自报未列举 kind 等） | 有界退避 `unknown_backoff_seconds`（每项一次重试），用完才 `coordinator_required`（监督器 reason `native_worker_blocked`，observer 动作 `coordinator_required` 并共享 drain），并把原始终态写进 `detail` / `blocked` |
+
+**A 类的安全前提**：每次自动续跑前先做一次**只读对账**（`reconcile_before_resume`）：对本槽位每个未提交批次读 operation 回执，`not_started` / 无写入的 `completed` / `reconciled_not_written` / 有效部分续跑直接放行；**失败且 `may_have_written=False` 的尝试**（典型是 76 闸门拒绝）走公共 `reconcile-operation` 的服务端来源回读，`confirmed_not_written` 才放行并把回执转成 `reconciled_not_written`；live owner、`may_have_written`、`requires_reconciliation`、远端有来源或回读失败一律判不安全，返回 `nas_gate_refused`（76）或 `infrastructure_submit_unverified` / `unknown_submit_unverified` 交人处理。这一步只读服务，不提交、不重放、不 release，所以自动重试不会重复写入。退避期间每次唤醒先探 NAS `/health`：不通就继续等（阶段 `waiting_nas_health`），不消耗重试次数，只受窗口约束。
+
+观测正文、agent 回复里的 502/WebSocket 字样**不算**信号；只扫 native CLI 的 `error`/`turn.failed` 消息和退出码非零的 `/tools/extract …` 命令输出。
+
+策略键与启动参数（同一个 `recovery_policy`，`recovery-policy-v1`）：
+
+| 键 | 启动参数 | 缺省 | 含义 |
+|---|---|---|---|
+| `infra_backoff_seconds` | `--infra-backoff-seconds 300,600,...` | `[300, 600, 1200, 2400, 3600]` | A 类退避序列，末值重复 |
+| `infra_max_window_seconds` | `--infra-max-window-seconds` | 21600 | 同一连续 A 类故障串的总窗口（含等 `/health` 的时间），超过报 `infrastructure_backoff_exhausted` |
+| `unknown_backoff_seconds` | `--unknown-backoff-seconds 600,1800` | `[600, 1800]` | C 类退避序列，长度即重试预算 |
+
+重试计数（`capacity_retries` / `infra_retries` / `infra_streak_started_at` / `unknown_retries`）持久化在 `supervisors/<model>[/<slot>]/worker.json`，一次干净的 turn 或协调器发布的续跑证明把它们全部清零。监督器回执多了 `terminal_class` / `terminal_signal` / `wait_seconds` / `reconciliation`；阶段名 `waiting_model_capacity` / `waiting_infrastructure` / `waiting_unknown_terminal` / `waiting_nas_health`。被封死时 `detail`（`campaign status` 的 `recovery_manager.slots[].blocked` 同样带）包含退出码、events 终态、自报 kind、最近 native 错误、命中的信号、stderr 尾部与已花的预算，不再只有一个标签。
+
+**出现没见过的故障，先看它为什么没落入 A/C 类自动路径，再考虑是否真的需要新代码**；`reconcile-*` 子命令不再新增（方案 §3.4）。P1 发布后只对新战役生效；在途战役不迁移。
+
 
 ## Persistent recovery and source decisions
 

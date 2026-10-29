@@ -689,15 +689,16 @@ def cmd_start(cid: str, models: list[str], *, executor: str, quota: int, batch: 
               recovery_policy: dict | None = None) -> dict:
     """structure_gate 给阈值就从 c0 起开启结构门槛；no_structure_gate 写原因表示明确不开（都记进 structure_gate_log）。
     命令行 start 缺省开启；函数缺省两者都不给，行为与门槛出现前相同。
-    recovery_policy 冻结本战役的容量退避（等待秒/上限/次数）；不给则沿用 campaign_supervision 缺省。"""
+    recovery_policy 冻结本战役的恢复退避（容量等待/上限/次数、基础设施退避序列与窗口、未知终态退避序列）；
+    不给则沿用 campaign_supervision 缺省。"""
     d = campaign_dir(cid)
     if (d / "campaign.json").exists():   # 先报「已存在」，别让重复开局被准入错误误导
         raise SystemExit(f"战役 {cid} 已存在")
     if recovery_policy is not None:
-        from tools.campaign_supervision import capacity_policy, RECOVERY_POLICY_VERSION
+        from tools.campaign_supervision import recovery_policy as validate_policy, RECOVERY_POLICY_VERSION
         frozen_policy = {"version": RECOVERY_POLICY_VERSION, **recovery_policy}
         try:
-            capacity_policy({"recovery_policy": frozen_policy})
+            validate_policy({"recovery_policy": frozen_policy})
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     if structure_gate is not None and no_structure_gate:
@@ -1741,10 +1742,10 @@ def triage_summary(d: Path, c: dict, since: str | None = None) -> dict:
             "enabled": sorted(enabled), "full": campaign_full(c), "quota": c["quota"]}
 
 
-def _status_policy(c: dict, capacity_policy) -> dict:
+def _status_policy(c: dict, recovery_policy) -> dict:
     """status 只读：策略坏了也要能看，把错误原样摆出来而不是让 status 崩。"""
     try:
-        return capacity_policy(c)
+        return recovery_policy(c)
     except ValueError as exc:
         return {"error": str(exc), "raw": c.get("recovery_policy")}
 
@@ -1754,7 +1755,7 @@ def cmd_status(cid: str) -> dict:
     c = load(d)
     from kg_hub_eval.business.utils.evaluation_receipts import overhead_coverage
     from utils.process_receipts import status as process_status, read as process_read
-    from tools.campaign_supervision import completed, capacity_policy
+    from tools.campaign_supervision import completed, recovery_policy
     n = parallelism(c)
     slots = {m: {str(slot or 1): {
         "supervisor": process_status(supervisor_dir(d, m, slot)),
@@ -1773,7 +1774,7 @@ def cmd_status(cid: str) -> dict:
                                  "last_observed_at": process_read(d / 'recovery/latest.json').get('observed_at'),
                                  "slots": [{k: row.get(k) for k in ("model", "slot", "action", "scope", "blocked")}
                                            for row in process_read(d / 'recovery/latest.json').get('slots') or []]},
-            "recovery_policy": _status_policy(c, capacity_policy),
+            "recovery_policy": _status_policy(c, recovery_policy),
             "active_workers": sum(s["native"]["lease_held"] is True for workers in slots.values() for s in workers.values()),
             "overhead_coverage": overhead_coverage(c.get("overhead") or []),
             "host_task_state": "unverified_by_repository",
@@ -1808,6 +1809,12 @@ def _main(argv=None) -> int:
         if number < 1:
             raise argparse.ArgumentTypeError("must be a positive integer")
         return number
+
+    def seconds_list(value):
+        parts = [x.strip() for x in str(value).split(",") if x.strip()]
+        if not parts:
+            raise argparse.ArgumentTypeError("need at least one positive integer")
+        return [positive_int(x) for x in parts]
     ap = argparse.ArgumentParser(description="抽取对比战役：定额多模型、各抽不同新批次、全部入库、每批复盘")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ('recovery-enable', 'recovery-disable', 'recovery-service', 'recovery-plan', 'recovery-watch', 'recovery-step',
@@ -1983,6 +1990,13 @@ def _main(argv=None) -> int:
             s.add_argument("--capacity-max-wait-seconds", type=positive_int, help="容量退避单次等待上限秒数")
             s.add_argument("--capacity-max-retries", type=positive_int,
                            help="同一 session 连续容量拒绝最多自动续跑几次，超过才报 model_capacity_exhausted")
+            s.add_argument("--infra-backoff-seconds", type=seconds_list, metavar="秒,秒,...",
+                           help="基础设施故障（NAS 锁/温控 76、HTTP 5xx、超时、连接重置、WebSocket 断连、/health 不通）"
+                                "的退避序列，末值重复直到窗口用完；缺省 300,600,1200,2400,3600")
+            s.add_argument("--infra-max-window-seconds", type=positive_int,
+                           help="同一连续基础设施故障串最多自动续跑的总窗口秒数，超过才报 infrastructure_backoff_exhausted；缺省 21600")
+            s.add_argument("--unknown-backoff-seconds", type=seconds_list, metavar="秒,秒,...",
+                           help="未知终态的有界退避序列（每项一次重试），用完才报 native_worker_blocked 交协调器；缺省 600,1800")
         if name == "chain":
             s.add_argument("--file", required=True)
         if name == "structure-gate":
@@ -2134,7 +2148,10 @@ def _main(argv=None) -> int:
                         no_structure_gate=a.no_structure_gate,
                         recovery_policy={k: v for k, v in (("capacity_wait_seconds", a.capacity_wait_seconds),
                                                            ("capacity_max_wait_seconds", a.capacity_max_wait_seconds),
-                                                           ("capacity_max_retries", a.capacity_max_retries))
+                                                           ("capacity_max_retries", a.capacity_max_retries),
+                                                           ("infra_backoff_seconds", a.infra_backoff_seconds),
+                                                           ("infra_max_window_seconds", a.infra_max_window_seconds),
+                                                           ("unknown_backoff_seconds", a.unknown_backoff_seconds))
                                          if v is not None} or None)
     elif a.cmd == "chain":
         out = cmd_chain(a.id, a.file)
