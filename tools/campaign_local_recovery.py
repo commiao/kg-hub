@@ -16,6 +16,27 @@ from utils import process_receipts as receipts
 from utils.extraction_quality import digest
 
 
+def _worker(c,d,model,slot,*,locked=False):
+    if slot is not None:
+        return cc._worker(c,d,model,slot,locked=locked)
+    if (ec.parallelism(c)!=1 or c.get('migration') or c.get('slot_sessions')
+            or model not in c['models'] or any(b.get('slot') is not None for b in c['batches'])):
+        raise ValueError('unmigrated single-worker owner required')
+    root=ec.supervisor_dir(d,model);worker=receipts.read(root/'worker.json')
+    native=root/'native';event=Path(worker.get('events','/missing')).resolve()
+    session=worker.get('session');outcome=supervision.events(event)
+    bindings=[receipts.read(ec.supervisor_dir(d,m)/'worker.json').get('session') for m in c['models']]
+    owner=receipts.read(root/'latest.json')
+    if (not session or bindings.count(session)!=1 or outcome.get('session')!=session
+            or event.parent!=root.resolve() or worker.get('adopted_from')
+            or owner.get('identity')!={'campaign':c['id'],'model':model}):
+        raise ValueError('original single-worker session binding differs')
+    terminal=({**receipts.read(native/'latest.json'),'lease_held':False} if locked else receipts.status(native))
+    if terminal.get('lease_held') is not False or not terminal.get('ended_at'):
+        raise ValueError('original native terminal required')
+    return root,worker,native,event,session,terminal,outcome
+
+
 def commands(event):
     pending={};done=[]
     for line in event.read_text().splitlines():
@@ -37,8 +58,11 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
               summary_handoff=None,http=None):
     if os.environ.get('KG_HUB_CAMPAIGN_SLOT') is not None or not reason.strip():
         raise ValueError('explicit coordinator disposition required')
+    if slot is None and any(x is not None for x in (repair,reviewer,prior_backend,prior_bundle,
+            capability_receipt,require_capability,summary_handoff)):
+        raise ValueError('legacy continuation is limited to a read-only HTTP502 preview')
     ec.tracking_guard();d=ec.campaign_dir(cid);c=ec.load(d)
-    root,worker,native,event,session,terminal,outcome=cc._worker(c,d,model,slot)
+    root,worker,native,event,session,terminal,outcome=_worker(c,d,model,slot)
     with receipts.idle(root),receipts.idle(native):
         if (terminal.get('exit_code')!=0 or outcome.get('terminal')!='turn.completed'
                 or outcome.get('hard_stop') or outcome.get('approval_refused')):
@@ -171,6 +195,13 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
                 raise ValueError('real permission/NAS refusal cannot use preview continuation')
             _,_,_,_,sha=cc._inputs(c,d,b)
             if op.get('input_sha256')!=sha:raise ValueError('original preview input changed')
+            if slot is None:
+                frozen=receipts.read(d/'batches'/(b['id']+'.json'))
+                keys=[{k:i[k] for k in ('source_description','source_obs_id')} for i in frozen['items']]
+                if (op.get('identity')!={'campaign':cid,'batch':b['id'],**ec.batch_identity(c,b)}
+                        or op.get('source_keys')!=keys
+                        or any(json.loads(line).get('batch')==b['id'] for line in (d/'log.jsonl').read_text().splitlines())):
+                    raise ValueError('exact nonwriting original preview source scope required')
             kind='readonly_preview_recovered'
         operations[b['id']]=digest(receipts.status(d/'operations'/b['id']))
         # Service-only readiness, no paid model admission/probe.
@@ -196,10 +227,11 @@ def reconcile(cid,model,slot,*,reason,url,token,bid=None,repair=None,reviewer=No
 
 def valid(c,d,model,slot,*,locked=False):
     try:
-        root,worker,native,event,session,terminal,outcome=cc._worker(c,d,model,slot,locked=locked)
+        root,worker,native,event,session,terminal,outcome=_worker(c,d,model,slot,locked=locked)
         ref=receipts.read(root/'local-continuation-active.json');path=Path(ref['path'])
         if not path.resolve().is_relative_to(root.resolve()) or cc.file_sha(path)!=ref['sha256']:return False
         proof=cc._read(path);b=ec.find_batch(c,proof['batch'])
+        if slot is None and proof.get('kind')!='readonly_preview_recovered':return False
         if (proof.get('version')!='local-owner-continuation-v1' or proof.get('campaign')!=c['id']
                 or proof.get('model')!=model or proof.get('slot')!=slot or proof.get('session')!=session
                 or proof.get('kind') not in ('repair_decision_recovered','readonly_preview_recovered','delegation_epoch_recovered','capability_restored','summary_identity_handoff_accepted')
