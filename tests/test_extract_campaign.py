@@ -89,6 +89,19 @@ class CampaignTest(unittest.TestCase):
         (_Path(self.tmp.name) / "state.json").write_text(json.dumps({"cursor": 123}))
         c = ec.cmd_start("t4", ["M"], executor="codex", quota=1, batch=1, after_id=None, lookup=PASS)
         self.assertEqual((c["cursor"], c["models"]["M"]["run_id"]), (123, "t4-M"))
+        self.assertNotIn("recovery_policy", c)                                   # 不给就不写，沿用缺省
+        self.assertEqual(ec.cmd_status("t4")["recovery_policy"]["capacity_max_retries"], 6)
+        with self.assertRaises(SystemExit):                                       # 非法策略在开局就拒绝
+            ec.cmd_start("t5", ["M"], executor="codex", quota=1, batch=1, after_id=0, lookup=PASS,
+                         recovery_policy={"capacity_max_retries": 0})
+        c = ec.cmd_start("t5", ["M"], executor="codex", quota=1, batch=1, after_id=0, lookup=PASS,
+                         recovery_policy={"capacity_max_retries": 9, "capacity_wait_seconds": 60})
+        self.assertEqual(c["recovery_policy"], {"version": "recovery-policy-v1", "capacity_max_retries": 9,
+                                                "capacity_wait_seconds": 60})
+        st = ec.cmd_status("t5")
+        self.assertEqual((st["recovery_policy"]["capacity_max_retries"], st["recovery_policy"]["capacity_wait_seconds"],
+                          st["recovery_policy"]["capacity_max_wait_seconds"]), (9, 60, 3600))
+        self.assertEqual(st["recovery_manager"]["slots"], [])                      # 没有 observer 快照就是空表
 
     def test_concurrent_claims_never_overlap_and_respect_quota(self):
         with ThreadPoolExecutor(max_workers=6) as ex:

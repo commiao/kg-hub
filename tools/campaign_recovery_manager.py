@@ -162,12 +162,25 @@ def checkpoint_progress(registration):
             'in_flight': value.get('in_flight'), 'checkpoint_sha256': digest(value)}
 
 
-def classify(outcome, native):
-    """Every stop has an explicit disposition; unknown kinds fail closed."""
+def classify(outcome, native, worker=None, policy=None):
+    """Every stop has an explicit disposition.
+
+    Class B (approval, NAS 75, quality, business permission, uncertain write) keeps
+    its human-only disposition verbatim. Class A (capacity, NAS gate timeout 76,
+    transport/service failures) and class C (unknown terminal) continue the same
+    session under the campaign's bounded backoff; once the persisted worker state
+    shows that budget spent, the slot becomes coordinator_required with the raw
+    terminal attached by `snapshot` instead of an opaque label.
+    """
     if native.get('lease_held'):
         return 'wait_original', 'slot'
     if outcome.get('approval_refused') or outcome.get('recovery_kind') == 'approval_rejected':
         return 'approval_required', 'campaign'
+    if outcome.get('hard_stop') == 76:
+        policy = policy or supervision.recovery_policy(None)
+        if supervision.backoff_exhausted(worker, policy, 'infrastructure'):
+            return 'coordinator_required', 'campaign'
+        return 'bounded_infrastructure_continuation', 'slot'
     if outcome.get('hard_stop') or outcome.get('recovery_kind') == 'nas_refused':
         return 'nas_reconciliation_required', 'campaign'
     if outcome.get('recovery_kind') == 'quality_process_violation':
@@ -178,7 +191,14 @@ def classify(outcome, native):
             and native.get('ended_at') and outcome.get('terminal') == 'turn.completed'
             and supervision.normal_recovery(outcome.get('recovery_kind'))):
         return 'same_session_continuation', 'slot'
-    return 'engineering_reconciliation_required', 'campaign'
+    verdict = supervision.classify_terminal(outcome, native)
+    if verdict['class'] == 'business':
+        return 'engineering_reconciliation_required', 'campaign'
+    policy = policy or supervision.recovery_policy(None)
+    if supervision.backoff_exhausted(worker, policy, verdict['class']):
+        return 'coordinator_required', 'campaign'
+    return ('bounded_infrastructure_continuation' if verdict['class'] == 'infrastructure'
+            else 'bounded_unknown_continuation'), 'slot'
 
 
 def isolated_slot_failure(result):
@@ -213,7 +233,9 @@ def unchanged_block(d, row):
         if (result.get('state')=='blocked' and result.get('model')==row['model']
                 and result.get('slot')==row['slot']
                 and result.get('conditions_sha256')==row['conditions_sha256']):
-            return {'event':path.parent.name,'reason':result.get('reason')}
+            return {'event':path.parent.name,'reason':result.get('reason'),
+                    **({'detail': result['detail']} if result.get('detail') else {}),
+                    **({'message': result['message']} if result.get('message') else {})}
     return None
 
 
@@ -222,6 +244,10 @@ def snapshot(cid):
     if policy.get('enabled') is not True:
         raise ValueError('explicit recovery-enable registration required')
     verify_contract(c, policy)
+    try:
+        policy_values = supervision.recovery_policy(c)
+    except ValueError:
+        policy_values = supervision.recovery_policy(None)
     rows = []
     for model in c['models']:
         for slot in range(1, ec.parallelism(c) + 1):
@@ -230,7 +256,7 @@ def snapshot(cid):
             native, supervisor = receipts.status(root / 'native'), receipts.status(root)
             session = c.get('slot_sessions', {}).get(model, {}).get(str(slot))
             outcome = supervision.events(Path(worker['events'])) if worker.get('events') else {}
-            disposition, scope = classify(outcome, native)
+            disposition, scope = classify(outcome, native, worker, policy_values)
             continuation = False
             if not native.get('lease_held') and not supervisor.get('lease_held') and session and outcome.get('session') == session:
                 from tools.campaign_continuation import worker_reconciled
@@ -262,7 +288,8 @@ def snapshot(cid):
                 action = 'coordinator_semantic_acceptance_required'
             elif (c.get('dispatch') or {}).get('state') == 'draining':
                 action = 'dispatch_draining'
-            elif disposition in ('same_session_continuation', 'bounded_capacity_continuation', 'published_continuation'):
+            elif disposition in ('same_session_continuation', 'bounded_capacity_continuation', 'published_continuation',
+                                 'bounded_infrastructure_continuation', 'bounded_unknown_continuation'):
                 action = 'supervise'
             else:
                 action = disposition
@@ -281,7 +308,8 @@ def snapshot(cid):
                         if (op.get('identity')=={'campaign':cid,'batch':b['id'],**ec.batch_identity(c,b)}
                                 and op.get('source_keys')==keys and keys):scope='slot'
                         break
-                    if op.get('exit_code') in (75, 76):
+                    if op.get('exit_code') == 75 or (op.get('exit_code') == 76 and not supervision.gate_timeout_before_write(op)
+                                                     and op.get('state') != 'reconciled_not_written'):
                         action = 'nas_reconciliation_required'; scope = 'campaign'; break
             pending=[b for b in own if b['status'] not in ('submitted','released')]
             if action=='engineering_reconciliation_required' and len(pending)==1 and outcome.get('recovery_kind')=='infrastructure_failed':
@@ -307,6 +335,10 @@ def snapshot(cid):
             if handoff:
                 row['accepted_rework_handoff'] = handoff
                 row['conditions_sha256'] = digest({'conditions': row['conditions_sha256'], 'handoff': handoff})
+            if action in ('coordinator_required', 'engineering_reconciliation_required'):
+                # The raw terminal, not just a label: stderr tail, events terminal,
+                # exit code and the spent retry budget.
+                row['blocked'] = {'reason': action, **supervision.blocked_detail(worker, outcome, native)}
             if action in ('supervise','rework','reconcile_preview'):
                 blocked=unchanged_block(d,row)
                 if blocked:
@@ -403,7 +435,8 @@ def tick(cid, *, spawn=None):
             return {'state': 'disabled', 'campaign': cid}
         plan = snapshot(cid)
         shared = {'approval_required', 'nas_reconciliation_required', 'registered_rework_required',
-                  'unknown_write_reconciliation_required', 'engineering_reconciliation_required'}
+                  'unknown_write_reconciliation_required', 'engineering_reconciliation_required',
+                  'coordinator_required'}
         incidents = [r for r in plan['slots'] if r['action'] in shared and r['scope']=='campaign']
         for row in incidents:
             path = d / 'recovery/incidents' / (row['event_id'] + '.json')

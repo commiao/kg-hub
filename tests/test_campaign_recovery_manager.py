@@ -67,11 +67,39 @@ class RecoveryManagerTests(unittest.TestCase):
                              ('quality_process_violation', 'registered_rework_required'),
                              ('nas_refused', 'nas_reconciliation_required'),
                              ('approval_rejected', 'approval_required'),
-                             ('new-unknown-case', 'engineering_reconciliation_required')]:
+                             ('business_permission_denied', 'engineering_reconciliation_required'),
+                             ('uncertain_submit', 'engineering_reconciliation_required'),
+                             ('infrastructure_failed', 'bounded_infrastructure_continuation'),
+                             ('new-unknown-case', 'bounded_unknown_continuation')]:
             with self.subTest(kind=kind):
                 self.assertEqual(manager.classify({'terminal': 'turn.completed', 'recovery_kind': kind}, native)[0], action)
-        self.assertEqual(manager.classify({'terminal': 'turn.completed'}, {**native, 'exit_code': 143})[0],
-                         'engineering_reconciliation_required')
+        unknown = ({'terminal': 'turn.completed'}, {**native, 'exit_code': 143})
+        self.assertEqual(manager.classify(*unknown), ('bounded_unknown_continuation', 'slot'))
+        self.assertEqual(manager.classify(*unknown, {'unknown_retries': 2}), ('coordinator_required', 'campaign'))
+        self.assertEqual(manager.classify({'terminal': 'turn.completed', 'hard_stop': 76}, native), ('bounded_infrastructure_continuation', 'slot'))
+        self.assertEqual(manager.classify({'terminal': 'turn.completed', 'hard_stop': 76}, native,
+                                          {'infra_streak_started_at': 1.0}), ('coordinator_required', 'campaign'))
+        self.assertEqual(manager.classify({'terminal': 'turn.completed', 'hard_stop': 75}, native), ('nas_reconciliation_required', 'campaign'))
+        self.assertEqual(manager.classify({'terminal': 'turn.failed', 'infra_signals': [{'kind': 'http_5xx'}]},
+                                          {**native, 'exit_code': 1}), ('bounded_infrastructure_continuation', 'slot'))
+
+    def test_unknown_terminal_is_supervised_within_budget_then_blocked_with_raw_terminal(self):
+        self.prepare()
+        self.write_turn('new-unknown-case', code=3)
+        self.assertEqual(self.row()['action'], 'supervise')
+        self.assertFalse(list((self.d / 'recovery/incidents').glob('*.json')))
+        stderr = self.owner / 'native.stderr.log'; stderr.write_text('Traceback: nobody saw this')
+        receipts.write(self.owner / 'worker.json', {'session': 'original-session', 'events': str(self.event),
+                                                    'stderr': str(stderr), 'unknown_retries': 2})
+        row = self.row()
+        self.assertEqual((row['action'], row['scope']), ('coordinator_required', 'campaign'))
+        self.assertEqual((row['blocked']['exit_code'], row['blocked']['recovery_kind'], row['blocked']['unknown_retries']),
+                         (3, 'new-unknown-case', 2))
+        self.assertIn('nobody saw this', row['blocked']['stderr_tail'])
+        with mock.patch.object(manager.subprocess, 'Popen') as spawn:
+            manager.tick(self.c['id']); spawn.assert_not_called()
+        self.assertEqual(ec.load(self.d)['dispatch']['state'], 'draining')
+        self.assertTrue(list((self.d / 'recovery/incidents').glob('*.json')))
 
     def test_live_original_and_unknown_write_never_launch(self):
         self.prepare()

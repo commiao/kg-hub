@@ -60,7 +60,7 @@ class CapacityTests(SingleReworkTests):
         self.fail_capacity()
         with self.assertRaisesRegex(ValueError, '300-second'):
             self.run_rework(retry_capacity=True)
-        w = receipts.read(self.worker / 'worker.json');w['capacity_retries'] = 3
+        w = receipts.read(self.worker / 'worker.json');w['capacity_retries'] = supervision.MAX_CAPACITY_RETRIES
         receipts.write(self.worker / 'worker.json', w)
         with self.assertRaisesRegex(ValueError, 'budget exhausted'):self.retry()
 

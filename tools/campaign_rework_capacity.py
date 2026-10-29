@@ -224,10 +224,12 @@ def validate(c, root, model, slot, session, worker, native, batches):
             or abs(_time(end['ended_at']) - _time(native['ended_at'])) > 2):
         raise ValueError('original rework scope and exit must match')
     count = worker.get('capacity_retries', 0)
-    if type(count) is not int or not 0 <= count < supervision.MAX_CAPACITY_RETRIES:
+    policy = supervision.capacity_policy(c)
+    if type(count) is not int or not 0 <= count < policy['capacity_max_retries']:
         raise ValueError('rework capacity retry budget exhausted')
-    if _time(receipts.now()) - _time(native['ended_at']) < supervision.CAPACITY_WAIT_SECONDS:
-        raise ValueError('capacity continuation requires the original 300-second backoff')
+    wait = supervision.capacity_wait(policy, count + 1)
+    if _time(receipts.now()) - _time(native['ended_at']) < wait:
+        raise ValueError(f'capacity continuation requires the original {wait:g}-second backoff')
     scopes = {str((ec.campaign_dir(c['id']) / 'private-rework' / bid).resolve()):
               set(ec.find_batch(c, bid)['ids']) for bid in batches}
     source_keys = {}

@@ -19,8 +19,169 @@ from tools import agent_extract as ax, extract_campaign as ec, claim_registry, n
 from utils import process_receipts as receipts
 
 CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model.'
+# Defaults for a campaign without an explicit recovery_policy. A provider
+# capacity refusal is infrastructure, not a business refusal: the supervisor
+# backs off (doubling from the base wait, capped) and resumes the same session
+# without a coordinator, up to the retry budget. 2026-10-29: 3×300s froze the
+# 8000 campaign while capacity outages routinely lasted longer than 15 minutes.
 CAPACITY_WAIT_SECONDS = 300
-MAX_CAPACITY_RETRIES = 3
+CAPACITY_MAX_WAIT_SECONDS = 3600
+MAX_CAPACITY_RETRIES = 6
+# Class A (infrastructure) and class C (unknown) backoff defaults. The infra
+# sequence repeats its last value until the streak window closes; the unknown
+# sequence is the whole retry budget. 2026-10-29 redesign plan §3.1/3.2.
+INFRA_BACKOFF_SECONDS = (300, 600, 1200, 2400, 3600)
+INFRA_MAX_WINDOW_SECONDS = 21600
+UNKNOWN_BACKOFF_SECONDS = (600, 1800)
+RECOVERY_POLICY_VERSION = 'recovery-policy-v1'
+RECOVERY_POLICY_KEYS = ('capacity_wait_seconds', 'capacity_max_wait_seconds', 'capacity_max_retries')
+BACKOFF_POLICY_KEYS = ('infra_backoff_seconds', 'infra_max_window_seconds', 'unknown_backoff_seconds')
+# Worker self-reports that always keep a human in the loop (class B). They are
+# never retried automatically, whatever the transport looked like.
+BUSINESS_KINDS = ('approval_rejected', 'business_permission_denied', 'quality_process_violation',
+                  'uncertain_submit', 'nas_refused')
+# Objective transport/service failure shapes. Matched only against native CLI
+# error events, the turn.failed message and failed public tool commands, never
+# against observation bodies or agent prose.
+INFRA_PATTERNS = (
+    ('http_5xx', re.compile(r'HTTP(?:\s*Error)?\s*50[234]\b|\bhttp_50[234]\b|\b50[234]\s+(?:Bad Gateway|Service Unavailable|Gateway Time-?out)', re.I)),
+    ('read_timeout', re.compile(r'ReadTimeout|Read timed out|timed out', re.I)),
+    ('connection_reset', re.compile(r'Connection reset|ECONNRESET|ConnectionResetError|RemoteDisconnected|Connection refused|stream disconnected', re.I)),
+    ('reconnecting', re.compile(r'Reconnecting\.\.\.')),
+    ('websocket', re.compile(r'WebSocket', re.I)),
+)
+TOOL_COMMAND = re.compile(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+")
+
+
+def _bounded_int(key, value, limit):
+    if type(value) is not int or value < 1 or value > limit:
+        raise ValueError(f'campaign recovery_policy.{key} must be a bounded positive integer')
+    return value
+
+
+def recovery_policy(c: dict | None) -> dict:
+    """Frozen per-campaign recovery policy; legacy campaigns keep module defaults.
+
+    Capacity (A, provider), infrastructure (A, transport/NAS) and unknown (C)
+    backoff all live in the same campaign.json `recovery_policy` structure.
+    """
+    policy = dict((c or {}).get('recovery_policy') or {})
+    if policy and policy.get('version') != RECOVERY_POLICY_VERSION:
+        raise ValueError('unknown campaign recovery_policy version')
+    if set(policy) - {'version', *RECOVERY_POLICY_KEYS, *BACKOFF_POLICY_KEYS}:
+        raise ValueError('unknown campaign recovery_policy keys')
+    out = {'capacity_wait_seconds': CAPACITY_WAIT_SECONDS,
+           'capacity_max_wait_seconds': CAPACITY_MAX_WAIT_SECONDS,
+           'capacity_max_retries': MAX_CAPACITY_RETRIES,
+           'infra_backoff_seconds': list(INFRA_BACKOFF_SECONDS),
+           'infra_max_window_seconds': INFRA_MAX_WINDOW_SECONDS,
+           'unknown_backoff_seconds': list(UNKNOWN_BACKOFF_SECONDS)}
+    for key in RECOVERY_POLICY_KEYS:
+        if key in policy:
+            out[key] = _bounded_int(key, policy[key], 50 if key == 'capacity_max_retries' else 86400)
+    if out['capacity_max_wait_seconds'] < out['capacity_wait_seconds']:
+        raise ValueError('campaign recovery_policy capacity wait exceeds its cap')
+    for key in ('infra_backoff_seconds', 'unknown_backoff_seconds'):
+        if key in policy:
+            value = policy[key]
+            if type(value) is not list or not value or len(value) > 20:
+                raise ValueError(f'campaign recovery_policy.{key} must be a nonempty bounded list of seconds')
+            out[key] = [_bounded_int(key, x, 86400) for x in value]
+    if 'infra_max_window_seconds' in policy:
+        out['infra_max_window_seconds'] = _bounded_int('infra_max_window_seconds', policy['infra_max_window_seconds'], 7 * 86400)
+    if out['infra_max_window_seconds'] < out['infra_backoff_seconds'][0]:
+        raise ValueError('campaign recovery_policy infra window is shorter than its first backoff')
+    return out
+
+
+def capacity_policy(c: dict | None) -> dict:
+    """Capacity subset of the frozen policy (kept for the P0 callers)."""
+    return {key: value for key, value in recovery_policy(c).items() if key in RECOVERY_POLICY_KEYS}
+
+
+def capacity_wait(policy: dict, retries: int) -> float:
+    """Wait before retry number `retries` (1-based): base × 2^(n-1), capped."""
+    base = policy['capacity_wait_seconds']
+    return min(base * (2 ** max(retries - 1, 0)), max(policy['capacity_max_wait_seconds'], base))
+
+
+def backoff_wait(sequence, retries: int) -> float:
+    """Wait before retry number `retries` (1-based); the last value repeats."""
+    return sequence[min(max(retries, 1), len(sequence)) - 1]
+
+
+def nas_health(url: str, token: str | None, get=None) -> bool:
+    """Cheap read-only liveness probe; any transport failure counts as unreachable."""
+    try:
+        code, _ = (get or ax._http)('GET', url.rstrip('/') + '/health', None, token, 10)
+    except Exception:  # noqa: BLE001 - a probe must never raise into the supervisor
+        return False
+    return code == 200
+
+
+def classify_terminal(outcome: dict, terminal: dict, *, health_ok: bool | None = None) -> dict:
+    """Objective class of a finished native turn, independent of the worker's self-report.
+
+    business   class B: approval/quality/permission/uncertain-write stops, NAS 75; human required.
+    capacity   class A: the exact provider capacity refusal (existing bounded backoff).
+    clean      normal turn end; same-session continuation.
+    infrastructure class A: NAS gate timeout exit 76, HTTP 5xx, read timeouts, connection resets,
+               CLI reconnect/WebSocket notices, or NAS /health unreachable; the worker's
+               `infrastructure_failed` self-report is admitted only as corroboration.
+    unknown    class C: anything else; bounded backoff, then the coordinator.
+    """
+    kind = outcome.get('recovery_kind')
+    if outcome.get('approval_refused') or outcome.get('hard_stop') == 75:
+        return {'class': 'business', 'signal': 'approval_refused' if outcome.get('approval_refused') else 'nas_gate_exit75'}
+    if outcome.get('hard_stop') == 76:
+        return {'class': 'infrastructure', 'signal': 'nas_gate_timeout_exit76'}
+    if kind in BUSINESS_KINDS:
+        return {'class': 'business', 'signal': kind}
+    if capacity_terminal(outcome, terminal):
+        return {'class': 'capacity', 'signal': 'model_at_capacity'}
+    # Same leniency as the pre-redesign supervisor: a migrated or adopted owner may
+    # carry no native exit receipt at all; the events terminal is then authoritative.
+    if (terminal.get('exit_code', 0) == 0 and terminal.get('state') not in ('failed', 'uncertain', 'running')
+            and outcome.get('terminal') == 'turn.completed' and normal_recovery(kind)):
+        return {'class': 'clean', 'signal': None}
+    signals = outcome.get('infra_signals') or []
+    if signals:
+        return {'class': 'infrastructure', 'signal': signals[0]['kind']}
+    if health_ok is False:
+        return {'class': 'infrastructure', 'signal': 'nas_health_unreachable'}
+    if kind == 'infrastructure_failed':
+        return {'class': 'infrastructure', 'signal': 'worker_reported_infrastructure_failed'}
+    return {'class': 'unknown', 'signal': f"exit={terminal.get('exit_code')} terminal={outcome.get('terminal')} kind={kind}"}
+
+
+def backoff_exhausted(worker: dict | None, policy: dict, cls: str, *, clock=time.time) -> bool:
+    """Whether the persisted retry state already spent the class's budget."""
+    worker = worker or {}
+    if cls == 'infrastructure':
+        started = worker.get('infra_streak_started_at')
+        return bool(started) and clock() - float(started) >= policy['infra_max_window_seconds']
+    if cls == 'unknown':
+        return int(worker.get('unknown_retries', 0)) >= len(policy['unknown_backoff_seconds'])
+    return False
+
+
+def stderr_tail(path, limit: int = 2000) -> str:
+    try:
+        data = Path(path).read_bytes()
+    except (OSError, TypeError):
+        return ''
+    return data[-limit:].decode('utf-8', 'replace')
+
+
+def blocked_detail(worker: dict | None, outcome: dict, terminal: dict) -> dict:
+    """What a human needs to see on a blocked slot: raw terminal, not just a label."""
+    worker = worker or {}
+    return {'exit_code': terminal.get('exit_code'), 'native_state': terminal.get('state'),
+            'events_terminal': outcome.get('terminal'), 'recovery_kind': outcome.get('recovery_kind'),
+            'native_errors': outcome.get('native_errors') or [], 'infra_signals': outcome.get('infra_signals') or [],
+            'hard_stop': outcome.get('hard_stop'), 'stderr_tail': stderr_tail(worker.get('stderr')),
+            'infra_retries': worker.get('infra_retries', 0), 'unknown_retries': worker.get('unknown_retries', 0),
+            'capacity_retries': worker.get('capacity_retries', 0)}
 
 
 def capacity_terminal(outcome, terminal):
@@ -64,6 +225,17 @@ def events(path: Path) -> dict:
     result = {}
     native_errors = []
     terminal_error = None
+    signals = []
+
+    def scan(source, text):
+        if not isinstance(text, str) or len(signals) >= 20:
+            return
+        for kind, pattern in INFRA_PATTERNS:
+            hit = pattern.search(text)
+            if hit:
+                start = max(hit.start() - 80, 0)
+                signals.append({'kind': kind, 'source': source, 'excerpt': text[start:hit.end() + 80]})
+                return
     with path.open("rb") as stream:
         for line in stream:
             try:
@@ -76,11 +248,19 @@ def events(path: Path) -> dict:
                 result["terminal"] = row["type"]
             if row.get('type') == 'error':
                 native_errors.append(row.get('message'))
+                scan('error', row.get('message'))
             elif row.get('type') == 'turn.failed':
                 error = row.get('error')
                 terminal_error = error.get('message') if isinstance(error, dict) else None
                 native_errors.append(terminal_error)
+                if terminal_error != CAPACITY_MESSAGE:
+                    scan('turn.failed', terminal_error)
             item = row.get("item", {})
+            if (item.get('type') == 'command_execution' and item.get('exit_code')
+                    and TOOL_COMMAND.search(item.get('command', ''))):
+                # Only our own public tool commands: their output is service/transport
+                # state, whereas an observation body may quote anything.
+                scan('command', str(item.get('aggregated_output', ''))[-4000:])
             if (item.get('type') == 'command_execution' and item.get('exit_code')
                     and 'This action was rejected due to unacceptable risk' in str(item.get('aggregated_output', ''))):
                 result['approval_refused'] = True
@@ -97,7 +277,10 @@ def events(path: Path) -> dict:
                     continue
                 if isinstance(report, dict) and report.get("recovery_kind"):
                     result["recovery_kind"] = report["recovery_kind"]
+    if signals:
+        result['infra_signals'] = signals
     if native_errors:
+        result['native_errors'] = [str(m)[:300] if m is not None else None for m in native_errors[-5:]]
         # The CLI emits recoverable reconnect notices as error events too.
         # Admit only this transport notice, never arbitrary earlier errors; the
         # actual terminal failure must still be the exact capacity response.
@@ -193,9 +376,64 @@ def native_args(c: dict, model: str, session: str | None, slot: int | None = Non
     return args + [prompt]
 
 
+def gate_timeout_before_write(operation: dict) -> bool:
+    """A NAS gate timeout (76) that failed before any HTTP write left nothing to reconcile remotely."""
+    return (operation.get('exit_code') == 76 and operation.get('state') == 'failed'
+            and operation.get('may_have_written') is False and not operation.get('requires_reconciliation'))
+
+
+def reconcile_before_resume(cid: str, c: dict, d: Path, model: str, slot: int | None, *,
+                            url: str, token: str | None, check=None) -> dict:
+    """Read-only proof that no pending own batch may have reached the graph.
+
+    Reuses the public `reconcile-operation` verification (service source read-back,
+    `confirmed_not_written`) for a failed attempt that never wrote; a live owner, an
+    unknown write or an unverifiable remote state is reported unsafe and keeps its
+    existing human-only recovery. Never submits, replays or releases anything.
+    """
+    from tools.campaign_continuation import valid_partial
+    batches, safe = {}, True
+    for b in c['batches']:
+        if b['model'] != model or (slot is not None and ec.batch_slot(c, b) != slot) or b['status'] in ('submitted', 'released'):
+            continue
+        op = receipts.status(d / 'operations' / b['id'])
+        state = op.get('state')
+        if op.get('lease_held'):
+            batches[b['id']] = {'state': 'live_owner'}; safe = False
+        elif state == 'not_started':
+            batches[b['id']] = {'state': 'not_started'}
+        elif valid_partial(c, d, b, op):
+            batches[b['id']] = {'state': 'partial_continuation'}
+        elif (state in ('completed', 'reconciled_not_written') and not op.get('may_have_written')
+              and not op.get('requires_reconciliation')):
+            batches[b['id']] = {'state': state, 'kind': op.get('kind')}
+        elif state == 'failed' and op.get('may_have_written') is False and not op.get('requires_reconciliation'):
+            try:
+                proof = ec.cmd_reconcile_operation(cid, b['id'], url=url, token=token, check=check)
+            except (ValueError, RuntimeError, OSError, receipts.Busy, receipts.Uncertain) as exc:
+                batches[b['id']] = {'state': 'check_failed', 'error_type': type(exc).__name__, 'message': str(exc)[:300]}
+                safe = False
+                continue
+            if proof.get('confirmed_not_written') is True:
+                batches[b['id']] = {'state': 'reconciled_not_written', 'exit_code': op.get('exit_code'),
+                                    'checked_sources': proof.get('checked_sources')}
+            else:
+                batches[b['id']] = {'state': 'remote_unverified', 'present_sources': proof.get('present_sources'),
+                                    'action': proof.get('action')}
+                safe = False
+        else:
+            batches[b['id']] = {'state': state, 'may_have_written': op.get('may_have_written'),
+                                'requires_reconciliation': op.get('requires_reconciliation'), 'exit_code': op.get('exit_code')}
+            safe = False
+    return {'safe': safe, 'read_only': True, 'batches': batches}
+
+
 def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | None = None,
         adopt_events: Path | None = None, poll: float = 15, max_stalled: int = 3, sleep=time.sleep,
-        spawn=subprocess.Popen, preflight=None, slot: int | None = None, stop=None) -> dict:
+        spawn=subprocess.Popen, preflight=None, slot: int | None = None, stop=None,
+        check=None, health=None, clock=time.time) -> dict:
+    """check(items, url, token) reads service source state for the built-in read-only reconciliation;
+    health(url, token) probes NAS /health during infrastructure backoff. Both default to real HTTP."""
     if poll <= 0 or max_stalled < 1 or bool(adopt_exit) != bool(adopt_events):
         raise ValueError("positive polling/stall limit and paired adoption receipts required")
     d = ec.campaign_dir(cid)
@@ -213,6 +451,10 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             raise ValueError("resume session differs from managed worker identity")
         session = saved.get("session") or session
         capacity_retries = int(saved.get('capacity_retries', 0))
+        infra_retries = int(saved.get('infra_retries', 0))
+        unknown_retries = int(saved.get('unknown_retries', 0))
+        service_url, service_token = os.environ.get("KG_HUB_URL", ax.DEFAULT_URL), ax.api_token()
+        probe = health or nas_health
         bind_slot_session(d, model, slot, session)
         baseline = completed(c, d, model, slot)
         if (baseline < c["quota"] and not saved and adopt_exit is None
@@ -263,6 +505,11 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 elif op["action"] == "legacy_terminal_unverified" and batch["status"] == "dry_run":
                     update(phase="coordinator_required", exit_code=2, reason="legacy_submit_terminal_unverified", batch=batch["id"])
                     return {"model": model, "state": "blocked", "reason": "legacy_submit_terminal_unverified"}
+                elif op["action"] == "stop_nas_gate_refusal" and gate_timeout_before_write(operation):
+                    # NAS lock/thermal timeout (76) raised before any HTTP write:
+                    # class A; the terminal branch reconciles read-only, backs off
+                    # and resumes. A 75 or an unknown write still stops below.
+                    continue
                 elif op["action"] in ("reconcile_service_before_replay", "stop_nas_gate_refusal") or (
                         op["operation"].get("error_type") == "PermissionError"):
                     update(phase="coordinator_required", exit_code=2, reason=op["action"], batch=batch["id"])
@@ -292,7 +539,7 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                 else:
                     continuation = worker_reconciled(c, d, model, slot)
                 cleared = bool(outcome.get("hard_stop")) and stops_reconciled(c, d, model, Path(saved["events"]), outcome)
-                if outcome.get("hard_stop") and not cleared:
+                if outcome.get("hard_stop") == 75 and not cleared:
                     update(phase="coordinator_required", exit_code=2, reason="nas_gate_refused", business_exit_code=outcome["hard_stop"])
                     return {"model": model, "state": "blocked", "reason": "nas_gate_refused",
                             "business_exit_code": outcome["hard_stop"]}
@@ -301,25 +548,37 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                     return {"model": model, "state": "blocked", "reason": "native_session_mismatch"}
                 session = outcome.get("session") or session
                 bind_slot_session(d, model, slot, session)
-                capacity = capacity_terminal(outcome, state)
-                if capacity and continuation:
-                    # A coordinator may clear an exhausted capacity refusal only
-                    # after a fresh same-model probe and exact terminal binding.
-                    capacity_retries = 0
-                    saved['capacity_retries'] = 0
+                verdict = classify_terminal(outcome, state)
+                if (cleared and state.get("exit_code") == 0 and outcome.get("terminal") == "turn.completed"
+                        and (outcome.get("recovery_kind") == "nas_refused" or normal_recovery(outcome.get("recovery_kind")))):
+                    verdict = {'class': 'clean', 'signal': 'coordinator_reconciled_gate_stop'}
+                if verdict['class'] == 'unknown' and not continuation:
+                    # No objective transport signal in the events: ask the service itself.
+                    verdict = classify_terminal(outcome, state, health_ok=probe(service_url, service_token))
+                capacity = verdict['class'] == 'capacity'
+                detail = blocked_detail(saved, outcome, state)
+                update(terminal_class=verdict['class'], terminal_signal=verdict['signal'])
+                if continuation:
+                    # A coordinator-published continuation proof (exact terminal
+                    # binding, fresh probe) clears every automatic retry counter.
+                    capacity_retries = infra_retries = unknown_retries = 0
+                    saved.update(capacity_retries=0, infra_retries=0, unknown_retries=0, infra_streak_started_at=None)
                     receipts.write(root / 'worker.json', saved)
                 elif capacity:
-                    if not capacity_safe or capacity_retries >= MAX_CAPACITY_RETRIES:
+                    policy = capacity_policy(c)
+                    if not capacity_safe or capacity_retries >= policy['capacity_max_retries']:
                         reason = 'capacity_submit_unverified' if not capacity_safe else 'model_capacity_exhausted'
                         update(phase='coordinator_required', exit_code=2, reason=reason,
-                               capacity_retries=capacity_retries)
+                               capacity_retries=capacity_retries, capacity_max_retries=policy['capacity_max_retries'])
                         return {'model': model, 'state': 'blocked', 'reason': reason}
                     capacity_retries += 1
                     saved['capacity_retries'] = capacity_retries
                     receipts.write(root / 'worker.json', saved)
+                    wait = capacity_wait(policy, capacity_retries)
                     update(phase='waiting_model_capacity', session=session,
-                           capacity_retries=capacity_retries, wait_seconds=CAPACITY_WAIT_SECONDS)
-                    remaining = CAPACITY_WAIT_SECONDS
+                           capacity_retries=capacity_retries, capacity_max_retries=policy['capacity_max_retries'],
+                           wait_seconds=wait)
+                    remaining = wait
                     while remaining > 0:
                         if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
                             update(phase='claims_drained', success=count)
@@ -327,13 +586,76 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                         step = min(poll, remaining)
                         sleep(step)
                         remaining -= step
-                elif not continuation and (state.get("exit_code", 0) != 0 or outcome.get("terminal") != "turn.completed"
-                        or (not normal_recovery(outcome.get("recovery_kind"))
-                            and not (cleared and outcome.get("recovery_kind") == "nas_refused"))):
-                    update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked")
-                    return {"model": model, "state": "blocked", "reason": "native_worker_blocked"}
-                if not capacity:
-                    capacity_retries = 0
+                elif verdict['class'] in ('infrastructure', 'unknown'):
+                    policy = recovery_policy(c)
+                    # Safety premise of every automatic retry: prove read-only that
+                    # no pending own batch may have reached the graph. An unknown
+                    # write keeps its existing human-only path.
+                    reconciliation = reconcile_before_resume(cid, c, d, model, slot, url=service_url,
+                                                             token=service_token, check=check)
+                    if not reconciliation['safe']:
+                        reason = ('nas_gate_refused' if outcome.get('hard_stop') == 76 else
+                                  verdict['class'] + '_submit_unverified')
+                        update(phase='coordinator_required', exit_code=2, reason=reason, detail=detail,
+                               reconciliation=reconciliation,
+                               **({'business_exit_code': 76} if outcome.get('hard_stop') == 76 else {}))
+                        return {'model': model, 'state': 'blocked', 'reason': reason, 'detail': detail,
+                                'reconciliation': reconciliation}
+                    now = clock()
+                    if verdict['class'] == 'infrastructure':
+                        started = float(saved.get('infra_streak_started_at') or now)
+                        wait = backoff_wait(policy['infra_backoff_seconds'], infra_retries + 1)
+                        if now - started + wait > policy['infra_max_window_seconds']:
+                            update(phase='coordinator_required', exit_code=2, reason='infrastructure_backoff_exhausted',
+                                   detail=detail, infra_retries=infra_retries,
+                                   infra_max_window_seconds=policy['infra_max_window_seconds'])
+                            return {'model': model, 'state': 'blocked', 'reason': 'infrastructure_backoff_exhausted',
+                                    'detail': detail}
+                        infra_retries += 1
+                        saved.update(infra_retries=infra_retries, infra_streak_started_at=started)
+                        phase = 'waiting_infrastructure'
+                    else:
+                        if unknown_retries >= len(policy['unknown_backoff_seconds']):
+                            update(phase='coordinator_required', exit_code=2, reason='native_worker_blocked',
+                                   detail=detail, unknown_retries=unknown_retries)
+                            return {'model': model, 'state': 'blocked', 'reason': 'native_worker_blocked', 'detail': detail}
+                        unknown_retries += 1
+                        wait = backoff_wait(policy['unknown_backoff_seconds'], unknown_retries)
+                        saved['unknown_retries'] = unknown_retries
+                        started = None
+                        phase = 'waiting_unknown_terminal'
+                    receipts.write(root / 'worker.json', saved)
+                    update(phase=phase, session=session, wait_seconds=wait, terminal_signal=verdict['signal'],
+                           infra_retries=infra_retries, unknown_retries=unknown_retries, reconciliation=reconciliation)
+                    remaining = wait
+                    while remaining > 0:
+                        if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
+                            update(phase='claims_drained', success=count)
+                            return {'model': model, 'state': 'drained', 'success': count}
+                        step = min(poll, remaining)
+                        sleep(step)
+                        remaining -= step
+                    # Each wake-up asks NAS /health first. Unreachable NAS extends
+                    # the wait without spending a retry; only the window bounds it.
+                    while not probe(service_url, service_token):
+                        if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
+                            update(phase='claims_drained', success=count)
+                            return {'model': model, 'state': 'drained', 'success': count}
+                        if started is not None and clock() - started >= policy['infra_max_window_seconds']:
+                            update(phase='coordinator_required', exit_code=2, reason='infrastructure_backoff_exhausted',
+                                   detail=detail, infra_retries=infra_retries, nas_health=False)
+                            return {'model': model, 'state': 'blocked', 'reason': 'infrastructure_backoff_exhausted',
+                                    'detail': detail}
+                        update(phase='waiting_nas_health', session=session, nas_health=False)
+                        sleep(poll)
+                elif verdict['class'] == 'business':
+                    update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked", detail=detail)
+                    return {"model": model, "state": "blocked", "reason": "native_worker_blocked", "detail": detail}
+                if verdict['class'] == 'clean' or continuation:
+                    capacity_retries = infra_retries = unknown_retries = 0
+                    if saved.get('infra_retries') or saved.get('unknown_retries') or saved.get('infra_streak_started_at'):
+                        saved.update(infra_retries=0, unknown_retries=0, infra_streak_started_at=None)
+                        receipts.write(root / 'worker.json', saved)
                     stalled = stalled + 1 if own_count <= baseline else 0
                 baseline = own_count
                 update(stalled_turns=stalled, success=count, session=session)
@@ -360,7 +682,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
             tag = uuid.uuid4().hex
             output, error = root / (tag + ".events.jsonl"), root / (tag + ".stderr.log")
             saved = {"session": session, "events": str(output), "stderr": str(error),
-                     "capacity_retries": capacity_retries}
+                     "capacity_retries": capacity_retries, "infra_retries": infra_retries,
+                     "unknown_retries": unknown_retries,
+                     "infra_streak_started_at": saved.get("infra_streak_started_at") if infra_retries else None}
             receipts.write(root / "worker.json", saved)
             entry = Path(os.environ.get("KG_HUB_CODE", "~/.local/share/kg-hub/current")).expanduser() / "tools/extract"
             args = [str(entry), "runtime", "exec", "--proxy-mode", ec.runtime_settings(c)["proxy_mode"],
