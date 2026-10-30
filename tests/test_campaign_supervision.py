@@ -237,6 +237,22 @@ class SupervisorTests(unittest.TestCase):
         self.c["batches"][0]["released_ids"] = [1]
         self.assertEqual(s.completed(self.c, self.d, "m"), 1)
 
+    def test_counts_ignore_partial_tail_and_read_corrections_next_time(self):
+        self.formal(1)
+        p = self.d / 'log.jsonl'
+        partial = json.dumps({'batch': 'b', 'id': 1, 'status': 'error', 'model': 'm',
+                              'run_id': 'r', 'executor': 'codex'})
+        with p.open('a') as out:
+            out.write(partial)
+        self.assertEqual(s.completed_counts(self.c, self.d)[('m', None)], 1)
+        with p.open('a') as out:
+            out.write('\n')
+        self.assertEqual(s.completed_counts(self.c, self.d).get(('m', None), 0), 0)
+        with p.open('a') as out:
+            out.write('invalid complete record\n')
+        with self.assertRaises(ValueError):
+            s.completed_counts(self.c, self.d)
+
     def test_real_fake_executable_resumes_same_session_with_frozen_settings(self):
         binary, code = self.root / "bin", self.root / "code"
         binary.mkdir(); (code / "tools").mkdir(parents=True)
@@ -625,6 +641,37 @@ class ObjectiveClassificationTests(SupervisorTests):
         self.assertIn('waiting_nas_health', phases)
         self.assertEqual(r.read(self.d / 'supervisors/m/latest.json').get('unknown_retries'), 0)
         self.assertGreaterEqual(len(probes), 4)
+
+    def test_nas_fails_after_unknown_classification_has_a_durable_wait_limit(self):
+        c = ec.load(self.d)
+        c['recovery_policy'] = {'version': s.RECOVERY_POLICY_VERSION,
+            'unknown_backoff_seconds': [1], 'infra_backoff_seconds': [1],
+            'infra_max_window_seconds': 3}
+        ec.save(self.d, c)
+        now, calls, probes = [100.0], [], []
+        def health(*args):
+            probes.append(1)
+            return len(probes) == 1  # healthy classification, outage after backoff
+        def sleep(seconds):
+            now[0] += seconds
+            if now[0] > 110:
+                self.fail('health wait exceeded its bounded window')
+        rows = [{'type': 'turn.failed', 'error': {'message': 'unclassified failure'}}]
+        out = self.run_supervisor(poll=1, sleep=sleep, clock=lambda: now[0], health=health,
+                                  spawn=self.failing(calls, rows, exit_code=3))
+        self.assertEqual(out['reason'], 'infrastructure_backoff_exhausted')
+        self.assertEqual(len(calls), 1)
+        worker = r.read(self.d / 'supervisors/m/worker.json')
+        self.assertIsNotNone(worker['infra_streak_started_at'])
+        self.assertTrue(s.backoff_exhausted(worker, s.recovery_policy(c), 'infrastructure', clock=lambda: now[0]))
+
+    def test_timeout_does_not_mask_business_refusal(self):
+        for kind in ('approval_rejected', 'business_permission_denied', 'quality_process_violation', 'uncertain_submit'):
+            self.assertEqual(s.classify_terminal({'hard_stop': 76, 'recovery_kind': kind}, {})['class'], 'business')
+        p = self.root / 'mixed-gates.events'
+        p.write_text(''.join(json.dumps({'type': 'item.completed', 'item': {
+            'type': 'command_execution', 'command': self.SUBMIT, 'exit_code': code}}) + '\n' for code in (75, 76)))
+        self.assertEqual(s.events(p)['hard_stop'], 75)
 
     def test_business_stops_still_block_at_once(self):
         for kind in ('business_permission_denied', 'quality_process_violation', 'uncertain_submit', 'approval_rejected'):

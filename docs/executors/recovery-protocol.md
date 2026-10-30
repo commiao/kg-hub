@@ -143,3 +143,20 @@ source results remain. Live owners, unresolved writes, real refusals and partial
 acceptance are rejected. Repeating the same approval cannot reset a later
 no-progress budget. The normal production supervisor resumes the same session;
 it still requires current quality review and a full preview before submission.
+# Bounded health waits and consistent progress snapshots
+
+An unknown terminal can be classified while NAS is healthy, then encounter an
+outage after its backoff. The first failed wake-up probe persists an
+`infra_streak_started_at` timestamp; `infra_max_window_seconds` bounds that wait
+across supervisor restarts. A health probe never authorizes replay of an unknown
+write. Exhaustion reports `infrastructure_backoff_exhausted` for reconciliation.
+
+In mixed failures, an earlier NAS 75 or an explicit approval, permission,
+quality, or uncertain-write refusal takes precedence over a later timeout 76.
+All original hard-stop events remain in the receipt.
+
+Each recovery snapshot reads the formal log once for all model and slot counts.
+The next snapshot reads it again: corrections, released IDs and newly completed
+records remain visible. Incomplete trailing records are ignored; malformed
+complete records still fail. This optimization changes observation overhead,
+not the NAS serialization, temperature limits or source-review requirements.

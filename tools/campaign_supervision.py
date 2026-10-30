@@ -133,10 +133,10 @@ def classify_terminal(outcome: dict, terminal: dict, *, health_ok: bool | None =
     kind = outcome.get('recovery_kind')
     if outcome.get('approval_refused') or outcome.get('hard_stop') == 75:
         return {'class': 'business', 'signal': 'approval_refused' if outcome.get('approval_refused') else 'nas_gate_exit75'}
+    if kind in BUSINESS_KINDS and not (kind == 'nas_refused' and outcome.get('hard_stop') == 76):
+        return {'class': 'business', 'signal': kind}
     if outcome.get('hard_stop') == 76:
         return {'class': 'infrastructure', 'signal': 'nas_gate_timeout_exit76'}
-    if kind in BUSINESS_KINDS:
-        return {'class': 'business', 'signal': kind}
     if capacity_terminal(outcome, terminal):
         return {'class': 'capacity', 'signal': 'model_at_capacity'}
     # Same leniency as the pre-redesign supervisor: a migrated or adopted owner may
@@ -197,25 +197,37 @@ def normal_recovery(kind):
 
 
 def completed(c: dict, d: Path, model: str, slot: int | None = None) -> int:
-    batches = {b["id"]: b for b in c["batches"] if b["model"] == model
-               and (slot is None or ec.batch_slot(c, b) == slot)}
+    return completed_counts(c, d).get((model, slot), 0)
+
+
+def completed_counts(c: dict, d: Path) -> dict:
+    """One fresh log scan for all models/slots in an observation.
+
+    No cross-observation cache: appended corrections and released IDs must take
+    effect on the next call. Ignore only an unfinished last line, as before.
+    """
+    batches = {b['id']: b for b in c['batches']}
+    members = {bid: set(b['ids']) - set(b.get('released_ids') or []) for bid, b in batches.items()}
     latest = {}
     log = d / "log.jsonl"
     if log.exists():
-        raw = log.read_text()
-        lines = raw.splitlines()
-        if raw and not raw.endswith("\n"):
-            lines = lines[:-1]  # another submit may still be appending its final record
-        for line in lines:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            b = batches.get(row.get("batch"))
-            if (b and row.get("model") == model and row.get("run_id") == c["models"][model]["run_id"]
-                    and row.get("executor") == c["executor"] and row.get("id") in b["ids"]
-                    and row["id"] not in (b.get("released_ids") or [])):
-                latest[(b["id"], row["id"])] = row
-    return sum(row.get("status") == "ok" or ax.confirmed_empty(row) for row in latest.values())
+        with log.open() as stream:
+            for line in stream:
+                if not line.endswith('\n') or not line.strip():
+                    continue
+                row = json.loads(line)
+                b = batches.get(row.get('batch'))
+                if (b and row.get('model') == b['model']
+                        and row.get('run_id') == c['models'][b['model']]['run_id']
+                        and row.get('executor') == c['executor'] and row.get('id') in members[b['id']]):
+                    latest[(b['id'], row['id'])] = row
+    counts = {}
+    for (bid, _), row in latest.items():
+        if row.get('status') == 'ok' or ax.confirmed_empty(row):
+            b = batches[bid]
+            for key in {(b['model'], None), (b['model'], ec.batch_slot(c, b))}:
+                counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def events(path: Path) -> dict:
@@ -267,7 +279,9 @@ def events(path: Path) -> dict:
             if (row.get("type") == "item.completed" and item.get("type") == "command_execution"
                     and item.get("exit_code") in (75, 76)
                     and re.search(r"(?:/tools/extract|extract_cli\.py)[\"']?\s+campaign\s+(?:submit|prepare)\b", item.get("command", ""))):
-                result["hard_stop"] = item["exit_code"]
+                # A later timeout cannot erase an earlier real refusal.
+                if result.get('hard_stop') != 75:
+                    result["hard_stop"] = item["exit_code"]
                 result.setdefault("hard_stops", []).append({"id": item.get("id"),
                     "command": item.get("command", ""), "exit_code": item["exit_code"]})
             if item.get("type") == "agent_message":
@@ -464,8 +478,9 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
         child = None
         while True:
             c = ec.load(d)
-            count = completed(c, d, model)
-            own_count = completed(c, d, model, slot)
+            counts = completed_counts(c, d)
+            count = counts.get((model, None), 0)
+            own_count = counts.get((model, slot), 0)
             if adopt_exit is not None:
                 update(phase="waiting_existing_worker", success=count, session=session)
                 if not adopt_exit.is_file():
@@ -641,13 +656,21 @@ def run(cid: str, model: str, *, session: str | None = None, adopt_exit: Path | 
                         if (ec.load(d).get('dispatch') or {}).get('state') == 'draining' or stop and stop.is_set():
                             update(phase='claims_drained', success=count)
                             return {'model': model, 'state': 'drained', 'success': count}
-                        if started is not None and clock() - started >= policy['infra_max_window_seconds']:
+                        if started is None:
+                            # NAS may fail AFTER the initial unknown classification.
+                            # Persist its first outage time so observer/restart cannot
+                            # turn a bounded retry into an endless health wait.
+                            previous = saved.get('infra_streak_started_at')
+                            started = float(previous) if previous is not None else clock()
+                            saved['infra_streak_started_at'] = started
+                            receipts.write(root / 'worker.json', saved)
+                        if clock() - started >= policy['infra_max_window_seconds']:
                             update(phase='coordinator_required', exit_code=2, reason='infrastructure_backoff_exhausted',
                                    detail=detail, infra_retries=infra_retries, nas_health=False)
                             return {'model': model, 'state': 'blocked', 'reason': 'infrastructure_backoff_exhausted',
                                     'detail': detail}
                         update(phase='waiting_nas_health', session=session, nas_health=False)
-                        sleep(poll)
+                        sleep(min(poll, max(0, started + policy['infra_max_window_seconds'] - clock())))
                 elif verdict['class'] == 'business':
                     update(phase="coordinator_required", exit_code=2, reason="native_worker_blocked", detail=detail)
                     return {"model": model, "state": "blocked", "reason": "native_worker_blocked", "detail": detail}
