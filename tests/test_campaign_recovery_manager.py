@@ -101,6 +101,26 @@ class RecoveryManagerTests(unittest.TestCase):
         self.assertEqual(ec.load(self.d)['dispatch']['state'], 'draining')
         self.assertTrue(list((self.d / 'recovery/incidents').glob('*.json')))
 
+    def test_one_formal_scan_per_snapshot_and_fresh_next_snapshot(self):
+        self.prepare()
+        with mock.patch.object(supervision, 'completed_counts', wraps=supervision.completed_counts) as count:
+            first = manager.snapshot(self.c['id'])
+            self.assertEqual(count.call_count, 1)
+            self.finish(self.bid)
+            second = manager.snapshot(self.c['id'])
+            self.assertEqual(count.call_count, 2)
+        self.assertEqual(first['formal']['m'], 0)
+        self.assertEqual(second['formal']['m'], 50)
+
+    def test_gate_timeout_cannot_mask_other_business_stops(self):
+        native = {'state': 'completed', 'exit_code': 1, 'ended_at': 't'}
+        for kind, action in [('quality_process_violation', 'registered_rework_required'),
+                             ('business_permission_denied', 'engineering_reconciliation_required'),
+                             ('uncertain_submit', 'engineering_reconciliation_required'),
+                             ('approval_rejected', 'approval_required')]:
+            self.assertEqual(manager.classify({'hard_stop': 76, 'recovery_kind': kind}, native),
+                             (action, 'campaign'))
+
     def test_live_original_and_unknown_write_never_launch(self):
         self.prepare()
         with receipts.attempt(self.owner / 'native', kind='native_cli'):

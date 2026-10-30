@@ -176,6 +176,12 @@ def classify(outcome, native, worker=None, policy=None):
         return 'wait_original', 'slot'
     if outcome.get('approval_refused') or outcome.get('recovery_kind') == 'approval_rejected':
         return 'approval_required', 'campaign'
+    if outcome.get('hard_stop') == 75:
+        return 'nas_reconciliation_required', 'campaign'
+    if outcome.get('recovery_kind') == 'quality_process_violation':
+        return 'registered_rework_required', 'campaign'
+    if outcome.get('recovery_kind') in ('business_permission_denied', 'uncertain_submit'):
+        return 'engineering_reconciliation_required', 'campaign'
     if outcome.get('hard_stop') == 76:
         policy = policy or supervision.recovery_policy(None)
         if supervision.backoff_exhausted(worker, policy, 'infrastructure'):
@@ -183,8 +189,6 @@ def classify(outcome, native, worker=None, policy=None):
         return 'bounded_infrastructure_continuation', 'slot'
     if outcome.get('hard_stop') or outcome.get('recovery_kind') == 'nas_refused':
         return 'nas_reconciliation_required', 'campaign'
-    if outcome.get('recovery_kind') == 'quality_process_violation':
-        return 'registered_rework_required', 'campaign'
     if supervision.capacity_terminal(outcome, native):
         return 'bounded_capacity_continuation', 'slot'
     if (native.get('state') == 'completed' and native.get('exit_code') == 0
@@ -206,7 +210,7 @@ def isolated_slot_failure(result):
     return result.get('reason') in ('model_capacity_exhausted', 'no_formal_progress')
 
 
-def conditions(c, d, model, slot, registration, progress):
+def conditions(c, d, model, slot, registration, progress, *, formal_counts=None):
     """Eligibility excludes native attempt IDs and peers' formal counters.
 
     A new failed invocation is not a changed prerequisite. Persisted blocked
@@ -220,7 +224,8 @@ def conditions(c, d, model, slot, registration, progress):
             if p.exists():files.append(ref(p))
         files.extend(ref(p) for p in sorted((d/'source-decisions'/b['id']).glob('*/latest.json')))
     return digest({'session':c.get('slot_sessions',{}).get(model,{}).get(str(slot)),
-        'own_formal':supervision.completed(c,d,model,slot),
+        'own_formal':(supervision.completed(c,d,model,slot) if formal_counts is None
+                      else formal_counts.get((model,slot),0)),
         'pending':[{k:b.get(k) for k in ('id','model','slot','ids','chain','status','decision_protocol')} for b in pending],
         'inputs':files,
         'registration':registration.get('id'),'progress':progress,
@@ -249,6 +254,7 @@ def snapshot(cid):
     except ValueError:
         policy_values = supervision.recovery_policy(None)
     rows = []
+    formal_counts = supervision.completed_counts(c, d)
     for model in c['models']:
         for slot in range(1, ec.parallelism(c) + 1):
             root = ec.supervisor_dir(d, model, slot)
@@ -318,7 +324,7 @@ def snapshot(cid):
                         and op.get('may_have_written') is False and statuses.get('http_502')
                         and not set(statuses)-{'dry_run','empty','http_502'}):
                     action='reconcile_preview';scope='slot'
-            if supervision.completed(c, d, model) >= c['quota'] and action == 'supervise':
+            if formal_counts.get((model, None), 0) >= c['quota'] and action == 'supervise':
                 action = 'quota_complete'
             handoff = None
             if worker.get('mode') == 'quality_rework' and action == 'supervise':
@@ -331,7 +337,7 @@ def snapshot(cid):
                    'worker': worker, 'outcome': outcome, 'progress': progress,
                    'registration': registration, 'dispatch_id': (c.get('dispatch') or {}).get('id')}
             row['published_continuation_valid'] = continuation
-            row['conditions_sha256'] = conditions(c,d,model,slot,registration,progress)
+            row['conditions_sha256'] = conditions(c,d,model,slot,registration,progress,formal_counts=formal_counts)
             if handoff:
                 row['accepted_rework_handoff'] = handoff
                 row['conditions_sha256'] = digest({'conditions': row['conditions_sha256'], 'handoff': handoff})
@@ -346,7 +352,7 @@ def snapshot(cid):
             row['event_id'] = digest(row)
             rows.append(row)
     return {'version': VERSION, 'campaign': cid, 'observed_at': receipts.now(), 'dispatch': c.get('dispatch'),
-            'slots': rows, 'formal': {m: supervision.completed(c, d, m) for m in c['models']}}
+            'slots': rows, 'formal': {m: formal_counts.get((m,None),0) for m in c['models']}}
 
 
 def approve_resume(cid, *, evidence, reason):
