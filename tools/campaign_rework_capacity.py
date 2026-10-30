@@ -7,11 +7,12 @@ read-only stale-preview/not-found pair.
 """
 import ast
 import json
+import os
 import re
 import shlex
 from pathlib import Path
 
-from tools import campaign_supervision as supervision, extract_campaign as ec
+from tools import campaign_supervision as supervision, extract_campaign as ec, agent_extract as ax
 from tools.campaign_rework_completion import _shell
 from tools.campaign_ownership_recovery import _ref, _time
 from utils import process_receipts as receipts
@@ -205,6 +206,79 @@ def transcript(path, session, scopes, readonly=None):
     return failures
 
 
+
+def reviewed_incident(c, root, model, slot, session, worker, native, batches, path):
+    """Reconcile the one source-audited incident; never waive an unknown script.
+
+    This evidence-only function cannot acquire a retry permission. Its only
+    production caller is validate(), consumed by campaign_rework.run inside
+    the existing supervisor attempt and native idle contexts, twice before
+    startup. Budget, service, NAS, approval and operation gates remain outside
+    and cannot be replaced by a caller-provided lock boolean.
+    """
+    from tools import campaign_rework_context as original
+    from tools import campaign_rework_reviewed_effects as effects
+    from tools import campaign_rework_repairs as explicit
+    from tools.campaign_rework_evidence import read_regular, unique_json
+    # Exact immutable transcript reviewed alongside the code-pinned private profile.
+    # A changed or unrelated transcript follows the ordinary strict validator.
+    if _ref(path)['sha256'] != '2404c3537d0c3e46791d6d5dcfc0ba6dc464b33687f040c0c17373d51001027a':
+        return None
+    if slot is not None:
+        raise ValueError('reviewed incident cannot migrate the original single lane')
+    d = ec.campaign_dir(c['id'])
+    sessions = Path.home() / '.codex/sessions'
+    releases = Path.home() / '.local/share/kg-hub/releases'
+    context = original.capture(d, c['id'], model, sessions_root=sessions,
+                               releases_root=releases, workspace=ec.workspace_dir())
+    identity = context['identity']
+    if (identity['session'] != session or [identity['batch']] != batches
+            or identity['native_attempt'] != native['attempt']
+            or identity['native_child_pid'] != native['child_pid']
+            or d / identity['job_relative'] != path.parent
+            or root != d / 'supervisors' / model):
+        raise ValueError('reviewed original invocation identity changed')
+    effect = effects.inspect(context, d, releases, sessions)
+    refs = context['manifest']['files']
+    rows = [unique_json(line) for line in read_regular(d,refs['events']['path'],refs['events']['sha256']).splitlines()]
+    batch = unique_json(read_regular(d,refs['batch']['path'],refs['batch']['sha256']))
+    source_keys = {x['id']:(x['source_description'],x['source_obs_id']) for x in batch['items']}
+    audit = d / identity['audit_relative']
+    reconciled = explicit.reconcile(rows,effect['repair_inventory'],
+        expected_items={x['item'] for x in effect['repair_inventory']},audit=audit,
+        source_keys=source_keys,model=model,executor=c['executor'],run_id=c['models'][model]['run_id'],
+        status_get=lambda rid:explicit.read_status(rid,os.environ.get('KG_HUB_URL',ax.DEFAULT_URL)))
+    # Fresh GETs cannot replace unchanged original authority. Retain every input
+    # needed to reconstruct this disposition in the new job's frozen evidence.
+    evidence = {}
+    for absolute, ref in context['authority'].items():
+        read_regular(ref['anchor'],ref['path'],ref['sha256'])
+        evidence[absolute] = {'path':absolute,'sha256':ref['sha256']}
+    if effects.inspect(context,d,releases,sessions) != effect:
+        raise ValueError('reviewed retained source changed during public readback')
+    for absolute, ref in effect['retained_source_references'].items():
+        evidence[absolute] = {'path':absolute,'sha256':ref['sha256']}
+    for entry in effect['repair_inventory']:
+        for suffix,key in [('reviewed-request','request_sha256'),('apply','apply_sha256')]:
+            name=f"{entry['source_id']}.{suffix}.json"
+            read_regular(audit,name,entry[key])
+            evidence[str(audit/name)]={'path':str(audit/name),'sha256':entry[key]}
+    profile=d/effects.PROFILE_RELATIVE
+    if _ref(profile)['sha256'] != effect['review_profile_sha256']:
+        raise ValueError('private reviewed profile changed')
+    evidence[str(profile)] = _ref(profile)
+    proof = context['evidence']
+    failures = [{'id':x['item'],'disposition':x['evidence_disposition']}
+                for x in proof['local_evidence']]
+    failures.append({'id':proof['host_evidence']['native_item'],
+                     'disposition':proof['host_evidence']['disposition']})
+    return {'local_failures':failures,'evidence':evidence,
+            'reviewed_incident':{'original_identity':identity,'original_evidence':proof,
+                'source_effect_review':effect,'public_repair_readbacks':reconciled,
+                'normal_os_exit_proven':False,'semantic_acceptance':False,
+                'new_source_quota':0}}
+
+
 def validate(c, root, model, slot, session, worker, native, batches):
     path = Path(worker.get('events', '/missing')).resolve(strict=True)
     job = path.parent
@@ -241,6 +315,9 @@ def validate(c, root, model, slot, session, worker, native, batches):
                 or op.get('kind') != 'submit' or op.get('exit_code') != 0
                 or op.get('may_have_written') or op.get('requires_reconciliation')):
             raise ValueError('submitted batch operation must have a complete known terminal')
+    reviewed = reviewed_incident(c, root, model, slot, session, worker, native, batches, path)
+    if reviewed is not None:
+        return {'retry': count + 1, **reviewed}
     repairs = {}
     for audit, ids in scopes.items():
         for applied in Path(audit).glob('*-apply.json'):
