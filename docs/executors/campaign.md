@@ -429,6 +429,13 @@ applied/verified回执。协调器仍须先通过公共repair status核对最新
 原worker/native回执保存不可变副本。该选项不能与startup/adoption/maintenance例外组合。
 启动仍须经获准宿主环境；完整返工、专项记录和协调器质量验收完成后才可恢复生产领取。
 
+对单独审查并固定全部原始字节的单路事件，恢复入口还可消费原宿主的 failed/-1
+完成回执，严格绑定原SID/turn/argv/process和完整来源及写入清单。它不补造原生终态，
+也不把-1改为成功；固定摘要的私有审计profile不是调用者可自行提交的豁免文件。
+消费者在监督器/native实际锁内核验全部原证据及每项repair的最新规范化request/result，
+服务预检后再次核验并冻结证据；原退避、预算、审批、NAS与未知写入门继续执行。
+详见 [恢复协议](recovery-protocol.md)。该例外不适用于任意缺失终态或任意脚本失败。
+
 不能先全额resume再补质量欠账。协调器使用独立 `rework` 入口，仍由原模型、原槽位和原session
 完成自己已提交的批次，不把批次交给协助槽。普通supervise在draining时不新开模型回合。
 

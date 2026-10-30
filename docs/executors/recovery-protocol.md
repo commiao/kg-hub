@@ -95,6 +95,25 @@ after service preflight. This does not accept stale repair inputs: the resumed
 owner must compare fresh source state and author a newly reviewed request when
 needed. No apply, real permission refusal or unknown write is cleared.
 
+A separately reviewed legacy single-lane incident may reconcile a missing native
+command terminal against the original host rollout's failed `-1` completion.
+This is an evidence disposition, not a synthetic native success or proof of a
+normal OS exit. The original session, turn, argv, process, timestamps, assignment,
+source batch, retained release and command bytes must match. A code-pinned digest
+selects a private `recovery-profiles/<digest>.json` under the campaign; callers
+cannot supply an approval profile or broaden its command inventory. The private
+profile and incident records belong in the private evidence archive, not this
+repository. Exact reviewed local failures retain their failed receipts; unknown
+scripts, changed files and unaccounted writes remain rejected.
+
+The consumer runs inside the existing supervisor attempt and native idle locks,
+reconciles every listed public repair with fresh GET request/result readbacks,
+then repeats validation after service preflight. It freezes all referenced inputs
+before starting the same session with zero new-source quota and claims draining.
+Backoff, retry budget, original-submit, approval and NAS gates still apply. Source
+review does not claim an original import trace, and process continuation does not
+accept the rework's semantic quality or cost report.
+
 Submitted source repair admission accepts either its original single-source
 context or the complete, unchanged original frozen batch. The latter reuses the
 already shared server quality contract for `batch_item` citations and requires
